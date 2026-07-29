@@ -1,0 +1,11 @@
+# Default owner for everything.
+*                       @kostia7alania
+
+# Areas where a mistake is expensive, listed so review attention lands there.
+/src/retention/         @kostia7alania
+/src/telegram/          @kostia7alania
+/src/logging/redact.ts  @kostia7alania
+/src/sessionizer/       @kostia7alania
+/SECURITY.md            @kostia7alania
+/RECORDING_POLICY.md    @kostia7alania
+/.github/workflows/     @kostia7alania

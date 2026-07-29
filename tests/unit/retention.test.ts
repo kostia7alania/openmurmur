@@ -1,0 +1,409 @@
+import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, it } from 'node:test';
+import { DEFAULT_CONFIG } from '../../src/config/schema.ts';
+import { type Database, openDatabase } from '../../src/database/db.ts';
+import { AlertEvaluator, renderAlert } from '../../src/health/alerts.ts';
+import { evaluateHealth, renderHealthLines } from '../../src/health/monitor.ts';
+import { applyRetention, planRetention } from '../../src/retention/policy.ts';
+
+let dir: string;
+let db: Database;
+
+const RETENTION = DEFAULT_CONFIG.retention;
+const OLD = '2020-01-01T00:00:00.000Z';
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'om-ret-'));
+  db = openDatabase({ file: join(dir, 'test.db') });
+});
+
+afterEach(() => {
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/**
+ * Creates a session whose audio is fully delivered — every condition retention
+ * demands. Individual tests then break exactly one condition, so a failure
+ * names the specific guarantee that regressed.
+ */
+interface SessionOptions {
+  state?: string;
+  finalized?: number;
+  delivered?: number;
+  sha256?: string | null;
+  withTranscript?: boolean;
+  transcriptSent?: boolean;
+  outboxPending?: boolean;
+  pendingJob?: boolean;
+}
+
+function seedDeliveredSession(id: string, options: SessionOptions = {}): string {
+  const {
+    state = 'DONE',
+    finalized = 1,
+    delivered = 1,
+    sha256 = 'abc123',
+    withTranscript = true,
+    transcriptSent = true,
+    outboxPending = false,
+    pendingJob = false,
+  } = options;
+
+  const path = join(dir, `${id}.flac`);
+  writeFileSync(path, Buffer.alloc(1024));
+
+  db.handle
+    .prepare(
+      `INSERT INTO audio_sessions (session_id, state, started_at, ended_at, duration_ms,
+                                   speech_ms, part_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 60000, 30000, 1, ?, ?)`,
+    )
+    .run(id, state, OLD, OLD, OLD, OLD);
+
+  db.handle
+    .prepare(
+      `INSERT INTO audio_parts (part_id, session_id, part_index, path, started_at, ended_at,
+                                bytes, sha256, finalized, delivered, created_at)
+       VALUES (?, ?, 0, ?, ?, ?, 1024, ?, ?, ?, ?)`,
+    )
+    .run(`${id}-p0`, id, path, OLD, OLD, sha256, finalized, delivered, OLD);
+
+  if (withTranscript) {
+    db.handle
+      .prepare(
+        `INSERT INTO transcript_revisions (revision_id, session_id, revision_number, engine, model,
+                                           languages, text, word_count, is_current, created_at)
+         VALUES (?, ?, 1, 'e', 'm', '["ru"]', 'текст', 5, 1, ?)`,
+      )
+      .run(`${id}-r1`, id, OLD);
+  }
+
+  if (transcriptSent) {
+    db.handle
+      .prepare(
+        `INSERT INTO telegram_outbox (outbox_id, delivery_part_id, session_id, kind, ordinal,
+                                      payload, state, run_after, created_at, updated_at)
+         VALUES (?, ?, ?, 'transcript', 10, '{}', 'sent', ?, ?, ?)`,
+      )
+      .run(`${id}-o1`, `transcript:${id}:1`, id, OLD, OLD, OLD);
+  }
+
+  if (outboxPending) {
+    db.handle
+      .prepare(
+        `INSERT INTO telegram_outbox (outbox_id, delivery_part_id, session_id, kind, ordinal,
+                                      payload, state, run_after, created_at, updated_at)
+         VALUES (?, ?, ?, 'report', 20, '{}', 'pending', ?, ?, ?)`,
+      )
+      .run(`${id}-o2`, `report:${id}`, id, OLD, OLD, OLD);
+  }
+
+  if (pendingJob) {
+    db.handle
+      .prepare(
+        `INSERT INTO jobs (job_id, kind, idempotency_key, payload, state, run_after,
+                           created_at, updated_at)
+         VALUES (?, 'asr', ?, '{}', 'pending', ?, ?, ?)`,
+      )
+      .run(`${id}-j1`, `asr:${id}`, OLD, OLD, OLD);
+  }
+
+  return path;
+}
+
+describe('retention: what may be deleted', () => {
+  it('deletes audio only once every condition holds', () => {
+    seedDeliveredSession('s1');
+    const plan = planRetention(db.handle, RETENTION);
+
+    assert.equal(plan.candidates.length, 1);
+    assert.equal(plan.candidates[0]?.kind, 'session_audio');
+    assert.equal(plan.totalBytes, 1024);
+  });
+
+  it('keeps audio that is not yet old enough', () => {
+    seedDeliveredSession('s1');
+    // Evaluate as if it were the moment the session ended.
+    const plan = planRetention(db.handle, RETENTION, Date.parse(OLD));
+    assert.equal(plan.candidates.length, 0);
+  });
+
+  it('deletes rejected-noise audio on its own shorter schedule', () => {
+    seedDeliveredSession('noise', {
+      state: 'REJECTED',
+      delivered: 0,
+      withTranscript: false,
+      transcriptSent: false,
+    });
+
+    const plan = planRetention(db.handle, RETENTION);
+    assert.equal(plan.candidates.length, 1);
+    assert.equal(plan.candidates[0]?.kind, 'rejected_session_audio');
+  });
+});
+
+describe('retention: what must never be deleted', () => {
+  const cases: { name: string; options: SessionOptions; expectedBlock: RegExp }[] = [
+    {
+      name: 'ASR has not finished',
+      options: { state: 'PROCESSING', delivered: 0, withTranscript: false, transcriptSent: false },
+      expectedBlock: /ASR has not finished/,
+    },
+    {
+      name: 'the checksum was never computed',
+      options: { sha256: null },
+      expectedBlock: /checksum not computed/,
+    },
+    {
+      name: 'the audio part was never finalized',
+      options: { finalized: 0 },
+      expectedBlock: /never finalized/,
+    },
+    {
+      name: 'Telegram never confirmed this audio part',
+      options: { delivered: 0 },
+      expectedBlock: /not confirmed delivered/,
+    },
+    {
+      name: 'the transcript was never delivered',
+      options: { transcriptSent: false },
+      expectedBlock: /transcript delivery not confirmed/,
+    },
+    {
+      name: 'a message for this session is still queued',
+      options: { outboxPending: true },
+      expectedBlock: /./,
+    },
+    {
+      name: 'a job still references the session',
+      options: { pendingJob: true },
+      expectedBlock: /./,
+    },
+    {
+      name: 'there is no transcript at all',
+      options: { withTranscript: false },
+      expectedBlock: /./,
+    },
+  ];
+
+  for (const { name, options, expectedBlock } of cases) {
+    it(`refuses to delete when ${name}`, () => {
+      const path = seedDeliveredSession('s1', options);
+      const plan = planRetention(db.handle, RETENTION);
+
+      assert.equal(plan.candidates.length, 0, `audio was wrongly eligible when ${name}`);
+      assert.equal(plan.blocked.length, 1, 'the reason for keeping it must be reported');
+      assert.match(plan.blocked[0]?.reason ?? '', expectedBlock);
+      assert.ok(existsSync(path));
+    });
+  }
+
+  it('explains why a file is being kept rather than staying silent', () => {
+    seedDeliveredSession('s1', { delivered: 0 });
+    const plan = planRetention(db.handle, RETENTION);
+    assert.ok((plan.blocked[0]?.reason.length ?? 0) > 0);
+    assert.ok(plan.blocked[0]?.path.endsWith('.flac'));
+  });
+});
+
+describe('retention: dry-run and apply agree', () => {
+  it('apply deletes exactly what dry-run listed', async () => {
+    const deletable = seedDeliveredSession('s1');
+    const kept = seedDeliveredSession('s2', { delivered: 0 });
+
+    const plan = planRetention(db.handle, RETENTION);
+    assert.deepEqual(
+      plan.candidates.map((c) => c.path),
+      [deletable],
+    );
+
+    const result = await applyRetention(db.handle, plan);
+
+    assert.equal(result.deleted, 1);
+    assert.equal(result.freedBytes, 1024);
+    assert.equal(existsSync(deletable), false);
+    assert.equal(existsSync(kept), true, 'a blocked file must survive apply');
+  });
+
+  it('dry-run changes nothing on disk or in the database', () => {
+    const path = seedDeliveredSession('s1');
+    planRetention(db.handle, RETENTION);
+    planRetention(db.handle, RETENTION);
+
+    assert.ok(existsSync(path));
+    const row = db.handle.prepare('SELECT deleted_at FROM audio_parts').get() as {
+      deleted_at: string | null;
+    };
+    assert.equal(row.deleted_at, null);
+  });
+
+  it('marks the row deleted only after the file is really gone', async () => {
+    seedDeliveredSession('s1');
+    const plan = planRetention(db.handle, RETENTION);
+    await applyRetention(db.handle, plan);
+
+    const row = db.handle.prepare('SELECT deleted_at FROM audio_parts').get() as {
+      deleted_at: string | null;
+    };
+    assert.ok(row.deleted_at !== null);
+  });
+
+  it('does not re-offer a file it already deleted', async () => {
+    seedDeliveredSession('s1');
+    await applyRetention(db.handle, planRetention(db.handle, RETENTION));
+    assert.equal(planRetention(db.handle, RETENTION).candidates.length, 0);
+  });
+});
+
+describe('alert deduplication', () => {
+  function evaluator(nowRef: { value: number }) {
+    return new AlertEvaluator(db.handle, { cooldownMinutes: 30, now: () => nowRef.value });
+  }
+
+  it('says nothing while a condition is false', () => {
+    const now = { value: Date.now() };
+    const alerts = evaluator(now);
+    for (let i = 0; i < 10; i += 1) {
+      assert.equal(alerts.evaluate('disk_low', false).send, false);
+    }
+  });
+
+  it('alerts once when a condition becomes true', () => {
+    const now = { value: Date.now() };
+    const alerts = evaluator(now);
+
+    const first = alerts.evaluate('recorder_stale', true);
+    assert.equal(first.send, true);
+    assert.equal(first.transition, 'raised');
+
+    // A health poll runs every few seconds; it must not message every time.
+    for (let i = 0; i < 20; i += 1) {
+      now.value += 5000;
+      assert.equal(alerts.evaluate('recorder_stale', true).send, false);
+    }
+  });
+
+  it('sends a recovery message when the condition clears', () => {
+    const now = { value: Date.now() };
+    const alerts = evaluator(now);
+    alerts.evaluate('recorder_stale', true);
+
+    const cleared = alerts.evaluate('recorder_stale', false);
+    assert.equal(cleared.send, true);
+    assert.equal(cleared.transition, 'cleared');
+
+    assert.equal(alerts.evaluate('recorder_stale', false).send, false, 'and only once');
+  });
+
+  it('re-reminds after the cooldown, but no sooner', () => {
+    const now = { value: Date.now() };
+    const alerts = evaluator(now);
+    alerts.evaluate('disk_low', true);
+
+    now.value += 29 * 60_000;
+    assert.equal(alerts.evaluate('disk_low', true).send, false);
+
+    now.value += 2 * 60_000;
+    const repeated = alerts.evaluate('disk_low', true);
+    assert.equal(repeated.send, true);
+    assert.equal(repeated.transition, 'repeated');
+  });
+
+  it('tracks each alert independently', () => {
+    const now = { value: Date.now() };
+    const alerts = evaluator(now);
+
+    assert.equal(alerts.evaluate('disk_low', true).send, true);
+    assert.equal(alerts.evaluate('asr_backlog', true).send, true);
+    assert.equal(alerts.isActive('disk_low'), true);
+    assert.equal(alerts.isActive('telegram_delivery'), false);
+  });
+
+  it('gives each alert edge a stable delivery id', () => {
+    const raise = renderAlert('recorder_stale', 'raised', 'нет аудио 20 сек', 12345);
+    const again = renderAlert('recorder_stale', 'raised', 'нет аудио 25 сек', 12345);
+    const clear = renderAlert('recorder_stale', 'cleared', '', 12345);
+
+    assert.equal(raise.deliveryPartId, again.deliveryPartId, 'same edge, same id, no duplicate');
+    assert.notEqual(raise.deliveryPartId, clear.deliveryPartId);
+    assert.match(raise.text, /🟡 Запись временно недоступна/);
+    assert.match(clear.text, /🟢 Запись восстановлена/);
+  });
+});
+
+describe('health evaluation', () => {
+  const base = {
+    recorderRunning: true,
+    msSinceLastFrame: 100,
+    minutesSinceLastClosedPart: 2,
+    workerReady: true,
+    workerDetail: 'ready',
+    ollamaReady: true,
+    ollamaDetail: 'ready',
+    activeSessionMs: null,
+    asrBacklogMinutes: 0,
+    outboxAgeMinutes: 0,
+    diskFreeGb: 200,
+    sqliteWritable: true,
+    hoursSinceLastDigest: 1,
+  };
+
+  it('reports OK when everything is fine', () => {
+    const report = evaluateHealth(base, DEFAULT_CONFIG.health);
+    assert.equal(report.overall, 'healthy');
+    assert.equal(renderHealthLines(report), 'OK');
+  });
+
+  it('fails when audio has stopped arriving', () => {
+    const report = evaluateHealth(
+      { ...base, msSinceLastFrame: 16 * 60_000 },
+      DEFAULT_CONFIG.health,
+    );
+    assert.equal(report.overall, 'failed');
+    assert.match(renderHealthLines(report), /ERROR: recorder/);
+  });
+
+  it('is "recovering", not "failed", before the first frame arrives', () => {
+    // Startup is not a failure; announcing one would be a false alarm.
+    const report = evaluateHealth({ ...base, msSinceLastFrame: null }, DEFAULT_CONFIG.health);
+    assert.equal(report.overall, 'recovering');
+  });
+
+  it('warns on low disk without failing', () => {
+    const report = evaluateHealth({ ...base, diskFreeGb: 5 }, DEFAULT_CONFIG.health);
+    assert.equal(report.overall, 'degraded');
+    assert.match(renderHealthLines(report), /WARN: disk/);
+  });
+
+  it('warns on ASR backlog', () => {
+    const report = evaluateHealth({ ...base, asrBacklogMinutes: 63 }, DEFAULT_CONFIG.health);
+    assert.match(renderHealthLines(report), /WARN: asr_backlog — oldest job 63 min old/);
+  });
+
+  it('treats a missing LLM as degraded, never as a stop', () => {
+    // Audio and transcripts must still be delivered without a summarizer.
+    const report = evaluateHealth(
+      { ...base, ollamaReady: false, ollamaDetail: 'not reachable' },
+      DEFAULT_CONFIG.health,
+    );
+    assert.equal(report.overall, 'degraded');
+    assert.equal(report.checks.find((c) => c.component === 'llm')?.status, 'degraded');
+  });
+
+  it('fails when the database is unwritable', () => {
+    const report = evaluateHealth({ ...base, sqliteWritable: false }, DEFAULT_CONFIG.health);
+    assert.equal(report.overall, 'failed');
+  });
+
+  it('reports the worst status across all components', () => {
+    const report = evaluateHealth(
+      { ...base, diskFreeGb: 1, recorderRunning: false },
+      DEFAULT_CONFIG.health,
+    );
+    assert.equal(report.overall, 'failed');
+  });
+});

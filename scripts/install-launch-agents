@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Installs the launchd agents from the templates in launchd/.
+#
+# Grant microphone access interactively FIRST (`openmurmur capture test`).
+# launchd cannot always surface the macOS TCC prompt.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+REPO="$(pwd)"
+AGENTS="$HOME/Library/LaunchAgents"
+NODE_BIN="$(command -v node)"
+
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+ok()   { printf '\033[32m✓ %s\033[0m\n' "$1"; }
+warn() { printf '\033[33m! %s\033[0m\n' "$1"; }
+
+[ "$(uname -s)" = "Darwin" ] || { echo "macOS only." >&2; exit 1; }
+
+bold "Installing OpenMurmur launch agents"
+echo "  repo: $REPO"
+echo "  node: $NODE_BIN"
+echo
+
+warn "Have you run 'openmurmur capture test' and granted microphone access?"
+warn "launchd may not be able to show the permission prompt."
+printf 'Continue? [y/N] '
+read -r reply
+case "$reply" in [yY]*) ;; *) echo "Cancelled."; exit 1 ;; esac
+
+mkdir -p "$AGENTS" "$HOME/Library/Application Support/OpenMurmur/logs"
+
+for template in launchd/*.plist.example; do
+  name="$(basename "$template" .example)"
+  target="$AGENTS/$name"
+
+  sed -e "s|__REPO_DIR__|$REPO|g" \
+      -e "s|__NODE_BIN__|$NODE_BIN|g" \
+      -e "s|__HOME__|$HOME|g" \
+      "$template" > "$target"
+
+  plutil -lint "$target" >/dev/null || { echo "Generated plist is invalid: $target" >&2; exit 1; }
+
+  launchctl bootout "gui/$(id -u)/${name%.plist}" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$target"
+  ok "$name"
+done
+
+echo
+bold "Installed. Check status with:"
+echo "  launchctl print gui/$(id -u)/io.openmurmur.daemon"
+echo "  openmurmur status"
+echo "  tail -f ~/Library/Application\\ Support/OpenMurmur/logs/daemon.err.log"

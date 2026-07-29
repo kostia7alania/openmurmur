@@ -1,0 +1,31 @@
+{
+  "name": "openmurmur",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first ambient audio journal for Apple Silicon. Records speech sessions, transcribes RU/EN/TH on-device, and sends audio, transcripts, summaries and health status to Telegram.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=26.0.0"
+  },
+  "packageManager": "pnpm@10.19.0",
+  "bin": {
+    "openmurmur": "./src/cli/main.ts"
+  },
+  "scripts": {
+    "openmurmur": "node src/cli/main.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "test": "node --test 'tests/unit/*.test.ts' 'tests/integration/*.test.ts'",
+    "test:unit": "node --test 'tests/unit/*.test.ts'",
+    "test:integration": "node --test 'tests/integration/*.test.ts'",
+    "check": "pnpm run typecheck && pnpm run lint && pnpm run test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.6",
+    "@types/node": "26.1.2",
+    "typescript": "7.0.2"
+  }
+}

@@ -1,0 +1,77 @@
+name: Bug report
+description: Something does not work as documented
+labels: ["type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste a bot token, a transcript, or recorded audio into a
+        public issue.** `openmurmur doctor` redacts secrets; check its output
+        before pasting anyway.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. openmurmur start
+        2. Speak for ~10 seconds
+        3. Wait 60 seconds
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `openmurmur doctor`
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - capture (microphone, permissions)
+        - sessionizer (sessions start/stop wrongly)
+        - asr (transcription quality or failure)
+        - llm (summaries)
+        - telegram (delivery, commands, incoming audio)
+        - storage (database, retention)
+        - macos (launchd, TCC, sleep)
+        - other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: OpenMurmur version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and chip
+      placeholder: "26.5.2, M3 Max, 64 GB"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: From `~/Library/Application Support/OpenMurmur/logs/`. Secrets are redacted, but read them first.
+      render: text

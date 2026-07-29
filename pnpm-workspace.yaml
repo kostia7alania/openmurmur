@@ -1,0 +1,5 @@
+packages:
+  - "."
+
+# The Python MLX worker under python/openmurmur_audio is managed by `uv`,
+# not by pnpm. See python/openmurmur_audio/pyproject.toml.

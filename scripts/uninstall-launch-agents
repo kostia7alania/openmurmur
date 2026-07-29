@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Removes the launchd agents. Leaves your data completely untouched.
+set -euo pipefail
+
+AGENTS="$HOME/Library/LaunchAgents"
+UID_NUM="$(id -u)"
+
+for label in io.openmurmur.daemon io.openmurmur.telegram io.openmurmur.digest; do
+  if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
+    launchctl bootout "gui/$UID_NUM/$label" 2>/dev/null || true
+    printf '\033[32m✓ unloaded %s\033[0m\n' "$label"
+  fi
+  rm -f "$AGENTS/$label.plist"
+done
+
+echo
+echo "Agents removed. Your audio, transcripts and database are untouched at:"
+echo "  ~/Library/Application Support/OpenMurmur/"
+echo
+echo "To remove data as well, see PRIVACY.md."

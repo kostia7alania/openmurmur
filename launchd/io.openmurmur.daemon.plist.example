@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OpenMurmur recording daemon.
+
+  scripts/install-launch-agents substitutes __REPO_DIR__, __NODE_BIN__ and
+  __HOME__ and installs this into ~/Library/LaunchAgents.
+
+  No secrets appear here. The Telegram bot token lives in the macOS Keychain;
+  a launchd plist is world-readable and is synced by some backup tools.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.openmurmur.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__NODE_BIN__</string>
+        <string>__REPO_DIR__/src/cli/main.ts</string>
+        <string>start</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it exits, but throttle so a permission failure does not
+         spin at full speed forever. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Application Support/OpenMurmur/logs/daemon.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Application Support/OpenMurmur/logs/daemon.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Audio capture is latency-sensitive; do not let it be throttled. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>LowPriorityIO</key>
+    <false/>
+    <key>Nice</key>
+    <integer>-5</integer>
+</dict>
+</plist>

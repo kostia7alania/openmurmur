@@ -1,0 +1,42 @@
+name: Language or transcription quality
+description: Report poor recognition for a specific language
+labels: ["type:bug", "area:asr"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not attach your own recordings.** They contain private speech.
+        Describe the problem, or provide a short clip you recorded specifically
+        for this report and are happy to make public.
+
+  - type: dropdown
+    id: language
+    attributes:
+      label: Language
+      options: [Russian, English, Thai, Mixed, Other]
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What was said, and what was transcribed
+      placeholder: |
+        Said:        "Давай перенесём встречу на вторник"
+        Transcribed: "Давай перенесем встречу на второй"
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: ASR model and quantization
+      placeholder: "Qwen/Qwen3-ASR-1.7B, 8bit"
+    validations:
+      required: true
+
+  - type: textarea
+    id: conditions
+    attributes:
+      label: Recording conditions
+      placeholder: "Quiet room, built-in microphone, ~1 m away, one speaker"

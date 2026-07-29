@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Installs everything OpenMurmur needs. Idempotent: safe to re-run.
+#
+# It never installs models (multi-gigabyte, and your choice) and never touches
+# the Keychain. Run `openmurmur setup telegram` for that.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+warn() { printf '\033[33m! %s\033[0m\n' "$1"; }
+ok()   { printf '\033[32m✓ %s\033[0m\n' "$1"; }
+die()  { printf '\033[31m✗ %s\033[0m\n' "$1" >&2; exit 1; }
+
+bold "OpenMurmur bootstrap"
+echo
+
+[ "$(uname -s)" = "Darwin" ] || die "OpenMurmur runs on macOS only."
+if [ "$(uname -m)" != "arm64" ]; then
+  warn "This is not Apple Silicon. MLX needs Metal on an M-series chip; ASR will not work."
+fi
+
+# --- Node ---------------------------------------------------------------
+command -v node >/dev/null 2>&1 || die "Node is not installed. Install Node 26: https://nodejs.org"
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+[ "$NODE_MAJOR" -ge 26 ] || die "Node $NODE_MAJOR found; OpenMurmur needs Node 26 or newer (see .nvmrc)."
+ok "Node $(node -v)"
+
+# --- pnpm ---------------------------------------------------------------
+if ! command -v pnpm >/dev/null 2>&1; then
+  warn "pnpm not found; installing via corepack"
+  corepack enable && corepack prepare pnpm@10.19.0 --activate
+fi
+ok "pnpm $(pnpm -v)"
+
+# --- FFmpeg -------------------------------------------------------------
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    warn "ffmpeg not found; installing with Homebrew"
+    brew install ffmpeg
+  else
+    die "ffmpeg is required. Install Homebrew (https://brew.sh) then: brew install ffmpeg"
+  fi
+fi
+ok "$(ffmpeg -version | head -1)"
+
+# --- uv -----------------------------------------------------------------
+if ! command -v uv >/dev/null 2>&1; then
+  warn "uv not found; installing"
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+ok "$(uv --version)"
+
+# --- Dependencies -------------------------------------------------------
+bold "Installing Node dependencies"
+pnpm install --frozen-lockfile
+
+bold "Installing the Python audio worker (CI-safe subset)"
+uv sync --project python/openmurmur_audio
+ok "Python worker ready"
+
+echo
+warn "The MLX ASR stack is NOT installed by default (several GB, needs Metal):"
+echo "    uv sync --project python/openmurmur_audio --extra mlx"
+echo
+warn "Ollama is optional. Without it you get audio and transcripts, but no summaries:"
+echo "    brew install ollama && ollama serve && ollama pull qwen3.6:27b"
+echo
+
+bold "Next steps"
+cat <<'STEPS'
+  pnpm openmurmur doctor           # verify everything
+  pnpm openmurmur setup            # create directories and config
+  pnpm openmurmur setup telegram   # connect your bot
+  pnpm openmurmur capture test     # grant microphone access, check levels
+  pnpm openmurmur start            # run the daemon
+STEPS

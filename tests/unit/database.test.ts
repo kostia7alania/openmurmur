@@ -1,0 +1,321 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, it } from 'node:test';
+import {
+  compareVersions,
+  type Database,
+  migrate,
+  openDatabase,
+  transaction,
+} from '../../src/database/db.ts';
+import {
+  countWords,
+  SessionRepository,
+  TranscriptRepository,
+} from '../../src/database/repository.ts';
+import { backoffMs, JobQueue } from '../../src/jobs/queue.ts';
+
+let dir: string;
+let db: Database;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'om-db-'));
+  db = openDatabase({ file: join(dir, 'test.db') });
+});
+
+afterEach(() => {
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+describe('migrations', () => {
+  it('creates every table the pipeline needs', () => {
+    const tables = new Set(
+      (
+        db.handle.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as {
+          name: string;
+        }[]
+      ).map((r) => r.name),
+    );
+
+    for (const table of [
+      'audio_sessions',
+      'audio_parts',
+      'vad_segments',
+      'transcript_revisions',
+      'transcript_segments',
+      'jobs',
+      'summaries',
+      'health_events',
+      'alert_state',
+      'telegram_updates',
+      'telegram_outbox',
+      'incoming_telegram_files',
+      'schema_migrations',
+    ]) {
+      assert.ok(tables.has(table), `missing table ${table}`);
+    }
+  });
+
+  it('is idempotent: re-running applies nothing and loses nothing', () => {
+    new SessionRepository(db.handle).create('s1', new Date().toISOString());
+
+    assert.deepEqual(migrate(db.handle), [], 'second run must apply no migrations');
+    assert.deepEqual(migrate(db.handle), []);
+    assert.ok(new SessionRepository(db.handle).get('s1'), 'existing data survives');
+  });
+
+  it('records what it applied', () => {
+    const applied = db.handle.prepare('SELECT name FROM schema_migrations').all() as {
+      name: string;
+    }[];
+    assert.ok(applied.length >= 1);
+    assert.ok(applied.every((row) => row.name.endsWith('.sql')));
+  });
+
+  it('turns on WAL and foreign keys', () => {
+    const journal = db.handle.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
+    const fk = db.handle.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number };
+    assert.equal(journal.journal_mode, 'wal');
+    assert.equal(fk.foreign_keys, 1);
+  });
+
+  it('enforces foreign keys', () => {
+    assert.throws(
+      () =>
+        db.handle
+          .prepare(
+            `INSERT INTO audio_parts (part_id, session_id, part_index, path, started_at, created_at)
+             VALUES ('p1','does-not-exist',0,'/tmp/a.flac','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`,
+          )
+          .run(),
+      /FOREIGN KEY/i,
+    );
+  });
+
+  it('has FTS5 with the trigram tokenizer available', () => {
+    assert.doesNotThrow(() => db.handle.prepare('SELECT count(*) FROM transcript_fts').get());
+  });
+});
+
+describe('version comparison', () => {
+  it('orders versions numerically, not lexically', () => {
+    assert.equal(compareVersions('3.53.4', '3.53.4'), 0);
+    assert.equal(compareVersions('3.53.3', '3.53.4'), -1);
+    assert.equal(compareVersions('3.9.0', '3.10.0'), -1, '9 < 10 numerically');
+    assert.equal(compareVersions('3.54', '3.53.9'), 1);
+  });
+});
+
+describe('transactions', () => {
+  it('rolls back everything on failure', () => {
+    const sessions = new SessionRepository(db.handle);
+    assert.throws(() =>
+      transaction(db.handle, () => {
+        sessions.create('s-rollback', new Date().toISOString());
+        throw new Error('boom');
+      }),
+    );
+    assert.equal(sessions.get('s-rollback'), undefined);
+  });
+
+  it('commits on success', () => {
+    const sessions = new SessionRepository(db.handle);
+    transaction(db.handle, () => sessions.create('s-commit', new Date().toISOString()));
+    assert.ok(sessions.get('s-commit'));
+  });
+});
+
+describe('immutable transcript revisions', () => {
+  it('appends rather than overwrites, and moves the current pointer', () => {
+    const sessions = new SessionRepository(db.handle);
+    const transcripts = new TranscriptRepository(db.handle);
+    sessions.create('s1', new Date().toISOString());
+
+    transcripts.append({
+      sessionId: 's1',
+      engine: 'e',
+      model: 'v1',
+      languages: ['ru'],
+      text: 'первый вариант',
+      segments: [],
+    });
+    transcripts.append({
+      sessionId: 's1',
+      engine: 'e',
+      model: 'v2',
+      languages: ['ru'],
+      text: 'второй вариант',
+      segments: [],
+    });
+
+    const rows = db.handle
+      .prepare(
+        'SELECT revision_number, text, is_current FROM transcript_revisions WHERE session_id = ? ORDER BY revision_number',
+      )
+      .all('s1') as { revision_number: number; text: string; is_current: number }[];
+
+    assert.equal(rows.length, 2, 'the old revision is kept, not replaced');
+    assert.equal(rows[0]?.is_current, 0);
+    assert.equal(rows[1]?.is_current, 1);
+    assert.equal(rows[0]?.text, 'первый вариант', 'a re-run must not destroy the original');
+    assert.equal(transcripts.current('s1')?.text, 'второй вариант');
+  });
+
+  it('stores segments with their timestamp provenance', () => {
+    const sessions = new SessionRepository(db.handle);
+    const transcripts = new TranscriptRepository(db.handle);
+    sessions.create('s1', new Date().toISOString());
+
+    const revisionId = transcripts.append({
+      sessionId: 's1',
+      engine: 'e',
+      model: 'm',
+      languages: ['ru', 'th'],
+      text: 'привет สวัสดี',
+      segments: [
+        { startMs: 0, endMs: 1000, timestampSource: 'aligner', language: 'ru', text: 'привет' },
+        { startMs: 1000, endMs: 2000, timestampSource: 'vad', language: 'th', text: 'สวัสดี' },
+      ],
+    });
+
+    const segments = transcripts.segments(revisionId);
+    assert.equal(segments[0]?.timestampSource, 'aligner');
+    assert.equal(segments[1]?.timestampSource, 'vad', 'Thai never claims aligner timings');
+  });
+
+  it('refuses a transcript that belongs to nothing', () => {
+    assert.throws(
+      () =>
+        new TranscriptRepository(db.handle).append({
+          engine: 'e',
+          model: 'm',
+          languages: [],
+          text: 'x',
+          segments: [],
+        }),
+      /must belong to/,
+    );
+  });
+});
+
+describe('word counting', () => {
+  it('counts space-separated words', () => {
+    assert.equal(countWords('one two three'), 3);
+    assert.equal(countWords('  padded   words  '), 2);
+    assert.equal(countWords(''), 0);
+  });
+
+  it('approximates Thai, which is written without spaces', () => {
+    // A pure character count would make the 5-word gate reject all Thai.
+    assert.ok(countWords('สวัสดีครับผมชื่อสมชาย') >= 5);
+    assert.equal(countWords('สวัสดี'), 1);
+  });
+
+  it('handles mixed scripts', () => {
+    assert.ok(countWords('hello สวัสดีครับผมชื่อ world') >= 3);
+  });
+});
+
+describe('job queue', () => {
+  it('is idempotent on the natural key', () => {
+    const jobs = new JobQueue(db.handle);
+    assert.ok(
+      jobs.enqueue({ kind: 'asr', idempotencyKey: 'asr:s1', payload: { sessionId: 's1' } }),
+    );
+    assert.equal(
+      jobs.enqueue({ kind: 'asr', idempotencyKey: 'asr:s1', payload: { sessionId: 's1' } }),
+      null,
+      'the same unit of work must not be queued twice',
+    );
+    assert.equal(jobs.pendingCount('asr'), 1);
+  });
+
+  it('claims a job exactly once', () => {
+    const jobs = new JobQueue(db.handle);
+    jobs.enqueue({ kind: 'asr', idempotencyKey: 'asr:s1', payload: {} });
+
+    assert.ok(jobs.claim(['asr']));
+    assert.equal(jobs.claim(['asr']), null, 'a leased job must not be claimable again');
+  });
+
+  it('only claims the kinds asked for', () => {
+    const jobs = new JobQueue(db.handle);
+    jobs.enqueue({ kind: 'summarize', idempotencyKey: 'sum:s1', payload: {} });
+    assert.equal(jobs.claim(['asr']), null);
+    assert.ok(jobs.claim(['summarize']));
+  });
+
+  it('recovers a lease abandoned by a crashed worker', () => {
+    const jobs = new JobQueue(db.handle, 'worker-that-died');
+    jobs.enqueue({ kind: 'asr', idempotencyKey: 'asr:s1', payload: {} });
+
+    const claimed = jobs.claim(['asr'], 50);
+    assert.ok(claimed);
+    assert.equal(jobs.claim(['asr']), null);
+
+    // Expire the lease the way the passage of time would.
+    db.handle
+      .prepare("UPDATE jobs SET lease_expires_at = '2000-01-01T00:00:00.000Z' WHERE job_id = ?")
+      .run(claimed.jobId);
+
+    assert.equal(jobs.recoverStaleLeases(), 1);
+    const reclaimed = jobs.claim(['asr']);
+    assert.ok(reclaimed, 'the job returns to the pool rather than being lost');
+    assert.equal(reclaimed.jobId, claimed.jobId);
+    assert.equal(reclaimed.attempts, 2, 'the attempt counter carries across the crash');
+  });
+
+  it('does not steal a lease that is still valid', () => {
+    const jobs = new JobQueue(db.handle);
+    jobs.enqueue({ kind: 'asr', idempotencyKey: 'asr:s1', payload: {} });
+    jobs.claim(['asr'], 600_000);
+    assert.equal(jobs.recoverStaleLeases(), 0);
+  });
+
+  it('retries with backoff, then gives up loudly', () => {
+    const jobs = new JobQueue(db.handle);
+    jobs.enqueue({ kind: 'asr', idempotencyKey: 'asr:s1', payload: {}, maxAttempts: 2 });
+
+    const first = jobs.claim(['asr']);
+    assert.ok(first);
+    assert.equal(jobs.fail(first.jobId, 'model unavailable'), 'retry');
+
+    db.handle.prepare("UPDATE jobs SET run_after = '2000-01-01T00:00:00.000Z'").run();
+    const second = jobs.claim(['asr']);
+    assert.ok(second);
+    assert.equal(jobs.fail(second.jobId, 'model unavailable again'), 'dead');
+
+    const row = db.handle.prepare('SELECT state, last_error FROM jobs').get() as {
+      state: string;
+      last_error: string;
+    };
+    assert.equal(row.state, 'dead', 'an exhausted job stays visible, not silently dropped');
+    assert.match(row.last_error, /model unavailable again/);
+  });
+
+  it('grows the backoff and caps it', () => {
+    assert.ok(backoffMs(1) < backoffMs(3));
+    assert.ok(backoffMs(3) < backoffMs(5));
+    assert.equal(backoffMs(100), 15 * 60 * 1000);
+  });
+
+  it('does not claim a job scheduled for the future', () => {
+    const jobs = new JobQueue(db.handle);
+    jobs.enqueue({ kind: 'asr', idempotencyKey: 'asr:s1', payload: {}, runAfterMs: 60_000 });
+    assert.equal(jobs.claim(['asr']), null);
+  });
+
+  it('reports backlog age', () => {
+    const jobs = new JobQueue(db.handle);
+    jobs.enqueue({ kind: 'asr', idempotencyKey: 'asr:s1', payload: {} });
+    db.handle.prepare("UPDATE jobs SET created_at = '2000-01-01T00:00:00.000Z'").run();
+    assert.ok(jobs.oldestPendingAgeMinutes('asr') > 1000);
+  });
+
+  it('reports zero backlog when the queue is empty', () => {
+    assert.equal(new JobQueue(db.handle).oldestPendingAgeMinutes(), 0);
+  });
+});

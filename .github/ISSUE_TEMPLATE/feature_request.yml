@@ -1,0 +1,53 @@
+name: Feature request
+description: Suggest something OpenMurmur should do
+labels: ["type:feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check `docs/BACKLOG.md` first — it may already be planned, and
+        `docs/PRODUCT.md` lists things this project deliberately will not do.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Does this respect the project's constraints?
+      options:
+        - label: It does not require sending audio anywhere other than the user's own Telegram chat
+          required: true
+        - label: It does not make covert recording easier (see RECORDING_POLICY.md)
+          required: true
+        - label: It does not give a Telegram message the ability to stop recording or delete data
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - capture
+        - sessionizer
+        - asr
+        - llm
+        - telegram
+        - storage
+        - macos
+        - docs
+        - other
+    validations:
+      required: true

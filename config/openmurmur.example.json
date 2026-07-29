@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "sessionizer": {
+    "preRollSeconds": 5,
+    "speechCandidateMs": 500,
+    "silenceTimeoutSeconds": 60,
+    "maxPartSeconds": 900,
+    "minSpeechSeconds": 3,
+    "minTranscriptWords": 5,
+    "vadThreshold": 0.5,
+    "vadFrameMs": 32
+  },
+  "audio": {
+    "sampleRate": 16000,
+    "channels": 1,
+    "captureDevice": "default",
+    "ffmpegPath": "ffmpeg",
+    "ffprobePath": "ffprobe",
+    "flacCompressionLevel": 5
+  },
+  "asr": {
+    "backend": "mlx",
+    "model": "Qwen/Qwen3-ASR-1.7B",
+    "quantization": "8bit",
+    "languageHints": [],
+    "alignerLanguages": ["ru", "en"],
+    "pythonWorkerTimeoutMs": 900000
+  },
+  "llm": {
+    "backend": "ollama",
+    "baseUrl": "http://127.0.0.1:11434",
+    "model": "qwen3.6:27b",
+    "contextTokens": 32768,
+    "temperature": 0,
+    "think": false,
+    "requestTimeoutMs": 600000
+  },
+  "telegram": {
+    "apiBaseUrl": "https://api.telegram.org",
+    "maxOutgoingBytes": 52428800,
+    "maxIncomingBytes": 20971520,
+    "transcriptInlineLimit": 3500,
+    "pollIntervalMs": 1000,
+    "longPollSeconds": 25,
+    "maxIncomingDurationSeconds": 7200,
+    "maxConcurrentIncomingJobs": 2,
+    "summarizeIncoming": true
+  },
+  "retention": {
+    "sessionAudioHours": 48,
+    "incomingAudioHours": 24,
+    "quarantineHours": 168,
+    "rejectedSessionHours": 6
+  },
+  "health": {
+    "pollIntervalMs": 5000,
+    "recorderStaleSeconds": 15,
+    "asrBacklogMinutes": 60,
+    "outboxStaleMinutes": 30,
+    "diskFreeWarnGb": 20,
+    "alertCooldownMinutes": 30
+  },
+  "digest": {
+    "enabled": true,
+    "atLocalTime": "23:30",
+    "timezone": "local"
+  },
+  "logLevel": "info"
+}

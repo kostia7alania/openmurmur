@@ -1,0 +1,25 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.DS_Store
+*.swp
+
+# Never commit local state, recordings or secrets.
+*.db
+*.db-wal
+*.db-shm
+*.flac
+*.wav
+*.ogg
+*.opus
+*.m4a
+openmurmur.json
+!config/openmurmur.example.json

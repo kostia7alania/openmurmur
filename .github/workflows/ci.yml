@@ -1,0 +1,226 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only by default. No job in this workflow publishes anything, creates a
+# release, downloads a model, contacts Telegram, or reads a user secret.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '26.5.0'
+  PNPM_VERSION: '10.19.0'
+
+jobs:
+  typescript:
+    name: TypeScript (macOS, Node ${{ matrix.node }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 26.x is the project target (Current). 24.x is the latest Active LTS,
+        # checked so a gratuitous incompatibility surfaces early — see
+        # docs/adr/0001-node-26.md.
+        node: ['26.5.0', '24']
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Report toolchain
+        run: |
+          node --version
+          pnpm --version
+          node -e "const{DatabaseSync}=require('node:sqlite');console.log('sqlite',new DatabaseSync(':memory:').prepare('select sqlite_version() v').get().v)"
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Lint and format
+        run: pnpm run lint
+
+      - name: Unit tests
+        run: pnpm run test:unit
+
+      - name: Integration tests (synthetic ffmpeg audio, no microphone)
+        run: pnpm run test:integration
+
+  python:
+    name: Python worker
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
+
+      - name: Install (CI-safe subset — the MLX extra is deliberately excluded)
+        working-directory: python/openmurmur_audio
+        run: uv sync
+
+      - name: Lint
+        working-directory: python/openmurmur_audio
+        run: uv run ruff check .
+
+      - name: Format check
+        working-directory: python/openmurmur_audio
+        run: uv run ruff format --check .
+
+      - name: Typecheck (strict)
+        working-directory: python/openmurmur_audio
+        run: uv run mypy src
+
+      - name: Tests
+        working-directory: python/openmurmur_audio
+        run: uv run pytest -v
+
+      - name: Worker responds over NDJSON without a model
+        working-directory: python/openmurmur_audio
+        run: |
+          set -euo pipefail
+          out=$(printf '{"id":"1","op":"ping"}\n{"id":"2","op":"shutdown"}\n' | uv run openmurmur-audio-worker 2>/dev/null)
+          echo "$out"
+          echo "$out" | grep -q '"id":"1","ok":true' || { echo "worker did not answer ping"; exit 1; }
+
+  shell-and-plists:
+    name: Shell and plist validation
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          for f in scripts/*; do
+            [ -f "$f" ] || continue
+            bash -n "$f"
+            echo "ok: $f"
+          done
+
+      - name: Scripts are executable
+        run: |
+          set -euo pipefail
+          for f in scripts/*; do
+            [ -x "$f" ] || { echo "not executable: $f"; exit 1; }
+          done
+
+      - name: plist validation
+        run: |
+          set -euo pipefail
+          for f in launchd/*.plist.example; do
+            cp "$f" "/tmp/$(basename "$f" .example)"
+            plutil -lint "/tmp/$(basename "$f" .example)"
+          done
+
+      - name: Example config parses against the real schema
+        run: |
+          set -euo pipefail
+          node --input-type=module -e "
+            import { readFileSync } from 'node:fs';
+            import { parseConfig } from './src/config/schema.ts';
+            const raw = JSON.parse(readFileSync('config/openmurmur.example.json', 'utf8'));
+            parseConfig(raw);
+            console.log('config/openmurmur.example.json is valid');
+          "
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Look for committed Telegram tokens and private keys
+        run: |
+          set -euo pipefail
+
+          # Telegram bot token shape: 123456789:AA...
+          # --binary-files=text matters: with grep's default, a file containing
+          # a single stray control byte is treated as binary and skipped, which
+          # is precisely where a leaked secret could hide.
+          if grep -rnE --binary-files=text '[0-9]{6,12}:[A-Za-z0-9_-]{30,}' \
+               --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv \
+               --exclude=pnpm-lock.yaml --exclude=uv.lock \
+               . ; then
+            echo "::error::A string matching a Telegram bot token was found."
+            exit 1
+          fi
+
+          if grep -rn --binary-files=text -- '-----BEGIN .*PRIVATE KEY-----' \
+               --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv . ; then
+            echo "::error::A private key was found."
+            exit 1
+          fi
+
+          echo "No secrets found."
+
+      - name: A committed FUNDING.yml must not contain placeholders
+        run: |
+          set -euo pipefail
+          if [ -f .github/FUNDING.yml ]; then
+            if grep -qE 'YOUR_|REPLACE_|example' .github/FUNDING.yml; then
+              echo "::error::.github/FUNDING.yml still contains placeholders."
+              exit 1
+            fi
+          fi
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Audit npm dependencies
+        run: pnpm audit --audit-level moderate
+
+      - name: Versions must be pinned exactly, not ranged
+        run: |
+          set -euo pipefail
+          node --input-type=module -e "
+            import { readFileSync } from 'node:fs';
+            const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+            const bad = Object.entries(pkg.devDependencies ?? {})
+              .filter(([, v]) => /^[\^~><*]/.test(v));
+            if (bad.length > 0) {
+              console.error('Ranged versions found:', bad);
+              process.exit(1);
+            }
+            console.log('All dependency versions are pinned exactly.');
+          "
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+
+      - name: Python lockfile is up to date with pyproject.toml
+        working-directory: python/openmurmur_audio
+        run: uv lock --check

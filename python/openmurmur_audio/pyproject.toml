@@ -1,0 +1,57 @@
+[project]
+name = "openmurmur-audio"
+version = "0.1.0"
+description = "Local MLX ASR and Silero VAD worker for OpenMurmur"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+# 3.14 is the newest interpreter with binary wheels across the whole stack;
+# onnxruntime 1.28 publishes cp311-cp314 and nothing for 3.15 yet. Compatibility
+# beats version novelty here — see docs/adr/0002-python-runtime.md.
+requires-python = ">=3.14,<3.15"
+
+dependencies = [
+    "numpy>=2.5.1,<3",
+    "onnxruntime>=1.28.0,<2",
+    "soundfile>=0.14.0,<0.15",
+]
+
+[project.optional-dependencies]
+# Not installed in CI: these pull several GB of weights and require Metal.
+mlx = [
+    "mlx>=0.32.0,<0.33",
+    "mlx-qwen3-asr>=0.3.5,<0.4",
+]
+
+[project.scripts]
+openmurmur-audio-worker = "openmurmur_audio.worker:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
+    "ruff>=0.14.0",
+    "mypy>=1.18.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openmurmur_audio"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "BLE", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unreachable = true
+# The MLX extra is optional; its absence must not fail typechecking in CI.
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
