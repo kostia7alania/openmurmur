@@ -231,6 +231,14 @@ async function confirm(prompt: string): Promise<boolean> {
   }
 }
 
+/** How long to wait for the first frame before assuming a pending TCC prompt. */
+const FIRST_FRAME_TIMEOUT_MS = 10_000;
+
+/** Best-effort name of the app that owns the microphone grant. */
+function terminalHint(): string {
+  return process.env['TERM_PROGRAM'] ?? 'your terminal';
+}
+
 /**
  * Opens the microphone for a few seconds and reports levels. This is the
  * command that triggers the macOS TCC prompt on a fresh install, which is why
@@ -252,26 +260,62 @@ async function captureTest(ffmpegPath: string, device: string): Promise<number> 
 
   const deadline = Date.now() + 5000;
   let frames = 0;
+  let timedOut = false;
   let speechFrames = 0;
   let peakDbfs = Number.NEGATIVE_INFINITY;
 
   try {
-    for await (const frame of capture.start()) {
-      frames += 1;
-      const dbfs = rmsDbfs(frame.pcm);
-      if (Number.isFinite(dbfs)) peakDbfs = Math.max(peakDbfs, dbfs);
-      if (vad.probability(frame.pcm) >= 0.5) speechFrames += 1;
-      if (Date.now() >= deadline) break;
+    // Watchdog for the first frame. Until the user answers the macOS
+    // permission dialog, ffmpeg neither exits nor produces audio, so without
+    // this the command hangs forever and then reports a useless exit code.
+    const watchdog = setTimeout(() => {
+      if (frames > 0) return;
+      process.stderr.write(
+        [
+          '',
+          '⏳ No audio yet after 10 seconds.',
+          '',
+          'macOS is almost certainly showing a microphone permission dialog.',
+          'Click "Allow", then run this command again.',
+          '',
+          'If you see no dialog, grant access manually:',
+          '  System Settings -> Privacy & Security -> Microphone',
+          `  and enable it for the app running this command (${terminalHint()}).`,
+          '',
+          'The permission belongs to the app that launches OpenMurmur, so',
+          'switching terminals means being asked again.',
+          '',
+        ].join('\n'),
+      );
+      timedOut = true;
+      void capture.stop();
+    }, FIRST_FRAME_TIMEOUT_MS);
+
+    try {
+      for await (const frame of capture.start()) {
+        frames += 1;
+        if (frames === 1) clearTimeout(watchdog);
+        const dbfs = rmsDbfs(frame.pcm);
+        if (Number.isFinite(dbfs)) peakDbfs = Math.max(peakDbfs, dbfs);
+        if (vad.probability(frame.pcm) >= 0.5) speechFrames += 1;
+        if (Date.now() >= deadline) break;
+      }
+    } finally {
+      clearTimeout(watchdog);
     }
   } catch (error) {
-    process.stderr.write(`\n❌ ${(error as Error).message}\n`);
+    // A capture we stopped ourselves reports a spurious exit; the watchdog has
+    // already printed the useful explanation.
+    if (!timedOut) process.stderr.write(`\n❌ ${(error as Error).message}\n`);
     return 1;
   } finally {
     await capture.stop();
   }
 
   if (frames === 0) {
-    process.stderr.write('❌ No audio frames arrived. The microphone did not open.\n');
+    if (!timedOut) {
+      process.stderr.write('❌ No audio frames arrived. The microphone did not open.\n');
+    }
     return 1;
   }
 
