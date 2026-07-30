@@ -33,7 +33,8 @@
     "contextTokens": 32768,
     "temperature": 0,
     "think": false,
-    "requestTimeoutMs": 600000
+    "requestTimeoutMs": 600000,
+    "keepAlive": ""
   },
   "telegram": {
     "apiBaseUrl": "https://api.telegram.org",

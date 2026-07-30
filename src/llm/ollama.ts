@@ -120,6 +120,7 @@ export class OllamaLlm implements LlmBackend {
       body: JSON.stringify({
         model: this.#config.model,
         stream: false,
+        ...(this.#config.keepAlive !== '' ? { keep_alive: this.#config.keepAlive } : {}),
         // Constrained decoding: the model cannot emit a non-conforming object.
         format: SUMMARY_JSON_SCHEMA,
         think: this.#config.think,

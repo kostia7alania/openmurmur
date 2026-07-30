@@ -56,6 +56,17 @@ export interface LlmConfig {
   /** Qwen3 "thinking" mode. Off for schema extraction, on for reconciliation. */
   readonly think: boolean;
   readonly requestTimeoutMs: number;
+  /**
+   * How long Ollama keeps the model in memory after a request, e.g. "5m",
+   * "30m", "-1" to keep it loaded indefinitely, "0" to unload immediately.
+   *
+   * Sessions are sporadic, so by default the model is usually cold and the
+   * first summarize after an idle period pays a reload. That is acceptable —
+   * summarization is not on the recording path — but a machine with memory to
+   * spare can trade RAM for latency here. An empty string uses Ollama's own
+   * default (5 minutes).
+   */
+  readonly keepAlive: string;
 }
 
 export interface TelegramConfig {
@@ -145,6 +156,7 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
     temperature: 0,
     think: false,
     requestTimeoutMs: 10 * 60 * 1000,
+    keepAlive: '',
   },
   telegram: {
     apiBaseUrl: 'https://api.telegram.org',
