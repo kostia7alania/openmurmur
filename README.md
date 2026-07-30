@@ -26,9 +26,10 @@ destination, and you configure it yourself.
 ## Status
 
 **v0.1.0 — early MVP.** The control plane, sessionizer, storage, delivery,
-retention and Telegram integration are implemented and tested. The MLX ASR and
-Ollama summarizer are implemented against their real APIs but have **not been
-verified end-to-end against downloaded model weights** — see
+retention and Telegram integration are implemented and tested. Local ASR
+(Qwen3-ASR over MLX) and Silero VAD have been run against real model weights
+and behave as documented. The Ollama summarizer, live microphone capture and
+real Telegram delivery are **still unverified** — see
 [What is verified](#what-is-verified) for the honest breakdown.
 
 ## Requirements
