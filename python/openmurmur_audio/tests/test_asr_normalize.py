@@ -151,3 +151,77 @@ def test_dtype_mapping_covers_every_configured_quantization() -> None:
     assert resolve_dtype("8bit") is mx.float16
     assert resolve_dtype("4bit") is mx.float16
     assert resolve_dtype("nonsense-value") is mx.float16
+
+
+def test_display_names_are_mapped_to_iso_codes() -> None:
+    """Qwen3-ASR returns "Russian", not "ru".
+
+    Found by running the real model: the aligner allowlist is keyed on ISO
+    codes, so without this mapping RU and EN silently lost their word-level
+    timestamps and the report printed "English" instead of "английский".
+    """
+    from openmurmur_audio.asr import normalize_language
+
+    assert normalize_language("English") == "en"
+    assert normalize_language("Russian") == "ru"
+    assert normalize_language("Thai") == "th"
+    # Already-normalized and locale-tagged values pass through.
+    assert normalize_language("ru") == "ru"
+    assert normalize_language("en-US") == "en"
+    assert normalize_language("ru_RU") == "ru"
+    # Unknown languages are kept, not dropped.
+    assert normalize_language("Klingon") == "klingon"
+    assert normalize_language("") is None
+    assert normalize_language(None) is None
+
+
+def test_segments_inherit_the_detected_language() -> None:
+    """Word chunks carry timings but no language of their own.
+
+    The aligner allowlist can only apply if a segment knows its language, so a
+    segment inherits the recording's detected language unless it overrides it.
+    """
+    raw = _FakeTranscriptionResult(
+        text="Let's ship it",
+        language="English",
+        segments=[
+            {"text": "Let's", "start": 0.0, "end": 0.24},
+            {"text": "ship", "start": 0.24, "end": 0.56},
+        ],
+    )
+    result = normalize_result(raw, "m", ALIGNER, 800)
+
+    assert result.languages == ["en"]
+    assert all(s.language == "en" for s in result.segments)
+    assert all(s.timestamp_source == "aligner" for s in result.segments)
+
+
+def test_thai_display_name_still_never_gets_aligner() -> None:
+    """The Thai policy must survive the display-name mapping."""
+    raw = _FakeTranscriptionResult(
+        text="สวัสดีครับ",
+        language="Thai",
+        segments=[{"text": "สวัสดีครับ", "start": 0.0, "end": 1.36}],
+    )
+    result = normalize_result(raw, "m", ALIGNER, 1360)
+
+    assert result.languages == ["th"]
+    assert result.segments[0].timestamp_source == "vad"
+
+
+def test_a_segment_may_override_the_detected_language() -> None:
+    """Mixed-language speech: a segment's own label wins over the default."""
+    raw = _FakeTranscriptionResult(
+        text="привет hello",
+        language="Russian",
+        segments=[
+            {"text": "привет", "start": 0.0, "end": 1.0},
+            {"text": "สวัสดี", "language": "Thai", "start": 1.0, "end": 2.0},
+        ],
+    )
+    result = normalize_result(raw, "m", ALIGNER, 2000)
+
+    sources = {s.language: s.timestamp_source for s in result.segments}
+    assert sources["ru"] == "aligner"
+    assert sources["th"] == "vad"
+    assert set(result.languages) == {"ru", "th"}

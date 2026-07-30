@@ -36,7 +36,7 @@ verified end-to-end against downloaded model weights** — see
 | Requirement | Detail |
 | --- | --- |
 | Hardware | Apple Silicon (M-series). MLX requires Metal; Intel Macs are not supported. |
-| Memory | 64 GB recommended. 32 GB works with a smaller LLM; 16 GB will struggle with a 27B model. |
+| Memory | 64 GB recommended. Development and the verification above were done on 36 GB (M4 Max, ~28 GB usable by the GPU), where a 27B LLM and a resident 1.7B ASR model fit but leave little headroom. 16 GB will struggle. |
 | macOS | 14 or newer. |
 | Node.js | 26.x (`.nvmrc` included). |
 | Python | 3.14, installed automatically by `uv`. |
@@ -313,13 +313,27 @@ message splitting, path traversal, chat allowlisting, update deduplication,
 offset persistence, secret redaction, prompt-injection fencing, retention
 eligibility and blocking, alert deduplication, migrations.
 
-**Implemented and exercised, but not against real model weights:**
-`MlxAsr` (the persistent worker protocol is tested end-to-end; Qwen3-ASR
-inference itself has not been run here) and `OllamaLlm` (Ollama was not
-installed on the development machine).
+**Verified against the real models** on macOS 26.5 / M4 Max, using speech
+synthesized with macOS `say`:
 
-**Not verified:** live microphone capture, real Telegram delivery, launchd
-under a real login session, sleep/wake behaviour.
+| Check | Result |
+| --- | --- |
+| Qwen3-ASR-1.7B load (`Session`, fp16) | 5.3 s, stays resident |
+| English transcription | exact match on a 4.6 s utterance |
+| Russian transcription | exact match on a 5.8 s utterance, including "эм ви пи" → "MVP" |
+| Thai transcription | correct text, language detected as `th` |
+| RU/EN word timestamps | `aligner`, word-aligned (`0–240 ms "Let's"`) |
+| Thai timestamps | `vad` — never `aligner`, as documented |
+| Silero VAD on speech | p = 0.997 (EN) / 0.970 (RU), one segment each |
+| Silero VAD on white noise | p = 0.009 — correctly *not* speech |
+| Silero VAD on a 440 Hz tone | p = 0.000 — correctly *not* speech |
+
+The last two are the distinction an energy gate cannot make, and the reason
+Silero is used rather than a level threshold.
+
+**Still not verified:** `OllamaLlm` against a real model, live microphone
+capture (needs an interactive macOS permission grant), real Telegram delivery,
+launchd under a login session, and sleep/wake behaviour.
 
 See [docs/BACKLOG.md](docs/BACKLOG.md) for what closes these gaps.
 

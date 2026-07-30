@@ -122,6 +122,58 @@ class QwenAsr:
         return normalize_result(result, self._model_name, aligner_languages, duration_ms(samples))
 
 
+# Qwen3-ASR reports languages as English display names ("Russian", "Thai"),
+# but every consumer — the aligner allowlist, the report renderer, the database
+# — speaks ISO 639-1. Normalizing here keeps that mismatch in one place.
+#
+# Found by running the real model: without this the aligner allowlist never
+# matched, so RU and EN silently lost their word-level timestamps.
+_LANGUAGE_CODES: dict[str, str] = {
+    "english": "en",
+    "russian": "ru",
+    "thai": "th",
+    "chinese": "zh",
+    "mandarin": "zh",
+    "german": "de",
+    "french": "fr",
+    "spanish": "es",
+    "italian": "it",
+    "portuguese": "pt",
+    "japanese": "ja",
+    "korean": "ko",
+    "arabic": "ar",
+    "hindi": "hi",
+    "vietnamese": "vi",
+    "indonesian": "id",
+    "dutch": "nl",
+    "polish": "pl",
+    "turkish": "tr",
+    "ukrainian": "uk",
+}
+
+
+def normalize_language(value: object) -> str | None:
+    """Maps a model language label onto an ISO 639-1 code.
+
+    Accepts a display name ("Russian"), an existing code ("ru"), or a tagged
+    form ("ru-RU"). Unknown labels are lowercased and passed through rather
+    than dropped, so an unmapped language still reaches the transcript.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+
+    mapped = _LANGUAGE_CODES.get(text.lower())
+    if mapped is not None:
+        return mapped
+
+    # "ru-RU" / "en_US" -> "ru" / "en"
+    head = text.replace("_", "-").split("-")[0].lower()
+    return head if head else None
+
+
 def normalize_result(
     raw: Any,
     model_name: str,
@@ -165,16 +217,22 @@ def normalize_result(
 
     text = str(raw.get("text", "")).strip()
     raw_segments = raw.get("segments") or []
-    languages: list[str] = []
     segments: list[Segment] = []
 
+    # The model reports the detected language once, at the top level; the
+    # per-segment entries are word chunks carrying only text and timings. A
+    # segment therefore inherits the recording's language unless it overrides
+    # it, which is what makes the aligner allowlist apply at all.
+    detected = normalize_language(raw.get("language"))
+    languages: list[str] = [detected] if detected is not None else []
+
     for item in raw_segments:
-        language = item.get("language")
-        if isinstance(language, str) and language not in languages:
+        language = normalize_language(item.get("language")) or detected
+        if language is not None and language not in languages:
             languages.append(language)
 
         has_word_times = item.get("start") is not None and item.get("end") is not None
-        aligner_supported = isinstance(language, str) and language in aligner_languages
+        aligner_supported = language is not None and language in aligner_languages
 
         if has_word_times and aligner_supported:
             source: TimestampSource = "aligner"
@@ -198,13 +256,9 @@ def normalize_result(
                 start_ms=start_ms,
                 end_ms=end_ms,
                 timestamp_source=source,
-                language=language if isinstance(language, str) else None,
+                language=language,
             )
         )
-
-    top_language = raw.get("language")
-    if isinstance(top_language, str) and top_language not in languages:
-        languages.insert(0, top_language)
 
     if not segments and text:
         segments.append(
