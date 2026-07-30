@@ -16,10 +16,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Not installed in CI: these pull several GB of weights and require Metal.
+# The real local model stack. Deliberately optional and excluded from CI:
+#   * mlx / mlx-qwen3-asr pull multi-GB weights and require Metal;
+#   * silero-vad depends on torch + torchaudio (~2 GB) even though we only
+#     ever use its bundled ONNX model through onnxruntime.
+#
+# Without this extra the daemon still runs end-to-end with the fake adapters,
+# and `openmurmur doctor` reports the fake backends as a warning rather than
+# letting a user believe they are getting real transcripts.
 mlx = [
     "mlx>=0.32.0,<0.33",
     "mlx-qwen3-asr>=0.3.5,<0.4",
+    "silero-vad>=6.2.1,<7",
 ]
 
 [project.scripts]

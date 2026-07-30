@@ -44,37 +44,61 @@ class AsrUnavailableError(Exception):
     """Raised when the MLX stack or the model weights are not installed."""
 
 
+def resolve_dtype(quantization: str) -> Any:
+    """Maps our config value onto an MLX dtype.
+
+    Weight quantization and compute dtype are separate axes in mlx-qwen3-asr:
+    `Session` takes a `dtype`, while 8-/4-bit weights come from an already
+    quantized Hugging Face repo. So "8bit" and "4bit" select float16 compute
+    and are expected to be paired with a quantized `asr.model` repo id; the
+    worker logs which combination it actually used rather than pretending.
+    """
+    import mlx.core as mx
+
+    return {
+        "fp32": mx.float32,
+        "fp16": mx.float16,
+        "bf16": mx.bfloat16,
+        "8bit": mx.float16,
+        "4bit": mx.float16,
+    }.get(quantization, mx.float16)
+
+
 class QwenAsr:
-    """Persistent Qwen3-ASR session."""
+    """Persistent Qwen3-ASR session.
+
+    `mlx_qwen3_asr.Session` keeps the model resident, which is the whole point
+    of running this worker as a long-lived process.
+    """
 
     def __init__(self) -> None:
-        self._model: Any = None
+        self._session: Any = None
         self._model_name: str = ""
         self._quantization: str = ""
 
     @property
     def loaded(self) -> bool:
-        return self._model is not None
+        return self._session is not None
 
     @property
     def model_name(self) -> str:
         return self._model_name
 
     def load(self, model: str, quantization: str) -> None:
-        if self._model is not None and self._model_name == model:
+        if self._session is not None and self._model_name == model:
             return
         try:
-            from mlx_qwen3_asr import load_model
+            from mlx_qwen3_asr import Session
         except ImportError as exc:
             raise AsrUnavailableError(
                 "mlx-qwen3-asr is not installed.\n"
-                "Install the MLX extra:\n"
+                "Install the local model stack:\n"
                 "  uv sync --project python/openmurmur_audio --extra mlx\n"
                 "OpenMurmur transcribes on-device only and has no cloud fallback."
             ) from exc
 
         try:
-            self._model = load_model(model, quantization=quantization)
+            self._session = Session(model, dtype=resolve_dtype(quantization))
         except Exception as exc:  # any load failure is surfaced verbatim to the user
             raise AsrUnavailableError(f"could not load {model} ({quantization}): {exc}") from exc
 
@@ -87,12 +111,13 @@ class QwenAsr:
         language_hints: list[str],
         aligner_languages: list[str],
     ) -> Transcription:
-        if self._model is None:
+        if self._session is None:
             raise AsrUnavailableError("model is not loaded")
 
-        result = self._model.transcribe(
+        result = self._session.transcribe(
             samples,
             language=language_hints[0] if language_hints else None,
+            return_timestamps=True,
         )
         return normalize_result(result, self._model_name, aligner_languages, duration_ms(samples))
 
@@ -107,7 +132,18 @@ def normalize_result(
 
     Kept separate from `QwenAsr` so it can be unit-tested without MLX, and so a
     change to the upstream result shape is one function to fix.
+
+    Accepts three shapes: a plain string, a mapping, and the real
+    `mlx_qwen3_asr.TranscriptionResult` dataclass (attributes rather than keys,
+    with `language` as a single string).
     """
+    if not isinstance(raw, str | dict) and hasattr(raw, "text"):
+        raw = {
+            "text": getattr(raw, "text", ""),
+            "language": getattr(raw, "language", None),
+            "segments": getattr(raw, "segments", None) or getattr(raw, "chunks", None) or [],
+        }
+
     if isinstance(raw, str):
         return Transcription(
             text=raw.strip(),

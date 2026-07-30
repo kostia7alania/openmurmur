@@ -11,6 +11,7 @@ single instance must be reset between unrelated audio streams.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -29,6 +30,42 @@ class SpeechSegment:
     mean_probability: float
 
 
+class SileroModelMissingError(Exception):
+    """Raised when the Silero ONNX model is not installed."""
+
+
+def find_model_path() -> Path:
+    """Locates the Silero ONNX model shipped inside the `silero_vad` package.
+
+    The package exposes no path helper, so the file is resolved from the
+    package directory. We deliberately load the ONNX graph with onnxruntime
+    rather than going through `silero_vad`'s own loader, which would drag in
+    torch on every call.
+    """
+    try:
+        import silero_vad
+    except ImportError as exc:
+        raise SileroModelMissingError(
+            "silero-vad is not installed.\n"
+            "Install the local model stack:\n"
+            "  uv sync --project python/openmurmur_audio --extra mlx\n"
+            "Without it the daemon can still run with the fake adapters, but it "
+            "cannot detect speech."
+        ) from exc
+
+    data_dir = Path(silero_vad.__file__).parent / "data"
+    # Prefer the 16 kHz-specific graph; fall back to the general one.
+    for name in ("silero_vad_16k_op15.onnx", "silero_vad.onnx"):
+        candidate = data_dir / name
+        if candidate.is_file():
+            return candidate
+
+    raise SileroModelMissingError(
+        f"silero-vad is installed but no ONNX model was found in {data_dir}. "
+        "Reinstall it with: uv sync --project python/openmurmur_audio --extra mlx"
+    )
+
+
 class SileroVad:
     """Thin wrapper over the Silero ONNX model with explicit state handling."""
 
@@ -42,7 +79,8 @@ class SileroVad:
         if self._session is not None:
             return
         import onnxruntime as ort
-        from silero_vad import get_model_path
+
+        model_path = find_model_path()
 
         options = ort.SessionOptions()
         # One thread: the daemon may run several jobs, and oversubscribing the
@@ -50,7 +88,7 @@ class SileroVad:
         options.inter_op_num_threads = 1
         options.intra_op_num_threads = 1
         self._session = ort.InferenceSession(
-            str(get_model_path()), sess_options=options, providers=["CPUExecutionProvider"]
+            str(model_path), sess_options=options, providers=["CPUExecutionProvider"]
         )
         self.reset()
 
