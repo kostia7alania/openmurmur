@@ -28,8 +28,9 @@ destination, and you configure it yourself.
 **v0.1.0 — early MVP.** The control plane, sessionizer, storage, delivery,
 retention and Telegram integration are implemented and tested. Local ASR
 (Qwen3-ASR over MLX), Silero VAD and the Ollama summarizer have all been run
-against real model weights and behave as documented. Live microphone capture,
-real Telegram delivery and launchd are **still unverified** — see
+against real model weights and behave as documented, and microphone capture
+works on real hardware. Real Telegram delivery, launchd and sleep/wake are
+**still unverified** — see
 [What is verified](#what-is-verified) for the honest breakdown.
 
 ## Requirements
@@ -349,9 +350,12 @@ a summarize job following a quiet period pays a reload. That is acceptable —
 summarization is off the recording path — but `llm.keepAlive` trades RAM for
 latency if you have memory to spare.
 
-**Still not verified:** live microphone capture (needs an interactive macOS
-permission grant), real Telegram delivery, launchd under a login session, and
-sleep/wake behaviour.
+Live microphone capture is verified too: `openmurmur capture test` on this
+machine captured 125 frames (4 s), peak −23.3 dBFS, 73 frames above the speech
+gate, after the macOS permission prompt was granted interactively.
+
+**Still not verified:** real Telegram delivery (needs a bot token), launchd
+under a login session, and sleep/wake behaviour.
 
 See [docs/BACKLOG.md](docs/BACKLOG.md) for what closes these gaps.
 
