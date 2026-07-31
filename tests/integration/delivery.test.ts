@@ -11,6 +11,7 @@ import {
   PartRepository,
   SessionRepository,
   TranscriptRepository,
+  VadSegmentRepository,
 } from '../../src/database/repository.ts';
 import { enqueueSessionDelivery } from '../../src/jobs/delivery.ts';
 import { handleJob, reconcileSessionDelivery } from '../../src/jobs/pipeline.ts';
@@ -385,5 +386,81 @@ describe('recording is never blocked by processing', () => {
 
     assert.equal(new SessionRepository(db.handle).get('s2')?.state, 'PROCESSING');
     assert.equal(jobs.pendingCount('asr'), 2, 'both sessions are tracked independently');
+  });
+});
+
+describe('final VAD pass', () => {
+  it('stores authoritative speech segments for the session', async () => {
+    seedFinalizedSession('s1', 2);
+    await handleJob(deps(), {
+      jobId: 'j1',
+      kind: 'asr',
+      payload: { sessionId: 's1' },
+      attempts: 1,
+      maxAttempts: 5,
+    });
+
+    const vad = new VadSegmentRepository(db.handle);
+    const segments = vad.listForSession('s1');
+
+    assert.equal(segments.length, 2, 'one segment per part from the fake backend');
+    assert.ok(vad.totalSpeechMs('s1') > 0);
+  });
+
+  it('offsets segment times so they refer to the whole session', async () => {
+    // Each seeded part is 60 s long, so the second part's segments must be
+    // shifted by 60 000 ms rather than restarting at zero.
+    seedFinalizedSession('s1', 2);
+    await handleJob(deps(), {
+      jobId: 'j1',
+      kind: 'asr',
+      payload: { sessionId: 's1' },
+      attempts: 1,
+      maxAttempts: 5,
+    });
+
+    const segments = new VadSegmentRepository(db.handle).listForSession('s1');
+    assert.equal(segments[0]?.startMs, 0);
+    assert.equal(segments[1]?.startMs, 60_000, 'second part is offset by the first part duration');
+  });
+
+  it('is idempotent, so a retried ASR job cannot duplicate segments', async () => {
+    seedFinalizedSession('s1');
+    const job = {
+      jobId: 'j1',
+      kind: 'asr' as const,
+      payload: { sessionId: 's1' },
+      attempts: 1,
+      maxAttempts: 5,
+    };
+    await handleJob(deps(), job);
+    await handleJob(deps(), job);
+
+    assert.equal(new VadSegmentRepository(db.handle).listForSession('s1').length, 1);
+  });
+
+  it('does not cost the user their transcript when VAD fails', async () => {
+    seedFinalizedSession('s1');
+    const failing = new FakeAsr();
+    failing.vadSegments = async () => {
+      throw new Error('worker died');
+    };
+
+    await handleJob(
+      { ...deps(), asr: failing },
+      {
+        jobId: 'j1',
+        kind: 'asr',
+        payload: { sessionId: 's1' },
+        attempts: 1,
+        maxAttempts: 5,
+      },
+    );
+
+    assert.equal(new VadSegmentRepository(db.handle).listForSession('s1').length, 0);
+    assert.ok(
+      new TranscriptRepository(db.handle).current('s1'),
+      'the transcript must still be stored',
+    );
   });
 });

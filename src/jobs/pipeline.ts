@@ -6,8 +6,10 @@ import type { OpenMurmurConfig } from '../config/schema.ts';
 import {
   countWords,
   PartRepository,
+  type PartRow,
   SessionRepository,
   TranscriptRepository,
+  VadSegmentRepository,
 } from '../database/repository.ts';
 import type { LlmBackend } from '../llm/ollama.ts';
 import { EMPTY_SUMMARY } from '../llm/schema.ts';
@@ -57,6 +59,60 @@ function sessionIdOf(job: Job): string {
   return value;
 }
 
+/**
+ * Step 6 of the post-silence pipeline: a final VAD pass over the closed files.
+ *
+ * The streaming pass that drove the sessionizer saw 32 ms at a time and could
+ * not look ahead, so its boundaries were provisional. This pass sees each
+ * complete part and stores the authoritative segments, offset so their times
+ * refer to the whole session rather than to one part.
+ *
+ * It is best-effort by design. A VAD failure must not cost the user their
+ * transcript, so it is logged and the pipeline continues — the segments are a
+ * refinement, not a prerequisite. Nothing here decides what to delete.
+ */
+async function runFinalVadPass(
+  deps: PipelineDeps,
+  sessionId: string,
+  parts: readonly PartRow[],
+): Promise<void> {
+  const repository = new VadSegmentRepository(deps.db);
+  const collected: { startMs: number; endMs: number; meanProbability: number }[] = [];
+  let offsetMs = 0;
+
+  for (const part of parts) {
+    try {
+      const segments = await deps.asr.vadSegments({
+        audioPath: part.path,
+        threshold: deps.config.sessionizer.vadThreshold,
+      });
+      for (const segment of segments) {
+        collected.push({
+          startMs: segment.startMs + offsetMs,
+          endMs: segment.endMs + offsetMs,
+          meanProbability: segment.meanProbability,
+        });
+      }
+    } catch (error) {
+      deps.logger.warn('final VAD pass failed for a part; continuing without it', {
+        sessionId,
+        partId: part.part_id,
+        error: (error as Error).message,
+      });
+    }
+    offsetMs += part.duration_ms ?? 0;
+  }
+
+  if (collected.length === 0) return;
+
+  repository.replaceForSession(sessionId, collected);
+  deps.logger.info('final VAD pass stored', {
+    sessionId,
+    segments: collected.length,
+    speechMs: repository.totalSpeechMs(sessionId),
+  });
+}
+
 async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
   const sessionId = sessionIdOf(job);
   const sessions = new SessionRepository(deps.db);
@@ -67,6 +123,8 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
   if (finalized.length === 0) {
     throw new Error(`session ${sessionId} has no finalized audio parts`);
   }
+
+  await runFinalVadPass(deps, sessionId, finalized);
 
   // Parts are transcribed in order and concatenated. Timestamps are offset by
   // the cumulative duration so segment times refer to the whole session.

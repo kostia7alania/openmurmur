@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import type { AsrBackend, AsrRequest, AsrResult } from './types.ts';
+import type { AsrBackend, AsrRequest, AsrResult, VadRequest, VadSegment } from './types.ts';
 
 /**
  * Deterministic ASR stand-in for CI and for `--fake` local runs.
@@ -44,6 +44,11 @@ export class FakeAsr implements AsrBackend {
     };
   }
 
+  /** One plausible segment, so the persistence path is exercised in tests. */
+  async vadSegments(_request: VadRequest): Promise<readonly VadSegment[]> {
+    return [{ startMs: 0, endMs: 1000, meanProbability: 0.9 }];
+  }
+
   async close(): Promise<void> {}
 }
 
@@ -62,6 +67,9 @@ export class SilentFakeAsr implements AsrBackend {
       model: 'fake-asr-0',
       durationMs: 0,
     };
+  }
+  async vadSegments(): Promise<readonly VadSegment[]> {
+    return [];
   }
   async close(): Promise<void> {}
 }

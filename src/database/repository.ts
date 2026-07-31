@@ -306,3 +306,69 @@ export function countWords(text: string): number {
   const hasSpacedContent = /[^\s฀-๿]/.test(text);
   return Math.max(hasSpacedContent ? spaced : 0, thaiWords);
 }
+
+export interface VadSegmentRow {
+  readonly startMs: number;
+  readonly endMs: number;
+  readonly meanProbability: number;
+}
+
+/**
+ * Speech segments from the final VAD pass over a finalized session.
+ *
+ * These are the authoritative boundaries. The streaming pass that drives the
+ * sessionizer sees 32 ms at a time and cannot look ahead, so its decisions are
+ * provisional; this pass sees the whole recording. They are also what gives
+ * Thai its segment timings, since no word aligner supports it.
+ */
+export class VadSegmentRepository {
+  readonly #db: DatabaseSync;
+  constructor(db: DatabaseSync) {
+    this.#db = db;
+  }
+
+  /**
+   * Replaces the stored segments for a session. Idempotent, so a retried ASR
+   * job cannot accumulate duplicates.
+   */
+  replaceForSession(sessionId: string, segments: readonly VadSegmentRow[]): void {
+    transaction(this.#db, () => {
+      this.#db.prepare('DELETE FROM vad_segments WHERE session_id = ?').run(sessionId);
+      const insert = this.#db.prepare(
+        `INSERT INTO vad_segments (session_id, start_ms, end_ms, mean_probability)
+         VALUES (?, ?, ?, ?)`,
+      );
+      for (const segment of segments) {
+        insert.run(sessionId, segment.startMs, segment.endMs, segment.meanProbability);
+      }
+    });
+  }
+
+  listForSession(sessionId: string): VadSegmentRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT start_ms, end_ms, mean_probability FROM vad_segments
+          WHERE session_id = ? ORDER BY start_ms`,
+      )
+      .all(sessionId) as unknown as {
+      start_ms: number;
+      end_ms: number;
+      mean_probability: number;
+    }[];
+    return rows.map((r) => ({
+      startMs: r.start_ms,
+      endMs: r.end_ms,
+      meanProbability: r.mean_probability,
+    }));
+  }
+
+  /** Total detected speech across a session, in milliseconds. */
+  totalSpeechMs(sessionId: string): number {
+    const row = this.#db
+      .prepare(
+        'SELECT COALESCE(SUM(end_ms - start_ms), 0) AS total FROM vad_segments WHERE session_id = ?',
+      )
+      .get(sessionId) as { total: number };
+    return row.total;
+  }
+}

@@ -8,7 +8,7 @@ import {
   type WorkerRequest,
   type WorkerResponse,
 } from './protocol.ts';
-import type { AsrBackend, AsrRequest, AsrResult } from './types.ts';
+import type { AsrBackend, AsrRequest, AsrResult, VadRequest, VadSegment } from './types.ts';
 
 export interface MlxAsrOptions {
   /** Usually `uv`, invoked with `run --project python/openmurmur_audio`. */
@@ -93,6 +93,26 @@ export class MlxAsr implements AsrBackend {
       model: response.model,
       durationMs: response.duration_ms,
     };
+  }
+
+  async vadSegments(request: VadRequest): Promise<readonly VadSegment[]> {
+    await this.#ensureStarted();
+
+    // Deliberately does not require the ASR model: a VAD pass must still work
+    // when the transcription model failed to load.
+    const response = await this.#send(
+      { id: randomUUID(), op: 'vad', path: request.audioPath, threshold: request.threshold },
+      this.#options.requestTimeoutMs,
+    );
+
+    if (!response.ok) throw new Error(`VAD failed: ${response.error}`);
+    if (response.op !== 'vad') throw new Error('worker replied to the wrong operation');
+
+    return response.segments.map((s) => ({
+      startMs: s.start_ms,
+      endMs: s.end_ms,
+      meanProbability: s.mean_probability,
+    }));
   }
 
   async close(): Promise<void> {

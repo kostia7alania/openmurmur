@@ -28,9 +28,33 @@ export interface AsrRequest {
   readonly requestId: string;
 }
 
+/** One stretch of detected speech, in milliseconds from the start of the file. */
+export interface VadSegment {
+  readonly startMs: number;
+  readonly endMs: number;
+  readonly meanProbability: number;
+}
+
+export interface VadRequest {
+  readonly audioPath: string;
+  readonly threshold: number;
+}
+
 export interface AsrBackend {
   readonly name: string;
   ready(): Promise<{ ok: true } | { ok: false; reason: string }>;
   transcribe(request: AsrRequest): Promise<AsrResult>;
+  /**
+   * Final VAD pass over a finalized part.
+   *
+   * Run after the file is closed rather than reusing the streaming decisions:
+   * the streaming pass sees 32 ms at a time and cannot look ahead, so its
+   * segment boundaries are provisional. This pass sees the whole part and
+   * produces the boundaries stored in `vad_segments` and used for Thai
+   * timings, where no word aligner exists.
+   *
+   * It never decides what to delete. Retention reads the database, not VAD.
+   */
+  vadSegments(request: VadRequest): Promise<readonly VadSegment[]>;
   close(): Promise<void>;
 }
