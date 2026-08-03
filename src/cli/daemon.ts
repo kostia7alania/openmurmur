@@ -2,6 +2,7 @@ import { rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { FfmpegCapture } from '../capture/ffmpeg.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
+import { recoverAfterCrash } from '../capture/recovery.ts';
 import type { LoadedConfig } from '../config/load.ts';
 import { type Database, openDatabase } from '../database/db.ts';
 import { PartRepository, SessionRepository, TranscriptRepository } from '../database/repository.ts';
@@ -119,6 +120,15 @@ export class Daemon {
     await writeFile(paths.pidFile, `${process.pid}\n`, { mode: 0o600 });
 
     // Reclaim anything a previous crash left half-done before new work starts.
+    const recovery = await recoverAfterCrash(this.#db.handle, paths, logger);
+    if (recovery.orphans.length > 0 || recovery.stalledSessions.length > 0) {
+      await this.#sendNow(
+        `🟡 Предыдущий запуск завершился некорректно\n\n` +
+          `Прерванных записей: ${recovery.orphans.length}\n` +
+          `Незавершённых сессий: ${recovery.stalledSessions.length}`,
+      );
+    }
+
     const reclaimedJobs = this.#jobs.recoverStaleLeases();
     const reclaimedSends = this.#outbox.recoverSending();
     if (reclaimedJobs > 0 || reclaimedSends > 0) {

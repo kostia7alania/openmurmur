@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { FfmpegCapture } from '../capture/ffmpeg.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
+import { recoverAfterCrash, renderRecoveryReport } from '../capture/recovery.ts';
 import { ensureDirectories, loadConfig } from '../config/load.ts';
 import { ConfigError } from '../config/schema.ts';
 import { openDatabase } from '../database/db.ts';
@@ -33,6 +34,7 @@ Setup and diagnostics
   setup                  Create directories, config and database (shows a plan first).
   setup telegram         Connect a Telegram bot. Token is entered hidden.
   capture test           Record a few seconds and report input levels.
+  recover                Report recordings an unclean shutdown left behind.
 
 Running
   start                  Run the daemon in the foreground.
@@ -139,6 +141,27 @@ async function main(argv: readonly string[]): Promise<number> {
         process.stderr.write(`Could not stop pid ${pid}: ${(error as Error).message}\n`);
         await rm(loaded.paths.pidFile, { force: true });
         return 1;
+      }
+    }
+
+    case 'recover': {
+      await ensureDirectories(loaded.paths);
+      const db = openDatabase({ file: loaded.paths.databaseFile });
+      try {
+        // Read-only unless --yes: seeing what a crash left is not the same as
+        // agreeing to delete it.
+        const report = await recoverAfterCrash(db.handle, loaded.paths, logger, {
+          remove: values['yes'] === true,
+        });
+        process.stdout.write(
+          asJson ? `${JSON.stringify(report, null, 2)}\n` : `${renderRecoveryReport(report)}\n`,
+        );
+        if (report.orphans.length > 0 && values['yes'] !== true) {
+          process.stdout.write('\nRe-run with --yes to remove them.\n');
+        }
+        return 0;
+      } finally {
+        db.close();
       }
     }
 

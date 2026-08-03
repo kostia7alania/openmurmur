@@ -236,6 +236,7 @@ openmurmur doctor              # check every dependency (read-only)
 openmurmur setup               # create dirs, config, database (shows a plan first)
 openmurmur setup telegram      # connect a bot (hidden token prompt)
 openmurmur capture test        # record 5s and report levels
+openmurmur recover             # report what an unclean shutdown left behind
 openmurmur start               # run the daemon
 openmurmur stop                # stop a running daemon
 openmurmur status              # local status, no network
