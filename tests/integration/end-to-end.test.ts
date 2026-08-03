@@ -248,12 +248,24 @@ describe('end to end: capture through delivery, without a microphone', () => {
       .prepare('SELECT kind, ordinal FROM telegram_outbox ORDER BY ordinal')
       .all() as { kind: string; ordinal: number }[];
 
-    assert.ok(queued.some((q) => q.kind === 'audio'), 'the source FLAC is queued');
-    assert.ok(queued.some((q) => q.kind === 'transcript'), 'the transcript is queued');
-    assert.ok(queued.some((q) => q.kind === 'report'), 'the report is queued');
+    assert.ok(
+      queued.some((q) => q.kind === 'audio'),
+      'the source FLAC is queued',
+    );
+    assert.ok(
+      queued.some((q) => q.kind === 'transcript'),
+      'the transcript is queued',
+    );
+    assert.ok(
+      queued.some((q) => q.kind === 'report'),
+      'the report is queued',
+    );
     assert.equal(outbox.claimNext()?.kind, 'audio', 'audio goes first');
 
-    assert.ok(new TranscriptRepository(db.handle).current(sessionId), 'a transcript revision exists');
+    assert.ok(
+      new TranscriptRepository(db.handle).current(sessionId),
+      'a transcript revision exists',
+    );
     assert.equal(sessions.get(sessionId)?.state, 'DELIVERING');
   });
 
@@ -280,9 +292,9 @@ describe('end to end: capture through delivery, without a microphone', () => {
     ]);
     await recorder.run();
 
-    const row = db.handle
-      .prepare('SELECT state, rejection_reason FROM audio_sessions')
-      .get() as { state: string; rejection_reason: string } | undefined;
+    const row = db.handle.prepare('SELECT state, rejection_reason FROM audio_sessions').get() as
+      | { state: string; rejection_reason: string }
+      | undefined;
 
     assert.equal(row?.state, 'REJECTED');
     assert.equal(row?.rejection_reason, 'insufficient_speech');
@@ -369,9 +381,11 @@ describe('end to end: capture through delivery, without a microphone', () => {
     await recorder.stop();
     await run;
 
-    const parts = db.handle
-      .prepare('SELECT path, finalized, sha256 FROM audio_parts')
-      .all() as { path: string; finalized: number; sha256: string | null }[];
+    const parts = db.handle.prepare('SELECT path, finalized, sha256 FROM audio_parts').all() as {
+      path: string;
+      finalized: number;
+      sha256: string | null;
+    }[];
 
     assert.ok(parts.length >= 1, 'the interrupted session still produced a part');
     for (const part of parts) {

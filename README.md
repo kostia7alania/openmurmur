@@ -135,6 +135,9 @@ IDLE ──speech 500ms──▶ SPEECH_CANDIDATE ──sustained──▶ ACTIV
 - Files rotate every 15 minutes; parts share one `session_id`.
 - Sessions with under 3 seconds of speech, or fewer than 5 recognized words, are
   rejected rather than sent, so the chat stays usable.
+- Transcripts stay searchable: `openmurmur search "встреч"` matches "Встреча",
+  because the index is trigram rather than whitespace-tokenized — which is also
+  what makes Thai searchable at all.
 - Recording never blocks on processing. A new session can start while the last
   one is still transcribing.
 
@@ -238,6 +241,7 @@ openmurmur stop                # stop a running daemon
 openmurmur status              # local status, no network
 openmurmur telegram test       # send a test message
 openmurmur telegram poll       # poll once and show routing decisions
+openmurmur search TEXT         # search every stored transcript
 openmurmur transcribe FILE     # transcribe one file locally
 openmurmur digest 2026-07-29   # build a daily digest
 openmurmur retention dry-run   # show what would be deleted, and why not

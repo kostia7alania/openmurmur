@@ -9,6 +9,7 @@ import { ensureDirectories, loadConfig } from '../config/load.ts';
 import { ConfigError } from '../config/schema.ts';
 import { openDatabase } from '../database/db.ts';
 import { TranscriptRepository } from '../database/repository.ts';
+import { renderSearchResults, searchTranscripts } from '../database/search.ts';
 import { buildDigest, renderDigest, storeDigest } from '../digest/daily.ts';
 import { createLogger } from '../logging/logger.ts';
 import { applyRetention, planRetention } from '../retention/policy.ts';
@@ -43,6 +44,7 @@ Telegram
   telegram poll          Poll once and print what would be handled.
 
 Work
+  search TEXT            Search every stored transcript.
   transcribe FILE        Transcribe one audio file locally and print the text.
   digest DATE            Build and print the digest for YYYY-MM-DD.
   retention dry-run      Show exactly what retention would delete, and why.
@@ -52,6 +54,8 @@ Options
   --root DIR             Override the state directory (default: OPENMURMUR_HOME).
   --json                 Machine-readable output where supported.
   --yes                  Skip the confirmation prompt.
+  --limit N              Maximum search results (default 20).
+  --since ISO --until ISO  Restrict search to a time range.
   --help, --version
 `;
 
@@ -64,6 +68,9 @@ async function main(argv: readonly string[]): Promise<number> {
       root: { type: 'string' },
       json: { type: 'boolean', default: false },
       yes: { type: 'boolean', default: false },
+      limit: { type: 'string' },
+      since: { type: 'string' },
+      until: { type: 'string' },
       help: { type: 'boolean', default: false, short: 'h' },
       version: { type: 'boolean', default: false },
     },
@@ -141,6 +148,15 @@ async function main(argv: readonly string[]): Promise<number> {
     case 'telegram':
       return telegramCommand(loaded, positionals[1]);
 
+    case 'search': {
+      const query = positionals.slice(1).join(' ');
+      if (query.length === 0) {
+        process.stderr.write('Usage: openmurmur search TEXT\n');
+        return 1;
+      }
+      return searchCommand(loaded, query, values, asJson);
+    }
+
     case 'transcribe': {
       const file = positionals[1];
       if (file === undefined) {
@@ -171,6 +187,32 @@ async function main(argv: readonly string[]): Promise<number> {
     default:
       process.stderr.write(`Unknown command "${command}".\n\n${USAGE}`);
       return 1;
+  }
+}
+
+async function searchCommand(
+  loaded: Awaited<ReturnType<typeof loadConfig>>,
+  query: string,
+  values: Record<string, unknown>,
+  asJson: boolean,
+): Promise<number> {
+  const db = openDatabase({ file: loaded.paths.databaseFile });
+  try {
+    const hits = searchTranscripts(db.handle, {
+      query,
+      ...(typeof values['limit'] === 'string'
+        ? { limit: Number.parseInt(values['limit'], 10) }
+        : {}),
+      ...(typeof values['since'] === 'string' ? { since: values['since'] } : {}),
+      ...(typeof values['until'] === 'string' ? { until: values['until'] } : {}),
+    });
+    process.stdout.write(
+      asJson ? `${JSON.stringify(hits, null, 2)}\n` : `${renderSearchResults(hits, query)}\n`,
+    );
+    // Exit 1 on no match, so `openmurmur search x || echo none` works in a script.
+    return hits.length > 0 ? 0 : 1;
+  } finally {
+    db.close();
   }
 }
 
