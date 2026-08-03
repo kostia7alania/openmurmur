@@ -99,6 +99,27 @@ export class Recorder {
     await this.#options.capture.stop();
   }
 
+  /**
+   * Closes any open session immediately, as if the silence timeout had fired.
+   *
+   * Used when the machine wakes from sleep: the audio stream stopped without
+   * the sessionizer seeing any silence, so a session left open would appear to
+   * span the gap. Returns the session id that was closed, if any.
+   */
+  async closeOpenSession(reason: string): Promise<string | null> {
+    const sessionId = this.#machine.sessionId;
+    if (sessionId === null) return null;
+
+    for (const intent of this.#machine.forceFinalize()) {
+      await this.#applyIntent(intent, null);
+    }
+    if (this.#openPart !== null) {
+      await this.#closeOpenPart(Date.now(), this.#lastMonotonicMs);
+    }
+    this.#options.logger.info('closed an open session early', { sessionId, reason });
+    return sessionId;
+  }
+
   async #handleFrame(frame: CaptureFrame): Promise<void> {
     this.#lastMonotonicMs = frame.monotonicMs;
     const probability = await this.#options.vad.probability(frame.pcm);

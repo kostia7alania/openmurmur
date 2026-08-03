@@ -182,8 +182,10 @@ iTerm, or the launchd agent. Consequences worth knowing:
 ## Sleep and the lid
 
 - **Sleep:** capture stops. macOS suspends the process; no audio is recorded.
-  On wake, the recorder restarts and sends `🟢 Запись восстановлена`. An open
-  session is closed and delivered rather than silently spanning the gap.
+  The daemon detects the gap on wake — sleep advances the wall clock while the
+  monotonic clock stays frozen, which is a fingerprint nothing else produces —
+  closes any open session so it cannot appear to span the gap, and reports
+  `🟡 Запись прерывалась: компьютер спал` with the duration.
 - **Closed lid:** with an external display and power, the Mac may stay awake and
   recording continues. On battery with the lid closed, the Mac sleeps and
   recording stops.

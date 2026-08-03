@@ -15,6 +15,7 @@ import {
   renderHealthLines,
   sqliteWritable,
 } from '../health/monitor.ts';
+import { renderSleepMessage, SleepDetector } from '../health/sleep.ts';
 import { handleJob, markAudioDelivered, reconcileSessionDelivery } from '../jobs/pipeline.ts';
 import { JobQueue } from '../jobs/queue.ts';
 import type { Logger } from '../logging/logger.ts';
@@ -75,6 +76,7 @@ export class Daemon {
   #chatId: number | null = null;
   #stopping = false;
   #recorderFailure: string | null = null;
+  readonly #sleepDetector: SleepDetector;
   #announcedRecording = false;
   readonly #timers: NodeJS.Timeout[] = [];
 
@@ -100,6 +102,13 @@ export class Daemon {
       frameSamples: 512,
       ffmpegPath: config.audio.ffmpegPath,
       clock: { monotonicMs: () => Number(process.hrtime.bigint() / 1_000_000n), wallMs: Date.now },
+    });
+
+    this.#sleepDetector = new SleepDetector({
+      clock: {
+        monotonicMs: () => Number(process.hrtime.bigint() / 1_000_000n),
+        wallMs: Date.now,
+      },
     });
 
     this.#recorder = new Recorder({
@@ -150,6 +159,7 @@ export class Daemon {
     this.#loop('outbox', () => this.#tickOutbox(), 1500);
     this.#loop('telegram', () => this.#tickTelegram(), config.telegram.pollIntervalMs);
     this.#loop('health', () => this.#tickHealth(), config.health.pollIntervalMs);
+    this.#loop('sleep', () => this.#tickSleep(), 2000);
     this.#loop('retention', () => this.#tickDigest(), 5 * 60 * 1000);
 
     logger.info('daemon started', { pid: process.pid, version: VERSION });
@@ -491,6 +501,25 @@ export class Daemon {
       sqliteWritable: sqliteWritable(this.#db.handle),
       hoursSinceLastDigest: hoursSinceLastDigest(this.#db.handle),
     };
+  }
+
+  /**
+   * Detects that the Mac was asleep and closes any session that would
+   * otherwise appear to span the gap.
+   */
+  async #tickSleep(): Promise<void> {
+    const event = this.#sleepDetector.poll();
+    if (event === null) return;
+
+    this.#options.logger.warn('detected a sleep gap', { sleptMs: event.sleptMs });
+    const closed = await this.#recorder.closeOpenSession('machine slept');
+
+    await this.#sendNow(renderSleepMessage(event));
+    if (closed !== null) {
+      this.#options.logger.info('closed a session that spanned the sleep gap', {
+        sessionId: closed,
+      });
+    }
   }
 
   async #tickHealth(): Promise<void> {
