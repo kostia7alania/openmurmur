@@ -23,6 +23,15 @@ export interface SessionizerConfig {
   readonly vadThreshold: number;
   /** VAD frame size. Silero operates on 512 samples at 16 kHz = 32 ms. */
   readonly vadFrameMs: number;
+  /**
+   * Live speech detector.
+   *
+   * `silero` is the real one and the default. `energy` is a loudness gate: it
+   * cannot tell a voice from a fan or a television, so it is only for machines
+   * where the Python worker cannot run at all. Choosing it changes what a
+   * "speech session" means, so it is never selected automatically.
+   */
+  readonly vadBackend: 'silero' | 'energy';
 }
 
 export interface AudioConfig {
@@ -131,6 +140,7 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
     minTranscriptWords: 5,
     vadThreshold: 0.5,
     vadFrameMs: 32,
+    vadBackend: 'silero',
   },
   audio: {
     sampleRate: 16_000,
@@ -274,6 +284,9 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
   if (s.minTranscriptWords < 0) issues.push('sessionizer.minTranscriptWords must be >= 0');
   if (s.maxPartSeconds <= s.silenceTimeoutSeconds) {
     issues.push('sessionizer.maxPartSeconds must exceed sessionizer.silenceTimeoutSeconds');
+  }
+  if (s.vadBackend !== 'silero' && s.vadBackend !== 'energy') {
+    issues.push('sessionizer.vadBackend must be "silero" or "energy"');
   }
 
   if (c.audio.sampleRate !== 16_000) {

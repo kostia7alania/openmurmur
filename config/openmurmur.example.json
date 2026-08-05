@@ -8,7 +8,8 @@
     "minSpeechSeconds": 3,
     "minTranscriptWords": 5,
     "vadThreshold": 0.5,
-    "vadFrameMs": 32
+    "vadFrameMs": 32,
+    "vadBackend": "silero"
   },
   "audio": {
     "sampleRate": 16000,

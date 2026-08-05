@@ -10,6 +10,8 @@ model download that Hugging Face performs on first load.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import sys
 import time
 from dataclasses import asdict
@@ -17,15 +19,26 @@ from typing import Any
 
 from openmurmur_audio import __version__
 from openmurmur_audio.asr import AsrUnavailableError, QwenAsr
-from openmurmur_audio.audio import AudioError, load_mono_16k
+from openmurmur_audio.audio import AudioError, iter_frames, load_mono_16k, pcm16_to_float
 from openmurmur_audio.protocol import Request, error, log, ok, write_response
-from openmurmur_audio.vad import SileroVad, analyze, total_speech_ms
+from openmurmur_audio.vad import (
+    FRAME_SAMPLES,
+    SileroModelMissingError,
+    SileroVad,
+    analyze,
+    total_speech_ms,
+)
 
 
 class Worker:
     def __init__(self) -> None:
         self.asr = QwenAsr()
         self.vad = SileroVad()
+        # A second instance, because the live microphone stream and the
+        # after-the-fact pass over a finished file are two unrelated streams:
+        # sharing one LSTM state would let a finished recording corrupt the
+        # detector that is deciding, right now, whether someone is speaking.
+        self.stream_vad = SileroVad()
 
     def handle(self, request: Request) -> dict[str, Any]:
         match request.op:
@@ -37,6 +50,8 @@ class Worker:
                 return self._transcribe(request)
             case "vad":
                 return self._vad(request)
+            case "vad_stream":
+                return self._vad_stream(request)
             case "shutdown":
                 return ok(request.id, "shutdown")
             case _:
@@ -111,6 +126,52 @@ class Worker:
             segments=[asdict(segment) for segment in segments],
             speech_ms=total_speech_ms(segments),
         )
+
+    def _vad_stream(self, request: Request) -> dict[str, Any]:
+        """Scores live microphone frames, carrying Silero's state between calls.
+
+        The daemon sends whole 512-sample frames as they leave the capture pipe
+        and gets one probability back per frame, in order. `reset` starts a new
+        stream: the state from before a gap says nothing about the audio after
+        it.
+        """
+        payload = request.payload.get("pcm")
+        if not isinstance(payload, str):
+            return error(request.id, "bad_request", "vad_stream requires base64 pcm")
+
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            return error(request.id, "bad_request", f"pcm is not valid base64: {exc}")
+
+        frame_bytes = FRAME_SAMPLES * 2
+        if len(raw) == 0 or len(raw) % frame_bytes != 0:
+            return error(
+                request.id,
+                "bad_request",
+                f"pcm must be a whole number of {FRAME_SAMPLES}-sample frames "
+                f"({frame_bytes} bytes); got {len(raw)}",
+            )
+
+        try:
+            self.stream_vad.load()
+        except SileroModelMissingError as exc:
+            return error(request.id, "vad_unavailable", str(exc))
+
+        if request.payload.get("reset") is True:
+            self.stream_vad.reset()
+
+        try:
+            samples = pcm16_to_float(raw)
+            probabilities = [
+                self.stream_vad.probability(frame) for frame in iter_frames(samples, FRAME_SAMPLES)
+            ]
+        except AudioError as exc:
+            return error(request.id, "bad_request", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return error(request.id, "vad_failed", f"{type(exc).__name__}: {exc}")
+
+        return ok(request.id, "vad_stream", probabilities=probabilities)
 
 
 def _string_list(value: object) -> list[str]:

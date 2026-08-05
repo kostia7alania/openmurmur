@@ -63,3 +63,15 @@ def iter_frames(samples: FloatArray, frame_size: int) -> list[FloatArray]:
 
 def duration_ms(samples: FloatArray) -> int:
     return round(len(samples) / SAMPLE_RATE * 1000)
+
+
+def pcm16_to_float(raw: bytes) -> FloatArray:
+    """Converts signed 16-bit little-endian PCM to float32 in [-1, 1].
+
+    This is the format ffmpeg writes on the live capture pipe, so it is the
+    entry point for streaming VAD. Dividing by 32768 rather than 32767 keeps
+    the mapping exact for the negative full-scale sample.
+    """
+    if len(raw) % 2 != 0:
+        raise AudioError(f"pcm payload of {len(raw)} bytes is not a whole number of samples")
+    return (np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0).astype(np.float32)

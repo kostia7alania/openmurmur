@@ -173,9 +173,12 @@ Stated plainly rather than buried:
 5. **A television keeps VAD active.** Sessions can be recorded from broadcast
    speech. The minimum-speech and minimum-word gates reduce the noise but do not
    eliminate it.
-6. **The energy-gate VAD is not a speech detector.** It is used only for
-   `capture test` and tests; the daemon path uses Silero. Configuring the daemon
-   to use it would degrade session quality badly.
+6. **The energy-gate VAD is not a speech detector.** The daemon path uses
+   Silero. The gate is used for `capture test` and tests, and as a temporary
+   fallback if the Silero worker stops answering — in which case the daemon
+   says so rather than pretending nothing changed. Setting
+   `sessionizer.vadBackend` to `"energy"` makes it permanent and means noise can
+   be recorded as speech.
 
 ## Reporting
 

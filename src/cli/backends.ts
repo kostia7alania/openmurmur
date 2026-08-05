@@ -3,13 +3,17 @@ import { fileURLToPath } from 'node:url';
 import { FakeAsr } from '../asr/fake.ts';
 import { MlxAsr } from '../asr/mlx.ts';
 import type { AsrBackend } from '../asr/types.ts';
+import { WorkerProcess } from '../asr/worker-process.ts';
 import type { LoadedConfig } from '../config/load.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
 import { FakeLlm, type LlmBackend, OllamaLlm } from '../llm/ollama.ts';
 import type { Logger } from '../logging/logger.ts';
+import { SileroStreamVad, WorkerFrameScorer } from '../sessionizer/silero.ts';
+import { EnergyVad, type Vad } from '../sessionizer/vad.ts';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const PYTHON_PROJECT = join(REPO_ROOT, 'python', 'openmurmur_audio');
+const WORKER_ARGS = ['run', '--project', PYTHON_PROJECT, 'openmurmur-audio-worker'] as const;
 
 /**
  * Backend selection.
@@ -25,13 +29,49 @@ export function createAsrBackend(loaded: LoadedConfig, logger: Logger): AsrBacke
 
   return new MlxAsr({
     command: 'uv',
-    args: ['run', '--project', PYTHON_PROJECT, 'openmurmur-audio-worker'],
+    args: [...WORKER_ARGS],
     cwd: REPO_ROOT,
     model: loaded.config.asr.model,
     quantization: loaded.config.asr.quantization,
     alignerLanguages: loaded.config.asr.alignerLanguages,
     requestTimeoutMs: loaded.config.asr.pythonWorkerTimeoutMs,
     logger: logger.child('asr'),
+  });
+}
+
+export interface VadBackendHooks {
+  readonly onDegraded?: (reason: string) => void;
+  readonly onRecovered?: () => void;
+}
+
+/**
+ * The live speech detector.
+ *
+ * It gets its own Python process rather than sharing the ASR worker: that one
+ * handles requests in order, so a transcription in flight would hold up every
+ * frame behind it — and those frames are what decide whether the microphone is
+ * hearing speech right now.
+ */
+export function createVadBackend(
+  loaded: LoadedConfig,
+  logger: Logger,
+  hooks: VadBackendHooks = {},
+): Vad {
+  if (loaded.config.sessionizer.vadBackend === 'energy') return new EnergyVad();
+
+  const worker = new WorkerProcess({
+    command: 'uv',
+    args: [...WORKER_ARGS],
+    cwd: REPO_ROOT,
+    logger: logger.child('vad'),
+    label: 'VAD',
+  });
+
+  return new SileroStreamVad({
+    scorer: new WorkerFrameScorer(worker),
+    logger: logger.child('vad'),
+    ...(hooks.onDegraded ? { onDegraded: hooks.onDegraded } : {}),
+    ...(hooks.onRecovered ? { onRecovered: hooks.onRecovered } : {}),
   });
 }
 

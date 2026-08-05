@@ -23,6 +23,40 @@ bug, and is why the minimum-speech and minimum-word gates exist downstream.
 gate used for `capture test` and for tests, where the point is proving the audio
 path works, not classifying sound.
 
+Measured on this machine, over the streaming path the daemon actually uses:
+
+| input                        | Silero | energy gate |
+| ---------------------------- | -----: | ----------: |
+| Russian speech               | 0.927  |       0.857 |
+| English speech               | 0.927  |       0.915 |
+| 440 Hz tone at half scale    | 0.000  |       1.000 |
+| white noise at 0.3 full scale| 0.007  |       1.000 |
+| near silence                 | 0.005  |       0.000 |
+
+The two middle rows are the whole argument: to an energy gate a loud tone is
+indistinguishable from a person talking.
+
+### How it runs
+
+Frames go to Silero as they leave the capture pipe — 512 samples, 32 ms — over
+NDJSON to a Python worker that keeps the ONNX session and its LSTM state
+resident. A round trip costs about 0.2 ms, so scoring uses under 1% of the
+frame budget.
+
+That worker is a **separate process from the ASR worker**. The worker loop
+handles requests in order, so a transcription taking half a minute would hold up
+every VAD frame queued behind it — and those frames are what decide whether the
+microphone is hearing speech right now.
+
+If the worker stops answering, the recorder keeps running on the energy gate
+rather than stopping: a degraded journal beats no journal. This is never silent
+— the daemon sends 🟡 to Telegram naming the reason, retries Silero once a
+minute, and sends 🟢 when it recovers. `openmurmur doctor` reports the detector
+by actually starting it and scoring a frame, not by reading the config back.
+
+Setting `sessionizer.vadBackend` to `"energy"` makes the gate permanent. It is
+never selected automatically, because it changes what "a speech session" means.
+
 ## States
 
 ```

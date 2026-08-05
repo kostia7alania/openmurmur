@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The daemon now really uses Silero VAD to decide what a speech session is.**
+  It was wired to `EnergyVad` — the loudness gate the source itself documents as
+  "explicitly not a substitute" — while the docs claimed the daemon path used
+  Silero. In practice any loud sound opened a session and quiet speech could be
+  missed. Measured over the new streaming path: a 440 Hz tone and white noise
+  score 0.000 and 0.007 with Silero and 1.000 with the gate; real Russian and
+  English speech score 0.927.
+
+### Added
+
+- Streaming VAD (`vad_stream`) in the Python worker: whole 512-sample frames in,
+  one probability out per frame, Silero's LSTM state carried between calls.
+  About 0.2 ms per frame against a 32 ms budget.
+- The live detector runs in its own worker process, so a transcription in flight
+  cannot hold up the frames deciding whether someone is speaking.
+- `sessionizer.vadBackend` (`silero` by default, `energy` to opt out).
+- If the Silero worker stops answering, the recorder continues on the energy
+  gate and the daemon says so (🟡), retries once a minute, and reports recovery
+  (🟢). It never degrades silently.
+- `openmurmur doctor` gained a `speech_detection` check that starts the worker
+  and scores a frame, rather than reporting what the config claims.
+
 ## [0.1.0] — 2026-07-29
 
 Initial public MVP.

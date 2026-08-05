@@ -31,6 +31,13 @@ export type WorkerRequest =
       readonly path: string;
       readonly threshold: number;
     })
+  | (WorkerRequestBase & {
+      readonly op: 'vad_stream';
+      /** base64 of signed 16-bit LE PCM: a whole number of 512-sample frames. */
+      readonly pcm: string;
+      /** Start a new stream, discarding the state left by the previous audio. */
+      readonly reset?: boolean;
+    })
   | (WorkerRequestBase & { readonly op: 'shutdown' });
 
 export interface WorkerSegment {
@@ -66,6 +73,13 @@ export type WorkerResponse =
       readonly op: 'vad';
       readonly segments: readonly { start_ms: number; end_ms: number; mean_probability: number }[];
       readonly speech_ms: number;
+    }
+  | {
+      readonly id: string;
+      readonly ok: true;
+      readonly op: 'vad_stream';
+      /** One probability per submitted frame, in order. */
+      readonly probabilities: readonly number[];
     }
   | { readonly id: string; readonly ok: true; readonly op: 'shutdown' }
   | { readonly id: string; readonly ok: false; readonly error: string; readonly code: string };

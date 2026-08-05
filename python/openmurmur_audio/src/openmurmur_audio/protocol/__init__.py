@@ -21,6 +21,10 @@ ErrorCode = Literal[
     "audio_unreadable",
     "transcribe_failed",
     "vad_failed",
+    # The Silero model is not installed at all, as opposed to a frame that
+    # failed to score. The daemon reports it differently: one is a missing
+    # install the user can fix, the other is a transient error.
+    "vad_unavailable",
     "internal",
 ]
 

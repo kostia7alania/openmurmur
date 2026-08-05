@@ -1,10 +1,13 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { access, constants } from 'node:fs/promises';
 import { arch, platform } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import type { LoadedConfig } from '../config/load.ts';
 import { compareVersions, MINIMUM_SQLITE_VERSION, sqliteVersionOf } from '../database/db.ts';
 import { diskFreeGb } from '../health/monitor.ts';
+import { nullLogger } from '../logging/logger.ts';
+import { PYTHON_PROJECT, REPO_ROOT } from './backends.ts';
 
 export type CheckLevel = 'ok' | 'warn' | 'fail' | 'info';
 
@@ -124,6 +127,74 @@ async function checkUv(loaded: LoadedConfig): Promise<Check> {
   };
 }
 
+/**
+ * Scores one frame of real audio through the real worker.
+ *
+ * Reporting `vad=silero` from the config would only prove the config says so.
+ * The thing worth knowing before leaving a daemon running all day is whether
+ * the detector actually loads and answers, so this starts the worker, sends a
+ * frame and shuts it down again.
+ */
+async function checkSpeechDetection(loaded: LoadedConfig): Promise<Check> {
+  if (loaded.config.sessionizer.vadBackend === 'energy') {
+    return {
+      name: 'speech_detection',
+      level: 'warn',
+      detail: 'energy gate (Silero disabled in the config)',
+      fix:
+        'sessionizer.vadBackend is "energy". It measures loudness, not speech, so a fan or a ' +
+        'television can start a session and quiet speech can be missed.',
+    };
+  }
+
+  const { WorkerProcess } = await import('../asr/worker-process.ts');
+  const { SileroStreamVad, WorkerFrameScorer, FRAME_BYTES } = await import(
+    '../sessionizer/silero.ts'
+  );
+  const worker = new WorkerProcess({
+    command: 'uv',
+    args: ['run', '--project', PYTHON_PROJECT, 'openmurmur-audio-worker'],
+    cwd: REPO_ROOT,
+    logger: nullLogger,
+    label: 'VAD',
+  });
+
+  const started = Date.now();
+  try {
+    const vad = new SileroStreamVad({
+      scorer: new WorkerFrameScorer(worker, 60_000),
+      logger: nullLogger,
+      // Report the real failure instead of quietly answering from the gate.
+      failureThreshold: 1,
+      fallback: {
+        name: 'none',
+        probability: () => Number.NaN,
+        reset: () => {},
+      },
+    });
+    const probability = await vad.probability(new Uint8Array(FRAME_BYTES));
+    if (!Number.isFinite(probability)) throw new Error('the worker returned no probability');
+    return {
+      name: 'speech_detection',
+      level: 'ok',
+      detail: `Silero VAD answered in ${Date.now() - started} ms`,
+    };
+  } catch (error) {
+    return {
+      name: 'speech_detection',
+      level: 'fail',
+      detail: (error as Error).message.split('\n')[0] ?? 'unavailable',
+      fix:
+        'Sessions cannot be detected without it. Install the local model stack:\n' +
+        '  uv sync --project python/openmurmur_audio --extra mlx\n' +
+        'Or set sessionizer.vadBackend to "energy" to cut sessions by loudness instead, ' +
+        'accepting that noise will be recorded as speech.',
+    };
+  } finally {
+    await worker.close(randomUUID());
+  }
+}
+
 async function checkOllama(loaded: LoadedConfig): Promise<Check> {
   const { baseUrl, model } = loaded.config.llm;
   const result = await probeOllama(baseUrl, model);
@@ -185,15 +256,25 @@ function checkConfigSource(loaded: LoadedConfig): Check {
 }
 
 function checkBackends(loaded: LoadedConfig): Check {
-  const { asr, llm } = loaded.config;
-  const fake = asr.backend === 'fake' || llm.backend === 'fake';
+  const { asr, llm, sessionizer } = loaded.config;
+  const energyVad = sessionizer.vadBackend === 'energy';
+  const degraded = asr.backend === 'fake' || llm.backend === 'fake' || energyVad;
+
+  const fixes = [
+    asr.backend === 'fake'
+      ? 'asr.backend is "fake": transcripts will be placeholders, not real speech.'
+      : null,
+    energyVad
+      ? 'sessionizer.vadBackend is "energy": sessions are cut by loudness, so a fan or a ' +
+        'television can start one and quiet speech can be missed.'
+      : null,
+  ].filter((fix) => fix !== null);
+
   return {
     name: 'backends',
-    level: fake ? 'warn' : 'info',
-    detail: `asr=${asr.backend}, llm=${llm.backend}`,
-    ...(asr.backend === 'fake'
-      ? { fix: 'asr.backend is "fake": transcripts will be placeholders, not real speech.' }
-      : {}),
+    level: degraded ? 'warn' : 'info',
+    detail: `asr=${asr.backend}, llm=${llm.backend}, vad=${sessionizer.vadBackend}`,
+    ...(fixes.length > 0 ? { fix: fixes.join(' ') } : {}),
   };
 }
 
@@ -216,6 +297,7 @@ const CHECKS: readonly CheckFn[] = [
     binaryCheck('ffprobe', loaded.config.audio.ffprobePath, 'brew install ffmpeg')(loaded),
   checkAudioDevices,
   checkUv,
+  checkSpeechDetection,
   checkOllama,
   checkStateDirectory,
   checkDisk,

@@ -20,7 +20,8 @@ import { handleJob, markAudioDelivered, reconcileSessionDelivery } from '../jobs
 import { JobQueue } from '../jobs/queue.ts';
 import type { Logger } from '../logging/logger.ts';
 import { Recorder } from '../sessionizer/recorder.ts';
-import { EnergyVad } from '../sessionizer/vad.ts';
+import { SileroStreamVad } from '../sessionizer/silero.ts';
+import type { Vad } from '../sessionizer/vad.ts';
 import { TelegramClient } from '../telegram/client.ts';
 import { renderTranscriptMessages } from '../telegram/format.ts';
 import {
@@ -40,7 +41,7 @@ import {
   routeUpdate,
   writeOffset,
 } from '../telegram/router.ts';
-import { createAsrBackend, createLlmBackend } from './backends.ts';
+import { createAsrBackend, createLlmBackend, createVadBackend } from './backends.ts';
 import { VERSION } from './version.ts';
 
 /**
@@ -71,11 +72,14 @@ export class Daemon {
   readonly #alerts: AlertEvaluator;
   readonly #recorder: Recorder;
   readonly #capture: FfmpegCapture;
+  readonly #vad: Vad;
 
   #client: TelegramClient | null = null;
   #chatId: number | null = null;
   #stopping = false;
   #recorderFailure: string | null = null;
+  /** Resolves once `run()` has finalized whatever was open. */
+  #recorderDone: Promise<void> | null = null;
   readonly #sleepDetector: SleepDetector;
   #announcedRecording = false;
   readonly #timers: NodeJS.Timeout[] = [];
@@ -111,12 +115,26 @@ export class Daemon {
       },
     });
 
+    this.#vad = createVadBackend(options.loaded, options.logger, {
+      onDegraded: (reason) => {
+        void this.#sendNow(
+          '🟡 Распознавание речи работает в упрощённом режиме\n\n' +
+            'Silero VAD недоступен, сессии временно определяются по громкости: ' +
+            'шум может быть принят за речь, а тихая речь — пропущена.\n' +
+            `Причина: ${reason.slice(0, 300)}`,
+        );
+      },
+      onRecovered: () => {
+        void this.#sendNow('🟢 Определение речи снова работает нормально (Silero VAD)');
+      },
+    });
+
     this.#recorder = new Recorder({
       config,
       paths,
       db: this.#db.handle,
       capture: this.#capture,
-      vad: new EnergyVad(),
+      vad: this.#vad,
       logger: options.logger.child('recorder'),
       onFirstFrame: () => this.#announceRecordingStarted(),
     });
@@ -162,10 +180,22 @@ export class Daemon {
     this.#loop('sleep', () => this.#tickSleep(), 2000);
     this.#loop('retention', () => this.#tickDigest(), 5 * 60 * 1000);
 
+    // Creating the ONNX session takes about a second. Paying that on the first
+    // frame would queue a second of audio behind it at start-up.
+    if (this.#vad instanceof SileroStreamVad) {
+      try {
+        await this.#vad.warmUp();
+        logger.info('speech detection ready', { vad: this.#vad.name });
+      } catch (error) {
+        logger.warn('could not preload the speech detector', { error: (error as Error).message });
+      }
+    }
+
     logger.info('daemon started', { pid: process.pid, version: VERSION });
 
     try {
-      await this.#recorder.run();
+      this.#recorderDone = this.#recorder.run();
+      await this.#recorderDone;
       // A clean end to the capture stream still means recording stopped.
       if (!this.#stopping) this.#recorderFailure = 'capture stream ended unexpectedly';
     } catch (error) {
@@ -179,7 +209,16 @@ export class Daemon {
     if (this.#stopping) return;
     this.#stopping = true;
     for (const timer of this.#timers) clearInterval(timer);
+
+    // `recorder.stop()` only closes the capture device. The recorder then
+    // finalizes whatever was open — flushes the encoder, renames the part into
+    // the archive, marks the session PROCESSING, queues transcription — and
+    // that work must finish before the database closes underneath it.
+    // Skipping the wait threw away the recording in progress every time
+    // someone stopped the daemon.
     await this.#recorder.stop();
+    await this.#awaitRecorderFinalization();
+
     await this.#sendNow('🔴 Запись остановлена (демон завершается)');
     try {
       await rm(this.#options.loaded.paths.pidFile, { force: true });
@@ -187,6 +226,32 @@ export class Daemon {
       // Nothing useful to do if the pid file is already gone.
     }
     this.#db.close();
+  }
+
+  /**
+   * Waits for the recorder to finish finalizing, but not forever.
+   *
+   * A wedged encoder must not leave the daemon unkillable: launchd sends
+   * SIGKILL if SIGTERM is not honoured, and being killed mid-write is worse
+   * than giving up on the last part. Crash recovery handles what is left.
+   */
+  async #awaitRecorderFinalization(timeoutMs = 30_000): Promise<void> {
+    const done = this.#recorderDone;
+    if (done === null) return;
+
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs);
+    });
+
+    const outcome = await Promise.race([
+      done.then(() => 'done' as const).catch(() => 'done'),
+      deadline,
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (outcome === 'timeout') {
+      this.#options.logger.warn('gave up waiting for the recorder to finalize', { timeoutMs });
+    }
   }
 
   /**
