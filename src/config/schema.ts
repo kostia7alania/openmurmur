@@ -34,6 +34,31 @@ export interface SessionizerConfig {
   readonly vadBackend: 'silero' | 'energy';
 }
 
+export interface DiarizationConfig {
+  /**
+   * Off by default. It separates voices well and counts them badly on
+   * far-field room audio, so it is a deliberate choice rather than a surprise:
+   * a transcript labelled with the wrong number of people is worse than one
+   * with no labels at all.
+   *
+   * Requires the ONNX models — `./scripts/fetch-diarization-models`, ~44 MB,
+   * no account or token.
+   */
+  readonly enabled: boolean;
+  /**
+   * Hard cap on distinct voices, not a hint.
+   *
+   * Allowed to decide for itself, the clustering over-counts badly: a
+   * two-minute recording of two people came back with between 4 and 15
+   * "speakers" depending on the threshold. Capped at 3 the same recording gave
+   * three voices and three speaker changes. Raise it for a meeting, lower it
+   * to 2 for a one-to-one.
+   */
+  readonly maxSpeakers: number;
+  /** Turns shorter than this are dropped; fragments are where over-counting lives. */
+  readonly minTurnSeconds: number;
+}
+
 export interface AudioConfig {
   readonly sampleRate: number;
   readonly channels: number;
@@ -120,6 +145,7 @@ export interface OpenMurmurConfig {
   readonly version: 1;
   readonly sessionizer: SessionizerConfig;
   readonly audio: AudioConfig;
+  readonly diarization: DiarizationConfig;
   readonly asr: AsrConfig;
   readonly llm: LlmConfig;
   readonly telegram: TelegramConfig;
@@ -149,6 +175,11 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
     ffmpegPath: 'ffmpeg',
     ffprobePath: 'ffprobe',
     flacCompressionLevel: 5,
+  },
+  diarization: {
+    enabled: false,
+    maxSpeakers: 3,
+    minTurnSeconds: 1,
   },
   asr: {
     backend: 'mlx',
@@ -296,6 +327,12 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
   if (c.audio.flacCompressionLevel < 0 || c.audio.flacCompressionLevel > 12) {
     issues.push('audio.flacCompressionLevel must be between 0 and 12');
   }
+
+  const d = c.diarization;
+  if (d.maxSpeakers < 1 || d.maxSpeakers > 20) {
+    issues.push('diarization.maxSpeakers must be between 1 and 20');
+  }
+  if (d.minTurnSeconds < 0) issues.push('diarization.minTurnSeconds must be >= 0');
 
   if (c.asr.backend !== 'mlx' && c.asr.backend !== 'fake') {
     issues.push('asr.backend must be "mlx" or "fake"');

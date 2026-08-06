@@ -1,6 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import type { Logger } from '../logging/logger.ts';
-import type { AsrBackend, AsrRequest, AsrResult, VadRequest, VadSegment } from './types.ts';
+import type {
+  AsrBackend,
+  AsrRequest,
+  AsrResult,
+  DiarizationRequest,
+  SpeakerTurn,
+  VadRequest,
+  VadSegment,
+} from './types.ts';
 import { WorkerProcess } from './worker-process.ts';
 
 export interface MlxAsrOptions {
@@ -107,6 +115,31 @@ export class MlxAsr implements AsrBackend {
       startMs: s.start_ms,
       endMs: s.end_ms,
       meanProbability: s.mean_probability,
+    }));
+  }
+
+  async diarize(request: DiarizationRequest): Promise<readonly SpeakerTurn[]> {
+    await this.#worker.ensureStarted();
+
+    // Like the VAD pass, deliberately independent of the ASR model.
+    const response = await this.#worker.send(
+      {
+        id: randomUUID(),
+        op: 'diarize',
+        path: request.audioPath,
+        max_speakers: request.maxSpeakers,
+        min_turn_seconds: request.minTurnSeconds,
+      },
+      this.#options.requestTimeoutMs,
+    );
+
+    if (!response.ok) throw new Error(`diarization failed: ${response.error}`);
+    if (response.op !== 'diarize') throw new Error('worker replied to the wrong operation');
+
+    return response.turns.map((turn) => ({
+      startMs: turn.start_ms,
+      endMs: turn.end_ms,
+      speaker: turn.speaker,
     }));
   }
 

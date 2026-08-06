@@ -40,6 +40,28 @@ export interface VadRequest {
   readonly threshold: number;
 }
 
+/** One stretch of a single voice. `speaker` is an index within one recording. */
+export interface SpeakerTurn {
+  readonly startMs: number;
+  readonly endMs: number;
+  readonly speaker: number;
+}
+
+export interface DiarizationRequest {
+  readonly audioPath: string;
+  /**
+   * Hard cap on distinct voices.
+   *
+   * Not a hint. Allowed to decide for itself, the clustering over-counts badly
+   * on real room audio — a two-minute two-person recording came back with
+   * anywhere from 4 to 15 "speakers". Capping fixes it; the segmentation was
+   * never the problem.
+   */
+  readonly maxSpeakers: number;
+  /** Turns shorter than this are dropped: fragments are where over-counting lives. */
+  readonly minTurnSeconds: number;
+}
+
 export interface AsrBackend {
   readonly name: string;
   ready(): Promise<{ ok: true } | { ok: false; reason: string }>;
@@ -56,5 +78,16 @@ export interface AsrBackend {
    * It never decides what to delete. Retention reads the database, not VAD.
    */
   vadSegments(request: VadRequest): Promise<readonly VadSegment[]>;
+  /**
+   * Splits a finished recording into stretches by voice.
+   *
+   * Separates voices; it does not identify people. Speaker 0 in one session has
+   * nothing to do with speaker 0 in the next, and nothing here knows a name.
+   *
+   * Independent of the ASR model on purpose: a recording is worth labelling by
+   * voice even when transcription failed, and the caller attaches speakers to
+   * transcript segments afterwards, by overlap.
+   */
+  diarize(request: DiarizationRequest): Promise<readonly SpeakerTurn[]>;
   close(): Promise<void>;
 }

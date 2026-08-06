@@ -38,6 +38,13 @@ export type WorkerRequest =
       /** Start a new stream, discarding the state left by the previous audio. */
       readonly reset?: boolean;
     })
+  | (WorkerRequestBase & {
+      readonly op: 'diarize';
+      readonly path: string;
+      /** Hard cap on distinct voices. Left free, clustering over-counts badly. */
+      readonly max_speakers: number;
+      readonly min_turn_seconds: number;
+    })
   | (WorkerRequestBase & { readonly op: 'shutdown' });
 
 export interface WorkerSegment {
@@ -80,6 +87,13 @@ export type WorkerResponse =
       readonly op: 'vad_stream';
       /** One probability per submitted frame, in order. */
       readonly probabilities: readonly number[];
+    }
+  | {
+      readonly id: string;
+      readonly ok: true;
+      readonly op: 'diarize';
+      readonly turns: readonly { start_ms: number; end_ms: number; speaker: number }[];
+      readonly speakers: number;
     }
   | { readonly id: string; readonly ok: true; readonly op: 'shutdown' }
   | { readonly id: string; readonly ok: false; readonly error: string; readonly code: string };

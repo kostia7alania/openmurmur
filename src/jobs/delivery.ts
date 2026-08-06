@@ -121,6 +121,7 @@ export async function enqueueSessionDelivery(
       startMs: segment.startMs,
       endMs: segment.endMs,
       text: segment.text,
+      speaker: segment.speaker ?? null,
     })),
     transcript.text,
     input.config.telegram.transcriptInlineLimit,

@@ -173,6 +173,11 @@ export interface TranscriptSegmentInput {
   readonly timestampSource: 'aligner' | 'vad' | 'none';
   readonly language: string | null;
   readonly text: string;
+  /**
+   * Which voice, as an index within this recording. Null means unknown, not
+   * "the first speaker" — see migration 002.
+   */
+  readonly speaker?: number | null;
 }
 
 export interface TranscriptInput {
@@ -239,8 +244,9 @@ export class TranscriptRepository {
 
       const insertSegment = this.#db.prepare(
         `INSERT INTO transcript_segments
-           (revision_id, segment_index, start_ms, end_ms, timestamp_source, language, text)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (revision_id, segment_index, start_ms, end_ms, timestamp_source, language, text,
+            speaker)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       input.segments.forEach((segment, index) => {
         insertSegment.run(
@@ -251,6 +257,7 @@ export class TranscriptRepository {
           segment.timestampSource,
           segment.language,
           segment.text,
+          segment.speaker ?? null,
         );
       });
 
@@ -272,7 +279,7 @@ export class TranscriptRepository {
   segments(revisionId: string): TranscriptSegmentInput[] {
     const rows = this.#db
       .prepare(
-        `SELECT start_ms, end_ms, timestamp_source, language, text
+        `SELECT start_ms, end_ms, timestamp_source, language, text, speaker
            FROM transcript_segments WHERE revision_id = ? ORDER BY segment_index`,
       )
       .all(revisionId) as {
@@ -281,6 +288,7 @@ export class TranscriptRepository {
       timestamp_source: 'aligner' | 'vad' | 'none';
       language: string | null;
       text: string;
+      speaker: number | null;
     }[];
     return rows.map((r) => ({
       startMs: r.start_ms,
@@ -288,6 +296,7 @@ export class TranscriptRepository {
       timestampSource: r.timestamp_source,
       language: r.language,
       text: r.text,
+      speaker: r.speaker,
     }));
   }
 }
@@ -370,5 +379,58 @@ export class VadSegmentRepository {
       )
       .get(sessionId) as { total: number };
     return row.total;
+  }
+}
+
+/**
+ * The diarization turns as produced, before they are matched to transcript
+ * segments.
+ *
+ * Stored separately because the aligner and the diarizer segment the same
+ * audio independently, so when a report attributes a line to the wrong voice
+ * this is the only way to tell which of the two was wrong.
+ */
+export interface SpeakerTurnRow {
+  readonly startMs: number;
+  readonly endMs: number;
+  readonly speaker: number;
+}
+
+export class SpeakerTurnRepository {
+  readonly #db: DatabaseSync;
+  constructor(db: DatabaseSync) {
+    this.#db = db;
+  }
+
+  /** Replaces the turns for a session. Idempotent, so a retried job cannot duplicate. */
+  replaceForSession(sessionId: string, turns: readonly SpeakerTurnRow[]): void {
+    const now = new Date().toISOString();
+    transaction(this.#db, () => {
+      this.#db.prepare('DELETE FROM speaker_turns WHERE session_id = ?').run(sessionId);
+      const insert = this.#db.prepare(
+        `INSERT INTO speaker_turns (session_id, turn_index, start_ms, end_ms, speaker, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      turns.forEach((turn, index) => {
+        insert.run(sessionId, index, turn.startMs, turn.endMs, turn.speaker, now);
+      });
+    });
+  }
+
+  listForSession(sessionId: string): SpeakerTurnRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT start_ms, end_ms, speaker FROM speaker_turns
+          WHERE session_id = ? ORDER BY start_ms`,
+      )
+      .all(sessionId) as unknown as { start_ms: number; end_ms: number; speaker: number }[];
+    return rows.map((r) => ({ startMs: r.start_ms, endMs: r.end_ms, speaker: r.speaker }));
+  }
+
+  speakerCount(sessionId: string): number {
+    const row = this.#db
+      .prepare('SELECT COUNT(DISTINCT speaker) AS n FROM speaker_turns WHERE session_id = ?')
+      .get(sessionId) as { n: number };
+    return row.n;
   }
 }

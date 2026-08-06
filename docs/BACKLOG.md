@@ -331,8 +331,11 @@ dependencies, risk, estimate (S/M/L), release, tests.
 | P2-03 | ⬜ Optional local settings UI | Only if a real need appears | Justified by user reports, not by assumption | L | M |
 | P2-04 | ✅ Local Telegram Bot API server | Raises the 20 MB incoming limit | Documented setup; config points at `127.0.0.1`; local `file_path` supported | M | M |
 | P2-05 | ✅ Large incoming files | Transcribe long recordings sent to the bot | Local Bot API mode allows `telegram.maxIncomingBytes` up to 2 GB; streaming decode remains bounded | M | M |
-| P2-06 | ⬜ Optional diarization | "Who said what" | Only if quality is good enough to be worth the ambiguity it adds | H | L |
-| P2-07 | ⬜ Speaker enrollment | Distinguish the user from others | Local-only voice profiles; explicit opt-in | H | L |
+| P2-06 | ✅ Optional diarization | "Who said what" | sherpa-onnx, ungated models, capped speaker count, off by default — see [ADR-0008](adr/0008-speaker-diarization.md) | H | L |
+| P2-06a | ⬜ Measure diarization against a reference | Know the error rate instead of guessing | Hand-label who spoke in a few real recordings; report DER. Today the output is *plausible*, not *verified* | M | M |
+| P2-07 | ⬜ Speaker enrollment | Distinguish the user from others | Local-only voice profiles; explicit opt-in. Would turn "voice 1" into a name, which is exactly why it is separate | H | L |
+| P2-07a | ⬜ Speakers survive a part rotation | One person stays one voice across a long session | Cluster embeddings across parts instead of per part; today a 15-minute rotation renumbers everyone | M | M |
+| P2-10 | ⬜ Benchmark ASR choices on our own recordings | Public sets are read studio speech; this records rooms | Compare engines on hand-labelled recordings from the owner's environment. FLEURS said Qwen3-ASR wins on Thai ([ADR-0007](adr/0007-thai-asr-engine.md)); nobody has checked that on far-field audio | M | M |
 | P2-08 | ⬜ Official paid build | Fund maintenance | See `docs/BUSINESS_MODEL.md` | M | L |
 | P2-09 | ⬜ Sponsor tiers | Sustainable maintenance | GitHub Sponsors configured with honest tiers | L | S |
 

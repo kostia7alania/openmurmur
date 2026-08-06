@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { access, constants } from 'node:fs/promises';
 import { arch, platform } from 'node:os';
+import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { LoadedConfig } from '../config/load.ts';
 import { compareVersions, MINIMUM_SQLITE_VERSION, sqliteVersionOf } from '../database/db.ts';
@@ -195,6 +196,55 @@ async function checkSpeechDetection(loaded: LoadedConfig): Promise<Check> {
   }
 }
 
+/**
+ * Checks the diarization models are on disk, when it is switched on.
+ *
+ * Reported before the daemon runs rather than as a warning buried in a log at
+ * three in the morning: without the models every session is transcribed
+ * without speaker labels and nothing else complains.
+ */
+async function checkDiarization(loaded: LoadedConfig): Promise<Check> {
+  const { enabled, maxSpeakers } = loaded.config.diarization;
+  if (!enabled) {
+    return {
+      name: 'diarization',
+      level: 'info',
+      detail: 'off — transcripts will not say who spoke',
+      fix: 'Enable with diarization.enabled, after ./scripts/fetch-diarization-models (~44 MB).',
+    };
+  }
+
+  const models = join(loaded.paths.root, 'models');
+  const required = [
+    join(models, 'sherpa-onnx-pyannote-segmentation-3-0', 'model.onnx'),
+    join(models, '3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx'),
+  ];
+
+  const missing: string[] = [];
+  for (const path of required) {
+    try {
+      await access(path, constants.R_OK);
+    } catch {
+      missing.push(basename(path));
+    }
+  }
+
+  if (missing.length > 0) {
+    return {
+      name: 'diarization',
+      level: 'fail',
+      detail: `enabled, but the models are missing: ${missing.join(', ')}`,
+      fix: 'Fetch them (~44 MB, no account or token): ./scripts/fetch-diarization-models',
+    };
+  }
+
+  return {
+    name: 'diarization',
+    level: 'ok',
+    detail: `on, at most ${maxSpeakers} voice(s) per session`,
+  };
+}
+
 async function checkOllama(loaded: LoadedConfig): Promise<Check> {
   const { baseUrl, model } = loaded.config.llm;
   const result = await probeOllama(baseUrl, model);
@@ -298,6 +348,7 @@ const CHECKS: readonly CheckFn[] = [
   checkAudioDevices,
   checkUv,
   checkSpeechDetection,
+  checkDiarization,
   checkOllama,
   checkStateDirectory,
   checkDisk,

@@ -1,3 +1,5 @@
+import { speakerLabel } from '../asr/speakers.ts';
+
 /**
  * Telegram message formatting.
  *
@@ -94,6 +96,8 @@ export interface TimedTranscriptSegment {
   readonly startMs: number | null;
   readonly endMs: number | null;
   readonly text: string;
+  /** Which voice, when diarization ran. Null means unknown, not "the first". */
+  readonly speaker?: number | null;
 }
 
 /**
@@ -155,7 +159,13 @@ export function formatTimedTranscript(
 
   const flush = () => {
     const text = normalizeTranscriptLine(current.map((segment) => segment.text).join(''));
-    if (text.length > 0) lines.push(`${formatTimestamp(blockStart)}  ${text}`);
+    if (text.length > 0) {
+      // Only labelled when diarization attributed some part of the block. An
+      // unlabelled line is honest; a wrong one is not.
+      const speaker = current.find((s) => (s.speaker ?? null) !== null)?.speaker ?? null;
+      const label = speaker === null ? '' : `${speakerLabel(speaker)}: `;
+      lines.push(`${formatTimestamp(blockStart)}  ${label}${text}`);
+    }
     current = [];
   };
 
@@ -163,9 +173,23 @@ export function formatTimedTranscript(
     const start = segment.startMs ?? blockStart;
     const candidate = normalizeTranscriptLine([...current, segment].map((s) => s.text).join(''));
     const gapMs = Math.max(0, start - previousEnd);
+    // A change of voice ends the block whatever the clock says: running two
+    // people's words together is exactly what the labels exist to prevent.
+    //
+    // Only a change between two *known* voices counts, compared against the
+    // last known voice rather than the last segment. Unattributed segments are
+    // common — they fall in the gaps between diarization turns — and getting
+    // this wrong in either direction was visible on real audio: treating each
+    // null as a change shattered one person's sentence into three blocks, and
+    // comparing with the immediate predecessor let a null hide the handover
+    // and merged two people into one.
+    const previousSpeaker = current.findLast((s) => (s.speaker ?? null) !== null)?.speaker ?? null;
+    const nextSpeaker = segment.speaker ?? null;
+    const voiceChanged =
+      previousSpeaker !== null && nextSpeaker !== null && previousSpeaker !== nextSpeaker;
     if (
       current.length > 0 &&
-      (start - blockStart >= blockMs || gapMs >= 5_000 || candidate.length > 700)
+      (voiceChanged || start - blockStart >= blockMs || gapMs >= 5_000 || candidate.length > 700)
     ) {
       flush();
       blockStart = start;

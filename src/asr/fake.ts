@@ -1,6 +1,14 @@
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import type { AsrBackend, AsrRequest, AsrResult, VadRequest, VadSegment } from './types.ts';
+import type {
+  AsrBackend,
+  AsrRequest,
+  AsrResult,
+  DiarizationRequest,
+  SpeakerTurn,
+  VadRequest,
+  VadSegment,
+} from './types.ts';
 
 /**
  * Deterministic ASR stand-in for CI and for `--fake` local runs.
@@ -49,6 +57,14 @@ export class FakeAsr implements AsrBackend {
     return [{ startMs: 0, endMs: 1000, meanProbability: 0.9 }];
   }
 
+  /** Two voices taking turns, so speaker assignment is exercised in tests. */
+  async diarize(_request: DiarizationRequest): Promise<readonly SpeakerTurn[]> {
+    return [
+      { startMs: 0, endMs: 1000, speaker: 0 },
+      { startMs: 1000, endMs: 2000, speaker: 1 },
+    ];
+  }
+
   async close(): Promise<void> {}
 }
 
@@ -69,6 +85,9 @@ export class SilentFakeAsr implements AsrBackend {
     };
   }
   async vadSegments(): Promise<readonly VadSegment[]> {
+    return [];
+  }
+  async diarize(): Promise<readonly SpeakerTurn[]> {
     return [];
   }
   async close(): Promise<void> {}

@@ -208,6 +208,34 @@ iTerm, or the launchd agent. Consequences worth knowing:
 - **Long sleeps** produce a `🟡` alert on wake if the recorder was stale, and the
   job queue drains any backlog that accumulated.
 
+## Who spoke
+
+Off by default. Switched on, a transcript is labelled by voice:
+
+```
+0:02  Голос 1: …
+0:19  Голос 2: …
+0:34  …
+```
+
+```bash
+./scripts/fetch-diarization-models
+```
+
+then set `diarization.enabled` and restart. 44 MB, no account and no token —
+which is most of why sherpa-onnx was chosen over pyannote's own gated weights.
+
+It separates **voices**, not people: voice 1 in one session has nothing to do
+with voice 1 in the next, and nothing here knows a name. Lines it cannot
+attribute are left unlabelled rather than guessed at.
+
+It is off by default because on far-field room audio the clustering counts
+badly — unconstrained it reported between 4 and 15 voices for a two-person
+conversation, which is why the speaker count is capped rather than inferred.
+Thai attribution is weaker than Russian or English, because no forced aligner
+supports Thai and its segment timings are coarser. Reasoning and measurements:
+[ADR-0008](docs/adr/0008-speaker-diarization.md).
+
 ## Telegram: what leaves your machine
 
 This is the **only** network boundary. Understand it before you start.

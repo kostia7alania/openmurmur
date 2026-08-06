@@ -19,6 +19,11 @@
     "ffprobePath": "ffprobe",
     "flacCompressionLevel": 5
   },
+  "diarization": {
+    "enabled": false,
+    "maxSpeakers": 3,
+    "minTurnSeconds": 1
+  },
   "asr": {
     "backend": "mlx",
     "model": "Qwen/Qwen3-ASR-1.7B",

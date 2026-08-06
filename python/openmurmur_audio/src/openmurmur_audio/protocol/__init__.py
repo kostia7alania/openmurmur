@@ -25,6 +25,10 @@ ErrorCode = Literal[
     # failed to score. The daemon reports it differently: one is a missing
     # install the user can fix, the other is a transient error.
     "vad_unavailable",
+    # Same distinction for diarization: models missing (fixable by the user)
+    # versus a run that failed.
+    "diarization_unavailable",
+    "diarization_failed",
     "internal",
 ]
 

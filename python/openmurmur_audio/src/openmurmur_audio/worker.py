@@ -20,6 +20,13 @@ from typing import Any
 from openmurmur_audio import __version__
 from openmurmur_audio.asr import AsrUnavailableError, QwenAsr
 from openmurmur_audio.audio import AudioError, iter_frames, load_mono_16k, pcm16_to_float
+from openmurmur_audio.diarization import (
+    DEFAULT_MAX_SPEAKERS,
+    DEFAULT_MIN_TURN_SECONDS,
+    DiarizationUnavailableError,
+    Diarizer,
+    speaker_count,
+)
 from openmurmur_audio.protocol import Request, error, log, ok, write_response
 from openmurmur_audio.vad import (
     FRAME_SAMPLES,
@@ -39,6 +46,7 @@ class Worker:
         # sharing one LSTM state would let a finished recording corrupt the
         # detector that is deciding, right now, whether someone is speaking.
         self.stream_vad = SileroVad()
+        self.diarizer = Diarizer()
 
     def handle(self, request: Request) -> dict[str, Any]:
         match request.op:
@@ -52,6 +60,8 @@ class Worker:
                 return self._vad(request)
             case "vad_stream":
                 return self._vad_stream(request)
+            case "diarize":
+                return self._diarize(request)
             case "shutdown":
                 return ok(request.id, "shutdown")
             case _:
@@ -172,6 +182,45 @@ class Worker:
             return error(request.id, "vad_failed", f"{type(exc).__name__}: {exc}")
 
         return ok(request.id, "vad_stream", probabilities=probabilities)
+
+    def _diarize(self, request: Request) -> dict[str, Any]:
+        """Splits a finished recording into stretches by voice.
+
+        Deliberately independent of the ASR model: a recording is worth
+        labelling by voice even when transcription failed, and the daemon
+        assigns speakers to transcript segments by overlap afterwards.
+        """
+        path = request.payload.get("path")
+        if not isinstance(path, str):
+            return error(request.id, "bad_request", "diarize requires a string path")
+
+        max_speakers = request.payload.get("max_speakers", DEFAULT_MAX_SPEAKERS)
+        min_turn = request.payload.get("min_turn_seconds", DEFAULT_MIN_TURN_SECONDS)
+        if not isinstance(max_speakers, int) or max_speakers < 1:
+            return error(request.id, "bad_request", "max_speakers must be a positive integer")
+        if not isinstance(min_turn, (int, float)) or min_turn < 0:
+            return error(request.id, "bad_request", "min_turn_seconds must be a number >= 0")
+
+        try:
+            samples = load_mono_16k(path)
+        except AudioError as exc:
+            return error(request.id, "audio_unreadable", str(exc))
+
+        try:
+            turns = self.diarizer.diarize(
+                samples, max_speakers=max_speakers, min_turn_seconds=float(min_turn)
+            )
+        except DiarizationUnavailableError as exc:
+            return error(request.id, "diarization_unavailable", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return error(request.id, "diarization_failed", f"{type(exc).__name__}: {exc}")
+
+        return ok(
+            request.id,
+            "diarize",
+            turns=[asdict(turn) for turn in turns],
+            speakers=speaker_count(turns),
+        )
 
 
 def _string_list(value: object) -> list[str]:

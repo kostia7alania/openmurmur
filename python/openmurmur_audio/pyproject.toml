@@ -28,6 +28,16 @@ mlx = [
     "mlx>=0.32.0,<0.33",
     "mlx-qwen3-asr>=0.3.5,<0.4",
     "silero-vad>=6.2.1,<7",
+    # Speaker diarization. No torch, and its models are ungated, unlike
+    # pyannote's own weights which need an accepted licence and a Hugging Face
+    # token.
+    #
+    # `sherpa-onnx-core` is named explicitly even though `sherpa-onnx` declares
+    # it: resolving the extra installed only the wrapper, and the native module
+    # then failed to load its bundled libonnxruntime. It carries its own
+    # onnxruntime and does not conflict with the `onnxruntime` pinned above.
+    "sherpa-onnx>=1.13.4,<2",
+    "sherpa-onnx-core>=1.13.4,<2",
 ]
 
 [project.scripts]

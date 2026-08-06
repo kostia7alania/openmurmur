@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Speaker diarization** — transcripts can say which voice spoke each block.
+  sherpa-onnx (pyannote segmentation + 3D-Speaker embeddings, 44 MB, ungated,
+  no torch, RTF ~0.08). **Off by default**, with a hard cap on the speaker
+  count: left to count for itself the clustering reported between 4 and 15
+  voices for a two-person conversation, and a transcript that invents
+  participants is worse than one with no labels. See
+  [ADR-0008](docs/adr/0008-speaker-diarization.md).
+- `./scripts/fetch-diarization-models`, and a `diarization` check in `doctor`.
+
 ### Fixed
+
+- **A mixed-language transcript reported only one language.** A real
+  Thai-English conversation — 108 Thai characters, 195 Latin — was stored and
+  indexed as `["th"]`. The transcription was right; the label was not, and the
+  label is what the report, the digest and search are built on. Declared
+  languages are now reconciled against the scripts actually present, adding
+  only what nothing declared already covers.
+- Scripts that no detected language accounts for are now logged. Chinese
+  characters in a Thai transcript are the model drifting, not code-switching.
+  Reported, never edited out: silently rewriting a transcript would be worse
+  than an odd one.
 
 - **The daemon now really uses Silero VAD to decide what a speech session is.**
   It was wired to `EnergyVad` — the loudness gate the source itself documents as

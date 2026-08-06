@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import type { AsrBackend } from '../asr/types.ts';
+import { foreignScripts, reconcileLanguages } from '../asr/languages.ts';
+import { assignSpeaker, offsetTurns, speakerCount } from '../asr/speakers.ts';
+import type { AsrBackend, SpeakerTurn } from '../asr/types.ts';
 import type { Paths } from '../config/paths.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
 import {
@@ -8,6 +10,7 @@ import {
   PartRepository,
   type PartRow,
   SessionRepository,
+  SpeakerTurnRepository,
   TranscriptRepository,
   VadSegmentRepository,
 } from '../database/repository.ts';
@@ -113,6 +116,55 @@ async function runFinalVadPass(
   });
 }
 
+/**
+ * Splits the session into stretches by voice, best-effort.
+ *
+ * Never fatal: a transcript without speaker labels is the product working, a
+ * failed session is not. Each part is diarized on its own and speakers are
+ * renumbered into a session-wide space, because the clustering never compared
+ * voices across parts and pretending otherwise would merge strangers.
+ */
+async function runDiarization(
+  deps: PipelineDeps,
+  sessionId: string,
+  parts: readonly PartRow[],
+): Promise<readonly SpeakerTurn[]> {
+  if (!deps.config.diarization.enabled) return [];
+
+  const collected: SpeakerTurn[] = [];
+  let offsetMs = 0;
+  let speakerBase = 0;
+
+  for (const part of parts) {
+    try {
+      const turns = await deps.asr.diarize({
+        audioPath: part.path,
+        maxSpeakers: deps.config.diarization.maxSpeakers,
+        minTurnSeconds: deps.config.diarization.minTurnSeconds,
+      });
+      collected.push(...offsetTurns(turns, offsetMs, speakerBase));
+      speakerBase += speakerCount(turns);
+    } catch (error) {
+      deps.logger.warn('diarization failed for a part; continuing without speakers', {
+        sessionId,
+        partId: part.part_id,
+        error: (error as Error).message,
+      });
+    }
+    offsetMs += part.duration_ms ?? 0;
+  }
+
+  if (collected.length === 0) return [];
+
+  new SpeakerTurnRepository(deps.db).replaceForSession(sessionId, collected);
+  deps.logger.info('diarization stored', {
+    sessionId,
+    turns: collected.length,
+    speakers: speakerCount(collected),
+  });
+  return collected;
+}
+
 async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
   const sessionId = sessionIdOf(job);
   const sessions = new SessionRepository(deps.db);
@@ -125,6 +177,7 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
   }
 
   await runFinalVadPass(deps, sessionId, finalized);
+  const turns = await runDiarization(deps, sessionId, finalized);
 
   // Parts are transcribed in order and concatenated. Timestamps are offset by
   // the cumulative duration so segment times refer to the whole session.
@@ -182,22 +235,53 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
     return;
   }
 
+  // The model reports the language it settled on, which is incomplete on
+  // genuinely mixed speech: a real Thai-English conversation came back as
+  // ["th"] with more Latin characters in it than Thai.
+  const { languages: reconciled, added } = reconcileLanguages([...languages], text);
+  if (added.length > 0) {
+    deps.logger.info('added languages the text contains but the model did not report', {
+      sessionId,
+      declared: [...languages],
+      added,
+    });
+  }
+
+  // Drift, not code-switching: Chinese characters in a Thai transcript mean
+  // the model wandered. Reported, never edited out — silently rewriting a
+  // transcript would be worse than an odd one.
+  const foreign = foreignScripts(reconciled, text);
+  if (foreign.length > 0) {
+    deps.logger.warn('transcript contains scripts no detected language accounts for', {
+      sessionId,
+      scripts: foreign,
+    });
+  }
+
   transcripts.append({
     sessionId,
     engine,
     model,
-    languages: [...languages],
+    languages: reconciled,
     text,
-    segments,
+    segments: segments.map((segment) => ({
+      ...segment,
+      speaker: assignSpeaker(segment.startMs, segment.endMs, turns),
+    })),
   });
-  sessions.setLanguages(sessionId, [...languages]);
+  sessions.setLanguages(sessionId, reconciled);
 
   deps.jobs.enqueue({
     kind: 'summarize',
     idempotencyKey: `summarize:${sessionId}`,
     payload: { sessionId },
   });
-  deps.logger.info('transcript stored', { sessionId, words, languages: [...languages] });
+  deps.logger.info('transcript stored', {
+    sessionId,
+    words,
+    languages: reconciled,
+    speakers: speakerCount(turns),
+  });
 }
 
 async function handleSummarize(deps: PipelineDeps, job: Job): Promise<void> {

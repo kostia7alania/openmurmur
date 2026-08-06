@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Downloads the two ONNX models speaker diarization needs, about 44 MB.
+#
+# Kept out of `bootstrap` because bootstrap deliberately downloads no models.
+# Unlike pyannote's own weights, these need no account, no token and no
+# accepted licence — which is most of why they were chosen.
+#
+# Idempotent: re-running verifies what is already there and downloads nothing.
+set -euo pipefail
+
+RELEASES="https://github.com/k2-fsa/sherpa-onnx/releases/download"
+SEG_URL="$RELEASES/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+EMB_URL="$RELEASES/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+
+MODELS="${OPENMURMUR_MODELS_DIR:-$HOME/Library/Application Support/OpenMurmur/models}"
+SEG_PATH="$MODELS/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"
+EMB_PATH="$MODELS/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+ok()   { printf '\033[32m✓ %s\033[0m\n' "$1"; }
+die()  { printf '\033[31m✗ %s\033[0m\n' "$1" >&2; exit 1; }
+
+bold "Speaker diarization models"
+echo "  into: $MODELS"
+echo
+
+command -v curl >/dev/null 2>&1 || die "curl is required"
+mkdir -p "$MODELS"
+
+if [ -f "$SEG_PATH" ]; then
+  ok "segmentation already present"
+else
+  echo "Downloading segmentation model (~6 MB)..."
+  tmp="$(mktemp -t om-seg)"
+  # Published as a tarball, so it is extracted rather than moved into place.
+  curl -fL --progress-bar -o "$tmp.tar.bz2" "$SEG_URL" || die "download failed: $SEG_URL"
+  tar xf "$tmp.tar.bz2" -C "$MODELS" || die "could not extract the segmentation model"
+  rm -f "$tmp" "$tmp.tar.bz2"
+  [ -f "$SEG_PATH" ] || die "the archive did not contain $SEG_PATH"
+  ok "segmentation model"
+fi
+
+if [ -f "$EMB_PATH" ]; then
+  ok "speaker embedding already present"
+else
+  echo "Downloading speaker embedding extractor (~38 MB)..."
+  # Downloaded beside the final name and renamed, so an interrupted transfer
+  # never leaves a half-written file that looks installed.
+  curl -fL --progress-bar -o "$EMB_PATH.part" "$EMB_URL" || die "download failed: $EMB_URL"
+  mv "$EMB_PATH.part" "$EMB_PATH"
+  ok "speaker embedding extractor"
+fi
+
+echo
+du -sh "$MODELS" 2>/dev/null | awk '{print "  total: " $1}'
+bold "Done. Enable it with diarization.enabled = true, then restart the daemon."
