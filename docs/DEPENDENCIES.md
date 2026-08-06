@@ -1,8 +1,9 @@
 # Dependencies
 
 All versions below were **verified on the development machine on 2026-07-29**
-(macOS 26.5.2, Apple Silicon) unless the row says otherwise. Anything not
-actually executed is marked explicitly rather than assumed.
+(macOS 26.5.2, Apple Silicon), and the model stack was re-verified by running it
+on **2026-08-06**, unless the row says otherwise. Anything not actually executed
+is marked explicitly rather than assumed.
 
 ## Runtime
 
@@ -45,32 +46,34 @@ Exact versions, no ranges. `pnpm-lock.yaml` is committed.
 | ruff | 0.16.0 | ✅ clean | Lint and format. |
 | mypy | 2.3.0 | ✅ strict, clean | |
 
-### Optional `mlx` extra — **not installed or executed here**
+### Optional `mlx` extra — installed and run on the development machine, never in CI
 
 | Package | Pinned | Status |
 | --- | --- | --- |
-| mlx | ≥0.32.0,<0.33 | ⚠️ Not installed. Latest published is 0.32.0 (wheels cp310–cp314, macOS arm64). |
-| mlx-qwen3-asr | ≥0.3.5,<0.4 | ⚠️ Not installed. Latest published is 0.3.5 (pure Python, requires ≥3.10). |
+| mlx | ≥0.32.0,<0.33 | ✅ Installed and run (M4 Max, 36 GB). Wheels cp310–cp314, macOS arm64. |
+| mlx-qwen3-asr | ≥0.3.5,<0.4 | ✅ Qwen3-ASR-1.7B loads in ~5 s and stays resident; RU/EN/TH transcribed. |
+| silero-vad | ≥6.2.1,<7 | ✅ ONNX model run per frame in the live capture path. |
 
-Kept as an extra because it pulls several GB of weights and needs Metal, so CI
-must not install it. **Consequence: Qwen3-ASR inference is unverified in this
-repository.** The worker's error path for a missing MLX install *is* verified —
-it returns an actionable `model_load_failed` naming the `uv sync --extra mlx`
-command.
+Kept as an extra because it pulls several GB (torch and torchaudio come with
+`silero-vad`) and MLX needs Metal, so CI must not install it. CI therefore runs
+the fake adapters, and the worker's error path for a missing install is what CI
+verifies: an actionable `model_load_failed` or `vad_unavailable` naming the
+`uv sync --extra mlx` command.
 
-### Silero VAD — **not installed or executed here**
+**The extra is not optional in practice.** Without it there is no speech
+detection and no transcription — `openmurmur doctor` reports `speech_detection`
+as a failure, because it starts the worker and scores a frame rather than
+reading the config back.
 
-`silero-vad` 6.2.1 is the intended version. It is not in the CI-installed
-subset, so the ONNX model has not been run. The **segment-assembly logic** on
-top of it is fully tested (7 Python tests) because it is pure and takes a list
-of probabilities.
+Silero's **segment-assembly logic** is separately covered by pure Python tests,
+which take a list of probabilities and need no model.
 
 ## External services
 
 | Service | Version | Verified | Notes |
 | --- | --- | --- | --- |
-| Ollama | `qwen3.6:27b` (Q4_K_M) | ⚠️ **not installed** | Optional. Its absence degrades the report; it never blocks delivery. `doctor` reports it as a warning with the install command. |
-| Telegram Bot API | Cloud, official | ⚠️ **no live calls made** | Response shapes are exercised with a scripted `fetch`. |
+| Ollama | `qwen3.6:27b` (Q4_K_M) | ✅ Structured summary produced in 40.4 s | Optional. Its absence degrades the report; it never blocks delivery. `doctor` reports it as a warning with the install command. |
+| Telegram Bot API | Cloud, official | ⚠️ **no live calls made** | Response shapes are exercised with a scripted `fetch`. Blocked on a bot token, which only the owner can create. |
 
 ## How Python 3.14 was chosen
 
