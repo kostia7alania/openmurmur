@@ -23,7 +23,7 @@ import { Recorder } from '../sessionizer/recorder.ts';
 import { SileroStreamVad } from '../sessionizer/silero.ts';
 import type { Vad } from '../sessionizer/vad.ts';
 import { TelegramClient } from '../telegram/client.ts';
-import { renderTranscriptMessages } from '../telegram/format.ts';
+import { renderTimedTranscriptMessages } from '../telegram/format.ts';
 import {
   downloadToQuarantine,
   extractAttachment,
@@ -523,8 +523,9 @@ export class Daemon {
           downloaded.fileUid,
         );
 
-      for (const chunk of renderTranscriptMessages(
+      for (const chunk of renderTimedTranscriptMessages(
         downloaded.fileUid,
+        result.segments,
         result.text.length > 0 ? result.text : '(речь не распознана)',
         config.telegram.transcriptInlineLimit,
       )) {

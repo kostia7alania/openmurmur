@@ -5,6 +5,9 @@ import {
   escapeHtml,
   formatBytes,
   formatDuration,
+  formatTimedTranscript,
+  formatTimestamp,
+  renderTimedTranscriptMessages,
   renderTranscriptMessages,
   splitForTelegram,
   splitOnBoundaries,
@@ -133,6 +136,42 @@ describe('transcript messages', () => {
     assert.ok(messages[0]?.text.includes('&lt;b&gt;'));
     assert.ok(!messages[0]?.text.includes('<b>run'));
   });
+
+  it('renders timed transcript blocks from ASR segments', () => {
+    const text = formatTimedTranscript([
+      { startMs: 80, endMs: 320, text: 'Yes ' },
+      { startMs: 640, endMs: 880, text: 'okay ' },
+      { startMs: 31_000, endMs: 31_400, text: 'second ' },
+      { startMs: 31_400, endMs: 31_900, text: 'block.' },
+    ]);
+
+    assert.equal(text, '0:00  Yes okay\n\n0:31  second block.');
+  });
+
+  it('falls back to the raw transcript when segments have no timing', () => {
+    const messages = renderTimedTranscriptMessages(
+      sessionId,
+      [{ startMs: null, endMs: null, text: 'untimed' }],
+      'raw transcript',
+      3500,
+    );
+
+    assert.ok(messages[0]?.text.includes('raw transcript'));
+    assert.ok(!messages[0]?.text.includes('untimed'));
+  });
+
+  it('escapes markup after rendering timed transcript blocks', () => {
+    const messages = renderTimedTranscriptMessages(
+      sessionId,
+      [{ startMs: 0, endMs: 1000, text: '<b>spoken</b>' }],
+      '',
+      3500,
+    );
+
+    assert.ok(messages[0]?.text.includes('0:00'));
+    assert.ok(messages[0]?.text.includes('&lt;b&gt;spoken&lt;/b&gt;'));
+    assert.ok(!messages[0]?.text.includes('<b>spoken'));
+  });
 });
 
 describe('session report', () => {
@@ -190,6 +229,12 @@ describe('formatting helpers', () => {
     assert.equal(formatDuration(45_000), '45 сек');
     assert.equal(formatDuration(90_000), '1 мин 30 сек');
     assert.equal(formatDuration(3_600_000), '1 ч 0 мин');
+  });
+
+  it('formats transcript offsets', () => {
+    assert.equal(formatTimestamp(0), '0:00');
+    assert.equal(formatTimestamp(65_000), '1:05');
+    assert.equal(formatTimestamp(3_665_000), '1:01:05');
   });
 
   it('formats byte counts', () => {

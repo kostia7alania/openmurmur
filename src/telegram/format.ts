@@ -90,6 +90,12 @@ export interface TranscriptMessage {
   readonly partCount: number;
 }
 
+export interface TimedTranscriptSegment {
+  readonly startMs: number | null;
+  readonly endMs: number | null;
+  readonly text: string;
+}
+
 /**
  * Renders a transcript as numbered HTML messages, each carrying the session id
  * so that out-of-order delivery in a busy chat is still reassemblable.
@@ -117,6 +123,79 @@ export function renderTranscriptMessages(
     partNumber: index + 1,
     partCount: bodies.length,
   }));
+}
+
+export function renderTimedTranscriptMessages(
+  sessionId: string,
+  segments: readonly TimedTranscriptSegment[],
+  fallbackTranscript: string,
+  inlineLimit: number,
+): TranscriptMessage[] {
+  const formatted = formatTimedTranscript(segments);
+  return renderTranscriptMessages(
+    sessionId,
+    formatted.length > 0 ? formatted : fallbackTranscript,
+    inlineLimit,
+  );
+}
+
+export function formatTimedTranscript(
+  segments: readonly TimedTranscriptSegment[],
+  blockMs = 30_000,
+): string {
+  const timed = segments.filter(
+    (segment) => segment.startMs !== null && segment.text.trim() !== '',
+  );
+  if (timed.length === 0) return '';
+
+  const lines: string[] = [];
+  let blockStart = timed[0]?.startMs ?? 0;
+  let previousEnd = blockStart;
+  let current: TimedTranscriptSegment[] = [];
+
+  const flush = () => {
+    const text = normalizeTranscriptLine(current.map((segment) => segment.text).join(''));
+    if (text.length > 0) lines.push(`${formatTimestamp(blockStart)}  ${text}`);
+    current = [];
+  };
+
+  for (const segment of timed) {
+    const start = segment.startMs ?? blockStart;
+    const candidate = normalizeTranscriptLine([...current, segment].map((s) => s.text).join(''));
+    const gapMs = Math.max(0, start - previousEnd);
+    if (
+      current.length > 0 &&
+      (start - blockStart >= blockMs || gapMs >= 5_000 || candidate.length > 700)
+    ) {
+      flush();
+      blockStart = start;
+    }
+
+    current.push(segment);
+    previousEnd = segment.endMs ?? start;
+  }
+  flush();
+
+  return lines.join('\n\n');
+}
+
+export function formatTimestamp(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const mm = String(minutes).padStart(hours > 0 ? 2 : 1, '0');
+  const ss = String(seconds).padStart(2, '0');
+  if (hours > 0) return `${hours}:${mm}:${ss}`;
+  return `${mm}:${ss}`;
+}
+
+function normalizeTranscriptLine(text: string): string {
+  return text
+    .replace(/\s+/g, ' ')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .replace(/([¿¡])\s+/g, '$1')
+    .trim();
 }
 
 export function formatDuration(ms: number): string {
