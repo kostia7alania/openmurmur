@@ -21,6 +21,18 @@ destination, and you configure it yourself.
 > [RECORDING_POLICY.md](RECORDING_POLICY.md) before you run this near anyone
 > else.
 
+### Installing
+
+| Situation | Start here |
+| --- | --- |
+| A Mac you sit at, with Homebrew and Node 26 already installed | [Quick start](#quick-start), below |
+| A Mac with none of that yet | [docs/INSTALL.md](docs/INSTALL.md) — assumes nothing, starts at `xcode-select` |
+| A headless Mac reached over SSH, set up by an agent | [docs/SERVER.md](docs/SERVER.md) — and run `./scripts/server-preflight` first |
+
+Two steps can never be automated, on any machine: **clicking Allow on the macOS
+microphone prompt**, and **creating the Telegram bot and typing its token**.
+Everything else is scriptable. `docs/SERVER.md` says where each one falls.
+
 ---
 
 ## Status
@@ -300,6 +312,7 @@ Neither needs a microphone, a model, or a network.
 | Document | Contents |
 | --- | --- |
 | [INSTALL.md](docs/INSTALL.md) | Clean Mac to running daemon, assuming nothing |
+| [SERVER.md](docs/SERVER.md) | Headless Mac: no GUI session, locked Keychain, TCC over SSH |
 | [PRODUCT.md](docs/PRODUCT.md) | What this is and what it refuses to be |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, processes, data flow |
 | [SESSIONIZER.md](docs/SESSIONIZER.md) | The state machine in detail |

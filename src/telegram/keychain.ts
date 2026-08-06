@@ -66,11 +66,42 @@ async function setSecret(account: string, value: string): Promise<void> {
   }
 }
 
+/** `security` exit code for errSecItemNotFound — the only benign failure. */
+const ITEM_NOT_FOUND = 44;
+
 async function getSecret(account: string): Promise<string | null> {
   const result = await run(['find-generic-password', '-a', account, '-s', SERVICE, '-w']);
-  if (result.code !== 0) return null;
-  const value = result.stdout.trim();
-  return value.length > 0 ? value : null;
+
+  if (result.code === 0) {
+    const value = result.stdout.trim();
+    return value.length > 0 ? value : null;
+  }
+
+  // "Not configured yet" and "configured, but I cannot read it" must not look
+  // the same. On a headless server the login Keychain is locked until someone
+  // logs in, and `security` then fails with errSecInteractionNotAllowed —
+  // which, reported as "not configured", sends you off to re-create a bot that
+  // was never the problem.
+  if (result.code === ITEM_NOT_FOUND) return null;
+
+  const stderr = result.stderr.trim();
+  const locked =
+    stderr.includes('interaction is not allowed') ||
+    stderr.includes('-25308') ||
+    result.code === 36;
+
+  throw new KeychainError(
+    locked
+      ? `The macOS Keychain is locked, so "${account}" could not be read (${stderr}).\n` +
+          'This is what a headless or SSH-only session looks like: the login Keychain\n' +
+          'is not unlocked until someone logs in.\n' +
+          'Fix it with one of:\n' +
+          '  * enable automatic login so the login Keychain unlocks at boot, or\n' +
+          '  * run `security unlock-keychain` before starting the daemon, or\n' +
+          '  * start the daemon from a LaunchAgent in the logged-in GUI session.\n' +
+          'The token itself is intact; nothing needs to be re-created.'
+      : `Could not read "${account}" from the Keychain (exit ${result.code}): ${stderr}`,
+  );
 }
 
 async function deleteSecret(account: string): Promise<boolean> {

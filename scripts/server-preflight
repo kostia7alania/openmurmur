@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Checks what a headless Mac needs that a desktop Mac does not.
+#
+# `openmurmur doctor` covers dependencies. This covers the things that only
+# break when nobody is sitting at the machine: no GUI session, a locked
+# Keychain, a Mac that sleeps, no way to answer a permission dialog.
+#
+# Read-only. Changes nothing, needs no sudo, prompts for nothing.
+#
+# Exit 0: nothing blocking. Exit 1: at least one blocker.
+set -uo pipefail
+
+cd "$(dirname "$0")/.."
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; OFF=$'\033[0m'
+
+blockers=0
+todo=()
+
+ok()    { printf '%s✓%s %-22s %s\n' "$GRN" "$OFF" "$1" "$2"; }
+warn()  { printf '%s!%s %-22s %s\n' "$YLW" "$OFF" "$1" "$2"; }
+fail()  { printf '%s✗%s %-22s %s\n' "$RED" "$OFF" "$1" "$2"; blockers=$((blockers + 1)); }
+note()  { printf '  %s↳ %s%s\n' "$DIM" "$1" "$OFF"; }
+human() { todo+=("$1"); }
+
+printf '%sOpenMurmur server preflight%s\n\n' "$BOLD" "$OFF"
+
+# --- the machine ---------------------------------------------------------
+model=$(sysctl -n hw.model 2>/dev/null || echo unknown)
+ram=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+arch=$(uname -m)
+
+if [ "$arch" = "arm64" ]; then
+  ok "hardware" "$model, ${ram} GB, $arch"
+else
+  fail "hardware" "$model, $arch — MLX needs Apple Silicon"
+fi
+
+if [ "$ram" -lt 24 ]; then
+  warn "memory" "${ram} GB is tight for a 27B summarizer"
+  note "Use a smaller llm.model (qwen3.6:8b), or expect swapping."
+fi
+
+# --- audio input ---------------------------------------------------------
+# The only reliable enumeration is ffmpeg's; macOS has no CLI for it.
+if command -v ffmpeg >/dev/null 2>&1; then
+  devices=$(ffmpeg -f avfoundation -list_devices true -i "" 2>&1 \
+            | sed -n '/AVFoundation audio devices/,$p' | grep -c '^\[' || true)
+  if [ "${devices:-0}" -gt 1 ]; then
+    ok "audio input" "$((devices - 1)) device(s) available"
+  else
+    warn "audio input" "no audio input device found"
+    note "Ambient recording needs one. Without it the daemon still processes"
+    note "audio sent to the Telegram bot, and reports 🔴 at every start."
+  fi
+else
+  fail "audio input" "ffmpeg not installed, cannot enumerate"
+fi
+
+# --- GUI session ---------------------------------------------------------
+# A LaunchAgent runs in the Aqua session; no session, no agent. The login
+# Keychain is also locked until someone logs in.
+console_user=$(stat -f '%Su' /dev/console 2>/dev/null || echo unknown)
+if [ "$console_user" = "root" ] || [ "$console_user" = "unknown" ]; then
+  fail "gui session" "nobody logged in at the console (user: $console_user)"
+  note "The LaunchAgent cannot run and the Keychain stays locked."
+  human "Enable automatic login: System Settings → Users & Groups → Automatic login"
+else
+  ok "gui session" "logged in as $console_user"
+fi
+
+auto_login=$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || echo "")
+if [ -n "$auto_login" ]; then
+  ok "automatic login" "enabled for $auto_login"
+else
+  warn "automatic login" "not enabled"
+  note "Without it the machine comes back from a reboot with no GUI session,"
+  note "so the daemon does not start and the Keychain cannot be read."
+  human "Enable automatic login (requires FileVault to be off)"
+fi
+
+# --- sleep ---------------------------------------------------------------
+sleep_val=$(pmset -g 2>/dev/null | awk '$1=="sleep"{print $2; exit}')
+if [ "${sleep_val:-1}" = "0" ]; then
+  ok "sleep" "disabled"
+else
+  warn "sleep" "system sleep is ${sleep_val:-unknown} minutes"
+  note "Recording stops while asleep; the audio is not recoverable."
+  note "Fix: sudo pmset -a sleep 0 disksleep 0 displaysleep 0 powernap 0"
+fi
+
+if pmset -g assertions 2>/dev/null | grep -qE 'PreventUserIdleSystemSleep.*1'; then
+  ok "wake assertion" "something is holding the machine awake"
+fi
+
+# --- screen sharing ------------------------------------------------------
+# The only way to answer the microphone prompt on a headless machine.
+if launchctl print system/com.apple.screensharing >/dev/null 2>&1; then
+  ok "screen sharing" "enabled"
+else
+  warn "screen sharing" "not enabled"
+  note "Needed once, to grant microphone access — the dialog cannot be shown"
+  note "to an SSH session and there is no command that grants it."
+  human "Enable Screen Sharing: System Settings → General → Sharing"
+fi
+
+# --- keychain ------------------------------------------------------------
+# Distinguishes "no token yet" from "token present but unreadable", which is
+# the failure that wastes the most time on a server.
+security find-generic-password -s io.openmurmur -a telegram-bot-token -w >/dev/null 2>&1
+kc=$?
+case $kc in
+  0)  ok "keychain" "Telegram token stored and readable" ;;
+  44) warn "keychain" "no Telegram token stored yet"
+      human "Create a bot with @BotFather, then run: pnpm openmurmur setup telegram" ;;
+  *)  fail "keychain" "token exists but cannot be read (exit $kc)"
+      note "This is a locked login Keychain, not a missing token."
+      note "Fix: enable automatic login, or run"
+      note "  security unlock-keychain ~/Library/Keychains/login.keychain-db" ;;
+esac
+
+# --- launch agent --------------------------------------------------------
+if launchctl print "gui/$(id -u)/io.openmurmur.daemon" >/dev/null 2>&1; then
+  ok "launch agent" "installed and loaded"
+else
+  warn "launch agent" "not installed"
+  note "Install it AFTER granting microphone access: ./scripts/install-launch-agents"
+fi
+
+# --- disk ----------------------------------------------------------------
+free_gb=$(df -g / | awk 'NR==2{print $4}')
+if [ "${free_gb:-0}" -ge 25 ]; then
+  ok "disk" "${free_gb} GB free"
+else
+  fail "disk" "${free_gb} GB free — models need about 25 GB"
+fi
+
+# --- summary -------------------------------------------------------------
+echo
+if [ ${#todo[@]} -gt 0 ]; then
+  printf '%sNeeds a human — an agent cannot do these:%s\n' "$BOLD" "$OFF"
+  for item in "${todo[@]}"; do printf '  • %s\n' "$item"; done
+  echo
+fi
+
+printf '%sAlways needs a human:%s\n' "$BOLD" "$OFF"
+cat <<'HUMAN'
+  • Clicking Allow on the microphone prompt, in a Screen Sharing session.
+    macOS refuses the prompt to SSH, and SIP blocks granting it from a script.
+  • Creating the bot with @BotFather and typing the token into the hidden
+    prompt. The token must never reach argv, a file, or a log.
+HUMAN
+echo
+
+if [ "$blockers" -gt 0 ]; then
+  printf '%s%d blocking problem(s).%s Run `pnpm openmurmur doctor` for dependencies.\n' \
+    "$RED" "$blockers" "$OFF"
+  exit 1
+fi
+
+printf '%sNo blocking problems.%s Next: pnpm openmurmur doctor\n' "$GRN" "$OFF"

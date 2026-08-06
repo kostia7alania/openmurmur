@@ -162,10 +162,22 @@ export class Daemon {
       logger.info('recovered work from a previous run', { reclaimedJobs, reclaimedSends });
     }
 
-    const secrets = await (this.#options.secrets ?? keychainProvider).load();
-    if (secrets === null) {
-      logger.warn('Telegram is not configured; run `openmurmur setup telegram`');
-    } else {
+    // A Keychain that cannot be read must not stop the recorder. Recording is
+    // the part that cannot be redone later; delivery catches up from the outbox
+    // once the secrets become readable.
+    let secrets: Awaited<ReturnType<SecretsProvider['load']>> = null;
+    try {
+      secrets = await (this.#options.secrets ?? keychainProvider).load();
+      if (secrets === null) {
+        logger.warn('Telegram is not configured; run `openmurmur setup telegram`');
+      }
+    } catch (error) {
+      logger.error('could not read the Telegram secrets; recording anyway', {
+        error: (error as Error).message,
+      });
+    }
+
+    if (secrets !== null) {
       this.#client = new TelegramClient({
         token: secrets.token,
         baseUrl: config.telegram.apiBaseUrl,
