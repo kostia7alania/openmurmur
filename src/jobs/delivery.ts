@@ -6,7 +6,7 @@ import type { Paths } from '../config/paths.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
 import { PartRepository, SessionRepository, TranscriptRepository } from '../database/repository.ts';
 import type { StructuredSummary } from '../llm/schema.ts';
-import { renderTranscriptMessages } from '../telegram/format.ts';
+import { renderTimedTranscriptMessages } from '../telegram/format.ts';
 import { Outbox } from '../telegram/outbox.ts';
 import { renderSessionReport } from '../telegram/report.ts';
 
@@ -109,8 +109,19 @@ export async function enqueueSessionDelivery(
   }
 
   // --- Transcript --------------------------------------------------------
-  const messages = renderTranscriptMessages(
+  // Timestamped blocks, not one wall of text. The segments are already stored
+  // with their timings; a recorded session is the *main* output and was the
+  // only path still sending the flat blob, while audio sent to the bot got the
+  // readable form. `renderTimedTranscriptMessages` falls back to the flat text
+  // when no segment carries a timestamp, which is what Thai gets when the
+  // aligner cannot run.
+  const messages = renderTimedTranscriptMessages(
     input.sessionId,
+    transcripts.segments(transcript.revision_id).map((segment) => ({
+      startMs: segment.startMs,
+      endMs: segment.endMs,
+      text: segment.text,
+    })),
     transcript.text,
     input.config.telegram.transcriptInlineLimit,
   );
