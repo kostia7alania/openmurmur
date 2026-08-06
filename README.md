@@ -345,6 +345,21 @@ synthesized with macOS `say`:
 The last two are the distinction an energy gate cannot make, and the reason
 Silero is used rather than a level threshold.
 
+**Thai accuracy was measured against alternatives**, not assumed. On FLEURS
+`th_th` dev (40 utterances, 8.1 minutes) with one metric for every system —
+character error rate after identical normalization:
+
+| Engine | corpus CER | median CER | exact / 40 |
+| --- | ---: | ---: | ---: |
+| Qwen3-ASR-1.7B, the one shipped | **6.46%** | **2.56%** | **14** |
+| Typhoon Whisper Turbo 0.8B, a Thai fine-tune | 11.98% | 6.92% | 7 |
+| Typhoon Whisper Large-v3 2B, a Thai fine-tune | 12.56% | 6.81% | 10 |
+| Whisper large-v3-turbo, unmodified | 13.19% | 10.36% | 1 |
+
+Thai fine-tuning helps a great deal — and still does not catch the multilingual
+model, at either size. No Thai-specific engine is shipped. Reasoning, caveats
+and what would overturn it: [ADR-0007](docs/adr/0007-thai-asr-engine.md).
+
 Summarization was verified against `qwen3.6:27b` (Q4_K_M, 16.2 GB) on the same
 machine: a mixed RU/EN transcript produced a correct Russian summary with
 decisions, tasks and people extracted, and the model flagged the unrecognized
