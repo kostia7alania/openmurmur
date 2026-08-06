@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, resolve, sep } from 'node:path';
 import { describe, it } from 'node:test';
 import { buildUserPrompt } from '../../src/llm/ollama.ts';
 import { parseSummary } from '../../src/llm/schema.ts';
 import { createLogger } from '../../src/logging/logger.ts';
 import { REDACTED, redact, redactValue } from '../../src/logging/redact.ts';
-import type { TelegramMessage } from '../../src/telegram/client.ts';
+import { TelegramClient, type TelegramMessage } from '../../src/telegram/client.ts';
 import {
   assertContained,
   extractAttachment,
@@ -134,6 +136,29 @@ describe('incoming media validation', () => {
       limits,
     );
     assert.equal(probe.codec, 'opus');
+  });
+});
+
+describe('local Bot API downloads', () => {
+  it('streams an absolute local file path returned by a local Bot API server', async () => {
+    const dir = await mkdtemp(`${tmpdir()}/openmurmur-local-bot-api-`);
+    try {
+      const path = `${dir}/large-audio.ogg`;
+      await writeFile(path, 'local audio bytes');
+
+      const client = new TelegramClient({
+        token: '123:abc',
+        baseUrl: 'http://127.0.0.1:8081',
+        fetchImpl: async () => {
+          throw new Error('local absolute paths must not be fetched over HTTP');
+        },
+      });
+
+      const response = await client.downloadFile(path);
+      assert.equal(await response.text(), 'local audio bytes');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -329,8 +329,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
 | P2-01 | ⬜ Signed and notarized `.dmg` | Install without a toolchain | Drag-to-Applications install on a clean Mac | M | L |
 | P2-02 | ⬜ Updater | Security fixes reach users | Signed update check with user consent; never silent | M | M |
 | P2-03 | ⬜ Optional local settings UI | Only if a real need appears | Justified by user reports, not by assumption | L | M |
-| P2-04 | ⬜ Local Telegram Bot API server | Raises the 20 MB incoming limit | Documented setup; config points at `127.0.0.1`; limits adjust automatically | M | M |
-| P2-05 | ⬜ Large incoming files | Transcribe long recordings sent to the bot | Depends on P2-04; streaming decode within bounded memory | M | M |
+| P2-04 | ✅ Local Telegram Bot API server | Raises the 20 MB incoming limit | Documented setup; config points at `127.0.0.1`; local `file_path` supported | M | M |
+| P2-05 | ✅ Large incoming files | Transcribe long recordings sent to the bot | Local Bot API mode allows `telegram.maxIncomingBytes` up to 2 GB; streaming decode remains bounded | M | M |
 | P2-06 | ⬜ Optional diarization | "Who said what" | Only if quality is good enough to be worth the ambiguity it adds | H | L |
 | P2-07 | ⬜ Speaker enrollment | Distinguish the user from others | Local-only voice profiles; explicit opt-in | H | L |
 | P2-08 | ⬜ Official paid build | Fund maintenance | See `docs/BUSINESS_MODEL.md` | M | L |

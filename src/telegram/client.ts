@@ -1,5 +1,5 @@
 import { openAsBlob } from 'node:fs';
-import { basename } from 'node:path';
+import { basename, isAbsolute } from 'node:path';
 import { redact } from '../logging/redact.ts';
 
 /**
@@ -201,6 +201,15 @@ export class TelegramClient {
    * it to quarantine; nothing here is buffered.
    */
   async downloadFile(filePath: string): Promise<Response> {
+    if (this.#isLocalServer() && isAbsolute(filePath)) {
+      try {
+        const blob = await openAsBlob(filePath);
+        return new Response(blob.stream());
+      } catch (error) {
+        throw apiError('downloadFile', `local file download failed: ${(error as Error).message}`);
+      }
+    }
+
     const url = `${this.#baseUrl}/file/bot${this.#token}/${filePath}`;
     let response: Response;
     try {
@@ -216,5 +225,14 @@ export class TelegramClient {
       );
     }
     return response;
+  }
+
+  #isLocalServer(): boolean {
+    try {
+      const url = new URL(this.#baseUrl);
+      return url.protocol === 'http:' && url.hostname === '127.0.0.1';
+    } catch {
+      return false;
+    }
   }
 }

@@ -30,6 +30,13 @@ case "$reply" in [yY]*) ;; *) echo "Cancelled."; exit 1 ;; esac
 mkdir -p "$AGENTS" "$HOME/Library/Application Support/OpenMurmur/logs"
 
 for template in launchd/*.plist.example; do
+  case "$(basename "$template")" in
+    io.openmurmur.telegram.plist.example)
+      warn "Skipping optional Telegram-only poller; the daemon already polls Telegram."
+      continue
+      ;;
+  esac
+
   name="$(basename "$template" .example)"
   target="$AGENTS/$name"
 

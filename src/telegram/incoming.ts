@@ -175,7 +175,7 @@ export async function downloadToQuarantine(
   ) {
     throw new IncomingRejected(
       'too_large_declared',
-      `file is ${attachment.declaredBytes} bytes; the Telegram Bot API getFile limit is ` +
+      `file is ${attachment.declaredBytes} bytes; the configured incoming limit is ` +
         `${limits.maxIncomingBytes} bytes`,
     );
   }
@@ -281,10 +281,10 @@ export function rejectionMessage(reason: IncomingRejection, detail: string): str
     case 'too_large_actual':
       return (
         '⚠️ Файл слишком большой.\n\n' +
-        'Официальный Telegram Bot API разрешает боту скачивать файлы не больше 20 MB. ' +
-        'Это ограничение Telegram, а не OpenMurmur, и обойти его безопасно нельзя.\n\n' +
-        'Обходные пути: сожмите или разделите запись, либо запустите локальный ' +
-        'Telegram Bot API server (в бэклоге как P2).'
+        `${detail}\n\n` +
+        'Если используется официальный Cloud Bot API, предел входящего файла — 20 MB. ' +
+        'Для больших файлов запустите локальный Telegram Bot API server и увеличьте ' +
+        '`telegram.maxIncomingBytes`.'
       );
     case 'too_long':
       return `⚠️ Запись слишком длинная.\n\n${detail}`;

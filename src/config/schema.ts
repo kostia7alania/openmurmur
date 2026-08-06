@@ -82,7 +82,7 @@ export interface TelegramConfig {
   readonly apiBaseUrl: string;
   /** Cloud Bot API caps sendDocument at 50 MB. */
   readonly maxOutgoingBytes: number;
-  /** Cloud Bot API caps getFile at 20 MB. */
+  /** Cloud Bot API caps getFile at 20 MB; local Bot API mode can be higher. */
   readonly maxIncomingBytes: number;
   /** Longer transcripts are split and also attached as .md. */
   readonly transcriptInlineLimit: number;
@@ -307,20 +307,7 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
     issues.push('llm.temperature must be between 0 and 2');
   }
 
-  const t = c.telegram;
-  if (t.maxOutgoingBytes > 50 * 1024 * 1024) {
-    issues.push('telegram.maxOutgoingBytes cannot exceed the 50 MB Bot API sendDocument limit');
-  }
-  if (t.maxIncomingBytes > 20 * 1024 * 1024) {
-    issues.push('telegram.maxIncomingBytes cannot exceed the 20 MB Bot API getFile limit');
-  }
-  if (t.transcriptInlineLimit > 4096) {
-    issues.push('telegram.transcriptInlineLimit must be <= 4096 (Telegram message length limit)');
-  }
-  positive('telegram.maxConcurrentIncomingJobs', t.maxConcurrentIncomingJobs);
-  if (!t.apiBaseUrl.startsWith('https://') && !t.apiBaseUrl.startsWith('http://127.0.0.1')) {
-    issues.push('telegram.apiBaseUrl must be https, or a local Bot API server on 127.0.0.1');
-  }
+  validateTelegram(c.telegram, issues, positive);
 
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(c.digest.atLocalTime)) {
     issues.push('digest.atLocalTime must be HH:MM in 24-hour form');
@@ -328,5 +315,40 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
 
   if (!['debug', 'info', 'warn', 'error'].includes(c.logLevel)) {
     issues.push('logLevel must be one of: debug, info, warn, error');
+  }
+}
+
+function validateTelegram(
+  t: TelegramConfig,
+  issues: string[],
+  positive: (label: string, n: number) => void,
+): void {
+  const localBotApi = isLocalBotApiUrl(t.apiBaseUrl);
+  if (t.maxOutgoingBytes > 50 * 1024 * 1024) {
+    issues.push('telegram.maxOutgoingBytes cannot exceed the 50 MB Bot API sendDocument limit');
+  }
+  positive('telegram.maxIncomingBytes', t.maxIncomingBytes);
+  positive('telegram.maxOutgoingBytes', t.maxOutgoingBytes);
+  if (!localBotApi && t.maxIncomingBytes > 20 * 1024 * 1024) {
+    issues.push('telegram.maxIncomingBytes cannot exceed the 20 MB Bot API getFile limit');
+  }
+  if (localBotApi && t.maxIncomingBytes > 2 * 1024 * 1024 * 1024) {
+    issues.push('telegram.maxIncomingBytes cannot exceed 2 GB in local Bot API mode');
+  }
+  if (t.transcriptInlineLimit > 4096) {
+    issues.push('telegram.transcriptInlineLimit must be <= 4096 (Telegram message length limit)');
+  }
+  positive('telegram.maxConcurrentIncomingJobs', t.maxConcurrentIncomingJobs);
+  if (!t.apiBaseUrl.startsWith('https://') && !localBotApi) {
+    issues.push('telegram.apiBaseUrl must be https, or a local Bot API server on 127.0.0.1');
+  }
+}
+
+function isLocalBotApiUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' && url.hostname === '127.0.0.1';
+  } catch {
+    return false;
   }
 }

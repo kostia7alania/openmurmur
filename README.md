@@ -225,12 +225,14 @@ This is the **only** network boundary. Understand it before you start.
 | Limit | Value | Effect |
 | --- | --- | --- |
 | `sendDocument` upload | 50 MB | Oversize parts are split losslessly (no re-encode). |
-| `getFile` download | **20 MB** | Larger files you send the bot are refused with an explanation. |
+| `getFile` download via Cloud Bot API | **20 MB** | Larger files you send the bot are refused with an explanation. |
+| `getFile` download via local Bot API server | Configurable, capped at 2 GB by OpenMurmur | Large files are streamed into quarantine with byte-count and ffprobe validation. |
 | Message length | 4096 chars | Long transcripts are split into numbered messages. |
 
 The 20 MB incoming limit is a hard constraint of the official Cloud Bot API.
-OpenMurmur will not work around it with an unsafe external downloader. Support
-for a self-hosted Bot API server (which raises it) is tracked as **P2-04**.
+OpenMurmur will not work around it with an unsafe external downloader. Large
+incoming files are supported through Telegram's official local Bot API server;
+see [`docs/TELEGRAM.md`](docs/TELEGRAM.md#local-bot-api-server-for-large-incoming-files).
 
 ## Bot commands
 

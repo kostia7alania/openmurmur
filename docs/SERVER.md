@@ -214,6 +214,57 @@ launchctl print gui/$(id -u)/io.openmurmur.daemon | head -20
 pnpm openmurmur status
 ```
 
+### Optional — large incoming Telegram files
+
+The Cloud Bot API cannot give a bot files larger than 20 MB. For long recordings
+sent *to* the bot, run Telegram's official local Bot API server on the same Mac.
+
+Human prerequisite: create a Telegram app at `https://my.telegram.org/apps` and
+copy its `api_id` and `api_hash`.
+
+```bash
+brew install cmake gperf openssl
+git clone --recursive https://github.com/tdlib/telegram-bot-api.git /tmp/telegram-bot-api
+cd /tmp/telegram-bot-api
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
+cmake --build build --target telegram-bot-api -j"$(sysctl -n hw.ncpu)"
+mkdir -p "$HOME/.local/bin"
+install -m 0755 build/telegram-bot-api "$HOME/.local/bin/telegram-bot-api"
+```
+
+Run it in a separate terminal first:
+
+```bash
+mkdir -p "$HOME/Library/Application Support/OpenMurmur/telegram-bot-api"
+telegram-bot-api \
+  --api-id <api_id> \
+  --api-hash <api_hash> \
+  --local \
+  --http-port 8081 \
+  --dir "$HOME/Library/Application Support/OpenMurmur/telegram-bot-api"
+```
+
+Then edit `~/Library/Application Support/OpenMurmur/openmurmur.json`:
+
+```json
+{
+  "telegram": {
+    "apiBaseUrl": "http://127.0.0.1:8081",
+    "maxIncomingBytes": 2147483648
+  }
+}
+```
+
+Restart OpenMurmur:
+
+```bash
+pnpm openmurmur stop
+launchctl kickstart -k gui/$(id -u)/io.openmurmur.daemon
+```
+
+This changes only incoming files. Microphone sessions are already local and do
+not use `getFile`.
+
 ## Step 8 — Verify end to end
 
 Speak near the machine for **more than 3 seconds**, using **more than 5 words** —

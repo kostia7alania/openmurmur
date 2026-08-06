@@ -50,13 +50,15 @@ found its username.
 | Operation | Limit | Our behaviour |
 | --- | --- | --- |
 | `sendDocument` | 50 MB | Size re-checked against the live file immediately before upload. Oversize parts are split losslessly with `-c copy` — never re-encoded to a lossy format. |
-| `getFile` | **20 MB** | Larger files are refused with an explanation naming Telegram as the source of the limit. |
+| `getFile` via Cloud Bot API | **20 MB** | Larger files are refused with an explanation naming Telegram as the source of the limit. |
+| `getFile` via local Bot API server | Configured by `telegram.maxIncomingBytes`, capped at 2 GB by OpenMurmur | Large files are streamed into quarantine with the same byte-count and ffprobe validation. |
 | Message text | 4096 chars | Long transcripts split into numbered messages plus a `.md` attachment. |
 | Rate limiting | HTTP 429 | `retry_after` honoured exactly; the drain stops rather than hammering; no attempt is burned. |
 
 The 20 MB incoming limit is a hard constraint of the official Cloud Bot API.
-OpenMurmur will not work around it with an unsafe external downloader. A
-self-hosted Bot API server raises it and is tracked as **P2-04**.
+OpenMurmur will not work around it with an unsafe external downloader. A local
+Telegram Bot API server is the supported escape hatch: point `telegram.apiBaseUrl`
+at `http://127.0.0.1:<port>` and raise `telegram.maxIncomingBytes`.
 
 ## Delivery order
 
@@ -185,7 +187,8 @@ supported extension or an `audio/*` MIME type. Formats: `.ogg` `.opus` `.mp3`
 
 1. Verify the chat ID.
 2. Verify the message type.
-3. Check the **declared** size against 20 MB (avoids a pointless round trip).
+3. Check the **declared** size against `telegram.maxIncomingBytes` (avoids a
+   pointless round trip).
 4. `getFile`.
 5. Stream the download into quarantine, **counting bytes and aborting** if the
    real size exceeds the limit — a server that lies about `file_size`, or a
@@ -218,6 +221,58 @@ Nine hostile filenames are covered by tests.
 - Only the allowlisted chat ID.
 - Bounded concurrent jobs (`maxConcurrentIncomingJobs`).
 - Duration and post-decode size limits.
+
+## Local Bot API server for large incoming files
+
+Use this when users need to send long recordings to the bot. It replaces the
+Cloud Bot API endpoint with Telegram's official local server; OpenMurmur still
+validates every file as untrusted input.
+
+Human prerequisite: create a Telegram app at `https://my.telegram.org/apps` and
+copy its `api_id` and `api_hash`.
+
+Build/install the server:
+
+```bash
+brew install cmake gperf openssl
+git clone --recursive https://github.com/tdlib/telegram-bot-api.git /tmp/telegram-bot-api
+cd /tmp/telegram-bot-api
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
+cmake --build build --target telegram-bot-api -j"$(sysctl -n hw.ncpu)"
+mkdir -p "$HOME/.local/bin"
+install -m 0755 build/telegram-bot-api "$HOME/.local/bin/telegram-bot-api"
+```
+
+Run it locally:
+
+```bash
+mkdir -p "$HOME/Library/Application Support/OpenMurmur/telegram-bot-api"
+telegram-bot-api \
+  --api-id <api_id> \
+  --api-hash <api_hash> \
+  --local \
+  --http-port 8081 \
+  --dir "$HOME/Library/Application Support/OpenMurmur/telegram-bot-api"
+```
+
+Then update `~/Library/Application Support/OpenMurmur/openmurmur.json`:
+
+```json
+{
+  "telegram": {
+    "apiBaseUrl": "http://127.0.0.1:8081",
+    "maxIncomingBytes": 2147483648
+  }
+}
+```
+
+Restart the daemon:
+
+```bash
+pnpm openmurmur stop
+launchctl kickstart -k gui/$(id -u)/io.openmurmur.daemon
+pnpm openmurmur doctor
+```
 - Timeouts on `ffprobe` and `ffmpeg`, with bounded `-probesize`/`-analyzeduration`
   so a crafted file cannot make ffprobe read gigabytes.
 - Quarantine directory, mode `0600`.

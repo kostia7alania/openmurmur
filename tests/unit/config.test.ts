@@ -36,7 +36,7 @@ describe('config parsing', () => {
     );
   });
 
-  it('refuses a Telegram limit above what the Bot API allows', () => {
+  it('refuses Telegram limits above what the selected Bot API mode allows', () => {
     assert.throws(
       () => parseConfig({ telegram: { maxOutgoingBytes: 100 * 1024 * 1024 } }),
       /50 MB Bot API sendDocument limit/,
@@ -44,6 +44,24 @@ describe('config parsing', () => {
     assert.throws(
       () => parseConfig({ telegram: { maxIncomingBytes: 50 * 1024 * 1024 } }),
       /20 MB Bot API getFile limit/,
+    );
+    assert.doesNotThrow(() =>
+      parseConfig({
+        telegram: {
+          apiBaseUrl: 'http://127.0.0.1:8081',
+          maxIncomingBytes: 512 * 1024 * 1024,
+        },
+      }),
+    );
+    assert.throws(
+      () =>
+        parseConfig({
+          telegram: {
+            apiBaseUrl: 'http://127.0.0.1:8081',
+            maxIncomingBytes: 3 * 1024 * 1024 * 1024,
+          },
+        }),
+      /2 GB/,
     );
   });
 
