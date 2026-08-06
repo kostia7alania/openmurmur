@@ -59,6 +59,10 @@ summaries are kept indefinitely — they are small.
 
 ## Quick start
 
+This assumes Homebrew, Node 26 and FFmpeg are already installed. Starting from a
+Mac that has none of them? Follow [docs/INSTALL.md](docs/INSTALL.md) instead —
+same destination, nothing assumed.
+
 ```bash
 git clone https://github.com/kostia7alania/openmurmur.git
 cd openmurmur
@@ -295,6 +299,7 @@ Neither needs a microphone, a model, or a network.
 
 | Document | Contents |
 | --- | --- |
+| [INSTALL.md](docs/INSTALL.md) | Clean Mac to running daemon, assuming nothing |
 | [PRODUCT.md](docs/PRODUCT.md) | What this is and what it refuses to be |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, processes, data flow |
 | [SESSIONIZER.md](docs/SESSIONIZER.md) | The state machine in detail |
