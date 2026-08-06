@@ -90,6 +90,9 @@ class Worker:
 
         hints = _string_list(request.payload.get("language_hints"))
         aligner_languages = _string_list(request.payload.get("aligner_languages"))
+        context = request.payload.get("context", "")
+        if not isinstance(context, str):
+            return error(request.id, "bad_request", "context must be a string")
 
         try:
             samples = load_mono_16k(path)
@@ -97,7 +100,7 @@ class Worker:
             return error(request.id, "audio_unreadable", str(exc))
 
         try:
-            result = self.asr.transcribe(samples, hints, aligner_languages)
+            result = self.asr.transcribe(samples, hints, aligner_languages, context)
         except AsrUnavailableError as exc:
             return error(request.id, "model_not_loaded", str(exc))
         except Exception as exc:  # noqa: BLE001 - reported, never crashes the worker

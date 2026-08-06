@@ -25,6 +25,8 @@ export type WorkerRequest =
       readonly path: string;
       readonly language_hints: readonly string[];
       readonly aligner_languages: readonly string[];
+      /** Biasing terms placed in the model's system prompt. A nudge, not a rule. */
+      readonly context: string;
     })
   | (WorkerRequestBase & {
       readonly op: 'vad';

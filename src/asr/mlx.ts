@@ -75,6 +75,7 @@ export class MlxAsr implements AsrBackend {
         path: request.audioPath,
         language_hints: request.languageHints ?? [],
         aligner_languages: this.#options.alignerLanguages,
+        context: request.context ?? '',
       },
       this.#options.requestTimeoutMs,
     );

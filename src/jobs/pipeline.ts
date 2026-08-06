@@ -202,6 +202,7 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
       ...(deps.config.asr.languageHints.length > 0
         ? { languageHints: deps.config.asr.languageHints }
         : {}),
+      ...(deps.config.asr.context.length > 0 ? { context: deps.config.asr.context } : {}),
     });
     engine = result.engine;
     model = result.model;

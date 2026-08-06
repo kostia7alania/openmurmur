@@ -78,6 +78,24 @@ export interface AsrConfig {
   readonly languageHints: readonly string[];
   /** Languages for which the Qwen forced aligner produces word timestamps. */
   readonly alignerLanguages: readonly string[];
+  /**
+   * Terms to bias recognition toward: names, places, jargon, product names —
+   * whatever this microphone hears often and the model gets wrong.
+   *
+   * Qwen3-ASR takes these as background knowledge in its system prompt, which
+   * tilts probabilities rather than forcing words.
+   *
+   * **It cuts both ways.** Seeding a 38-second English recording with terms
+   * that were not in it turned "we do not need battery" into "we have to cut
+   * me para" — the model reached for the words it had been primed with.
+   * Published results put the benefit at its highest around a hundred terms,
+   * and irrelevant ones act as distractors, so list only what this microphone
+   * actually hears.
+   *
+   * Empty by default. Nothing is inferred from previous transcripts, because
+   * feeding recognition back into itself entrenches its own mistakes.
+   */
+  readonly context: string;
   readonly pythonWorkerTimeoutMs: number;
 }
 
@@ -187,6 +205,7 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
     quantization: '8bit',
     languageHints: [],
     alignerLanguages: ['ru', 'en'],
+    context: '',
     pythonWorkerTimeoutMs: 15 * 60 * 1000,
   },
   llm: {

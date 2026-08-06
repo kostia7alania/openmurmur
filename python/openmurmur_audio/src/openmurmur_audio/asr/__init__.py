@@ -110,13 +110,23 @@ class QwenAsr:
         samples: FloatArray,
         language_hints: list[str],
         aligner_languages: list[str],
+        context: str = "",
     ) -> Transcription:
+        """Transcribes one recording.
+
+        `context` is Qwen3-ASR's biasing input: terms placed in the system
+        prompt that tilt the decoder's probabilities toward them. It is a nudge,
+        not an instruction — the model can still ignore it — and it is the one
+        accuracy lever available without changing models, which matters most
+        for names, jargon and the English words that appear inside Thai speech.
+        """
         if self._session is None:
             raise AsrUnavailableError("model is not loaded")
 
         result = self._session.transcribe(
             samples,
             language=language_hints[0] if language_hints else None,
+            context=context,
             return_timestamps=True,
         )
         return normalize_result(result, self._model_name, aligner_languages, duration_ms(samples))

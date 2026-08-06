@@ -25,6 +25,13 @@ export interface AsrRequest {
   /** Absolute path to 16 kHz mono WAV or FLAC. */
   readonly audioPath: string;
   readonly languageHints?: readonly string[];
+  /**
+   * Terms to bias recognition toward — names, jargon, the English words that
+   * recur inside Thai speech. Placed in the model's system prompt, so it tilts
+   * probabilities rather than forcing output, and a long list of irrelevant
+   * terms hurts more than it helps.
+   */
+  readonly context?: string;
   readonly requestId: string;
 }
 

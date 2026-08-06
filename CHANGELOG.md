@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   participants is worse than one with no labels. See
   [ADR-0008](docs/adr/0008-speaker-diarization.md).
 - `./scripts/fetch-diarization-models`, and a `diarization` check in `doctor`.
+- `asr.context` — biasing terms for recognition: names, places, jargon, the
+  English words that recur inside Thai speech. Empty by default, and worth
+  treating carefully: priming a recording with terms that were not in it made
+  the transcript worse, not better, which is why nothing is inferred
+  automatically from previous transcripts.
 
 ### Fixed
 
@@ -30,7 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   characters in a Thai transcript are the model drifting, not code-switching.
   Reported, never edited out: silently rewriting a transcript would be worse
   than an odd one.
-
 - **The daemon now really uses Silero VAD to decide what a speech session is.**
   It was wired to `EnergyVad` — the loudness gate the source itself documents as
   "explicitly not a substitute" — while the docs claimed the daemon path used
@@ -38,8 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missed. Measured over the new streaming path: a 440 Hz tone and white noise
   score 0.000 and 0.007 with Silero and 1.000 with the gate; real Russian and
   English speech score 0.927.
+- Session transcripts are sent as timestamped blocks rather than one wall of
+  text. The formatter existed and worked — it was wired to incoming Telegram
+  audio, while recorded sessions, the whole point of the product, got the flat
+  blob.
 
-### Added
 
 - Streaming VAD (`vad_stream`) in the Python worker: whole 512-sample frames in,
   one probability out per frame, Silero's LSTM state carried between calls.
