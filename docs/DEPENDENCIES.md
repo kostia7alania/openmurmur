@@ -16,7 +16,7 @@ is marked explicitly rather than assumed.
 | `@types/node` | 26.1.2 | ✅ | Latest published. |
 | SQLite (`node:sqlite`) | **3.53.3** | ✅ queried at runtime | Below the 3.53.4 target — see [ADR-0004](adr/0004-sqlite-driver.md). |
 | FFmpeg / ffprobe | 8.1.1 | ✅ used in integration tests | `brew install ffmpeg`. |
-| Python | 3.14.5 | ✅ 26 tests pass | Newest with wheels across the whole stack. |
+| Python | 3.14.5 | ✅ 36 tests pass | Newest with wheels across the whole stack. |
 | uv | 0.11.14 | ✅ `uv sync` succeeded | |
 
 ## Node packages
@@ -42,7 +42,7 @@ Exact versions, no ranges. `pnpm-lock.yaml` is committed.
 | numpy | 2.5.1 | ✅ imported | Array handling. Requires ≥ 3.12. |
 | onnxruntime | 1.28.0 | ✅ imported | Silero VAD inference. **Publishes cp311–cp314 only**, which is what caps Python at 3.14. |
 | soundfile | 0.14.0 | ✅ imported | Audio file reading. |
-| pytest | 9.1.1 | ✅ 26 tests pass | |
+| pytest | 9.1.1 | ✅ 36 tests pass | |
 | ruff | 0.16.0 | ✅ clean | Lint and format. |
 | mypy | 2.3.0 | ✅ strict, clean | |
 
@@ -51,8 +51,10 @@ Exact versions, no ranges. `pnpm-lock.yaml` is committed.
 | Package | Pinned | Status |
 | --- | --- | --- |
 | mlx | ≥0.32.0,<0.33 | ✅ Installed and run (M4 Max, 36 GB). Wheels cp310–cp314, macOS arm64. |
-| mlx-qwen3-asr | ≥0.3.5,<0.4 | ✅ Qwen3-ASR-1.7B loads in ~5 s and stays resident; RU/EN/TH transcribed. |
+| mlx-qwen3-asr | ≥0.3.5,<0.4 | ✅ Qwen3-ASR-1.7B loads in ~5 s and stays resident; RU/EN/TH transcribed. Its `context` biasing is used; its built-in `diarize` is not — see below. |
 | silero-vad | ≥6.2.1,<7 | ✅ ONNX model run per frame in the live capture path. |
+| sherpa-onnx | ≥1.13.4,<2 | ✅ Speaker diarization, run on real recordings. RTF ~0.08. |
+| sherpa-onnx-core | ≥1.13.4,<2 | ✅ Named explicitly: resolving the extra installed only the wrapper, and the native module then failed to load its bundled `libonnxruntime`. Carries its own onnxruntime; does not conflict with the pin above. |
 
 Kept as an extra because it pulls several GB (torch and torchaudio come with
 `silero-vad`) and MLX needs Metal, so CI must not install it. CI therefore runs
@@ -67,6 +69,11 @@ reading the config back.
 
 Silero's **segment-assembly logic** is separately covered by pure Python tests,
 which take a list of probabilities and need no model.
+
+**Diarization models are not pip packages.** Two ONNX files, ~44 MB, fetched by
+`./scripts/fetch-diarization-models` from sherpa-onnx's GitHub releases. Chosen
+over pyannote's own weights, which are better but **gated** behind an accepted
+licence and a Hugging Face token — see [ADR-0008](adr/0008-speaker-diarization.md).
 
 ## External services
 
