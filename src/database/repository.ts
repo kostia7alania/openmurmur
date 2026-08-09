@@ -14,6 +14,13 @@ export interface SessionRow {
   part_count: number;
   rejection_reason: string | null;
   languages: string | null;
+  capture_host: string | null;
+  capture_timezone: string | null;
+}
+
+export interface SessionCaptureProvenance {
+  readonly hostName: string;
+  readonly timezone: string;
 }
 
 export interface PartRow {
@@ -37,14 +44,22 @@ export class SessionRepository {
     this.#db = db;
   }
 
-  create(sessionId: string, startedAtIso: string): void {
+  create(sessionId: string, startedAtIso: string, provenance?: SessionCaptureProvenance): void {
     const ts = nowIso();
     this.#db
       .prepare(
-        `INSERT INTO audio_sessions (session_id, state, started_at, created_at, updated_at)
-         VALUES (?, 'ACTIVE', ?, ?, ?)`,
+        `INSERT INTO audio_sessions
+           (session_id, state, started_at, capture_host, capture_timezone, created_at, updated_at)
+         VALUES (?, 'ACTIVE', ?, ?, ?, ?, ?)`,
       )
-      .run(sessionId, startedAtIso, ts, ts);
+      .run(
+        sessionId,
+        startedAtIso,
+        provenance?.hostName ?? null,
+        provenance?.timezone ?? null,
+        ts,
+        ts,
+      );
   }
 
   setState(sessionId: string, state: string): void {
@@ -164,6 +179,164 @@ export class PartRepository {
     return this.#db
       .prepare('SELECT * FROM audio_parts WHERE finalized = 1 ORDER BY ended_at DESC LIMIT 1')
       .get() as unknown as PartRow | undefined;
+  }
+}
+
+export type IncomingAttachmentType = 'voice' | 'audio' | 'document' | 'video_note';
+export type IncomingTelegramSource = 'direct' | 'forwarded';
+
+export interface IncomingFileRow {
+  readonly fileUid: string;
+  readonly telegramFileId: string;
+  readonly telegramUniqueId: string;
+  readonly chatId: number;
+  readonly messageId: number;
+  readonly botScope: string;
+  readonly updateId: number | null;
+  readonly telegramSource: IncomingTelegramSource | null;
+  readonly attachmentType: IncomingAttachmentType | null;
+  readonly claimedFilename: string | null;
+  readonly telegramMessageAt: string | null;
+  readonly originalSentAt: string | null;
+  readonly daemonHost: string | null;
+  readonly state: string;
+  readonly quarantinePath: string | null;
+  readonly normalizedPath: string | null;
+}
+
+export interface ClaimIncomingFileInput {
+  readonly telegramFileId: string;
+  readonly telegramUniqueId: string;
+  readonly chatId: number;
+  readonly messageId: number;
+  readonly botScope?: string;
+  readonly updateId: number;
+  readonly telegramSource: IncomingTelegramSource;
+  readonly attachmentType: IncomingAttachmentType;
+  readonly claimedFilename: string | null;
+  readonly telegramMessageAt: string;
+  readonly originalSentAt: string | null;
+  readonly daemonHost: string;
+  readonly declaredBytes: number | null;
+  readonly declaredMime: string | null;
+}
+
+/** Durable identity and display-only provenance for Telegram-supplied audio. */
+export class IncomingFileRepository {
+  readonly #db: DatabaseSync;
+  constructor(db: DatabaseSync) {
+    this.#db = db;
+  }
+
+  claim(input: ClaimIncomingFileInput): IncomingFileRow {
+    const ts = nowIso();
+    const botScope = input.botScope ?? 'legacy';
+    const telegramFileKey =
+      botScope === 'legacy' ? input.telegramUniqueId : `${botScope}:${input.telegramUniqueId}`;
+    this.#db
+      .prepare(
+        `INSERT INTO incoming_telegram_files
+           (file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id, bot_scope, update_id,
+            telegram_source, attachment_type, claimed_filename, telegram_message_at,
+            original_sent_at, daemon_host, declared_bytes, declared_mime, state,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?)
+         ON CONFLICT (telegram_unique_id) DO NOTHING`,
+      )
+      .run(
+        randomUUID(),
+        input.telegramFileId,
+        telegramFileKey,
+        input.chatId,
+        input.messageId,
+        botScope,
+        input.updateId,
+        input.telegramSource,
+        input.attachmentType,
+        input.claimedFilename,
+        input.telegramMessageAt,
+        input.originalSentAt,
+        input.daemonHost,
+        input.declaredBytes,
+        input.declaredMime,
+        ts,
+        ts,
+      );
+    const row = this.#find('telegram_unique_id', telegramFileKey);
+    if (row === undefined) throw new Error('could not claim incoming Telegram file');
+    return row;
+  }
+
+  findByTelegramUniqueId(
+    telegramUniqueId: string,
+    botScope = 'legacy',
+  ): IncomingFileRow | undefined {
+    const telegramFileKey =
+      botScope === 'legacy' ? telegramUniqueId : `${botScope}:${telegramUniqueId}`;
+    return this.#find('telegram_unique_id', telegramFileKey);
+  }
+
+  get(fileUid: string): IncomingFileRow | undefined {
+    return this.#find('file_uid', fileUid);
+  }
+
+  markDownloaded(fileUid: string, path: string, actualBytes: number): void {
+    this.#db
+      .prepare(
+        `UPDATE incoming_telegram_files
+            SET state = 'downloaded', quarantine_path = ?, actual_bytes = ?, updated_at = ?
+          WHERE file_uid = ?`,
+      )
+      .run(path, actualBytes, nowIso(), fileUid);
+  }
+
+  #find(column: 'file_uid' | 'telegram_unique_id', value: string): IncomingFileRow | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id, bot_scope, update_id,
+                telegram_source, attachment_type, claimed_filename, telegram_message_at,
+                original_sent_at, daemon_host, state, quarantine_path, normalized_path
+           FROM incoming_telegram_files WHERE ${column} = ?`,
+      )
+      .get(value) as
+      | {
+          file_uid: string;
+          telegram_file_id: string;
+          telegram_unique_id: string;
+          chat_id: number;
+          message_id: number;
+          bot_scope: string;
+          update_id: number | null;
+          telegram_source: IncomingTelegramSource | null;
+          attachment_type: IncomingAttachmentType | null;
+          claimed_filename: string | null;
+          telegram_message_at: string | null;
+          original_sent_at: string | null;
+          daemon_host: string | null;
+          state: string;
+          quarantine_path: string | null;
+          normalized_path: string | null;
+        }
+      | undefined;
+    if (row === undefined) return undefined;
+    return {
+      fileUid: row.file_uid,
+      telegramFileId: row.telegram_file_id,
+      telegramUniqueId: row.telegram_unique_id,
+      chatId: row.chat_id,
+      messageId: row.message_id,
+      botScope: row.bot_scope,
+      updateId: row.update_id,
+      telegramSource: row.telegram_source,
+      attachmentType: row.attachment_type,
+      claimedFilename: row.claimed_filename,
+      telegramMessageAt: row.telegram_message_at,
+      originalSentAt: row.original_sent_at,
+      daemonHost: row.daemon_host,
+      state: row.state,
+      quarantinePath: row.quarantine_path,
+      normalizedPath: row.normalized_path,
+    };
   }
 }
 

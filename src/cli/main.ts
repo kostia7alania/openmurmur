@@ -24,7 +24,7 @@ import { createLogger } from '../logging/logger.ts';
 import { applyRetention, planRetention } from '../retention/policy.ts';
 import { EnergyVad, rmsDbfs } from '../sessionizer/vad.ts';
 import { TelegramClient } from '../telegram/client.ts';
-import { keychain } from '../telegram/keychain.ts';
+import { keychain, telegramBotScope } from '../telegram/keychain.ts';
 import { Outbox, type OutboxPayload } from '../telegram/outbox.ts';
 import { nextOffsetFor, readOffset, routeUpdate, writeOffset } from '../telegram/router.ts';
 import { writeTextAtomically } from '../util/atomic-file.ts';
@@ -569,14 +569,15 @@ async function telegramCommand(
   if (subcommand === 'poll') {
     const db = openDatabase({ file: loaded.paths.databaseFile });
     try {
-      const offset = readOffset(db.handle);
+      const botScope = telegramBotScope(secrets.token);
+      const offset = readOffset(db.handle, botScope);
       const updates = await client.getUpdates(offset, 5);
       process.stdout.write(`Fetched ${updates.length} update(s) from offset ${offset}.\n`);
       for (const update of updates) {
         const action = routeUpdate(update, secrets.chatId);
         process.stdout.write(`  #${update.update_id}: ${action.kind}\n`);
       }
-      writeOffset(db.handle, nextOffsetFor(updates, offset));
+      writeOffset(db.handle, nextOffsetFor(updates, offset), botScope);
       return 0;
     } finally {
       db.close();

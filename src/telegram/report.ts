@@ -7,6 +7,11 @@ import {
   TELEGRAM_MESSAGE_LIMIT,
   type TimedTranscriptSegment,
 } from './format.ts';
+import {
+  type OutputProvenance,
+  renderProvenanceHtml,
+  renderProvenanceMarkdown,
+} from './provenance.ts';
 
 export interface SessionReportInput {
   readonly sessionId: string;
@@ -20,6 +25,7 @@ export interface SessionReportInput {
   readonly timezone?: string | undefined;
   readonly transcript?: string | undefined;
   readonly transcriptSegments?: readonly TimedTranscriptSegment[] | undefined;
+  readonly provenance?: OutputProvenance | undefined;
 }
 
 const LANGUAGE_NAMES: Record<string, string> = {
@@ -90,7 +96,11 @@ export function renderSessionReport(input: SessionReportInput): string {
     details.push('', `<b>${transcript.title}:</b>`, escapeHtml(transcript.text));
   }
 
-  details.push('', `Session ID: <code>${escapeHtml(input.sessionId)}</code>`);
+  if (input.provenance === undefined) {
+    details.push('', `Session UID: <code>${escapeHtml(input.sessionId)}</code>`);
+  } else {
+    details.push('', '<b>Происхождение:</b>', renderProvenanceHtml(input.provenance));
+  }
 
   const lines: string[] = ['🎙 <b>Сессия завершена</b>'];
   if (s.summary.length > 0) {
@@ -109,12 +119,14 @@ export function renderSessionSummaryPreview(input: SessionReportInput): string {
   if (input.summary.summary.length === 0) return '';
   const prefix = '🧠 <b>Кратко</b>\n<blockquote expandable>';
   const suffix = '</blockquote>';
+  const provenance =
+    input.provenance === undefined ? '' : `\n\n${renderProvenanceHtml(input.provenance)}`;
   const summary = compactPreview(
     input.summary.summary,
     500,
-    TELEGRAM_MESSAGE_LIMIT - prefix.length - suffix.length,
+    TELEGRAM_MESSAGE_LIMIT - prefix.length - suffix.length - provenance.length,
   );
-  return `${prefix}${escapeHtml(summary)}${suffix}`;
+  return `${prefix}${escapeHtml(summary)}${suffix}${provenance}`;
 }
 
 /** Full report artifact used when the Telegram-sized HTML rendering is too long. */
@@ -122,7 +134,9 @@ export function renderSessionReportMarkdown(input: SessionReportInput): string {
   const lines: string[] = [
     '# OpenMurmur session report',
     '',
-    `- Session: \`${input.sessionId}\``,
+    ...(input.provenance === undefined
+      ? [`- Session UID: \`${input.sessionId}\``]
+      : [renderProvenanceMarkdown(input.provenance)]),
     `- Time: ${formatClock(input.startedWallMs, input.timezone)}–${formatClock(input.endedWallMs, input.timezone)}`,
     `- Duration: ${formatDuration(input.durationMs)}`,
     `- Speech: ${formatDuration(input.speechMs)}`,

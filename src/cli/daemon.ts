@@ -8,7 +8,13 @@ import { normalizeToWav, probeAudio } from '../capture/probe.ts';
 import { recoverAfterCrash } from '../capture/recovery.ts';
 import type { LoadedConfig } from '../config/load.ts';
 import { type Database, openDatabase, transaction } from '../database/db.ts';
-import { PartRepository, SessionRepository, TranscriptRepository } from '../database/repository.ts';
+import {
+  IncomingFileRepository,
+  type IncomingFileRow,
+  PartRepository,
+  SessionRepository,
+  TranscriptRepository,
+} from '../database/repository.ts';
 import {
   buildDigest,
   hasUnfinishedSessionsForDate,
@@ -35,7 +41,7 @@ import { applyRetention, planRetention } from '../retention/policy.ts';
 import { Recorder } from '../sessionizer/recorder.ts';
 import { SileroStreamVad } from '../sessionizer/silero.ts';
 import type { Vad } from '../sessionizer/vad.ts';
-import { TelegramClient } from '../telegram/client.ts';
+import { isClientShutdown, TelegramClient, type TelegramMessage } from '../telegram/client.ts';
 import { renderTimedTranscriptMessages } from '../telegram/format.ts';
 import {
   downloadToQuarantine,
@@ -44,8 +50,13 @@ import {
   rejectionMessage,
   validateProbe,
 } from '../telegram/incoming.ts';
-import { keychainProvider, type SecretsProvider } from '../telegram/keychain.ts';
+import { keychainProvider, type SecretsProvider, telegramBotScope } from '../telegram/keychain.ts';
 import { drainOutbox, Outbox, type OutboxPayload } from '../telegram/outbox.ts';
+import {
+  incomingTelegramProvenance,
+  renderProvenanceHtml,
+  renderProvenancePlain,
+} from '../telegram/provenance.ts';
 import { HELP_TEXT, renderStatus } from '../telegram/report.ts';
 import {
   markUpdateHandled,
@@ -91,6 +102,7 @@ export class Daemon {
 
   #client: TelegramClient | null = null;
   #chatId: number | null = null;
+  #botScope: string | null = null;
   #stopping = false;
   #recorderFailure: string | null = null;
   /** Resolves once `run()` has finalized whatever was open. */
@@ -169,6 +181,8 @@ export class Daemon {
       capture: this.#capture,
       vad: this.#vad,
       logger: options.logger.child('recorder'),
+      captureHost: hostname(),
+      captureTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       onFirstFrame: () => this.#announceRecordingStarted(),
     });
   }
@@ -186,6 +200,7 @@ export class Daemon {
       await claimDaemonPid(paths.pidFile, paths.root);
       this.#pidClaimed = true;
       if (this.#stopping) return;
+      const staleNoticeCutoff = new Date().toISOString();
 
       // Reclaim anything a previous crash left half-done before new work starts.
       const recovery = await recoverAfterCrash(this.#db.handle, paths, logger);
@@ -205,14 +220,23 @@ export class Daemon {
 
       const reclaimedJobs = this.#jobs.recoverStaleLeases();
       const reclaimedSends = this.#outbox.recoverSending();
+      const retiredStaleNotices = retireStaleNotices(
+        this.#db.handle,
+        staleNoticeCutoff,
+        'superseded by the next daemon startup',
+      );
       this.#reconcileDeadAsrSessions();
-      if (reclaimedJobs > 0 || reclaimedSends > 0) {
-        logger.info('recovered work from a previous run', { reclaimedJobs, reclaimedSends });
+      if (reclaimedJobs > 0 || reclaimedSends > 0 || retiredStaleNotices > 0) {
+        logger.info('recovered work from a previous run', {
+          reclaimedJobs,
+          reclaimedSends,
+          retiredStaleNotices,
+        });
       }
 
-      // A locked Keychain must not stop the recorder. Telegram polling retries
-      // this bounded lookup, so delivery catches up without restarting once the
-      // user unlocks the Mac.
+      // A locked Keychain must not stop the recorder. The independent config
+      // loop retries this bounded lookup even in send-only mode, so delivery
+      // catches up without restarting once the user unlocks the Mac.
       this.#trackTask('initial Telegram configuration', () =>
         this.#ensureTelegramConfigured(true).then(() => {}),
       );
@@ -224,8 +248,17 @@ export class Daemon {
       );
       this.#loop('asr-jobs', () => this.#tickJobs(['asr', 'incoming_audio']), 1000);
       this.#loop('summary-jobs', () => this.#tickJobs(['summarize']), 1000);
+      this.#loop(
+        'telegram-config',
+        () => this.#ensureTelegramConfigured(false).then(() => {}),
+        5000,
+      );
       this.#loop('outbox', () => this.#tickOutbox(), 1500);
-      this.#loop('telegram', () => this.#tickTelegram(), config.telegram.pollIntervalMs);
+      if (config.telegram.receiveUpdates) {
+        this.#loop('telegram', () => this.#tickTelegram(), config.telegram.pollIntervalMs);
+      } else {
+        logger.info('Telegram update polling disabled; outbound delivery remains enabled');
+      }
       this.#loop('health', () => this.#tickHealth(), config.health.pollIntervalMs);
       this.#loop('sleep', () => this.#tickSleep(), 2000);
       this.#loop('digest', () => this.#tickDigest(), 5 * 60 * 1000);
@@ -293,15 +326,7 @@ export class Daemon {
       await this.#recorder.stop();
       await this.#awaitRecorderFinalization();
       if (this.#announcedRecording && this.#recorderFailure === null) {
-        this.#enqueueText(
-          '🔴 Запись остановлена (демон завершается)',
-          `notice:shutdown:${Date.now()}`,
-        );
-        void this.#tickOutbox().catch((error: unknown) => {
-          this.#options.logger.warn('could not send the shutdown notice immediately', {
-            error: (error as Error).message,
-          });
-        });
+        this.#options.logger.info('recording stopped during daemon shutdown');
       }
     } catch (error) {
       recorderStopError = error;
@@ -564,13 +589,20 @@ export class Daemon {
     if (!(await this.#ensureTelegramConfigured(false))) return;
     const client = this.#client;
     const chatId = this.#chatId;
-    if (client === null || chatId === null) return;
+    const botScope = this.#botScope;
+    if (client === null || chatId === null || botScope === null) return;
 
-    const offset = readOffset(this.#db.handle);
-    const updates = await client.getUpdates(
-      offset,
-      this.#options.loaded.config.telegram.longPollSeconds,
-    );
+    const offset = readOffset(this.#db.handle, botScope);
+    let updates: Awaited<ReturnType<TelegramClient['getUpdates']>>;
+    try {
+      updates = await client.getUpdates(
+        offset,
+        this.#options.loaded.config.telegram.longPollSeconds,
+      );
+    } catch (error) {
+      if (this.#stopping && isClientShutdown(error)) return;
+      throw error;
+    }
     if (updates.length === 0) return;
 
     for (const update of updates) {
@@ -578,7 +610,7 @@ export class Daemon {
       // An unhandled row is replayed after a crash. Every durable side effect
       // below has an update-based idempotency key, so replay completes missing
       // work instead of duplicating it.
-      if (!recordUpdate(this.#db.handle, update.update_id, action.kind)) continue;
+      if (!recordUpdate(this.#db.handle, update.update_id, action.kind, botScope)) continue;
 
       switch (action.kind) {
         case 'ignore':
@@ -587,30 +619,35 @@ export class Daemon {
           await this.#handleCommand(action.command, update.update_id);
           break;
         case 'unknown_command':
-          this.#enqueueText(`Неизвестная команда. ${HELP_TEXT}`, `cmd:${update.update_id}`);
+          this.#enqueueText(
+            `Неизвестная команда. ${HELP_TEXT}`,
+            scopedUpdateKey('cmd', botScope, update.update_id),
+          );
           break;
         case 'audio':
-          this.#jobs.enqueue({
-            kind: 'incoming_audio',
-            idempotencyKey: `incoming:${update.update_id}`,
-            payload: { updateId: update.update_id, message: action.message },
-          });
-          this.#enqueueText('🎧 Принято, распознаю локально...', `ack:${update.update_id}`);
-          break;
+          enqueueIncomingRequest(
+            this.#db.handle,
+            update.update_id,
+            action.message,
+            hostname(),
+            botScope,
+          );
+          continue;
         case 'text':
           break;
       }
-      markUpdateHandled(this.#db.handle, update.update_id);
+      markUpdateHandled(this.#db.handle, update.update_id, botScope);
     }
-    writeOffset(this.#db.handle, nextOffsetFor(updates, offset));
+    writeOffset(this.#db.handle, nextOffsetFor(updates, offset), botScope);
   }
 
   async #handleCommand(
     command: '/status' | '/health' | '/help' | '/start',
     updateId: number,
   ): Promise<void> {
+    const botScope = this.#botScope ?? 'legacy';
     if (command === '/help' || command === '/start') {
-      this.#enqueueText(HELP_TEXT, `help:${updateId}`);
+      this.#enqueueText(HELP_TEXT, scopedUpdateKey('help', botScope, updateId));
       return;
     }
     if (command === '/health') {
@@ -618,7 +655,11 @@ export class Daemon {
         await this.#collectHealth(),
         this.#options.loaded.config.health,
       );
-      this.#enqueueText(renderHealthLines(report), `health:${updateId}`, undefined);
+      this.#enqueueText(
+        renderHealthLines(report),
+        scopedUpdateKey('health', botScope, updateId),
+        undefined,
+      );
       return;
     }
 
@@ -651,7 +692,7 @@ export class Daemon {
         llmStatus: `${this.#options.loaded.config.llm.model} (${this.#options.loaded.config.llm.backend})`,
         version: VERSION,
       }),
-      `status:${updateId}`,
+      scopedUpdateKey('status', botScope, updateId),
       'HTML',
     );
   }
@@ -665,39 +706,52 @@ export class Daemon {
     const attachment = extractAttachment(message);
     if (attachment === null) return;
 
-    let incoming = findIncomingFile(this.#db.handle, attachment.fileUniqueId);
+    const incomingFiles = new IncomingFileRepository(this.#db.handle);
+    const payloadBotScope = payload['botScope'];
+    const botScope = typeof payloadBotScope === 'string' ? payloadBotScope : 'legacy';
+    const payloadFileUid = payload['fileUid'];
+    let incoming =
+      typeof payloadFileUid === 'string'
+        ? incomingFiles.get(payloadFileUid)
+        : findIncomingFile(this.#db.handle, attachment.fileUniqueId, botScope);
+    if (incoming === undefined) {
+      const updateId = payload['updateId'];
+      if (typeof updateId !== 'number') throw new Error('incoming audio has no update identity');
+      const claimed = claimIncomingRequest(
+        this.#db.handle,
+        updateId,
+        message,
+        hostname(),
+        botScope,
+      );
+      if (claimed === null) throw new Error('incoming audio payload has no supported attachment');
+      incoming = claimed;
+    }
 
     try {
-      if (incoming?.state === 'rejected') return;
+      if (incoming.state === 'rejected') return;
 
-      const storedTranscript =
-        incoming === undefined
-          ? undefined
-          : currentIncomingTranscript(this.#db.handle, incoming.fileUid);
-      if (incoming !== undefined && storedTranscript !== undefined) {
+      const storedTranscript = currentIncomingTranscript(this.#db.handle, incoming.fileUid);
+      if (storedTranscript !== undefined) {
         markIncomingTranscribed(this.#db.handle, incoming.fileUid);
-        this.#enqueueIncomingTranscript(
-          incoming.fileUid,
-          storedTranscript.text,
-          storedTranscript.segments,
-        );
+        this.#enqueueIncomingTranscript(incoming, storedTranscript.text, storedTranscript.segments);
         return;
       }
 
-      if (
-        incoming?.quarantinePath === null ||
-        incoming === undefined ||
-        !(await pathExists(incoming.quarantinePath))
-      ) {
-        const downloaded = await downloadToQuarantine(client, attachment, paths.quarantineDir, {
-          maxIncomingBytes: config.telegram.maxIncomingBytes,
-          maxDurationSeconds: config.telegram.maxIncomingDurationSeconds,
-        });
-        incoming = recordIncomingDownload(this.#db.handle, {
+      if (incoming.quarantinePath === null || !(await pathExists(incoming.quarantinePath))) {
+        const downloaded = await downloadToQuarantine(
+          client,
           attachment,
-          message,
-          downloaded,
-        });
+          paths.quarantineDir,
+          {
+            maxIncomingBytes: config.telegram.maxIncomingBytes,
+            maxDurationSeconds: config.telegram.maxIncomingDurationSeconds,
+          },
+          incoming.fileUid,
+        );
+        incomingFiles.markDownloaded(incoming.fileUid, downloaded.path, downloaded.actualBytes);
+        incoming = incomingFiles.get(incoming.fileUid);
+        if (incoming === undefined) throw new Error('incoming audio disappeared after download');
       }
 
       const quarantinePath = incoming.quarantinePath;
@@ -708,13 +762,12 @@ export class Daemon {
         maxDurationSeconds: config.telegram.maxIncomingDurationSeconds,
       });
 
-      const wavPath =
-        incoming.normalizedPath ?? join(paths.quarantineDir, `${incoming.fileUid}.16k.wav`);
-      if (!(await pathExists(wavPath))) {
-        if (!(await normalizeToWav(config.audio.ffmpegPath, quarantinePath, wavPath))) {
-          throw new IncomingRejected('corrupt_media', 'could not decode the audio');
-        }
-      }
+      const wavPath = await ensureIncomingWav(
+        config.audio.ffmpegPath,
+        quarantinePath,
+        paths.quarantineDir,
+        incoming,
+      );
 
       const result = await this.#asr.transcribe({
         audioPath: wavPath,
@@ -751,40 +804,47 @@ export class Daemon {
           incoming.fileUid,
         );
 
-      this.#enqueueIncomingTranscript(incoming.fileUid, result.text, result.segments);
+      this.#enqueueIncomingTranscript(incoming, result.text, result.segments);
     } catch (error) {
+      // The only undefined assignment above is a failed reload after download;
+      // there is then no durable row whose state can truthfully be changed.
+      if (incoming === undefined) throw error;
       if (error instanceof IncomingRejected) {
         this.#enqueueText(
-          rejectionMessage(error.reason, error.message),
+          `${rejectionMessage(error.reason, error.message)}\n\n${renderProvenancePlain(
+            incomingTelegramProvenance(incoming),
+          )}`.trim(),
           `reject:${attachment.fileUniqueId}`,
         );
-        if (incoming !== undefined) {
-          this.#db.handle
-            .prepare(
-              `UPDATE incoming_telegram_files SET state = 'rejected', rejection_reason = ?,
-                      updated_at = ? WHERE file_uid = ?`,
-            )
-            .run(error.reason, new Date().toISOString(), incoming.fileUid);
-        }
-        return;
-      }
-      if (incoming !== undefined) {
         this.#db.handle
           .prepare(
-            "UPDATE incoming_telegram_files SET state = 'failed', updated_at = ? WHERE file_uid = ?",
+            `UPDATE incoming_telegram_files SET state = 'rejected', rejection_reason = ?,
+                    updated_at = ? WHERE file_uid = ?`,
           )
-          .run(new Date().toISOString(), incoming.fileUid);
+          .run(error.reason, new Date().toISOString(), incoming.fileUid);
+        return;
       }
+      this.#db.handle
+        .prepare(
+          "UPDATE incoming_telegram_files SET state = 'failed', updated_at = ? WHERE file_uid = ?",
+        )
+        .run(new Date().toISOString(), incoming.fileUid);
       throw error;
     }
   }
 
-  #enqueueIncomingTranscript(fileUid: string, text: string, segments: readonly AsrSegment[]): void {
+  #enqueueIncomingTranscript(
+    incoming: IncomingFileRow,
+    text: string,
+    segments: readonly AsrSegment[],
+  ): void {
+    const fileUid = incoming.fileUid;
     for (const chunk of renderTimedTranscriptMessages(
       fileUid,
       segments,
       text.length > 0 ? text : '(речь не распознана)',
       this.#options.loaded.config.telegram.transcriptInlineLimit,
+      renderProvenanceHtml(incomingTelegramProvenance(incoming)),
     )) {
       this.#outbox.enqueue({
         deliveryPartId: `incoming:${fileUid}:${chunk.partNumber}`,
@@ -904,13 +964,37 @@ export class Daemon {
     ];
 
     for (const condition of conditions) {
-      const decision = this.#alerts.evaluate(condition.id, condition.active);
-      if (!decision.send || decision.transition === 'none') continue;
-      const alert = renderAlert(
+      this.#processHealthAlert(condition);
+    }
+  }
+
+  #processHealthAlert(condition: { id: AlertId; active: boolean; detail: string }): void {
+    const decision = this.#alerts.evaluate(condition.id, condition.active);
+    if (condition.id === 'telegram_delivery' && condition.active) {
+      retirePendingAlertDeliveries(
+        this.#db.handle,
         condition.id,
-        decision.transition,
-        condition.active ? condition.detail : '',
-        Math.floor(Date.now() / 60_000),
+        'Telegram delivery alerts stay local while delivery is delayed',
+      );
+    }
+    if (!decision.send || decision.transition === 'none') return;
+    if (!shouldEnqueueHealthAlert(condition.id, decision.transition)) {
+      this.#options.logger.warn('Telegram delivery is delayed; alert kept local', {
+        detail: condition.detail,
+      });
+      return;
+    }
+    const alert = renderAlert(
+      condition.id,
+      decision.transition,
+      condition.active ? condition.detail : '',
+      Date.now(),
+    );
+    transaction(this.#db.handle, () => {
+      retirePendingAlertDeliveries(
+        this.#db.handle,
+        condition.id,
+        `superseded by ${decision.transition} alert state`,
       );
       this.#outbox.enqueue({
         deliveryPartId: alert.deliveryPartId,
@@ -918,7 +1002,7 @@ export class Daemon {
         ordinal: 5,
         payload: { type: 'text', text: alert.text },
       });
-    }
+    });
   }
 
   async #tickDigest(): Promise<void> {
@@ -1002,10 +1086,11 @@ export class Daemon {
         baseUrl: this.#options.loaded.config.telegram.apiBaseUrl,
       });
       this.#chatId = secrets.chatId;
+      this.#botScope = telegramBotScope(secrets.token);
       if (this.#telegramUnavailable) {
         this.#enqueueText(
           '🟢 Доступ к Telegram восстановлен — отправляю накопленные сообщения.',
-          'notice:telegram-access-recovered',
+          `notice:telegram-access-recovered:${Date.now()}`,
         );
       }
       this.#telegramUnavailable = false;
@@ -1043,6 +1128,7 @@ export class Daemon {
     const client = this.#client;
     this.#client = null;
     this.#chatId = null;
+    this.#botScope = null;
     client?.close();
   }
 
@@ -1073,6 +1159,51 @@ export function releaseInterruptedJob(db: Database['handle'], jobId: string, err
             last_error = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
       WHERE job_id = ? AND state = 'leased'`,
   ).run(now, `daemon shutdown: ${(error as Error).message}`.slice(0, 2000), now, jobId);
+}
+
+export function retireStaleNotices(
+  db: Database['handle'],
+  beforeIso: string,
+  reason = 'superseded operational notice',
+): number {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE telegram_outbox
+          SET state = 'failed', last_error = ?, updated_at = ?
+        WHERE delivery_part_id GLOB 'notice:*'
+          AND state IN ('pending','sending')
+          AND created_at < ?`,
+    )
+    .run(reason.slice(0, 2000), now, beforeIso);
+  return Number(result.changes);
+}
+
+export function retirePendingAlertDeliveries(
+  db: Database['handle'],
+  alertId: AlertId,
+  reason = 'superseded alert notification',
+): number {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE telegram_outbox
+          SET state = 'failed', last_error = ?, updated_at = ?
+        WHERE kind = 'alert' AND state = 'pending'
+          AND delivery_part_id GLOB ?`,
+    )
+    .run(reason.slice(0, 2000), now, `alert:${alertId}:*`);
+  return Number(result.changes);
+}
+
+export function shouldEnqueueHealthAlert(
+  alertId: AlertId,
+  transition: 'raised' | 'cleared' | 'repeated',
+): boolean {
+  // An outage cannot report itself through the unavailable channel. Queueing
+  // the warning only makes a stale warning arrive after recovery and can grow
+  // the very backlog it describes. The recovery edge remains useful.
+  return alertId !== 'telegram_delivery' || transition === 'cleared';
 }
 
 export function markExhaustedAsrSession(
@@ -1215,39 +1346,86 @@ export async function releaseDaemonPid(pidFile: string, expectedPid: number): Pr
   await rm(pidFile, { force: true });
 }
 
-interface IncomingFileRow {
-  readonly fileUid: string;
-  readonly state: string;
-  readonly quarantinePath: string | null;
-  readonly normalizedPath: string | null;
-}
-
 export function findIncomingFile(
   db: Database['handle'],
   telegramUniqueId: string,
+  botScope = 'legacy',
 ): IncomingFileRow | undefined {
-  const row = db
-    .prepare(
-      `SELECT file_uid, state, quarantine_path, normalized_path
-         FROM incoming_telegram_files
-        WHERE telegram_unique_id = ?`,
-    )
-    .get(telegramUniqueId) as
-    | {
-        file_uid: string;
-        state: string;
-        quarantine_path: string | null;
-        normalized_path: string | null;
-      }
-    | undefined;
-  return row === undefined
-    ? undefined
-    : {
-        fileUid: row.file_uid,
-        state: row.state,
-        quarantinePath: row.quarantine_path,
-        normalizedPath: row.normalized_path,
-      };
+  return new IncomingFileRepository(db).findByTelegramUniqueId(telegramUniqueId, botScope);
+}
+
+/**
+ * Claims the stable local identity and the Telegram-supplied provenance before
+ * any network download. The claimed filename remains display-only.
+ */
+export function claimIncomingRequest(
+  db: Database['handle'],
+  updateId: number,
+  message: TelegramMessage,
+  daemonHost: string,
+  botScope = 'legacy',
+): IncomingFileRow | null {
+  const attachment = extractAttachment(message);
+  if (attachment === null) return null;
+  return new IncomingFileRepository(db).claim({
+    telegramFileId: attachment.fileId,
+    telegramUniqueId: attachment.fileUniqueId,
+    chatId: message.chat.id,
+    messageId: message.message_id,
+    botScope,
+    updateId,
+    telegramSource: message.forward_origin === undefined ? 'direct' : 'forwarded',
+    attachmentType: attachment.source,
+    claimedFilename: attachment.claimedFilename ?? null,
+    telegramMessageAt: telegramTimestampIso(message.date, 'message.date'),
+    originalSentAt:
+      message.forward_origin === undefined
+        ? null
+        : telegramTimestampIso(message.forward_origin.date, 'forward_origin.date'),
+    daemonHost,
+    declaredBytes: attachment.declaredBytes ?? null,
+    declaredMime: attachment.declaredMime ?? null,
+  });
+}
+
+/** Claim, enqueue, acknowledge and handle one update as one crash-consistent unit. */
+export function enqueueIncomingRequest(
+  db: Database['handle'],
+  updateId: number,
+  message: TelegramMessage,
+  daemonHost: string,
+  botScope = 'legacy',
+): IncomingFileRow {
+  return transaction(db, () => {
+    const incoming = claimIncomingRequest(db, updateId, message, daemonHost, botScope);
+    if (incoming === null) throw new Error('incoming audio update has no supported attachment');
+    new JobQueue(db).enqueue({
+      kind: 'incoming_audio',
+      idempotencyKey: scopedUpdateKey('incoming', botScope, updateId),
+      payload: { updateId, botScope, fileUid: incoming.fileUid, message },
+    });
+    new Outbox(db).enqueue({
+      deliveryPartId: scopedUpdateKey('ack', botScope, updateId),
+      kind: 'status',
+      ordinal: 1,
+      payload: {
+        type: 'text',
+        text: `🎧 Принято, распознаю локально…\n\n${renderProvenanceHtml(incomingTelegramProvenance(incoming))}`,
+        parseMode: 'HTML',
+      },
+    });
+    markUpdateHandled(db, updateId, botScope);
+    return incoming;
+  });
+}
+
+function scopedUpdateKey(prefix: string, botScope: string, updateId: number): string {
+  return botScope === 'legacy' ? `${prefix}:${updateId}` : `${prefix}:${botScope}:${updateId}`;
+}
+
+function telegramTimestampIso(seconds: number, field: string): string {
+  if (!Number.isFinite(seconds)) throw new Error(`Telegram ${field} must be a finite number`);
+  return new Date(seconds * 1000).toISOString();
 }
 
 interface IncomingDownloadInput {
@@ -1325,6 +1503,24 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function ensureIncomingWav(
+  ffmpegPath: string,
+  quarantinePath: string,
+  quarantineDir: string,
+  incoming: IncomingFileRow,
+): Promise<string> {
+  const wavPath = incoming.normalizedPath ?? join(quarantineDir, `${incoming.fileUid}.16k.wav`);
+  if (incoming.normalizedPath === null) {
+    // A pre-atomic-version crash may have left this deterministic path partial.
+    await rm(wavPath, { force: true });
+  }
+  if (await pathExists(wavPath)) return wavPath;
+  if (!(await normalizeToWav(ffmpegPath, quarantinePath, wavPath))) {
+    throw new IncomingRejected('corrupt_media', 'could not decode the audio');
+  }
+  return wavPath;
 }
 
 function processCommand(pid: number): Promise<string | null> {

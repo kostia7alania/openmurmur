@@ -124,8 +124,8 @@ export function safeExtension(claimedFilename: string | undefined): string | nul
 export function quarantinePathFor(
   quarantineDir: string,
   claimedFilename: string | undefined,
+  fileUid: string = randomUUID(),
 ): { fileUid: string; path: string } {
-  const fileUid = randomUUID();
   const ext = safeExtension(claimedFilename) ?? '.bin';
   const path = join(quarantineDir, `${fileUid}${ext}`);
   assertContained(quarantineDir, path);
@@ -168,6 +168,7 @@ export async function downloadToQuarantine(
   attachment: ExtractedAttachment,
   quarantineDir: string,
   limits: DownloadLimits,
+  fileUid?: string,
 ): Promise<DownloadResult> {
   if (
     attachment.declaredBytes !== undefined &&
@@ -200,7 +201,8 @@ export async function downloadToQuarantine(
     );
   }
 
-  const { fileUid, path } = quarantinePathFor(quarantineDir, attachment.claimedFilename);
+  const target = quarantinePathFor(quarantineDir, attachment.claimedFilename, fileUid);
+  const { path } = target;
   const response = await client.downloadFile(file.file_path);
   if (response.body === null) {
     throw new IncomingRejected('corrupt_media', 'Telegram returned an empty body');
@@ -238,7 +240,7 @@ export async function downloadToQuarantine(
     await rm(path, { force: true });
     throw new IncomingRejected('corrupt_media', 'downloaded file is empty');
   }
-  return { fileUid, path, actualBytes: info.size };
+  return { fileUid: target.fileUid, path, actualBytes: info.size };
 }
 
 export interface ProbeResult {

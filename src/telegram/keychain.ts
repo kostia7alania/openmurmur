@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 /**
  * Secrets live in the macOS Keychain, never in the config file, argv, the
@@ -177,6 +178,11 @@ async function deleteSecret(account: string): Promise<void> {
 export interface TelegramSecrets {
   readonly token: string;
   readonly chatId: number;
+}
+
+/** Stable, non-secret credential identity used to scope Telegram update state. */
+export function telegramBotScope(token: string): string {
+  return createHash('sha256').update(token, 'utf8').digest('hex').slice(0, 32);
 }
 
 export interface SecretStorageBackend {

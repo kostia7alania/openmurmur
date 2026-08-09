@@ -12,6 +12,7 @@ import {
 } from '../../src/database/db.ts';
 import {
   countWords,
+  IncomingFileRepository,
   SessionRepository,
   TranscriptRepository,
 } from '../../src/database/repository.ts';
@@ -97,6 +98,98 @@ describe('migrations', () => {
 
   it('has FTS5 with the trigram tokenizer available', () => {
     assert.doesNotThrow(() => db.handle.prepare('SELECT count(*) FROM transcript_fts').get());
+  });
+
+  it('adds durable live and incoming provenance columns', () => {
+    const sessionColumns = new Set(
+      (db.handle.prepare('PRAGMA table_info(audio_sessions)').all() as { name: string }[]).map(
+        (row) => row.name,
+      ),
+    );
+    const incomingColumns = new Set(
+      (
+        db.handle.prepare('PRAGMA table_info(incoming_telegram_files)').all() as { name: string }[]
+      ).map((row) => row.name),
+    );
+    assert.ok(sessionColumns.has('capture_host'));
+    assert.ok(sessionColumns.has('capture_timezone'));
+    for (const column of [
+      'bot_scope',
+      'update_id',
+      'telegram_source',
+      'attachment_type',
+      'claimed_filename',
+      'telegram_message_at',
+      'original_sent_at',
+      'daemon_host',
+    ]) {
+      assert.ok(incomingColumns.has(column), `missing provenance column ${column}`);
+    }
+    const updatePrimaryKey = db.handle.prepare('PRAGMA table_info(telegram_updates)').all() as {
+      name: string;
+      pk: number;
+    }[];
+    assert.deepEqual(
+      updatePrimaryKey
+        .filter((column) => column.pk > 0)
+        .sort((a, b) => a.pk - b.pk)
+        .map((column) => column.name),
+      ['bot_scope', 'update_id'],
+    );
+  });
+});
+
+describe('output provenance persistence', () => {
+  it('persists the original capture host and timezone with a live session', () => {
+    const sessions = new SessionRepository(db.handle);
+    sessions.create('live-1', '2026-08-09T10:00:00.000Z', {
+      hostName: 'studio-mac',
+      timezone: 'Europe/Moscow',
+    });
+    const row = sessions.get('live-1');
+    assert.equal(row?.capture_host, 'studio-mac');
+    assert.equal(row?.capture_timezone, 'Europe/Moscow');
+  });
+
+  it('claims one stable incoming UID with distinct forwarded and Telegram dates', () => {
+    const incoming = new IncomingFileRepository(db.handle);
+    const first = incoming.claim({
+      telegramFileId: 'file-id',
+      telegramUniqueId: 'telegram-unique',
+      chatId: 42,
+      messageId: 10,
+      updateId: 99,
+      telegramSource: 'forwarded',
+      attachmentType: 'document',
+      claimedFilename: '<unsafe>.mp3',
+      telegramMessageAt: '2026-08-09T12:00:00.000Z',
+      originalSentAt: '2026-08-08T08:00:00.000Z',
+      daemonHost: 'studio-mac',
+      declaredBytes: 12,
+      declaredMime: 'audio/mpeg',
+    });
+    const replay = incoming.claim({
+      telegramFileId: 'new-file-id',
+      telegramUniqueId: 'telegram-unique',
+      chatId: 42,
+      messageId: 11,
+      updateId: 100,
+      telegramSource: 'direct',
+      attachmentType: 'audio',
+      claimedFilename: 'replacement.mp3',
+      telegramMessageAt: '2026-08-10T12:00:00.000Z',
+      originalSentAt: null,
+      daemonHost: 'other-host',
+      declaredBytes: null,
+      declaredMime: null,
+    });
+
+    assert.equal(replay.fileUid, first.fileUid);
+    assert.equal(replay.updateId, 99, 'a resend must not rewrite the original request identity');
+    assert.equal(replay.telegramSource, 'forwarded');
+    assert.equal(replay.originalSentAt, '2026-08-08T08:00:00.000Z');
+    assert.equal(replay.telegramMessageAt, '2026-08-09T12:00:00.000Z');
+    assert.equal(replay.claimedFilename, '<unsafe>.mp3');
   });
 });
 

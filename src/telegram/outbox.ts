@@ -54,7 +54,7 @@ interface OutboxRow {
   max_attempts: number;
 }
 
-export type OutboxState = 'pending' | 'sending' | 'sent' | 'dead';
+export type OutboxState = 'pending' | 'sending' | 'sent' | 'failed' | 'dead';
 
 const nowIso = () => new Date().toISOString();
 const isoIn = (ms: number) => new Date(Date.now() + ms).toISOString();

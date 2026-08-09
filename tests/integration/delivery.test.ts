@@ -28,6 +28,7 @@ import { FakeLlm } from '../../src/llm/ollama.ts';
 import { EMPTY_SUMMARY } from '../../src/llm/schema.ts';
 import { nullLogger } from '../../src/logging/logger.ts';
 import { planRetention } from '../../src/retention/policy.ts';
+import { formatClock } from '../../src/telegram/format.ts';
 import { Outbox } from '../../src/telegram/outbox.ts';
 
 /**
@@ -66,7 +67,7 @@ function seedFinalizedSession(id: string, partCount = 1, bytesPerPart = 2048): s
   const parts = new PartRepository(db.handle);
   const nowIso = new Date().toISOString();
 
-  sessions.create(id, nowIso);
+  sessions.create(id, nowIso, { hostName: 'test-mac', timezone: 'Europe/Moscow' });
   sessions.finalize(id, nowIso, 60_000, 30_000, partCount);
 
   const created: string[] = [];
@@ -277,11 +278,42 @@ describe('delivery enqueue', () => {
     const row = db.handle
       .prepare("SELECT payload FROM telegram_outbox WHERE kind = 'audio'")
       .get() as { payload: string };
-    const payload = JSON.parse(row.payload) as { type: string; path: string; filename: string };
+    const payload = JSON.parse(row.payload) as {
+      type: string;
+      path: string;
+      filename: string;
+      caption: string;
+    };
 
     assert.equal(payload.type, 'document');
     assert.equal(payload.path, files[0], 'the source file itself is uploaded');
     assert.ok(payload.filename.endsWith('.flac'));
+    assert.match(payload.caption, /фоновая запись OpenMurmur/);
+    assert.match(payload.caption, /test-mac/);
+    assert.match(payload.caption, /Europe\/Moscow/);
+    assert.match(payload.caption, /Session UID: <code>s1<\/code>/);
+  });
+
+  it('renders report times in the persisted capture timezone', async () => {
+    seedFinalizedSession('s1');
+    await transcribeAndSummarize('s1');
+    await enqueueSessionDelivery(db.handle, {
+      sessionId: 's1',
+      summary: EMPTY_SUMMARY,
+      config: CONFIG,
+      paths: paths(),
+    });
+
+    const session = new SessionRepository(db.handle).get('s1');
+    assert.ok(session);
+    const row = db.handle
+      .prepare("SELECT payload FROM telegram_outbox WHERE kind = 'report'")
+      .get() as { payload: string };
+    const payload = JSON.parse(row.payload) as { text: string };
+    assert.match(
+      payload.text,
+      new RegExp(`Время: ${formatClock(Date.parse(session.started_at), 'Europe/Moscow')}`),
+    );
   });
 
   it('is idempotent: re-running enqueues nothing new', async () => {
@@ -469,7 +501,8 @@ describe('delivery enqueue', () => {
     const transcriptFile = join(dir, 'transcripts', 's1.md');
     assert.ok(existsSync(transcriptFile));
     const transcriptPayload = JSON.parse(md.payload) as { caption: string };
-    assert.equal(transcriptPayload.caption, '📝 Транскрипт с таймингами');
+    assert.match(transcriptPayload.caption, /^📝 Транскрипт с таймингами/);
+    assert.match(transcriptPayload.caption, /Session UID: <code>s1<\/code>/);
     assert.match(readFileSync(transcriptFile, 'utf8'), /0:00 {2}слово/);
   });
 
@@ -547,6 +580,8 @@ describe('delivery enqueue', () => {
     assert.equal(payload.filename, 's1.report.md');
     assert.ok(existsSync(payload.path));
     const report = readFileSync(payload.path, 'utf8');
+    assert.match(report, /Источник: фоновая запись OpenMurmur/);
+    assert.match(report, /Session UID: `s1`/);
     assert.match(report, /## Таймлайн\n/);
     assert.doesNotMatch(report, /Голос 1:/, 'отчёт не должен выдумывать голоса');
   });

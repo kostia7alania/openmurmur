@@ -42,6 +42,8 @@ One row per logical session.
 | `part_count` | Number of successfully finalized archive parts. After a partial encoder/finalization failure this is the surviving deliverable count, not the number of attempted `audio_parts` rows. |
 | `rejection_reason` | `insufficient_speech`, `insufficient_words`, `asr_empty`; terminal failures currently use `asr_failed` or `audio_finalize_failed` in the same diagnostic column. |
 | `languages` | JSON array, filled after ASR. |
+| `capture_host` | Daemon hostname captured when the live session opened; nullable only for legacy rows. |
+| `capture_timezone` | Resolved IANA timezone captured with the session so its original wall time remains reproducible; nullable for legacy rows. |
 
 ### `audio_parts`
 
@@ -154,21 +156,34 @@ Long reports and digests are document payloads pointing only at trusted
 
 ### `telegram_updates` and `telegram_offset`
 
-`telegram_updates.update_id` is Telegram's own id as the primary key. A row is
-first recorded as unhandled, then marked handled only after its durable action
-exists. Redelivery of a handled update is ignored; an unhandled row is replayed
-so a crash between deduplication and enqueue cannot silently skip it. The work
-created during replay has its own stable idempotency key.
+`telegram_updates` is keyed by `(bot_scope, update_id)`. `bot_scope` is a
+non-secret fingerprint of the Keychain credential; `update_id` is Telegram's
+own id within that bot. A row is first recorded as unhandled, then marked
+handled only after its durable action exists. Redelivery of a handled update is
+ignored; an unhandled row is replayed so a crash between deduplication and
+enqueue cannot silently skip it. The work created during replay uses the same
+bot scope in its stable idempotency key.
 
-`telegram_offset` is a single-row table (`CHECK (id = 1)`) holding the
-`getUpdates` offset. Persisting it means a restart neither replays an hour of
-updates nor skips the ones that arrived while down.
+`telegram_offset` holds one `getUpdates` cursor per `bot_scope`. Persisting it
+means a restart neither replays an hour of updates nor skips the ones that
+arrived while down, while rebinding the same data root to a different bot
+cannot inherit the previous bot's cursor.
 
 ### `incoming_telegram_files`
 
 Audio a user sent the bot. `file_uid` is **our** UUID — Telegram's filename
 never reaches the filesystem. `telegram_unique_id` is `UNIQUE`, so resending the
 same file is recognized.
+
+Provenance is durable rather than reconstructed during delivery: `bot_scope`
+plus `update_id` and the existing `message_id` identify the request;
+`telegram_source` distinguishes direct from forwarded input;
+`attachment_type` records voice/audio/document/video-note; `telegram_message_at`
+is when the message reached the bot chat, while nullable `original_sent_at` is
+Telegram's `forward_origin.date`; `daemon_host` identifies the claiming daemon.
+`claimed_filename` is untrusted display metadata only. Renderers bound and
+escape it; it never controls routing or a command. Provenance columns remain
+NULL on legacy rows and are displayed as unknown rather than backfilled.
 
 `state`: `received` → `downloaded` → `validated` → `transcribed` → `delivered`,
 or `rejected` / `failed`.
@@ -208,8 +223,9 @@ by tests.
 7. `telegram_outbox.delivery_part_id` is unique, so a logical delivery unit is
    enqueued at most once. Telegram acceptance remains at-least-once across the
    network/SQLite acknowledgement window.
-8. `telegram_updates.update_id` is unique; handled updates are ignored and
-   unhandled updates are safely re-driven through idempotent work keys.
+8. `(telegram_updates.bot_scope, update_id)` is unique; handled updates are
+   ignored and unhandled updates are safely re-driven through bot-scoped
+   idempotent work keys.
 9. `deleted_at` is set only after `rm` succeeded.
 10. All timestamps are UTC.
 

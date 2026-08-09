@@ -287,7 +287,10 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Epic:** Health
 - **User value:** Told when recording breaks — once, not 720 times an hour.
 - **Scope:** Edge-triggered alerts, stable alert ids, cooldown, deduplication,
-  recovery messages.
+  recovery messages. Delivery-channel failures stay visible in local logs and
+  `/health` but do not enqueue warnings into the failed channel itself; one
+  recovery edge is sent after the backlog clears. New pending alert states
+  supersede older unsent reminders.
 - **Acceptance:** A condition true for an hour produces at most one message per
   cooldown; clearing produces exactly one recovery message.
 - **Dependencies:** P0-04 · **Risk:** low · **Estimate:** M
@@ -390,6 +393,30 @@ suite. AR-07 and AR-14 remain untouched.
 - **Tests:** Boundary tests at 4095/4096/4097 UTF-16 code units, maximal schema
   output, emoji/combining marks, HTML/Markdown injection, and retry after a
   transient Telegram failure.
+
+#### UX-05 🟡 Make every recording artefact self-identifying
+
+- **Severity:** P1 · **Epic:** Telegram UX/data provenance · **Estimate:** M
+- **User value:** An audio file, transcript, report or incoming-file reply can
+  be understood after forwarding or saving it outside the original chat thread.
+- **Scope:** Live-capture outputs carry source type, capture daemon host and IANA
+  timezone, original wall date/time and session UID. Incoming Telegram outputs
+  distinguish direct from forwarded audio, retain both original-forward and
+  bot-chat message dates, daemon host, display-only claimed filename, update and
+  message ids, attachment type and stable file UID. Legacy unknown facts remain
+  explicitly unknown rather than being backfilled from the current host.
+- **Non-goals:** Using a claimed filename in a command, archive path or routing
+  decision; identifying a speaker/person; inventing provenance for old rows.
+- **Acceptance:** Ack, source-audio caption, transcript and report/file caption
+  contain their compact provenance without exceeding Telegram limits. Stored
+  provenance survives retries and host migration. Every untrusted display value
+  is bounded and escaped; original forwarded time and bot delivery time remain
+  distinct.
+- **Dependencies:** AR-02, AR-09, AR-15.
+- **Tests:** Migration from a legacy database; direct and all official forwarded
+  origin variants; hostile/control-character filename rendering; retry keeps
+  one file UID and original request identity; live host/timezone persistence;
+  HTML, Markdown and caption bounds.
 
 #### UX-04 🟡 Collapsed transcript and report presentation
 
@@ -542,6 +569,26 @@ suite. AR-07 and AR-14 remain untouched.
 - **Tests:** Delayed/wedged VAD, pipe backpressure, slow part close, queue
   saturation, encoder early exit, and monotonic timing tests using a fake clock
   rather than sleeps.
+
+#### AR-15 ⬜ Designate one input owner per Telegram bot token
+
+- **Severity:** P0 · **Epic:** Multi-host Telegram routing · **Estimate:** M
+- **Risk:** Two daemons polling `getUpdates` with independent SQLite offsets for
+  one bot token race for updates. Either host can consume an update the other
+  never sees, so incoming work and acknowledgements have no reliable owner.
+- **Acceptance:** Configuration expresses one role per instance. For each bot
+  token exactly one designated input worker may poll and enqueue incoming work;
+  every other host using that token is send-only. Because instances do not
+  share a coordinator, the current `receiveUpdates` role is operator-enforced;
+  closing this item still requires shared ownership/conflict detection or an
+  equally strong startup check. Every
+  outgoing message and acknowledgement identifies daemon host, source and
+  request identity. Separate bots remain the documented isolation alternative.
+- **Dependencies:** AR-04, UX-05.
+- **Tests:** Two configured instances sharing one token prove exclusive update
+  ownership once coordination exists; local tests prove send-only hosts never
+  poll; role/config validation covers missing and conflicting ownership;
+  separate-token instances remain independent.
 
 ### Delivery, operations, and observability repairs
 

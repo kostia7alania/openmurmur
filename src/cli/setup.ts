@@ -9,7 +9,12 @@ import { DEFAULT_CONFIG } from '../config/schema.ts';
 import { openDatabase } from '../database/db.ts';
 import type { TelegramUpdate } from '../telegram/client.ts';
 import { TelegramClient } from '../telegram/client.ts';
-import { keychain, type SecretsStore, type TelegramSecrets } from '../telegram/keychain.ts';
+import {
+  keychain,
+  type SecretsStore,
+  type TelegramSecrets,
+  telegramBotScope,
+} from '../telegram/keychain.ts';
 import { nextOffsetFor, readOffset, writeOffset } from '../telegram/router.ts';
 
 /**
@@ -186,14 +191,17 @@ export async function commitTelegramSetup(
   confirmDelivery: () => Promise<unknown>,
 ): Promise<void> {
   const previousSecrets = await store.load();
-  const previousOffset = readOffset(db);
+  const newBotScope = telegramBotScope(secrets.token);
+  const previousBotScope =
+    previousSecrets === null ? 'legacy' : telegramBotScope(previousSecrets.token);
+  const previousOffset = readOffset(db, previousBotScope);
   let stored = false;
   let offsetWritten = false;
 
   try {
     await store.storeSecrets(secrets);
     stored = true;
-    writeOffset(db, nextOffset);
+    writeOffset(db, nextOffset, newBotScope);
     offsetWritten = true;
     await confirmDelivery();
   } catch (error) {
@@ -208,7 +216,7 @@ export async function commitTelegramSetup(
 
     let offsetRestored = !offsetWritten;
     try {
-      writeOffset(db, previousOffset);
+      writeOffset(db, previousOffset, previousBotScope);
       offsetRestored = true;
     } catch (rollbackError) {
       rollbackErrors.push(rollbackError);

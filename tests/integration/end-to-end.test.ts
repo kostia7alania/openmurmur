@@ -157,6 +157,8 @@ function recorderFor(script: readonly ScriptedSegment[], overrides = {}, ffmpegP
     capture,
     vad: new EnergyVad(),
     logger: nullLogger,
+    captureHost: 'test-capture-mac',
+    captureTimezone: 'Asia/Bangkok',
     onFirstFrame: () => {
       firstFrameSeen = true;
     },
@@ -197,6 +199,9 @@ describe('end to end: capture through delivery, without a microphone', () => {
     assert.equal(rows.length, 1, 'exactly one session');
     const sessionId = rows[0]?.session_id ?? '';
     assert.equal(rows[0]?.state, 'PROCESSING');
+    const provenance = sessions.get(sessionId);
+    assert.equal(provenance?.capture_host, 'test-capture-mac');
+    assert.equal(provenance?.capture_timezone, 'Asia/Bangkok');
     assert.deepEqual(startedSessions, [sessionId], 'one durable start event per session');
     assert.deepEqual(finalizedSessions, [sessionId], 'one durable finish event per session');
     const lifecycle = db.handle

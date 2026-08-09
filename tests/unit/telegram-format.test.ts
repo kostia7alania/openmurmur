@@ -14,11 +14,69 @@ import {
   TELEGRAM_MESSAGE_LIMIT,
 } from '../../src/telegram/format.ts';
 import {
+  renderProvenanceHtml,
+  renderProvenanceMarkdown,
+  renderProvenancePlain,
+} from '../../src/telegram/provenance.ts';
+import {
   renderSessionReport,
   renderSessionReportMarkdown,
   renderSessionSummaryPreview,
   renderStatus,
 } from '../../src/telegram/report.ts';
+
+describe('output provenance', () => {
+  it('labels a live capture with its persisted host, timezone, wall time and UID', () => {
+    const provenance = {
+      kind: 'live_capture' as const,
+      hostName: 'Kostia <Mac>',
+      timezone: 'Europe/Moscow',
+      originalAt: '2026-08-09T10:00:00.000Z',
+      sessionId: 'session-1',
+    };
+    const html = renderProvenanceHtml(provenance);
+    assert.match(html, /фоновая запись OpenMurmur/);
+    assert.match(html, /Kostia &lt;Mac&gt;/);
+    assert.match(html, /Europe\/Moscow/);
+    assert.match(html, /Session UID: <code>session-1<\/code>/);
+  });
+
+  it('keeps a forwarded filename display-only, bounded and escaped', () => {
+    const provenance = {
+      kind: 'telegram_audio' as const,
+      hostName: '&'.repeat(1000),
+      telegramSource: 'forwarded' as const,
+      attachmentType: 'document' as const,
+      telegramMessageAt: '2026-08-09T12:00:00.000Z',
+      originalSentAt: '2026-08-08T08:00:00.000Z',
+      claimedFilename: `<b>../../secret\u0000</b>${'👨‍👩‍👧‍👦'.repeat(500)}.mp3`,
+      updateId: 99,
+      messageId: 10,
+      fileUid: 'file-uid',
+    };
+    const html = renderProvenanceHtml(provenance);
+    assert.match(html, /пересланное аудио из Telegram \(document\)/);
+    assert.match(html, /Telegram update\/message: <code>99\/10<\/code>/);
+    assert.match(html, /File UID: <code>file-uid<\/code>/);
+    assert.ok(!html.includes('<b>../../secret'));
+    assert.ok(!html.includes('\u0000'));
+    assert.ok(html.length <= 1024, 'the provenance must fit a Telegram caption by UTF-16 units');
+    assert.match(renderProvenancePlain(provenance), /File UID: file-uid/);
+    assert.match(renderProvenanceMarkdown(provenance), /- File UID: `file-uid`/);
+  });
+
+  it('renders missing legacy provenance as unknown instead of inventing current facts', () => {
+    const html = renderProvenanceHtml({
+      kind: 'live_capture',
+      hostName: null,
+      timezone: null,
+      originalAt: '2026-08-09T10:00:00.000Z',
+      sessionId: 'legacy',
+    });
+    assert.match(html, /Демон: <code>неизвестно<\/code>/);
+    assert.match(html, /неизвестно timezone/);
+  });
+});
 
 describe('HTML escaping', () => {
   it('escapes the characters Telegram treats as markup', () => {

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import {
   claimDaemonPid,
   commandLooksLikeOpenMurmurDaemon,
+  enqueueIncomingRequest,
   expectedDigestIsMissing,
   findIncomingFile,
   incomingFileUidFromDeliveryPart,
@@ -16,9 +17,14 @@ import {
   recordIncomingDownload,
   releaseDaemonPid,
   releaseInterruptedJob,
+  retirePendingAlertDeliveries,
+  retireStaleNotices,
+  shouldEnqueueHealthAlert,
 } from '../../src/cli/daemon.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
+import { Outbox } from '../../src/telegram/outbox.ts';
+import { recordUpdate } from '../../src/telegram/router.ts';
 
 let dir: string;
 let db: Database;
@@ -71,6 +77,140 @@ describe('daemon PID ownership', () => {
 });
 
 describe('incoming Telegram retry identity', () => {
+  it('claims direct provenance before atomically queueing the job and acknowledgement', () => {
+    const message = {
+      message_id: 10,
+      date: Date.parse('2025-08-09T12:00:00.000Z') / 1000,
+      chat: { id: 42, type: 'private' },
+      audio: {
+        file_id: 'telegram-file-direct',
+        file_unique_id: 'telegram-unique-direct',
+        file_name: 'meeting <one>.mp3',
+        mime_type: 'audio/mpeg',
+      },
+    };
+    assert.equal(recordUpdate(db.handle, 501, 'audio'), true);
+
+    const claimed = enqueueIncomingRequest(db.handle, 501, message, 'capture-mac');
+
+    assert.equal(claimed.telegramSource, 'direct');
+    assert.equal(claimed.originalSentAt, null);
+    assert.equal(claimed.telegramMessageAt, '2025-08-09T12:00:00.000Z');
+    assert.equal(claimed.claimedFilename, 'meeting <one>.mp3');
+    assert.equal(claimed.daemonHost, 'capture-mac');
+    const job = db.handle
+      .prepare("SELECT payload FROM jobs WHERE idempotency_key = 'incoming:501'")
+      .get() as { payload: string };
+    assert.equal((JSON.parse(job.payload) as { fileUid: string }).fileUid, claimed.fileUid);
+    const ack = db.handle
+      .prepare("SELECT payload FROM telegram_outbox WHERE delivery_part_id = 'ack:501'")
+      .get() as { payload: string };
+    const ackText = (JSON.parse(ack.payload) as { text: string }).text;
+    assert.match(ackText, /загруженное аудио из Telegram/);
+    assert.match(ackText, /capture-mac/);
+    assert.match(ackText, new RegExp(claimed.fileUid));
+    const update = db.handle
+      .prepare('SELECT handled FROM telegram_updates WHERE update_id = 501')
+      .get() as { handled: number };
+    assert.equal(update.handled, 1);
+
+    enqueueIncomingRequest(db.handle, 501, message, 'different-host-on-replay');
+    const jobCount = db.handle
+      .prepare("SELECT count(*) AS count FROM jobs WHERE idempotency_key = 'incoming:501'")
+      .get() as { count: number };
+    assert.equal(jobCount.count, 1);
+    assert.equal(findIncomingFile(db.handle, 'telegram-unique-direct')?.daemonHost, 'capture-mac');
+  });
+
+  it('keeps message and original dates distinct for every forwarded origin variant', () => {
+    const originTypes = ['user', 'hidden_user', 'chat', 'channel'] as const;
+    for (const [index, type] of originTypes.entries()) {
+      const updateId = 600 + index;
+      const message = {
+        message_id: 20 + index,
+        date: Date.parse('2025-08-09T12:00:00.000Z') / 1000,
+        chat: { id: 42, type: 'private' },
+        forward_origin: {
+          type,
+          date: Date.parse('2025-08-08T12:00:00.000Z') / 1000,
+        },
+        voice: {
+          file_id: `telegram-file-${type}`,
+          file_unique_id: `telegram-unique-${type}`,
+        },
+      };
+      assert.equal(recordUpdate(db.handle, updateId, 'audio'), true);
+
+      const claimed = enqueueIncomingRequest(db.handle, updateId, message, 'forward-host');
+
+      assert.equal(claimed.telegramSource, 'forwarded');
+      assert.equal(claimed.telegramMessageAt, '2025-08-09T12:00:00.000Z');
+      assert.equal(claimed.originalSentAt, '2025-08-08T12:00:00.000Z');
+      assert.equal(claimed.updateId, updateId);
+    }
+  });
+
+  it('does not collide incoming work when another bot reuses an update id', () => {
+    const firstMessage = {
+      message_id: 40,
+      date: Date.parse('2025-08-09T12:00:00.000Z') / 1000,
+      chat: { id: 42, type: 'private' },
+      voice: { file_id: 'bot-a-file', file_unique_id: 'bot-a-unique' },
+    };
+    const secondMessage = {
+      ...firstMessage,
+      message_id: 41,
+      voice: { file_id: 'bot-b-file', file_unique_id: 'bot-b-unique' },
+    };
+    assert.equal(recordUpdate(db.handle, 800, 'audio', 'bot-a'), true);
+    assert.equal(recordUpdate(db.handle, 800, 'audio', 'bot-b'), true);
+
+    const first = enqueueIncomingRequest(db.handle, 800, firstMessage, 'host-a', 'bot-a');
+    const second = enqueueIncomingRequest(db.handle, 800, secondMessage, 'host-b', 'bot-b');
+
+    assert.notEqual(first.fileUid, second.fileUid);
+    assert.equal(first.botScope, 'bot-a');
+    assert.equal(second.botScope, 'bot-b');
+    const jobs = db.handle
+      .prepare(
+        "SELECT idempotency_key FROM jobs WHERE kind = 'incoming_audio' ORDER BY idempotency_key",
+      )
+      .all() as { idempotency_key: string }[];
+    assert.deepEqual(
+      jobs.map((row) => row.idempotency_key),
+      ['incoming:bot-a:800', 'incoming:bot-b:800'],
+    );
+  });
+
+  it('rolls back the claim and job when acknowledgement enqueue fails', () => {
+    const message = {
+      message_id: 30,
+      date: Date.parse('2025-08-09T12:00:00.000Z') / 1000,
+      chat: { id: 42, type: 'private' },
+      voice: { file_id: 'rollback-file', file_unique_id: 'rollback-unique' },
+    };
+    assert.equal(recordUpdate(db.handle, 700, 'audio'), true);
+    db.handle.exec(`CREATE TRIGGER fail_incoming_ack
+      BEFORE INSERT ON telegram_outbox
+      WHEN NEW.delivery_part_id = 'ack:700'
+      BEGIN SELECT RAISE(ABORT, 'simulated ack failure'); END`);
+
+    assert.throws(
+      () => enqueueIncomingRequest(db.handle, 700, message, 'rollback-host'),
+      /simulated ack failure/,
+    );
+
+    assert.equal(findIncomingFile(db.handle, 'rollback-unique'), undefined);
+    const jobCount = db.handle
+      .prepare("SELECT count(*) AS count FROM jobs WHERE idempotency_key = 'incoming:700'")
+      .get() as { count: number };
+    assert.equal(jobCount.count, 0);
+    const update = db.handle
+      .prepare('SELECT handled FROM telegram_updates WHERE update_id = 700')
+      .get() as { handled: number };
+    assert.equal(update.handled, 0);
+  });
+
   it('keeps one file_uid for every telegram_unique_id across retries', () => {
     const attachment = {
       fileId: 'telegram-file-1',
@@ -158,6 +298,111 @@ describe('incoming Telegram retry identity', () => {
 });
 
 describe('daemon terminal state reconciliation', () => {
+  it('retires prior-run notices and preserves current and durable session statuses', () => {
+    const outbox = new Outbox(db.handle);
+    for (const deliveryPartId of [
+      'notice:shutdown:old-pending',
+      'notice:shutdown:old-sending',
+      'notice:recording:old',
+      'session-status:finalized:session-1',
+    ]) {
+      outbox.enqueue({
+        deliveryPartId,
+        kind: 'status',
+        ordinal: 1,
+        payload: { type: 'text', text: deliveryPartId },
+      });
+    }
+    db.handle
+      .prepare(
+        `UPDATE telegram_outbox SET state = 'sending'
+          WHERE delivery_part_id = 'notice:shutdown:old-sending'`,
+      )
+      .run();
+    const cutoff = new Date(Date.now() + 1000).toISOString();
+    outbox.enqueue({
+      deliveryPartId: 'notice:recovery:current',
+      kind: 'status',
+      ordinal: 1,
+      payload: { type: 'text', text: 'current startup notice' },
+    });
+    db.handle
+      .prepare(
+        `UPDATE telegram_outbox SET created_at = ?
+          WHERE delivery_part_id = 'notice:recovery:current'`,
+      )
+      .run(cutoff);
+
+    assert.equal(retireStaleNotices(db.handle, cutoff, 'superseded by startup'), 3);
+
+    const rows = db.handle
+      .prepare(
+        `SELECT delivery_part_id, state, last_error
+           FROM telegram_outbox ORDER BY delivery_part_id`,
+      )
+      .all() as unknown as { delivery_part_id: string; state: string; last_error: string | null }[];
+    assert.deepEqual(
+      rows.map((row) => ({ ...row })),
+      [
+        {
+          delivery_part_id: 'notice:recording:old',
+          state: 'failed',
+          last_error: 'superseded by startup',
+        },
+        {
+          delivery_part_id: 'notice:recovery:current',
+          state: 'pending',
+          last_error: null,
+        },
+        {
+          delivery_part_id: 'notice:shutdown:old-pending',
+          state: 'failed',
+          last_error: 'superseded by startup',
+        },
+        {
+          delivery_part_id: 'notice:shutdown:old-sending',
+          state: 'failed',
+          last_error: 'superseded by startup',
+        },
+        {
+          delivery_part_id: 'session-status:finalized:session-1',
+          state: 'pending',
+          last_error: null,
+        },
+      ],
+    );
+  });
+
+  it('coalesces pending alerts and never queues a stale delivery-down warning', () => {
+    const outbox = new Outbox(db.handle);
+    for (const [deliveryPartId, kind] of [
+      ['alert:telegram_delivery:raise:1', 'alert'],
+      ['alert:telegram_delivery:raise:2', 'alert'],
+      ['alert:asr_backlog:raise:1', 'alert'],
+      ['notice:recording', 'status'],
+    ] as const) {
+      outbox.enqueue({
+        deliveryPartId,
+        kind,
+        ordinal: 1,
+        payload: { type: 'text', text: deliveryPartId },
+      });
+    }
+
+    assert.equal(
+      retirePendingAlertDeliveries(db.handle, 'telegram_delivery', 'newer state wins'),
+      2,
+    );
+    assert.equal(outbox.stateOf('alert:telegram_delivery:raise:1'), 'failed');
+    assert.equal(outbox.stateOf('alert:telegram_delivery:raise:2'), 'failed');
+    assert.equal(outbox.stateOf('alert:asr_backlog:raise:1'), 'pending');
+    assert.equal(outbox.stateOf('notice:recording'), 'pending');
+    assert.equal(shouldEnqueueHealthAlert('telegram_delivery', 'raised'), false);
+    assert.equal(shouldEnqueueHealthAlert('telegram_delivery', 'repeated'), false);
+    assert.equal(shouldEnqueueHealthAlert('telegram_delivery', 'cleared'), true);
+    assert.equal(shouldEnqueueHealthAlert('asr_backlog', 'raised'), true);
+  });
+
   it('returns shutdown-interrupted work without burning its attempt', () => {
     const jobs = new JobQueue(db.handle, 'test-worker');
     const jobId = jobs.enqueue({

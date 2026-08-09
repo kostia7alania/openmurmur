@@ -1,4 +1,5 @@
 import { mkdir } from 'node:fs/promises';
+import { hostname } from 'node:os';
 import type { DatabaseSync } from 'node:sqlite';
 import type { CaptureBackend, CaptureFrame } from '../capture/backend.ts';
 import { PartWriter, partPaths } from '../capture/writer.ts';
@@ -9,6 +10,7 @@ import { PartRepository, SessionRepository } from '../database/repository.ts';
 import { JobQueue } from '../jobs/queue.ts';
 import type { Logger } from '../logging/logger.ts';
 import { Outbox } from '../telegram/outbox.ts';
+import { type LiveCaptureProvenance, renderProvenancePlain } from '../telegram/provenance.ts';
 import { Sessionizer } from './machine.ts';
 import type { SessionIntent } from './types.ts';
 import type { Vad } from './vad.ts';
@@ -30,6 +32,9 @@ export interface RecorderOptions {
   readonly capture: CaptureBackend;
   readonly vad: Vad;
   readonly logger: Logger;
+  /** Persisted provenance; injectable so tests never depend on the test runner host. */
+  readonly captureHost?: string;
+  readonly captureTimezone?: string;
   /** Fired once the first valid audio frame arrives, never before. */
   readonly onFirstFrame?: () => void;
   readonly onSessionStarted?: (sessionId: string) => void;
@@ -50,6 +55,8 @@ export class Recorder {
   readonly #parts: PartRepository;
   readonly #jobs: JobQueue;
   readonly #outbox: Outbox;
+  readonly #captureHost: string;
+  readonly #captureTimezone: string;
 
   /** Raw PCM held for pre-roll, aligned with the sessionizer's frame ring. */
   readonly #preRoll: CaptureFrame[] = [];
@@ -65,6 +72,9 @@ export class Recorder {
     this.#parts = new PartRepository(options.db);
     this.#jobs = new JobQueue(options.db);
     this.#outbox = new Outbox(options.db);
+    this.#captureHost = options.captureHost ?? hostname();
+    this.#captureTimezone =
+      options.captureTimezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   }
 
   get state(): string {
@@ -177,7 +187,10 @@ export class Recorder {
     switch (intent.kind) {
       case 'session_started':
         transaction(this.#options.db, () => {
-          this.#sessions.create(intent.sessionId, new Date(intent.startedWallMs).toISOString());
+          this.#sessions.create(intent.sessionId, new Date(intent.startedWallMs).toISOString(), {
+            hostName: this.#captureHost,
+            timezone: this.#captureTimezone,
+          });
           this.#enqueueLifecycleStatus(
             intent.sessionId,
             'started',
@@ -294,12 +307,20 @@ export class Recorder {
     stage: 'started' | 'finalized' | 'rejected' | 'failed',
     text: string,
   ): void {
+    const session = this.#sessions.get(sessionId);
+    const provenance: LiveCaptureProvenance = {
+      kind: 'live_capture',
+      hostName: session?.capture_host ?? null,
+      timezone: session?.capture_timezone ?? null,
+      originalAt: session?.started_at ?? new Date(0).toISOString(),
+      sessionId,
+    };
     this.#outbox.enqueue({
       deliveryPartId: `session-status:${stage}:${sessionId}`,
       kind: 'status',
       sessionId,
       ordinal: -10,
-      payload: { type: 'text', text },
+      payload: { type: 'text', text: `${text}\n\n${renderProvenancePlain(provenance)}` },
     });
   }
 

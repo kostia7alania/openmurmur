@@ -6,7 +6,12 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import { type Database, openDatabase } from '../../src/database/db.ts';
 import { SessionRepository } from '../../src/database/repository.ts';
 import { nullLogger } from '../../src/logging/logger.ts';
-import { isRetryable, TelegramClient } from '../../src/telegram/client.ts';
+import {
+  isClientShutdown,
+  isRetryable,
+  TelegramClient,
+  telegramLongPollDeadlineMs,
+} from '../../src/telegram/client.ts';
 import { drainOutbox, Outbox } from '../../src/telegram/outbox.ts';
 import {
   markUpdateHandled,
@@ -193,6 +198,10 @@ describe('outbox idempotency', () => {
 });
 
 describe('outbox delivery', () => {
+  it('keeps long-poll transport deadline safely beyond Telegram server timeout', () => {
+    assert.equal(telegramLongPollDeadlineMs(30_000, 25), 35_000);
+  });
+
   it('sends a pending message and records the Telegram message id', async () => {
     const { fetch: impl } = scriptedFetch([() => okMessage(777)]);
     const d = deps(impl);
@@ -333,6 +342,7 @@ describe('outbox delivery', () => {
 
     await assert.rejects(request, (error: unknown) => {
       assert.match((error as Error).message, /client shutdown/);
+      assert.equal(isClientShutdown(error), true);
       return true;
     });
   });
@@ -475,6 +485,18 @@ describe('update deduplication and offset persistence', () => {
     markUpdateHandled(db.handle, 1);
     assert.equal(recordUpdate(db.handle, 1, 'audio'), false);
     assert.equal(recordUpdate(db.handle, 2, 'audio'), true);
+  });
+
+  it('keeps colliding update ids and offsets independent across bot credentials', () => {
+    assert.equal(recordUpdate(db.handle, 1, 'audio', 'bot-a'), true);
+    markUpdateHandled(db.handle, 1, 'bot-a');
+    assert.equal(recordUpdate(db.handle, 1, 'audio', 'bot-a'), false);
+    assert.equal(recordUpdate(db.handle, 1, 'audio', 'bot-b'), true);
+
+    writeOffset(db.handle, 11, 'bot-a');
+    writeOffset(db.handle, 22, 'bot-b');
+    assert.equal(readOffset(db.handle, 'bot-a'), 11);
+    assert.equal(readOffset(db.handle, 'bot-b'), 22);
   });
 
   it('marks an update handled', () => {

@@ -52,6 +52,24 @@ Exactly **one** chat ID is allowed. Every other chat is ignored **silently** —
 replying "you are not authorized" would confirm the bot exists to anyone who
 found its username.
 
+Exactly one daemon may receive updates for a bot token. This is currently an
+operator-enforced ownership rule: set `telegram.receiveUpdates` to `true` only
+on the designated input host, and to `false` on every send-only host using the
+same token. Independent polling hosts keep independent SQLite offsets and can
+consume each other's updates; OpenMurmur cannot detect that cross-host conflict
+without a shared coordinator. Separate bots are the stronger isolation option.
+Within one data root, update ids, offsets, acknowledgement keys and incoming
+jobs are credential-scoped, so switching bots cannot collide with the previous
+bot's history. That protects rebinding; it does not coordinate two live hosts.
+
+```json
+{
+  "telegram": {
+    "receiveUpdates": false
+  }
+}
+```
+
 ## Limits (Telegram's, not ours)
 
 | Operation | Limit | Our behaviour |
@@ -90,6 +108,22 @@ digest units.
 be added later, but the lossless source is what is stored and what is delivered.
 
 ## Message formats
+
+### Provenance on every recording output
+
+Source audio captions, transcripts, reports and incoming-file acknowledgements
+are self-identifying. A live session shows `фоновая запись OpenMurmur`, the
+persisted daemon hostname and capture IANA timezone, original wall date/time and
+session UID. Telegram-supplied audio shows whether it was sent directly or
+forwarded, attachment type, processing daemon, original forwarded time when
+Telegram supplies one, the later bot-chat message time, update/message ids,
+original claimed filename when present, and the stable OpenMurmur file UID.
+
+Forward provenance uses the official `forward_origin.date`; it is never confused
+with `message.date`, which is when the forwarded copy reached the bot. Legacy
+rows say that missing host/timezone/request facts are unknown. Claimed filenames
+are bounded and escaped for display; they never become a command or routing
+decision.
 
 ### Session report
 
@@ -244,7 +278,9 @@ supported extension or an `audio/*` MIME type. Formats: `.ogg` `.opus` `.mp3`
    be. A `.pdf` claiming `audio/mpeg` is refused; so is a text file named
    `.mp3`.
 9. Enforce the duration limit on the probed duration, not the declared one.
-10. Normalize to 16 kHz mono WAV.
+10. Normalize to 16 kHz mono WAV through a private temporary file, then fsync
+    and atomically rename it. A crash cannot leave a partial deterministic WAV
+    that poisons every retry.
 11. Transcribe with the local ASR.
 12. Send the transcript (with a `.md` attachment when long).
 13. Delete after the retention window.
@@ -336,10 +372,18 @@ that unavoidable acknowledgement window.
 | --- | --- |
 | 429 | Deferred by `retry_after`; drain stops; attempt not burned. |
 | 5xx / network | Retried with exponential backoff, capped at 10 minutes. |
-| Local request deadline / daemon shutdown | JSON is bounded at 30 seconds, long polling gets its requested wait plus 5 seconds, and file transfer is bounded at 10 minutes. Abort returns the row to `pending` without burning an attempt; shutdown cancels immediately. |
+| Local request deadline / daemon shutdown | JSON is bounded at 30 seconds, long polling gets its requested wait plus 10 seconds of transport headroom, and file transfer is bounded at 10 minutes. Abort returns the row to `pending` without burning an attempt; shutdown cancels immediately. |
 | 4xx (not 429) | Marked `dead` immediately — a malformed message will never succeed. |
 | Crash mid-send | Row recovered from `sending` to `pending` at startup. |
 | Oversize file | Rejected before any network call. |
+
+Health alerts do not amplify an outage. A `telegram_delivery` failure is kept
+in the local log and `/health` while Telegram is delayed; putting that warning
+into the unavailable channel would only deliver a stale warning after recovery
+and grow the backlog it describes. The recovery edge is sent once. For other
+health checks, a newer pending state supersedes the older unsent alert instead
+of accumulating cooldown reminders. Prior-run `notice:*` rows are retired at
+startup, while durable `session-status:*` rows are preserved.
 
 The setup flow is intentionally narrower than normal bot routing: only a fresh
 private `/start` from an identifiable non-bot sender, observed after setup

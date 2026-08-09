@@ -15,6 +15,7 @@ export interface TelegramApiError extends Error {
   readonly method: string;
   /** A local deadline or shutdown interrupted the request before Telegram answered. */
   readonly retryWithoutAttempt: boolean | undefined;
+  readonly clientShutdown: boolean | undefined;
 }
 
 export function isRetryable(error: unknown): boolean {
@@ -28,24 +29,31 @@ export function shouldRetryWithoutAttempt(error: unknown): boolean {
   return (error as Partial<TelegramApiError>)?.retryWithoutAttempt === true;
 }
 
+export function isClientShutdown(error: unknown): boolean {
+  return (error as Partial<TelegramApiError>)?.clientShutdown === true;
+}
+
 function apiError(
   method: string,
   message: string,
   errorCode?: number,
   retryAfterSeconds?: number,
   retryWithoutAttempt?: boolean,
+  clientShutdown?: boolean,
 ): TelegramApiError {
   const error = new Error(redact(message)) as Error & {
     errorCode: number | undefined;
     retryAfterSeconds: number | undefined;
     method: string;
     retryWithoutAttempt: boolean | undefined;
+    clientShutdown: boolean | undefined;
   };
   error.name = 'TelegramApiError';
   error.errorCode = errorCode;
   error.retryAfterSeconds = retryAfterSeconds;
   error.method = method;
   error.retryWithoutAttempt = retryWithoutAttempt;
+  error.clientShutdown = clientShutdown;
   return error;
 }
 
@@ -75,6 +83,14 @@ export interface TelegramMessage {
   audio?: TelegramAudioLike;
   document?: TelegramAudioLike;
   video_note?: TelegramAudioLike;
+  /** Present when Telegram preserved an earlier message's origin. */
+  forward_origin?: TelegramMessageOrigin;
+}
+
+export interface TelegramMessageOrigin {
+  readonly type: 'user' | 'hidden_user' | 'chat' | 'channel';
+  /** Original Unix timestamp supplied by Telegram, distinct from message.date. */
+  readonly date: number;
 }
 
 export interface TelegramAudioLike {
@@ -112,7 +128,14 @@ export interface TelegramClientOptions {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_TRANSFER_TIMEOUT_MS = 10 * 60 * 1000;
-const LONG_POLL_GRACE_MS = 5_000;
+const LONG_POLL_GRACE_MS = 10_000;
+
+export function telegramLongPollDeadlineMs(
+  requestTimeoutMs: number,
+  timeoutSeconds: number,
+): number {
+  return Math.max(requestTimeoutMs, timeoutSeconds * 1000 + LONG_POLL_GRACE_MS);
+}
 
 export class TelegramClient {
   readonly #token: string;
@@ -205,7 +228,7 @@ export class TelegramClient {
         timeout: timeoutSeconds,
         allowed_updates: ['message'],
       },
-      Math.max(this.#requestTimeoutMs, timeoutSeconds * 1000 + LONG_POLL_GRACE_MS),
+      telegramLongPollDeadlineMs(this.#requestTimeoutMs, timeoutSeconds),
     );
   }
 
@@ -294,7 +317,14 @@ export class TelegramClient {
 
   #throwIfClosed(method: string): void {
     if (!this.#shutdown.signal.aborted) return;
-    throw apiError(method, `${method} interrupted by client shutdown`, undefined, undefined, true);
+    throw apiError(
+      method,
+      `${method} interrupted by client shutdown`,
+      undefined,
+      undefined,
+      true,
+      true,
+    );
   }
 
   #transportError(
@@ -305,7 +335,8 @@ export class TelegramClient {
     timeoutMs: number,
   ): TelegramApiError {
     const interrupted = signal.aborted;
-    const detail = this.#shutdown.signal.aborted
+    const clientShutdown = this.#shutdown.signal.aborted;
+    const detail = clientShutdown
       ? 'client shutdown'
       : interrupted
         ? `request timed out after ${timeoutMs} ms`
@@ -316,6 +347,7 @@ export class TelegramClient {
       undefined,
       undefined,
       interrupted,
+      clientShutdown,
     );
   }
 

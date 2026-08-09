@@ -108,11 +108,16 @@ export function renderTranscriptMessages(
   sessionId: string,
   transcript: string,
   inlineLimit: number,
+  provenanceHtml?: string,
 ): TranscriptMessage[] {
+  const provenance =
+    provenanceHtml === undefined
+      ? `<code>${escapeHtml(sessionId)}</code>\n\n`
+      : `${provenanceHtml}\n\n`;
   const header = (n: number, total: number) =>
     total === 1
-      ? `📝 <b>Transcript</b>\n<code>${escapeHtml(sessionId)}</code>\n\n`
-      : `📝 <b>Transcript ${n}/${total}</b>\n<code>${escapeHtml(sessionId)}</code>\n\n`;
+      ? `📝 <b>Transcript</b>\n${provenance}`
+      : `📝 <b>Transcript ${n}/${total}</b>\n${provenance}`;
   const quote = (body: string) => `<blockquote expandable>${body}</blockquote>`;
 
   const escaped = escapeHtml(transcript);
@@ -135,12 +140,14 @@ export function renderTimedTranscriptMessages(
   segments: readonly TimedTranscriptSegment[],
   fallbackTranscript: string,
   inlineLimit: number,
+  provenanceHtml?: string,
 ): TranscriptMessage[] {
   const formatted = formatTimedTranscript(segments);
   return renderTranscriptMessages(
     sessionId,
     formatted.length > 0 ? formatted : fallbackTranscript,
     inlineLimit,
+    provenanceHtml,
   );
 }
 

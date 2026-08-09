@@ -57,42 +57,53 @@ export function routeUpdate(update: TelegramUpdate, allowedChatId: number): Rout
  * not marked handled is deliberately replayed: the work it enqueues has its
  * own idempotency key, so this closes the crash window without duplicating it.
  */
-export function recordUpdate(db: DatabaseSync, updateId: number, kind: string): boolean {
+export function recordUpdate(
+  db: DatabaseSync,
+  updateId: number,
+  kind: string,
+  botScope = 'legacy',
+): boolean {
   const result = db
     .prepare(
-      `INSERT INTO telegram_updates (update_id, received_at, kind)
-       VALUES (?, ?, ?)
-       ON CONFLICT (update_id) DO NOTHING`,
+      `INSERT INTO telegram_updates (bot_scope, update_id, received_at, kind)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT (bot_scope, update_id) DO NOTHING`,
     )
-    .run(updateId, new Date().toISOString(), kind);
+    .run(botScope, updateId, new Date().toISOString(), kind);
   if (result.changes > 0) return true;
 
   const row = db
-    .prepare('SELECT handled FROM telegram_updates WHERE update_id = ?')
-    .get(updateId) as { handled: number } | undefined;
+    .prepare('SELECT handled FROM telegram_updates WHERE bot_scope = ? AND update_id = ?')
+    .get(botScope, updateId) as { handled: number } | undefined;
   return row?.handled === 0;
 }
 
-export function markUpdateHandled(db: DatabaseSync, updateId: number): void {
-  db.prepare('UPDATE telegram_updates SET handled = 1 WHERE update_id = ?').run(updateId);
+export function markUpdateHandled(db: DatabaseSync, updateId: number, botScope = 'legacy'): void {
+  db.prepare('UPDATE telegram_updates SET handled = 1 WHERE bot_scope = ? AND update_id = ?').run(
+    botScope,
+    updateId,
+  );
 }
 
 /**
  * The getUpdates offset is persisted, not held in memory: a restart must not
  * replay an hour of updates, nor skip the ones that arrived while down.
  */
-export function readOffset(db: DatabaseSync): number {
-  const row = db.prepare('SELECT next_offset FROM telegram_offset WHERE id = 1').get() as
-    | { next_offset: number }
-    | undefined;
+export function readOffset(db: DatabaseSync, botScope = 'legacy'): number {
+  const row = db
+    .prepare('SELECT next_offset FROM telegram_offset WHERE bot_scope = ?')
+    .get(botScope) as { next_offset: number } | undefined;
   return row?.next_offset ?? 0;
 }
 
-export function writeOffset(db: DatabaseSync, nextOffset: number): void {
-  db.prepare('UPDATE telegram_offset SET next_offset = ?, updated_at = ? WHERE id = 1').run(
-    nextOffset,
-    new Date().toISOString(),
-  );
+export function writeOffset(db: DatabaseSync, nextOffset: number, botScope = 'legacy'): void {
+  db.prepare(
+    `INSERT INTO telegram_offset (bot_scope, next_offset, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT (bot_scope) DO UPDATE SET
+       next_offset = excluded.next_offset,
+       updated_at = excluded.updated_at`,
+  ).run(botScope, nextOffset, new Date().toISOString());
 }
 
 /** Highest update_id + 1, which is what Telegram expects as the next offset. */

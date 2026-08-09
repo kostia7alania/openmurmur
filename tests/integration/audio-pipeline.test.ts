@@ -367,6 +367,16 @@ describe('incoming media validation against real files', {
     if (!hasFfmpeg) return t.skip('ffmpeg not available');
     const target = join(dir, 'out.wav');
     assert.equal(await normalizeToWav(FFMPEG, join(dir, 'no-such-file.mp3'), target), false);
+    assert.equal(existsSync(target), false);
+  });
+
+  it('never exposes a partial WAV or overwrites a complete target on failure', async (t) => {
+    if (!hasFfmpeg) return t.skip('ffmpeg not available');
+    const target = join(dir, 'out.wav');
+    writeFileSync(target, 'previous complete file');
+
+    assert.equal(await normalizeToWav(FFMPEG, join(dir, 'no-such-file.mp3'), target), false);
+    assert.equal(readFileSync(target, 'utf8'), 'previous complete file');
   });
 });
 

@@ -49,6 +49,7 @@
     "transcriptInlineLimit": 3500,
     "pollIntervalMs": 1000,
     "longPollSeconds": 25,
+    "receiveUpdates": true,
     "maxIncomingDurationSeconds": 7200,
     "maxConcurrentIncomingJobs": 2,
     "summarizeIncoming": true

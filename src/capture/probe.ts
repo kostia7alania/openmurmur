@@ -1,5 +1,9 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { rename, rm } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 import type { ProbeResult } from '../telegram/incoming.ts';
+import { fsyncDirectory, fsyncFile } from './writer.ts';
 
 interface FfprobeStream {
   codec_type?: string;
@@ -75,6 +79,8 @@ export async function normalizeToWav(
   outputPath: string,
   timeoutMs = 10 * 60 * 1000,
 ): Promise<boolean> {
+  const directory = dirname(outputPath);
+  const temporary = join(directory, `.${basename(outputPath)}.${process.pid}.${randomUUID()}.part`);
   const args = [
     '-hide_banner',
     '-loglevel',
@@ -95,9 +101,19 @@ export async function normalizeToWav(
     '-f',
     'wav',
     '-y',
-    outputPath,
+    temporary,
   ];
-  return (await runCapture(ffmpegPath, args, timeoutMs)) !== null;
+  try {
+    if ((await runCapture(ffmpegPath, args, timeoutMs)) === null) return false;
+    await fsyncFile(temporary);
+    await rename(temporary, outputPath);
+    await fsyncDirectory(directory);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await rm(temporary, { force: true }).catch(() => {});
+  }
 }
 
 function runCapture(

@@ -3,7 +3,11 @@ import { describe, it } from 'node:test';
 import { commitTelegramSetup, drainUpdateBacklog, waitForStart } from '../../src/cli/setup.ts';
 import { openDatabase } from '../../src/database/db.ts';
 import type { TelegramUpdate } from '../../src/telegram/client.ts';
-import type { SecretsStore, TelegramSecrets } from '../../src/telegram/keychain.ts';
+import {
+  type SecretsStore,
+  type TelegramSecrets,
+  telegramBotScope,
+} from '../../src/telegram/keychain.ts';
 import { readOffset, writeOffset } from '../../src/telegram/router.ts';
 
 function update(
@@ -142,7 +146,7 @@ describe('Telegram setup persistence', () => {
 
       assert.deepEqual(secrets.get(), { token: 'new-token', chatId: 20 });
       assert.deepEqual(secrets.writes, [{ token: 'new-token', chatId: 20 }]);
-      assert.equal(readOffset(db.handle), 101);
+      assert.equal(readOffset(db.handle, telegramBotScope('new-token')), 101);
     } finally {
       db.close();
     }
@@ -151,7 +155,8 @@ describe('Telegram setup persistence', () => {
   it('restores both the previous pair and offset when confirmation fails', async () => {
     const db = openDatabase({ file: ':memory:' });
     const secrets = memorySecrets({ token: 'old-token', chatId: 10 });
-    writeOffset(db.handle, 7);
+    const oldBotScope = telegramBotScope('old-token');
+    writeOffset(db.handle, 7, oldBotScope);
     try {
       await assert.rejects(
         commitTelegramSetup(
@@ -167,7 +172,7 @@ describe('Telegram setup persistence', () => {
       );
 
       assert.deepEqual(secrets.get(), { token: 'old-token', chatId: 10 });
-      assert.equal(readOffset(db.handle), 7);
+      assert.equal(readOffset(db.handle, oldBotScope), 7);
     } finally {
       db.close();
     }
@@ -176,7 +181,8 @@ describe('Telegram setup persistence', () => {
   it('leaves the old offset untouched when the atomic credential write fails', async () => {
     const db = openDatabase({ file: ':memory:' });
     const old = { token: 'old-token', chatId: 10 } as const;
-    writeOffset(db.handle, 7);
+    const oldBotScope = telegramBotScope(old.token);
+    writeOffset(db.handle, 7, oldBotScope);
     const store: SecretsStore = {
       async load() {
         return old;
@@ -199,7 +205,7 @@ describe('Telegram setup persistence', () => {
         ),
         /Keychain write failed/,
       );
-      assert.equal(readOffset(db.handle), 7);
+      assert.equal(readOffset(db.handle, oldBotScope), 7);
     } finally {
       db.close();
     }

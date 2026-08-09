@@ -131,6 +131,8 @@ export interface TelegramConfig {
   readonly transcriptInlineLimit: number;
   readonly pollIntervalMs: number;
   readonly longPollSeconds: number;
+  /** False makes this daemon send-only; another instance must own getUpdates. */
+  readonly receiveUpdates: boolean;
   readonly maxIncomingDurationSeconds: number;
   readonly maxConcurrentIncomingJobs: number;
   readonly summarizeIncoming: boolean;
@@ -225,6 +227,7 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
     transcriptInlineLimit: 3500,
     pollIntervalMs: 1000,
     longPollSeconds: 25,
+    receiveUpdates: true,
     maxIncomingDurationSeconds: 2 * 60 * 60,
     maxConcurrentIncomingJobs: 2,
     summarizeIncoming: true,

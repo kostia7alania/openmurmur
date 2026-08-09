@@ -27,6 +27,18 @@ describe('config parsing', () => {
     assert.equal(config.sessionizer.preRollSeconds, DEFAULT_CONFIG.sessionizer.preRollSeconds);
   });
 
+  it('supports a send-only Telegram instance while receiving remains the default', () => {
+    assert.equal(DEFAULT_CONFIG.telegram.receiveUpdates, true);
+    assert.equal(
+      parseConfig({ telegram: { receiveUpdates: false } }).telegram.receiveUpdates,
+      false,
+    );
+    assert.throws(
+      () => parseConfig({ telegram: { receiveUpdates: 'no' } }),
+      /telegram\.receiveUpdates.*boolean/,
+    );
+  });
+
   it('rejects an unknown key instead of ignoring it', () => {
     // A typo in a threshold name must not silently leave the default in place.
     assert.throws(

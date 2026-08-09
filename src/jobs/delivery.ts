@@ -10,6 +10,11 @@ import type { StructuredSummary } from '../llm/schema.ts';
 import { formatTimedTranscript, renderTimedTranscriptMessages } from '../telegram/format.ts';
 import { Outbox } from '../telegram/outbox.ts';
 import {
+  liveCaptureProvenance,
+  renderProvenanceHtml,
+  renderProvenanceMarkdown,
+} from '../telegram/provenance.ts';
+import {
   renderSessionReport,
   renderSessionReportMarkdown,
   renderSessionSummaryPreview,
@@ -67,9 +72,11 @@ export async function enqueueSessionAudio(
   const parts = new PartRepository(db);
   const outbox = new Outbox(db);
 
-  if (new SessionRepository(db).get(input.sessionId) === undefined) {
+  const session = new SessionRepository(db).get(input.sessionId);
+  if (session === undefined) {
     throw new Error(`unknown session ${input.sessionId}`);
   }
+  const provenanceCaption = renderProvenanceHtml(liveCaptureProvenance(session));
 
   const partRows = parts.listForSession(input.sessionId).filter((p) => p.finalized === 1);
   const oversizeParts: string[] = [];
@@ -110,6 +117,7 @@ export async function enqueueSessionAudio(
           path: part.path,
           filename: basename(part.path),
           partId: part.part_id,
+          caption: provenanceCaption,
         },
       });
       if (enqueued) audioRows += 1;
@@ -144,6 +152,7 @@ export async function enqueueSessionAudio(
             filename: basename(chunk),
             partId: part.part_id,
             deleteAfterSend: true,
+            caption: provenanceCaption,
           },
         });
         if (enqueued) {
@@ -273,6 +282,7 @@ export async function enqueueSessionTranscript(
   if (session === undefined) throw new Error(`unknown session ${input.sessionId}`);
   const transcript = transcripts.current(input.sessionId);
   if (transcript === undefined) throw new Error(`session ${input.sessionId} has no transcript`);
+  const provenance = liveCaptureProvenance(session);
 
   // Timestamped blocks, not one wall of text. The segments are already stored
   // with their timings; a recorded session is the *main* output and was the
@@ -290,6 +300,7 @@ export async function enqueueSessionTranscript(
     })),
     transcript.text,
     input.config.telegram.transcriptInlineLimit,
+    renderProvenanceHtml(provenance),
   );
   let transcriptRows = 0;
   if (messages.length === 1) {
@@ -320,7 +331,13 @@ export async function enqueueSessionTranscript(
     const hasSpeakers = segments.some((segment) => segment.speaker !== null);
     await writeTextAtomically(
       mdPath,
-      renderTranscriptMarkdown(input.sessionId, session.started_at, transcript.text, segments),
+      renderTranscriptMarkdown(
+        input.sessionId,
+        session.started_at,
+        transcript.text,
+        segments,
+        renderProvenanceMarkdown(provenance),
+      ),
     );
     const enqueued = outbox.enqueue({
       deliveryPartId: `transcript-md:${input.sessionId}`,
@@ -331,7 +348,9 @@ export async function enqueueSessionTranscript(
         type: 'document',
         path: mdPath,
         filename: `${input.sessionId}.md`,
-        caption: `📝 Транскрипт с таймингами${hasSpeakers ? ' и голосами' : ''}`,
+        caption:
+          `📝 Транскрипт с таймингами${hasSpeakers ? ' и голосами' : ''}\n\n` +
+          renderProvenanceHtml(provenance),
       },
     });
     if (enqueued) transcriptRows += 1;
@@ -373,6 +392,8 @@ export async function enqueueSessionReport(
     summary: input.summary,
     transcript: transcript?.text ?? '',
     transcriptSegments,
+    timezone: session.capture_timezone ?? 'UTC',
+    provenance: liveCaptureProvenance(session),
   };
   const report = renderSessionReport(reportInput);
   let reportRows = 0;
@@ -410,7 +431,7 @@ export async function enqueueSessionReport(
         type: 'document',
         path: reportPath,
         filename: `${input.sessionId}.report.md`,
-        caption: '📄 Полный отчёт по сессии',
+        caption: `📄 Полный отчёт по сессии\n\n${renderProvenanceHtml(reportInput.provenance)}`,
       },
     })
       ? reportRows + 1
@@ -431,12 +452,15 @@ export function renderTranscriptMarkdown(
     readonly text: string;
     readonly speaker?: number | null;
   }[] = [],
+  provenanceMarkdown?: string,
 ): string {
   const timed = formatTimedTranscript(segments);
   return [
     '# OpenMurmur transcript',
     '',
-    `- Session: \`${sessionId}\``,
+    ...(provenanceMarkdown === undefined
+      ? [`- Session UID: \`${sessionId}\``]
+      : [provenanceMarkdown]),
     `- Started: ${startedAt}`,
     '',
     '---',
