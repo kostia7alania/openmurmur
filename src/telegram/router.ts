@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import type { TelegramMessage, TelegramUpdate } from './client.ts';
+import type { TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from './client.ts';
 import { extractAttachment } from './incoming.ts';
 
 /**
@@ -13,12 +13,24 @@ import { extractAttachment } from './incoming.ts';
 
 export type RoutedAction =
   | { readonly kind: 'ignore'; readonly why: string }
-  | { readonly kind: 'command'; readonly command: '/status' | '/health' | '/help' | '/start' }
+  | {
+      readonly kind: 'command';
+      readonly command: '/status' | '/health' | '/help' | '/start' | '/settings';
+    }
+  | { readonly kind: 'callback'; readonly query: TelegramCallbackQuery }
   | { readonly kind: 'unknown_command'; readonly text: string }
   | { readonly kind: 'audio'; readonly message: TelegramMessage }
   | { readonly kind: 'text'; readonly text: string };
 
 export function routeUpdate(update: TelegramUpdate, allowedChatId: number): RoutedAction {
+  const callback = update.callback_query;
+  if (callback !== undefined) {
+    if (callback.message?.chat.id !== allowedChatId) {
+      return { kind: 'ignore', why: 'callback chat is not allowlisted' };
+    }
+    return { kind: 'callback', query: callback };
+  }
+
   const message = update.message;
   if (message === undefined) return { kind: 'ignore', why: 'not a message' };
   if (message.chat.id !== allowedChatId) {
@@ -38,7 +50,8 @@ export function routeUpdate(update: TelegramUpdate, allowedChatId: number): Rout
       command === '/status' ||
       command === '/health' ||
       command === '/help' ||
-      command === '/start'
+      command === '/start' ||
+      command === '/settings'
     ) {
       return { kind: 'command', command };
     }

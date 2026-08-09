@@ -2,6 +2,11 @@ import { spawn } from 'node:child_process';
 import { rm, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import {
+  effectiveAsrLanguage,
+  languageListLabel,
+  recognitionModeLabel,
+} from '../asr/preferences.ts';
 import type { Paths } from '../config/paths.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
 import { transaction } from '../database/db.ts';
@@ -19,6 +24,7 @@ import {
   renderSessionReportMarkdown,
   renderSessionSummaryPreview,
 } from '../telegram/report.ts';
+import { asrSettingsKeyboard } from '../telegram/settings.ts';
 import { writeTextAtomically } from '../util/atomic-file.ts';
 
 /**
@@ -283,6 +289,9 @@ export async function enqueueSessionTranscript(
   const transcript = transcripts.current(input.sessionId);
   if (transcript === undefined) throw new Error(`session ${input.sessionId} has no transcript`);
   const provenance = liveCaptureProvenance(session);
+  const settingsKeyboard = input.config.telegram.receiveUpdates
+    ? asrSettingsKeyboard(effectiveAsrLanguage(db, input.config.asr.languageHints), 'transcript')
+    : undefined;
 
   // Timestamped blocks, not one wall of text. The segments are already stored
   // with their timings; a recorded session is the *main* output and was the
@@ -301,6 +310,11 @@ export async function enqueueSessionTranscript(
     transcript.text,
     input.config.telegram.transcriptInlineLimit,
     renderProvenanceHtml(provenance),
+    {
+      languages: JSON.parse(transcript.languages) as string[],
+      forcedLanguage: transcript.forced_language,
+      showSettingsHint: settingsKeyboard !== undefined,
+    },
   );
   let transcriptRows = 0;
   if (messages.length === 1) {
@@ -311,7 +325,12 @@ export async function enqueueSessionTranscript(
         kind: 'transcript',
         sessionId: input.sessionId,
         ordinal: 10,
-        payload: { type: 'text', text: message.text, parseMode: 'HTML' },
+        payload: {
+          type: 'text',
+          text: message.text,
+          parseMode: 'HTML',
+          ...(settingsKeyboard === undefined ? {} : { replyMarkup: settingsKeyboard }),
+        },
       });
       if (enqueued) transcriptRows += 1;
     }
@@ -337,6 +356,10 @@ export async function enqueueSessionTranscript(
         transcript.text,
         segments,
         renderProvenanceMarkdown(provenance),
+        {
+          languages: JSON.parse(transcript.languages) as string[],
+          forcedLanguage: transcript.forced_language,
+        },
       ),
     );
     const enqueued = outbox.enqueue({
@@ -351,6 +374,7 @@ export async function enqueueSessionTranscript(
         caption:
           `📝 Транскрипт с таймингами${hasSpeakers ? ' и голосами' : ''}\n\n` +
           renderProvenanceHtml(provenance),
+        ...(settingsKeyboard === undefined ? {} : { replyMarkup: settingsKeyboard }),
       },
     });
     if (enqueued) transcriptRows += 1;
@@ -453,15 +477,22 @@ export function renderTranscriptMarkdown(
     readonly speaker?: number | null;
   }[] = [],
   provenanceMarkdown?: string,
+  languageInfo?: { readonly languages: readonly string[]; readonly forcedLanguage: string | null },
 ): string {
   const timed = formatTimedTranscript(segments);
   return [
-    '# OpenMurmur transcript',
+    '# Расшифровка OpenMurmur',
     '',
     ...(provenanceMarkdown === undefined
-      ? [`- Session UID: \`${sessionId}\``]
+      ? [`- UID сессии: \`${sessionId}\``]
       : [provenanceMarkdown]),
-    `- Started: ${startedAt}`,
+    `- Начало: ${startedAt}`,
+    ...(languageInfo === undefined
+      ? []
+      : [
+          `- Языки: ${languageListLabel(languageInfo.languages)}`,
+          `- Режим: ${recognitionModeLabel(languageInfo.forcedLanguage)}`,
+        ]),
     '',
     '---',
     '',

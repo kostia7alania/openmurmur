@@ -2,6 +2,12 @@ import { execFile } from 'node:child_process';
 import { access, readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { reconcileLanguages } from '../asr/languages.ts';
+import {
+  AsrPreferenceRepository,
+  effectiveAsrLanguage,
+  modelLanguageName,
+} from '../asr/preferences.ts';
 import type { AsrBackend, AsrSegment } from '../asr/types.ts';
 import { FfmpegCapture } from '../capture/ffmpeg.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
@@ -41,7 +47,14 @@ import { applyRetention, planRetention } from '../retention/policy.ts';
 import { Recorder } from '../sessionizer/recorder.ts';
 import { SileroStreamVad } from '../sessionizer/silero.ts';
 import type { Vad } from '../sessionizer/vad.ts';
-import { isClientShutdown, TelegramClient, type TelegramMessage } from '../telegram/client.ts';
+import {
+  isClientShutdown,
+  isRetryable,
+  type TelegramCallbackQuery,
+  TelegramClient,
+  type TelegramInlineKeyboardMarkup,
+  type TelegramMessage,
+} from '../telegram/client.ts';
 import { renderTimedTranscriptMessages } from '../telegram/format.ts';
 import {
   downloadToQuarantine,
@@ -66,6 +79,12 @@ import {
   routeUpdate,
   writeOffset,
 } from '../telegram/router.ts';
+import {
+  asrSettingsKeyboard,
+  OPENMURMUR_BOT_COMMANDS,
+  parseAsrModeCallback,
+  renderAsrSettings,
+} from '../telegram/settings.ts';
 import { writeTextAtomically } from '../util/atomic-file.ts';
 import { createAsrBackend, createLlmBackend, createVadBackend } from './backends.ts';
 import { VERSION } from './version.ts';
@@ -103,6 +122,7 @@ export class Daemon {
   #client: TelegramClient | null = null;
   #chatId: number | null = null;
   #botScope: string | null = null;
+  #asrLanguage: string | null;
   #stopping = false;
   #recorderFailure: string | null = null;
   /** Resolves once `run()` has finalized whatever was open. */
@@ -135,6 +155,7 @@ export class Daemon {
       file: paths.databaseFile,
       onVersionWarning: (message) => options.logger.warn(message),
     });
+    this.#asrLanguage = effectiveAsrLanguage(this.#db.handle, config.asr.languageHints);
     this.#jobs = new JobQueue(this.#db.handle);
     this.#outbox = new Outbox(this.#db.handle);
     this.#alerts = new AlertEvaluator(this.#db.handle, {
@@ -184,6 +205,7 @@ export class Daemon {
       captureHost: hostname(),
       captureTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       onFirstFrame: () => this.#announceRecordingStarted(),
+      resolveAsrLanguage: () => this.#asrLanguage,
     });
   }
 
@@ -618,6 +640,9 @@ export class Daemon {
         case 'command':
           await this.#handleCommand(action.command, update.update_id);
           break;
+        case 'callback':
+          await this.#handleCallback(action.query);
+          break;
         case 'unknown_command':
           this.#enqueueText(
             `Неизвестная команда. ${HELP_TEXT}`,
@@ -631,6 +656,7 @@ export class Daemon {
             action.message,
             hostname(),
             botScope,
+            this.#asrLanguage,
           );
           continue;
         case 'text':
@@ -642,12 +668,22 @@ export class Daemon {
   }
 
   async #handleCommand(
-    command: '/status' | '/health' | '/help' | '/start',
+    command: '/status' | '/health' | '/help' | '/start' | '/settings',
     updateId: number,
   ): Promise<void> {
     const botScope = this.#botScope ?? 'legacy';
     if (command === '/help' || command === '/start') {
       this.#enqueueText(HELP_TEXT, scopedUpdateKey('help', botScope, updateId));
+      return;
+    }
+    if (command === '/settings') {
+      const language = this.#asrLanguage;
+      this.#enqueueText(
+        renderAsrSettings(hostname(), language),
+        scopedUpdateKey('settings', botScope, updateId),
+        'HTML',
+        asrSettingsKeyboard(language),
+      );
       return;
     }
     if (command === '/health') {
@@ -697,6 +733,53 @@ export class Daemon {
     );
   }
 
+  async #handleCallback(query: TelegramCallbackQuery): Promise<void> {
+    const selected = parseAsrModeCallback(query.data);
+    const message = query.message;
+    if (selected === undefined || message === undefined) {
+      try {
+        await this.#client?.answerCallbackQuery(query.id, 'Эта кнопка больше не поддерживается');
+      } catch (error) {
+        if (isRetryable(error)) throw error;
+        this.#options.logger.warn('could not acknowledge an obsolete Telegram callback', {
+          error: (error as Error).message,
+        });
+      }
+      return;
+    }
+
+    new AsrPreferenceRepository(this.#db.handle).set(selected.language);
+    const language = selected.language === null ? null : modelLanguageName(selected.language);
+    this.#asrLanguage = language;
+    const client = this.#client;
+    if (client === null) throw new Error('Telegram is not configured');
+
+    try {
+      await client.answerCallbackQuery(query.id, 'Сохранено для следующих расшифровок');
+      if (selected.origin === 'settings') {
+        await client.editMessageText(
+          message.chat.id,
+          message.message_id,
+          renderAsrSettings(hostname(), language),
+          { parseMode: 'HTML', replyMarkup: asrSettingsKeyboard(language) },
+        );
+      } else {
+        await client.editMessageReplyMarkup(
+          message.chat.id,
+          message.message_id,
+          asrSettingsKeyboard(language, 'transcript'),
+        );
+      }
+    } catch (error) {
+      if (isRetryable(error)) throw error;
+      // The preference is already durable. An old/deleted message must not
+      // pin getUpdates forever merely because its keyboard can no longer edit.
+      this.#options.logger.warn('ASR preference saved but its Telegram panel could not update', {
+        error: (error as Error).message,
+      });
+    }
+  }
+
   async #handleIncomingJob(payload: Record<string, unknown>): Promise<void> {
     const client = this.#client;
     if (client === null) throw new Error('Telegram is not configured');
@@ -734,7 +817,13 @@ export class Daemon {
       const storedTranscript = currentIncomingTranscript(this.#db.handle, incoming.fileUid);
       if (storedTranscript !== undefined) {
         markIncomingTranscribed(this.#db.handle, incoming.fileUid);
-        this.#enqueueIncomingTranscript(incoming, storedTranscript.text, storedTranscript.segments);
+        this.#enqueueIncomingTranscript(
+          incoming,
+          storedTranscript.text,
+          storedTranscript.segments,
+          storedTranscript.languages,
+          storedTranscript.forcedLanguage,
+        );
         return;
       }
 
@@ -769,16 +858,21 @@ export class Daemon {
         incoming,
       );
 
+      const forcedLanguage = forcedLanguageFromPayload(payload, this.#asrLanguage);
       const result = await this.#asr.transcribe({
         audioPath: wavPath,
         requestId: incoming.fileUid,
+        ...(forcedLanguage === null ? {} : { languageHints: [forcedLanguage] }),
+        ...(config.asr.context.length > 0 ? { context: config.asr.context } : {}),
       });
+      const reconciledLanguages = reconcileLanguages(result.languages, result.text).languages;
 
       new TranscriptRepository(this.#db.handle).append({
         incomingFileId: incoming.fileUid,
         engine: result.engine,
         model: result.model,
-        languages: result.languages,
+        languages: reconciledLanguages,
+        forcedLanguage,
         text: result.text,
         segments: result.segments.map((s) => ({
           startMs: s.startMs,
@@ -804,7 +898,13 @@ export class Daemon {
           incoming.fileUid,
         );
 
-      this.#enqueueIncomingTranscript(incoming, result.text, result.segments);
+      this.#enqueueIncomingTranscript(
+        incoming,
+        result.text,
+        result.segments,
+        reconciledLanguages,
+        forcedLanguage,
+      );
     } catch (error) {
       // The only undefined assignment above is a failed reload after download;
       // there is then no durable row whose state can truthfully be changed.
@@ -837,6 +937,8 @@ export class Daemon {
     incoming: IncomingFileRow,
     text: string,
     segments: readonly AsrSegment[],
+    languages: readonly string[],
+    forcedLanguage: string | null,
   ): void {
     const fileUid = incoming.fileUid;
     for (const chunk of renderTimedTranscriptMessages(
@@ -845,12 +947,22 @@ export class Daemon {
       text.length > 0 ? text : '(речь не распознана)',
       this.#options.loaded.config.telegram.transcriptInlineLimit,
       renderProvenanceHtml(incomingTelegramProvenance(incoming)),
+      { languages, forcedLanguage, showSettingsHint: true },
     )) {
       this.#outbox.enqueue({
         deliveryPartId: `incoming:${fileUid}:${chunk.partNumber}`,
         kind: 'incoming_transcript',
         ordinal: 10,
-        payload: { type: 'text', text: chunk.text, parseMode: 'HTML' },
+        payload: {
+          type: 'text',
+          text: chunk.text,
+          parseMode: 'HTML',
+          ...(chunk.partNumber === chunk.partCount
+            ? {
+                replyMarkup: asrSettingsKeyboard(this.#asrLanguage, 'transcript'),
+              }
+            : {}),
+        },
       });
     }
   }
@@ -1053,9 +1165,18 @@ export class Daemon {
     }
   }
 
-  #enqueueText(text: string, key: string, parseMode?: 'HTML'): void {
-    const payload: OutboxPayload =
-      parseMode === undefined ? { type: 'text', text } : { type: 'text', text, parseMode };
+  #enqueueText(
+    text: string,
+    key: string,
+    parseMode?: 'HTML',
+    replyMarkup?: TelegramInlineKeyboardMarkup,
+  ): void {
+    const payload: OutboxPayload = {
+      type: 'text',
+      text,
+      ...(parseMode === undefined ? {} : { parseMode }),
+      ...(replyMarkup === undefined ? {} : { replyMarkup }),
+    };
     this.#outbox.enqueue({
       deliveryPartId: key,
       kind: 'status',
@@ -1081,12 +1202,20 @@ export class Daemon {
         return false;
       }
 
-      this.#client = new TelegramClient({
+      const client = new TelegramClient({
         token: secrets.token,
         baseUrl: this.#options.loaded.config.telegram.apiBaseUrl,
       });
+      this.#client = client;
       this.#chatId = secrets.chatId;
       this.#botScope = telegramBotScope(secrets.token);
+      try {
+        await client.setMyCommands(OPENMURMUR_BOT_COMMANDS);
+      } catch (error) {
+        this.#options.logger.warn('could not refresh the Telegram command menu', {
+          error: (error as Error).message,
+        });
+      }
       if (this.#telegramUnavailable) {
         this.#enqueueText(
           '🟢 Доступ к Telegram восстановлен — отправляю накопленные сообщения.',
@@ -1395,6 +1524,7 @@ export function enqueueIncomingRequest(
   message: TelegramMessage,
   daemonHost: string,
   botScope = 'legacy',
+  forcedLanguage: string | null = null,
 ): IncomingFileRow {
   return transaction(db, () => {
     const incoming = claimIncomingRequest(db, updateId, message, daemonHost, botScope);
@@ -1402,7 +1532,7 @@ export function enqueueIncomingRequest(
     new JobQueue(db).enqueue({
       kind: 'incoming_audio',
       idempotencyKey: scopedUpdateKey('incoming', botScope, updateId),
-      payload: { updateId, botScope, fileUid: incoming.fileUid, message },
+      payload: { updateId, botScope, fileUid: incoming.fileUid, message, forcedLanguage },
     });
     new Outbox(db).enqueue({
       deliveryPartId: scopedUpdateKey('ack', botScope, updateId),
@@ -1473,19 +1603,40 @@ export function recordIncomingDownload(
 function currentIncomingTranscript(
   db: Database['handle'],
   fileUid: string,
-): { text: string; segments: readonly AsrSegment[] } | undefined {
+):
+  | {
+      text: string;
+      segments: readonly AsrSegment[];
+      languages: readonly string[];
+      forcedLanguage: string | null;
+    }
+  | undefined {
   const row = db
     .prepare(
-      `SELECT revision_id, text
+      `SELECT revision_id, text, languages, forced_language
          FROM transcript_revisions
         WHERE incoming_file_id = ? AND is_current = 1`,
     )
-    .get(fileUid) as { revision_id: string; text: string } | undefined;
+    .get(fileUid) as
+    | { revision_id: string; text: string; languages: string; forced_language: string | null }
+    | undefined;
   if (row === undefined) return undefined;
   return {
     text: row.text,
     segments: new TranscriptRepository(db).segments(row.revision_id),
+    languages: JSON.parse(row.languages) as string[],
+    forcedLanguage: row.forced_language,
   };
+}
+
+function forcedLanguageFromPayload(
+  payload: Record<string, unknown>,
+  fallback: string | null,
+): string | null {
+  if (!Object.hasOwn(payload, 'forcedLanguage')) return fallback;
+  const value = payload['forcedLanguage'];
+  if (value === null || typeof value === 'string') return value;
+  throw new Error('incoming audio payload has an invalid forcedLanguage');
 }
 
 function markIncomingTranscribed(db: Database['handle'], fileUid: string): void {

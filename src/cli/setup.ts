@@ -166,7 +166,7 @@ export async function setupTelegram(
           chatId,
           '✅ OpenMurmur подключён.\n\n' +
             'Этот чат будет получать аудио, транскрипты, отчёты и статус записи.\n' +
-            'Команды: /status, /health, /help',
+            'Команды: /status, /health, /settings, /help',
         ),
     );
   } finally {

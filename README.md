@@ -1,5 +1,7 @@
 # OpenMurmur
 
+[Краткое руководство на русском](README.ru.md)
+
 **Private ambient journal for Apple Silicon.**
 
 OpenMurmur records speech sessions, transcribes them locally, and sends the
@@ -264,7 +266,8 @@ This is the **only** network boundary. Understand it before you start.
 
 - Your **source FLAC audio** is uploaded to Telegram.
 - Your **full transcript** is sent as one collapsed quote when short, or as one
-  `.md` file when long.
+  `.md` file when long. It includes detected/reconciled languages and whether
+  ASR used automatic identification or one forced language.
 - Your **summary** and a short report are sent as collapsed quotes. A long
   report arrives as a compact collapsed summary followed by one
   `<session_id>.report.md` document.
@@ -293,10 +296,17 @@ see [`docs/TELEGRAM.md`](docs/TELEGRAM.md#local-bot-api-server-for-large-incomin
 | --- | --- |
 | `/status` | Full daemon state: recorder, session, backlog, outbox, disk, models. |
 | `/health` | One-line `OK` / `WARN` / `ERROR` summary. |
+| `/settings` | Select Auto, Thai, Russian, English or Chinese for future ASR jobs on the input-owner Mac. |
 | `/help` | Available commands. |
 
 Send the bot a voice message or audio file and it transcribes it locally.
 Supported: `.ogg` `.opus` `.mp3` `.m4a` `.aac` `.wav` `.flac`.
+
+The Telegram product UI is intentionally Russian. Code, CLI/log output and the
+canonical engineering documentation are English; spoken transcript/summary
+content is not translated. Full i18n is deferred until a second real UI locale
+exists. With two Macs on one bot token, `/settings` affects only the one host
+that owns `getUpdates`; send-only dev output does not show dead buttons.
 
 There is deliberately **no** `/pause`, `/stop`, `/delete`, no shell access, no
 config editing and no arbitrary file access. A Telegram message must never be
@@ -403,7 +413,7 @@ Neither needs a microphone, a model, or a network.
 
 Honesty matters more than a green badge, so:
 
-**Verified on this revision by offline automated tests (364 TypeScript + 36
+**Verified on this revision by offline automated tests (375 TypeScript + 36
 Python tests):** sessionizer state machine with a fake clock, pre-roll,
 60-second close, 15-minute rotation, atomic FLAC and Markdown publication,
 lossless splitting, ffprobe validation of real media, staged audio-first

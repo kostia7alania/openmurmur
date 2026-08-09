@@ -40,6 +40,8 @@ export interface RecorderOptions {
   readonly onSessionStarted?: (sessionId: string) => void;
   readonly onSessionFinalized?: (sessionId: string) => void;
   readonly onSessionRejected?: (sessionId: string, reason: string) => void;
+  /** Snapshotted into each ASR job so later settings changes cannot alter a retry. */
+  readonly resolveAsrLanguage?: () => string | null;
 }
 
 interface OpenPart {
@@ -262,7 +264,10 @@ export class Recorder {
           this.#jobs.enqueue({
             kind: 'asr',
             idempotencyKey: `asr:${intent.sessionId}`,
-            payload: { sessionId: intent.sessionId },
+            payload: {
+              sessionId: intent.sessionId,
+              forcedLanguage: this.#options.resolveAsrLanguage?.() ?? null,
+            },
           });
           this.#enqueueLifecycleStatus(
             intent.sessionId,

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
+import { AsrPreferenceRepository, effectiveAsrLanguage } from '../../src/asr/preferences.ts';
 import {
   compareVersions,
   type Database,
@@ -54,6 +55,7 @@ describe('migrations', () => {
       'telegram_updates',
       'telegram_outbox',
       'incoming_telegram_files',
+      'asr_preferences',
       'schema_migrations',
     ]) {
       assert.ok(tables.has(table), `missing table ${table}`);
@@ -190,6 +192,19 @@ describe('output provenance persistence', () => {
     assert.equal(replay.originalSentAt, '2026-08-08T08:00:00.000Z');
     assert.equal(replay.telegramMessageAt, '2026-08-09T12:00:00.000Z');
     assert.equal(replay.claimedFilename, '<unsafe>.mp3');
+  });
+});
+
+describe('ASR language preference', () => {
+  it('distinguishes config fallback, explicit auto and a forced language', () => {
+    const preferences = new AsrPreferenceRepository(db.handle);
+    assert.equal(effectiveAsrLanguage(db.handle, ['Thai']), 'Thai');
+
+    preferences.set(null);
+    assert.equal(effectiveAsrLanguage(db.handle, ['Thai']), null, 'explicit auto overrides config');
+
+    preferences.set('ru');
+    assert.equal(effectiveAsrLanguage(db.handle, []), 'Russian');
   });
 });
 

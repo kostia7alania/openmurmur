@@ -286,10 +286,10 @@ export function renderDigest(digest: Digest, timezone: number | string): string 
 
 export function renderDigestMarkdown(digest: Digest, timezone: number | string): string {
   const lines = [
-    `# OpenMurmur digest — ${digest.date}`,
+    `# Дайджест OpenMurmur — ${digest.date}`,
     '',
-    `- Sessions: ${digest.sessionCount}`,
-    `- Total speech: ${formatDuration(digest.totalSpeechMs)}`,
+    `- Сессий: ${digest.sessionCount}`,
+    `- Всего речи: ${formatDuration(digest.totalSpeechMs)}`,
   ];
 
   const section = (title: string, items: readonly string[]) => {
@@ -298,22 +298,22 @@ export function renderDigestMarkdown(digest: Digest, timezone: number | string):
     for (const item of [...new Set(items)]) lines.push(`- ${escapeMarkdown(item)}`);
   };
   section(
-    'Decisions',
+    'Решения',
     digest.rows.flatMap((row) => row.decisions),
   );
   section(
-    'Tasks',
+    'Задачи',
     digest.rows.flatMap((row) => row.tasks),
   );
   section(
-    'Open questions',
+    'Открытые вопросы',
     digest.rows.flatMap((row) => row.questions),
   );
 
   if (digest.rows.length > 0) {
-    lines.push('', '## Sessions', '');
+    lines.push('', '## Сессии', '');
     for (const row of digest.rows) {
-      const preview = row.summary.length > 0 ? row.summary : '(no summary)';
+      const preview = row.summary.length > 0 ? row.summary : '(без резюме)';
       lines.push(`- ${formatClockInZone(row.startedAt, timezone)} — ${escapeMarkdown(preview)}`);
     }
   }

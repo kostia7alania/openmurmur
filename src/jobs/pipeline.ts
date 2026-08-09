@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { foreignScripts, reconcileLanguages } from '../asr/languages.ts';
+import { effectiveAsrLanguage } from '../asr/preferences.ts';
 import { assignSpeaker, offsetTurns, speakerCount } from '../asr/speakers.ts';
 import type { AsrBackend, SpeakerTurn } from '../asr/types.ts';
 import type { Paths } from '../config/paths.ts';
@@ -230,14 +231,13 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
   let offsetMs = 0;
   let engine = deps.asr.name;
   let model = 'unknown';
+  const forcedLanguage = forcedLanguageOf(job, deps);
 
   for (const part of finalized) {
     const result = await deps.asr.transcribe({
       audioPath: part.path,
       requestId: randomUUID(),
-      ...(deps.config.asr.languageHints.length > 0
-        ? { languageHints: deps.config.asr.languageHints }
-        : {}),
+      ...(forcedLanguage === null ? {} : { languageHints: [forcedLanguage] }),
       ...(deps.config.asr.context.length > 0 ? { context: deps.config.asr.context } : {}),
     });
     engine = result.engine;
@@ -266,11 +266,13 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
   // The model reports the language it settled on, which is incomplete on
   // genuinely mixed speech: a real Thai-English conversation came back as
   // ["th"] with more Latin characters in it than Thai.
-  const { languages: reconciled, added } = reconcileLanguages([...languages], text);
+  const declaredLanguages = [...languages];
+  const foreign = foreignScripts(declaredLanguages, text);
+  const { languages: reconciled, added } = reconcileLanguages(declaredLanguages, text);
   if (added.length > 0) {
     deps.logger.info('added languages the text contains but the model did not report', {
       sessionId,
-      declared: [...languages],
+      declared: declaredLanguages,
       added,
     });
   }
@@ -278,7 +280,6 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
   // Drift, not code-switching: Chinese characters in a Thai transcript mean
   // the model wandered. Reported, never edited out — silently rewriting a
   // transcript would be worse than an odd one.
-  const foreign = foreignScripts(reconciled, text);
   if (foreign.length > 0) {
     deps.logger.warn('transcript contains scripts no detected language accounts for', {
       sessionId,
@@ -292,6 +293,7 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
       engine,
       model,
       languages: reconciled,
+      forcedLanguage,
       text,
       segments: segments.map((segment) => ({
         ...segment,
@@ -307,8 +309,18 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
     sessionId,
     words,
     languages: reconciled,
+    forcedLanguage,
     speakers: speakerCount(turns),
   });
+}
+
+function forcedLanguageOf(job: Job, deps: PipelineDeps): string | null {
+  if (!Object.hasOwn(job.payload, 'forcedLanguage')) {
+    return effectiveAsrLanguage(deps.db, deps.config.asr.languageHints);
+  }
+  const value = job.payload['forcedLanguage'];
+  if (value === null || typeof value === 'string') return value;
+  throw new Error(`job ${job.jobId} has an invalid forcedLanguage`);
 }
 
 function rejectInsufficientTranscript(

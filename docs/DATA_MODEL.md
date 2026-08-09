@@ -2,7 +2,7 @@
 
 Canonical store: local SQLite at `~/Library/Application Support/OpenMurmur/openmurmur.db`.
 
-Schema: [`src/database/migrations/001_initial.sql`](../src/database/migrations/001_initial.sql).
+Schema: [`src/database/migrations/`](../src/database/migrations/).
 
 ## Connection settings
 
@@ -85,6 +85,17 @@ a `CHECK` constraint. `revision_number` is unique per owner.
 
 This is deliberate: a model upgrade that turns out to be worse must be
 recoverable, and the transcript is the artefact users keep forever.
+
+`forced_language` is null when Qwen performed automatic language identification.
+A value records the single language selected by config or `/settings`; it must
+not be presented as an independently detected language.
+
+### `asr_preferences`
+
+One host-local singleton row. Absence means the legacy config fallback applies;
+an explicit null selects Auto; `th`, `ru`, `en` or `zh` selects one forced
+language for future jobs. The job and immutable transcript revision snapshot
+the effective model-language name, so later button presses cannot alter a retry.
 
 ### `transcript_segments`
 

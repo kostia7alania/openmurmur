@@ -63,10 +63,12 @@ languages.
 
 - **Auto-detection costs about one CER point.** The shipped config leaves
   `asr.languageHints` empty, which is correct for an ambient journal — nobody
-  announces which language they are about to speak — but the measurement above
-  shows a fixed price for it. Recovering it needs two passes (detect, then
-  re-transcribe with the hint), which roughly doubles ASR cost for a
-  ~1-point gain. Not taken. Revisit if Thai sessions turn out to dominate.
+  announces which language they are about to speak. Qwen accepts at most one
+  forced language for one audio input; this is not a priority list. The
+  measurement above shows a fixed price for it. `/settings` therefore lets the
+  input-owner choose forced Thai for future known-monolingual jobs. An automatic
+  detect-then-retranscribe pass would roughly double ASR cost for a ~1-point
+  gain and is still not taken; revisit it only with a measured far-field corpus.
 - **Speed is the one place the specialized model wins outright**: RTF 0.24
   against 1.09. Qwen3-ASR is slower than real time on short utterances, where
   per-call overhead dominates. If the ASR queue ever falls behind, Typhoon
@@ -98,5 +100,7 @@ languages.
 
 ## References
 
+- [Qwen3-ASR official inference API and language forcing](https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/inference/qwen3_asr.py)
+- [Qwen3-ASR model card: forcing one language and context/hotwords](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf)
 - [Typhoon ASR Real-time: FastConformer-Transducer for Thai ASR](https://arxiv.org/html/2601.13044v1)
 - [Qwen3-ASR Technical Report](https://arxiv.org/html/2601.21337v1)

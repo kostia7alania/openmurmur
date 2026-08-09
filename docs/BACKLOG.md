@@ -54,7 +54,7 @@ dependencies, risk, estimate (S/M/L), release, tests.
 
 - **Epic:** Storage
 - **User value:** Data survives upgrades and crashes.
-- **Scope:** 14 tables, WAL, foreign keys, busy timeout, FTS5 trigram,
+- **Scope:** 16 tables, WAL, foreign keys, busy timeout, FTS5 trigram,
   idempotent filename-ordered migrations, runtime version check.
 - **Non-goals:** Down-migrations (a rollback on a database holding the user's
   only transcript is worse than the problem).
@@ -440,6 +440,69 @@ suite. AR-07 and AR-14 remain untouched.
   bound; long transcript file-only delivery; report preview plus file; timed
   transcript with and without diarization labels. Live Telegram rendering is
   still unverified.
+
+#### UX-06 🟡 Visible ASR language and host-scoped recognition settings
+
+- **Severity:** P1 · **Epic:** ASR/Telegram UX · **Estimate:** M
+- **User value:** A transcript says what language handling actually happened,
+  and Thai-first rooms can improve future monolingual recordings without
+  editing config or pretending that Qwen supports a priority list.
+- **Scope:** Show reconciled languages and Auto/forced mode in live and incoming
+  transcripts. Add a durable `/settings` radio panel for Auto, Thai, Russian,
+  English and Chinese. Snapshot the mode in new jobs/revisions. Attach controls
+  only on the one `receiveUpdates` input-owner host and identify that host.
+- **Non-goals:** A multi-language allowlist; LLM selection between several ASR
+  outputs; cross-host control; changing the Telegram interface locale.
+- **Acceptance:** Auto remains the default; one forced language reaches live
+  and incoming ASR; a later settings change cannot alter a leased/retried job;
+  forced results never claim that automatic LID ran; callback replay is
+  idempotent; send-only output has no dead keyboard.
+- **Tests:** Config rejects more than one legacy hint; preference persistence;
+  job snapshot; callback allowlist and Bot API payloads; transcript metadata;
+  input-owner versus send-only delivery. Real Bot API rendering and the real
+  Qwen language modes remain unverified on this revision.
+
+#### UX-07 ⬜ Re-transcribe one retained recording with a chosen language
+
+- **Severity:** P1 · **Epic:** ASR correction · **Estimate:** L
+- **User value:** If Auto chose the wrong language, one tap can correct that
+  recording rather than only improving the next one.
+- **Scope:** A `Перераспознать` action for source audio still present on the
+  polling host. Append an immutable transcript revision with Auto/forced
+  evidence, then run revision-scoped transcript, summary, search and delivery
+  jobs with revision-specific idempotency keys.
+- **Non-goals:** Reprocessing a dev-Mac file from prod; choosing the best of
+  five model outputs without confidence; restoring audio already deleted by
+  retention.
+- **Acceptance:** The old revision remains readable; exactly one new revision
+  and delivery chain is produced per callback; missing/local-on-another-host
+  audio returns a truthful answer; retention and current-pointer facts remain
+  crash-consistent.
+- **Dependencies:** P0-12, AR-15, UX-06. **Tests:** retry at every ASR/summary/
+  outbox crash boundary, expired callback, missing audio and two-host fixtures.
+
+#### UX-08 🟡 Finish the Russian user-surface contract
+
+- **Severity:** P1 · **Epic:** Product language · **Estimate:** M
+- **User value:** Inline output and attached files do not switch labels between
+  Russian and English when a Telegram size limit is crossed.
+- **Scope:** Russian bot-authored Telegram labels, provenance/status/health
+  names and `.md` chrome. Keep code, CLI, logs and canonical engineering docs
+  English; keep transcript/summary/filenames/hostnames in their source language.
+  Add a curated Russian onboarding README rather than a manually mirrored copy
+  of every technical document.
+- **Non-goals:** Full i18n before a second real UI locale; translating commands
+  (Bot API command names remain Latin); translating user content.
+- **Acceptance:** The language boundary is documented and snapshot-tested for
+  short/long transcript, report, digest, status, health and rejection output;
+  raw internal exceptions never become Russian-chat content.
+- **Tests:** Golden bot-output fixtures with Russian, Thai, English and Chinese
+  content plus Markdown/HTML/UTF-16 boundary cases.
+- **Current evidence:** Transcript/report/digest Markdown chrome, provenance,
+  status labels, command descriptions and the curated `README.ru.md` are
+  implemented and covered by offline render/transport tests. Health and media
+  rejection copy still need the same stable Russian error boundary, so this
+  item is not complete.
 
 ### Blocking correctness and privacy repairs
 

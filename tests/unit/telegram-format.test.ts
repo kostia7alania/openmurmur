@@ -38,7 +38,7 @@ describe('output provenance', () => {
     assert.match(html, /фоновая запись OpenMurmur/);
     assert.match(html, /Kostia &lt;Mac&gt;/);
     assert.match(html, /Europe\/Moscow/);
-    assert.match(html, /Session UID: <code>session-1<\/code>/);
+    assert.match(html, /UID сессии: <code>session-1<\/code>/);
   });
 
   it('keeps a forwarded filename display-only, bounded and escaped', () => {
@@ -55,14 +55,14 @@ describe('output provenance', () => {
       fileUid: 'file-uid',
     };
     const html = renderProvenanceHtml(provenance);
-    assert.match(html, /пересланное аудио из Telegram \(document\)/);
-    assert.match(html, /Telegram update\/message: <code>99\/10<\/code>/);
-    assert.match(html, /File UID: <code>file-uid<\/code>/);
+    assert.match(html, /пересланное аудио из Telegram \(документ\)/);
+    assert.match(html, /ID обновления\/сообщения Telegram: <code>99\/10<\/code>/);
+    assert.match(html, /UID файла: <code>file-uid<\/code>/);
     assert.ok(!html.includes('<b>../../secret'));
     assert.ok(!html.includes('\u0000'));
     assert.ok(html.length <= 1024, 'the provenance must fit a Telegram caption by UTF-16 units');
-    assert.match(renderProvenancePlain(provenance), /File UID: file-uid/);
-    assert.match(renderProvenanceMarkdown(provenance), /- File UID: `file-uid`/);
+    assert.match(renderProvenancePlain(provenance), /UID файла: file-uid/);
+    assert.match(renderProvenanceMarkdown(provenance), /- UID файла: `file-uid`/);
   });
 
   it('renders missing legacy provenance as unknown instead of inventing current facts', () => {
@@ -74,7 +74,7 @@ describe('output provenance', () => {
       sessionId: 'legacy',
     });
     assert.match(html, /Демон: <code>неизвестно<\/code>/);
-    assert.match(html, /неизвестно timezone/);
+    assert.match(html, /часовой пояс неизвестно/);
   });
 });
 
@@ -166,6 +166,19 @@ describe('transcript messages', () => {
     assert.equal(messages[0]?.partCount, 1);
     assert.ok(messages[0]?.text.includes(sessionId));
     assert.ok(messages[0]?.text.includes('<blockquote expandable>'));
+  });
+
+  it('shows detected languages, forced mode and the future-settings boundary', () => {
+    const message = renderTranscriptMessages(sessionId, 'สวัสดี hello', 3500, undefined, {
+      languages: ['th', 'en'],
+      forcedLanguage: 'Thai',
+      showSettingsHint: true,
+    })[0]?.text;
+
+    assert.match(message ?? '', /<b>Расшифровка<\/b>/);
+    assert.match(message ?? '', /Языки: тайский, английский/);
+    assert.match(message ?? '', /Режим: только тайский/);
+    assert.match(message ?? '', /следующих расшифровок/);
   });
 
   it('numbers the parts of a long transcript', () => {
@@ -299,9 +312,9 @@ describe('session report', () => {
         { startMs: 1000, endMs: 2000, text: 'Продолжили.', speaker: 1 },
       ],
     });
-    assert.match(report, /^# OpenMurmur session report/);
-    assert.match(report, /## Summary\n\nКраткий итог/);
-    assert.match(report, /## Tasks\n\n- Позвонить завтра/);
+    assert.match(report, /^# Отчёт OpenMurmur/);
+    assert.match(report, /## Кратко\n\nКраткий итог/);
+    assert.match(report, /## Задачи\n\n- Позвонить завтра/);
     assert.match(report, /## Таймлайн и голоса/);
     assert.match(report, /0:00 {2}Голос 1: Начали обсуждение\\\./);
     assert.match(report, /0:01 {2}Голос 2: Продолжили\\\./);

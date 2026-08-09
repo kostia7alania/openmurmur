@@ -236,10 +236,28 @@ across messages.
 | --- | --- |
 | `/status` | Daemon host name, recorder state, last frame age, current session, ASR backlog, outbox depth, last delivery, free disk, model status, version. |
 | `/health` | `OK`, or one `WARN:`/`ERROR:` line per unhealthy component. |
+| `/settings` | Shows this daemon host and selects Auto, Thai, Russian, English, or Chinese for future ASR jobs. |
 | `/help` | Available commands. |
 | `/start` | Same as `/help`. |
 
 The `@botname` suffix Telegram adds in groups is stripped.
+
+`/settings` is a radio choice, not a language allowlist. Qwen accepts either
+automatic identification or one forced language for one audio input. The
+choice is snapshotted into new jobs on this Mac. Transcript buttons change the
+same future default; they do not rewrite the transcript above them.
+
+Only the daemon with `telegram.receiveUpdates: true` can receive callback
+queries, so send-only development instances do not attach dead buttons to
+their output. With two Macs on one bot token, settings affect the input-owner
+host shown in the panel, not the other Mac.
+
+The implementation follows the official Bot API callback contract:
+`callback_data` stays below 64 bytes, every accepted press calls
+`answerCallbackQuery`, and the existing keyboard is edited rather than adding a
+new settings message. See [InlineKeyboardButton](https://core.telegram.org/bots/api#inlinekeyboardbutton),
+[CallbackQuery](https://core.telegram.org/bots/api#callbackquery), and
+[answerCallbackQuery](https://core.telegram.org/bots/api#answercallbackquery).
 
 ### Commands that deliberately do not exist
 

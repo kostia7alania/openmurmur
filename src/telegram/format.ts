@@ -1,3 +1,4 @@
+import { languageListLabel, recognitionModeLabel } from '../asr/preferences.ts';
 import { speakerLabel } from '../asr/speakers.ts';
 
 /**
@@ -100,6 +101,12 @@ export interface TimedTranscriptSegment {
   readonly speaker?: number | null;
 }
 
+export interface TranscriptLanguageInfo {
+  readonly languages: readonly string[];
+  readonly forcedLanguage: string | null;
+  readonly showSettingsHint?: boolean;
+}
+
 /**
  * Renders a transcript as numbered HTML messages, each carrying the session id
  * so that out-of-order delivery in a busy chat is still reassemblable.
@@ -109,15 +116,25 @@ export function renderTranscriptMessages(
   transcript: string,
   inlineLimit: number,
   provenanceHtml?: string,
+  languageInfo?: TranscriptLanguageInfo,
 ): TranscriptMessage[] {
   const provenance =
     provenanceHtml === undefined
       ? `<code>${escapeHtml(sessionId)}</code>\n\n`
       : `${provenanceHtml}\n\n`;
+  const languageLines =
+    languageInfo === undefined
+      ? ''
+      : `🌐 Языки: ${escapeHtml(languageListLabel(languageInfo.languages))}\n` +
+        `🎯 Режим: ${escapeHtml(recognitionModeLabel(languageInfo.forcedLanguage))}\n` +
+        (languageInfo.showSettingsHint === true
+          ? '⚙️ Кнопки ниже меняют режим следующих расшифровок.\n'
+          : '') +
+        '\n';
   const header = (n: number, total: number) =>
     total === 1
-      ? `📝 <b>Transcript</b>\n${provenance}`
-      : `📝 <b>Transcript ${n}/${total}</b>\n${provenance}`;
+      ? `📝 <b>Расшифровка</b>\n${provenance}${languageLines}`
+      : `📝 <b>Расшифровка ${n}/${total}</b>\n${provenance}${languageLines}`;
   const quote = (body: string) => `<blockquote expandable>${body}</blockquote>`;
 
   const escaped = escapeHtml(transcript);
@@ -141,6 +158,7 @@ export function renderTimedTranscriptMessages(
   fallbackTranscript: string,
   inlineLimit: number,
   provenanceHtml?: string,
+  languageInfo?: TranscriptLanguageInfo,
 ): TranscriptMessage[] {
   const formatted = formatTimedTranscript(segments);
   return renderTranscriptMessages(
@@ -148,6 +166,7 @@ export function renderTimedTranscriptMessages(
     formatted.length > 0 ? formatted : fallbackTranscript,
     inlineLimit,
     provenanceHtml,
+    languageInfo,
   );
 }
 

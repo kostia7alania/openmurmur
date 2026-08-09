@@ -359,6 +359,8 @@ export interface TranscriptInput {
   readonly engine: string;
   readonly model: string;
   readonly languages: readonly string[];
+  /** Null means automatic language identification; a value was forced by config/user. */
+  readonly forcedLanguage?: string | null;
   readonly text: string;
   readonly segments: readonly TranscriptSegmentInput[];
 }
@@ -399,8 +401,8 @@ export class TranscriptRepository {
         .prepare(
           `INSERT INTO transcript_revisions
              (revision_id, session_id, incoming_file_id, revision_number, engine, model,
-              languages, text, word_count, is_current, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+              languages, forced_language, text, word_count, is_current, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
         )
         .run(
           revisionId,
@@ -410,6 +412,7 @@ export class TranscriptRepository {
           input.engine,
           input.model,
           JSON.stringify(input.languages),
+          input.forcedLanguage ?? null,
           input.text,
           wordCount,
           nowIso(),
@@ -443,15 +446,30 @@ export class TranscriptRepository {
     });
   }
 
-  current(
-    sessionId: string,
-  ): { revision_id: string; text: string; word_count: number } | undefined {
+  current(sessionId: string):
+    | {
+        revision_id: string;
+        text: string;
+        word_count: number;
+        languages: string;
+        forced_language: string | null;
+      }
+    | undefined {
     return this.#db
       .prepare(
-        `SELECT revision_id, text, word_count FROM transcript_revisions
+        `SELECT revision_id, text, word_count, languages, forced_language
+           FROM transcript_revisions
           WHERE session_id = ? AND is_current = 1`,
       )
-      .get(sessionId) as { revision_id: string; text: string; word_count: number } | undefined;
+      .get(sessionId) as
+      | {
+          revision_id: string;
+          text: string;
+          word_count: number;
+          languages: string;
+          forced_language: string | null;
+        }
+      | undefined;
   }
 
   segments(revisionId: string): TranscriptSegmentInput[] {

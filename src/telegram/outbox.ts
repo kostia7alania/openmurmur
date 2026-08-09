@@ -3,7 +3,12 @@ import { rm, stat } from 'node:fs/promises';
 import type { DatabaseSync } from 'node:sqlite';
 import { transaction } from '../database/db.ts';
 import type { Logger } from '../logging/logger.ts';
-import { isRetryable, shouldRetryWithoutAttempt, type TelegramClient } from './client.ts';
+import {
+  isRetryable,
+  shouldRetryWithoutAttempt,
+  type TelegramClient,
+  type TelegramInlineKeyboardMarkup,
+} from './client.ts';
 
 /**
  * Transactional outbox for every Telegram send.
@@ -24,13 +29,19 @@ export type OutboxKind =
   | 'incoming_transcript';
 
 export type OutboxPayload =
-  | { readonly type: 'text'; readonly text: string; readonly parseMode?: 'HTML' }
+  | {
+      readonly type: 'text';
+      readonly text: string;
+      readonly parseMode?: 'HTML';
+      readonly replyMarkup?: TelegramInlineKeyboardMarkup;
+    }
   | {
       readonly type: 'document';
       readonly path: string;
       readonly filename: string;
       readonly caption?: string;
       readonly partId?: string;
+      readonly replyMarkup?: TelegramInlineKeyboardMarkup;
       /** Ephemeral delivery artifact, safe to remove only after Telegram accepted it. */
       readonly deleteAfterSend?: boolean;
     };
@@ -324,6 +335,7 @@ async function sendPayload(deps: OutboxWorkerDeps, payload: OutboxPayload): Prom
   if (payload.type === 'text') {
     const message = await deps.client.sendMessage(deps.chatId, payload.text, {
       parseMode: payload.parseMode,
+      ...(payload.replyMarkup === undefined ? {} : { replyMarkup: payload.replyMarkup }),
     });
     return message.message_id;
   }
@@ -341,6 +353,7 @@ async function sendPayload(deps: OutboxWorkerDeps, payload: OutboxPayload): Prom
   }
   const message = await deps.client.sendDocument(deps.chatId, payload.path, {
     filename: payload.filename,
+    ...(payload.replyMarkup === undefined ? {} : { replyMarkup: payload.replyMarkup }),
     ...(payload.caption !== undefined
       ? { caption: payload.caption, parseMode: 'HTML' as const }
       : {}),

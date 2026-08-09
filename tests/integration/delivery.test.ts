@@ -115,6 +115,28 @@ describe('ASR job', () => {
     assert.equal(jobs.pendingCount('summarize'), 1);
   });
 
+  it('uses the language snapshotted in the job and records that auto-detection was skipped', async () => {
+    seedFinalizedSession('s1');
+    const asr = new FakeAsr();
+    const original = asr.transcribe.bind(asr);
+    let receivedHints: readonly string[] | undefined;
+    asr.transcribe = async (request) => {
+      receivedHints = request.languageHints;
+      return original(request);
+    };
+
+    await handleJob(deps(asr), {
+      jobId: 'j-forced',
+      kind: 'asr',
+      payload: { sessionId: 's1', forcedLanguage: 'Thai' },
+      attempts: 1,
+      maxAttempts: 5,
+    });
+
+    assert.deepEqual(receivedHints, ['Thai']);
+    assert.equal(new TranscriptRepository(db.handle).current('s1')?.forced_language, 'Thai');
+  });
+
   it('concatenates every part of a multi-part session', async () => {
     seedFinalizedSession('s1', 3);
     await handleJob(deps(), {
@@ -265,6 +287,54 @@ describe('delivery enqueue', () => {
     assert.equal(outbox.claimNext()?.kind, 'report');
   });
 
+  it('shows languages and settings controls only on the input-owner transcript', async () => {
+    seedFinalizedSession('owner');
+    await transcribeAndSummarize('owner');
+    await enqueueSessionDelivery(db.handle, {
+      sessionId: 'owner',
+      summary: EMPTY_SUMMARY,
+      config: CONFIG,
+      paths: paths(),
+    });
+    const ownerPayload = JSON.parse(
+      (
+        db.handle
+          .prepare(
+            "SELECT payload FROM telegram_outbox WHERE delivery_part_id = 'transcript:owner:1'",
+          )
+          .get() as { payload: string }
+      ).payload,
+    ) as { text: string; replyMarkup?: unknown };
+    assert.match(ownerPayload.text, /Языки: английский/);
+    assert.ok(ownerPayload.replyMarkup, 'the polling host offers working settings controls');
+
+    seedFinalizedSession('send-only');
+    await transcribeAndSummarize('send-only');
+    await enqueueSessionDelivery(db.handle, {
+      sessionId: 'send-only',
+      summary: EMPTY_SUMMARY,
+      config: {
+        ...CONFIG,
+        telegram: { ...CONFIG.telegram, receiveUpdates: false },
+      },
+      paths: paths(),
+    });
+    const sendOnlyPayload = JSON.parse(
+      (
+        db.handle
+          .prepare(
+            "SELECT payload FROM telegram_outbox WHERE delivery_part_id = 'transcript:send-only:1'",
+          )
+          .get() as { payload: string }
+      ).payload,
+    ) as { replyMarkup?: unknown };
+    assert.equal(
+      sendOnlyPayload.replyMarkup,
+      undefined,
+      'send-only dev must not show dead buttons',
+    );
+  });
+
   it('sends the original FLAC, never a re-encode', async () => {
     const files = seedFinalizedSession('s1', 1);
     await transcribeAndSummarize('s1');
@@ -291,7 +361,7 @@ describe('delivery enqueue', () => {
     assert.match(payload.caption, /фоновая запись OpenMurmur/);
     assert.match(payload.caption, /test-mac/);
     assert.match(payload.caption, /Europe\/Moscow/);
-    assert.match(payload.caption, /Session UID: <code>s1<\/code>/);
+    assert.match(payload.caption, /UID сессии: <code>s1<\/code>/);
   });
 
   it('renders report times in the persisted capture timezone', async () => {
@@ -502,7 +572,7 @@ describe('delivery enqueue', () => {
     assert.ok(existsSync(transcriptFile));
     const transcriptPayload = JSON.parse(md.payload) as { caption: string };
     assert.match(transcriptPayload.caption, /^📝 Транскрипт с таймингами/);
-    assert.match(transcriptPayload.caption, /Session UID: <code>s1<\/code>/);
+    assert.match(transcriptPayload.caption, /UID сессии: <code>s1<\/code>/);
     assert.match(readFileSync(transcriptFile, 'utf8'), /0:00 {2}слово/);
   });
 
@@ -581,7 +651,7 @@ describe('delivery enqueue', () => {
     assert.ok(existsSync(payload.path));
     const report = readFileSync(payload.path, 'utf8');
     assert.match(report, /Источник: фоновая запись OpenMurmur/);
-    assert.match(report, /Session UID: `s1`/);
+    assert.match(report, /UID сессии: `s1`/);
     assert.match(report, /## Таймлайн\n/);
     assert.doesNotMatch(report, /Голос 1:/, 'отчёт не должен выдумывать голоса');
   });

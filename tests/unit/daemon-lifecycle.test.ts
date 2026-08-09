@@ -91,7 +91,14 @@ describe('incoming Telegram retry identity', () => {
     };
     assert.equal(recordUpdate(db.handle, 501, 'audio'), true);
 
-    const claimed = enqueueIncomingRequest(db.handle, 501, message, 'capture-mac');
+    const claimed = enqueueIncomingRequest(
+      db.handle,
+      501,
+      message,
+      'capture-mac',
+      'legacy',
+      'Thai',
+    );
 
     assert.equal(claimed.telegramSource, 'direct');
     assert.equal(claimed.originalSentAt, null);
@@ -101,7 +108,12 @@ describe('incoming Telegram retry identity', () => {
     const job = db.handle
       .prepare("SELECT payload FROM jobs WHERE idempotency_key = 'incoming:501'")
       .get() as { payload: string };
-    assert.equal((JSON.parse(job.payload) as { fileUid: string }).fileUid, claimed.fileUid);
+    const jobPayload = JSON.parse(job.payload) as {
+      fileUid: string;
+      forcedLanguage: string | null;
+    };
+    assert.equal(jobPayload.fileUid, claimed.fileUid);
+    assert.equal(jobPayload.forcedLanguage, 'Thai');
     const ack = db.handle
       .prepare("SELECT payload FROM telegram_outbox WHERE delivery_part_id = 'ack:501'")
       .get() as { payload: string };

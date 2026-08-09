@@ -102,11 +102,33 @@ export interface TelegramAudioLike {
   file_name?: string;
 }
 
+export interface TelegramInlineKeyboardButton {
+  readonly text: string;
+  readonly callback_data: string;
+}
+
+export interface TelegramInlineKeyboardMarkup {
+  readonly inline_keyboard: readonly (readonly TelegramInlineKeyboardButton[])[];
+}
+
+export interface TelegramBotCommand {
+  readonly command: string;
+  readonly description: string;
+}
+
+export interface TelegramCallbackQuery {
+  readonly id: string;
+  readonly from: TelegramUser;
+  readonly message?: TelegramMessage;
+  readonly data?: string;
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
   channel_post?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 }
 
 export interface TelegramFile {
@@ -220,13 +242,17 @@ export class TelegramClient {
     return this.#call<TelegramUser>('getMe');
   }
 
+  setMyCommands(commands: readonly TelegramBotCommand[]): Promise<true> {
+    return this.#json<true>('setMyCommands', { commands });
+  }
+
   getUpdates(offset: number, timeoutSeconds: number): Promise<TelegramUpdate[]> {
     return this.#json<TelegramUpdate[]>(
       'getUpdates',
       {
         offset,
         timeout: timeoutSeconds,
-        allowed_updates: ['message'],
+        allowed_updates: ['message', 'callback_query'],
       },
       telegramLongPollDeadlineMs(this.#requestTimeoutMs, timeoutSeconds),
     );
@@ -235,25 +261,73 @@ export class TelegramClient {
   sendMessage(
     chatId: number,
     text: string,
-    options: { parseMode?: 'HTML' | undefined; disablePreview?: boolean } = {},
+    options: {
+      parseMode?: 'HTML' | undefined;
+      disablePreview?: boolean;
+      replyMarkup?: TelegramInlineKeyboardMarkup;
+    } = {},
   ): Promise<TelegramMessage> {
     return this.#json<TelegramMessage>('sendMessage', {
       chat_id: chatId,
       text,
       ...(options.parseMode !== undefined ? { parse_mode: options.parseMode } : {}),
+      ...(options.replyMarkup !== undefined ? { reply_markup: options.replyMarkup } : {}),
       link_preview_options: { is_disabled: options.disablePreview !== false },
+    });
+  }
+
+  answerCallbackQuery(callbackQueryId: string, text?: string): Promise<true> {
+    return this.#json<true>('answerCallbackQuery', {
+      callback_query_id: callbackQueryId,
+      ...(text !== undefined ? { text } : {}),
+    });
+  }
+
+  editMessageText(
+    chatId: number,
+    messageId: number,
+    text: string,
+    options: { parseMode?: 'HTML'; replyMarkup?: TelegramInlineKeyboardMarkup } = {},
+  ): Promise<TelegramMessage | true> {
+    return this.#json<TelegramMessage | true>('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      ...(options.parseMode !== undefined ? { parse_mode: options.parseMode } : {}),
+      ...(options.replyMarkup !== undefined ? { reply_markup: options.replyMarkup } : {}),
+      link_preview_options: { is_disabled: true },
+    });
+  }
+
+  editMessageReplyMarkup(
+    chatId: number,
+    messageId: number,
+    replyMarkup: TelegramInlineKeyboardMarkup,
+  ): Promise<TelegramMessage | true> {
+    return this.#json<TelegramMessage | true>('editMessageReplyMarkup', {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup,
     });
   }
 
   async sendDocument(
     chatId: number,
     filePath: string,
-    options: { caption?: string; filename?: string; parseMode?: 'HTML' } = {},
+    options: {
+      caption?: string;
+      filename?: string;
+      parseMode?: 'HTML';
+      replyMarkup?: TelegramInlineKeyboardMarkup;
+    } = {},
   ): Promise<TelegramMessage> {
     const form = new FormData();
     form.set('chat_id', String(chatId));
     if (options.caption !== undefined) form.set('caption', options.caption);
     if (options.parseMode !== undefined) form.set('parse_mode', options.parseMode);
+    if (options.replyMarkup !== undefined) {
+      form.set('reply_markup', JSON.stringify(options.replyMarkup));
+    }
     // openAsBlob streams from disk instead of buffering a 50 MB file in RAM.
     const blob = await openAsBlob(filePath);
     form.set('document', blob, options.filename ?? basename(filePath));

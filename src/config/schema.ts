@@ -74,7 +74,7 @@ export interface AsrConfig {
   readonly backend: 'mlx' | 'fake';
   readonly model: string;
   readonly quantization: 'fp16' | '8bit' | '4bit';
-  /** Empty = automatic language detection. */
+  /** Empty = automatic detection; one value force-selects that language. */
   readonly languageHints: readonly string[];
   /** Languages for which the Qwen forced aligner produces word timestamps. */
   readonly alignerLanguages: readonly string[];
@@ -359,9 +359,7 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
   }
   nonNegative('diarization.minTurnSeconds', d.minTurnSeconds);
 
-  if (c.asr.backend !== 'mlx' && c.asr.backend !== 'fake') {
-    issues.push('asr.backend must be "mlx" or "fake"');
-  }
+  validateAsr(c.asr, issues);
   positive('asr.pythonWorkerTimeoutMs', c.asr.pythonWorkerTimeoutMs);
   if (c.llm.backend !== 'ollama' && c.llm.backend !== 'fake') {
     issues.push('llm.backend must be "ollama" or "fake"');
@@ -406,6 +404,20 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
 
   if (!['debug', 'info', 'warn', 'error'].includes(c.logLevel)) {
     issues.push('logLevel must be one of: debug, info, warn, error');
+  }
+}
+
+function validateAsr(asr: AsrConfig, issues: string[]): void {
+  if (asr.backend !== 'mlx' && asr.backend !== 'fake') {
+    issues.push('asr.backend must be "mlx" or "fake"');
+  }
+  if (asr.languageHints.some((value) => typeof value !== 'string' || value.trim().length === 0)) {
+    issues.push('asr.languageHints must contain only non-empty strings');
+  }
+  if (asr.languageHints.length > 1) {
+    issues.push(
+      'asr.languageHints accepts at most one forced language; Qwen does not support a priority list',
+    );
   }
 }
 

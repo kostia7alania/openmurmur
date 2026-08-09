@@ -35,8 +35,11 @@ what they actually said — without renting that record from anyone.
 - Opens a session on sustained speech, with 5 seconds of pre-roll.
 - Survives pauses; closes after 60 continuous seconds of silence.
 - Rotates the physical file every 15 minutes, keeping one logical session.
-- Transcribes locally with Qwen3-ASR (RU / EN / TH, mixed-language, automatic
-  detection).
+- Transcribes locally with Qwen3-ASR (RU / EN / TH / ZH). Automatic language
+  identification is the default; the Telegram input-owner can force one
+  language for future jobs when a recording is known to be monolingual.
+- Shows the detected/reconciled languages on every transcript. Script evidence
+  supplements the model result for mixed text; it is not a confidence score.
 - Extracts a structured summary with a local LLM.
 - Delivers the **original FLAC**, the full transcript and a short report to one
   Telegram chat.
@@ -58,6 +61,11 @@ what they actually said — without renting that record from anyone.
 | Speaker diarization (for now) | Doing it badly is worse than not doing it. Tracked as P2. |
 | A GUI | Only if a real need appears. A settings window that nobody opens is a liability. |
 | Silently degrading to a worse model | If the local ASR is unavailable, you get a clear error, not a quiet downgrade. |
+
+The product surface in Telegram is Russian. Source code, CLI output and
+engineering documentation remain English; transcript and summary content keep
+the language that was spoken. A second UI locale would justify i18n, but one
+does not.
 
 ## Design commitments
 

@@ -1,3 +1,4 @@
+import { languageListLabel } from '../asr/preferences.ts';
 import type { StructuredSummary } from '../llm/schema.ts';
 import {
   escapeHtml,
@@ -28,21 +29,6 @@ export interface SessionReportInput {
   readonly provenance?: OutputProvenance | undefined;
 }
 
-const LANGUAGE_NAMES: Record<string, string> = {
-  ru: 'русский',
-  en: 'английский',
-  th: 'тайский',
-  de: 'немецкий',
-  fr: 'французский',
-  es: 'испанский',
-  zh: 'китайский',
-};
-
-function languageLabel(codes: readonly string[]): string {
-  if (codes.length === 0) return 'не определены';
-  return codes.map((code) => LANGUAGE_NAMES[code] ?? code).join(', ');
-}
-
 function bulletList(title: string, items: readonly string[]): string[] {
   if (items.length === 0) return [];
   return ['', `<b>${title}</b>`, ...items.map((item) => `• ${escapeHtml(item)}`)];
@@ -71,7 +57,7 @@ export function renderSessionReport(input: SessionReportInput): string {
     `Время: ${formatClock(input.startedWallMs, input.timezone)}–${formatClock(input.endedWallMs, input.timezone)}`,
     `Продолжительность: ${formatDuration(input.durationMs)}`,
     `Речь: ${formatDuration(input.speechMs)}`,
-    `Языки: ${escapeHtml(languageLabel(input.languages))}`,
+    `Языки: ${escapeHtml(languageListLabel(input.languages))}`,
     `Частей аудио: ${input.partCount}`,
   ];
 
@@ -97,7 +83,7 @@ export function renderSessionReport(input: SessionReportInput): string {
   }
 
   if (input.provenance === undefined) {
-    details.push('', `Session UID: <code>${escapeHtml(input.sessionId)}</code>`);
+    details.push('', `UID сессии: <code>${escapeHtml(input.sessionId)}</code>`);
   } else {
     details.push('', '<b>Происхождение:</b>', renderProvenanceHtml(input.provenance));
   }
@@ -132,32 +118,32 @@ export function renderSessionSummaryPreview(input: SessionReportInput): string {
 /** Full report artifact used when the Telegram-sized HTML rendering is too long. */
 export function renderSessionReportMarkdown(input: SessionReportInput): string {
   const lines: string[] = [
-    '# OpenMurmur session report',
+    '# Отчёт OpenMurmur',
     '',
     ...(input.provenance === undefined
-      ? [`- Session UID: \`${input.sessionId}\``]
+      ? [`- UID сессии: \`${input.sessionId}\``]
       : [renderProvenanceMarkdown(input.provenance)]),
-    `- Time: ${formatClock(input.startedWallMs, input.timezone)}–${formatClock(input.endedWallMs, input.timezone)}`,
-    `- Duration: ${formatDuration(input.durationMs)}`,
-    `- Speech: ${formatDuration(input.speechMs)}`,
-    `- Languages: ${languageLabel(input.languages)}`,
-    `- Audio parts: ${input.partCount}`,
+    `- Время: ${formatClock(input.startedWallMs, input.timezone)}–${formatClock(input.endedWallMs, input.timezone)}`,
+    `- Продолжительность: ${formatDuration(input.durationMs)}`,
+    `- Речь: ${formatDuration(input.speechMs)}`,
+    `- Языки: ${languageListLabel(input.languages)}`,
+    `- Частей аудио: ${input.partCount}`,
   ];
 
   const s = input.summary;
-  if (s.summary.length > 0) lines.push('', '## Summary', '', escapeMarkdown(s.summary));
-  lines.push(...markdownList('Decisions', s.decisions));
-  lines.push(...markdownList('Tasks', s.tasks));
-  lines.push(...markdownList('Commitments', s.commitments));
-  lines.push(...markdownList('Expenses', s.expenses));
-  lines.push(...markdownList('Ideas', s.ideas));
-  lines.push(...markdownList('Questions', s.questions));
-  lines.push(...markdownList('Uncertainties', s.uncertainties));
+  if (s.summary.length > 0) lines.push('', '## Кратко', '', escapeMarkdown(s.summary));
+  lines.push(...markdownList('Решения', s.decisions));
+  lines.push(...markdownList('Задачи', s.tasks));
+  lines.push(...markdownList('Обязательства', s.commitments));
+  lines.push(...markdownList('Расходы', s.expenses));
+  lines.push(...markdownList('Идеи', s.ideas));
+  lines.push(...markdownList('Вопросы', s.questions));
+  lines.push(...markdownList('Неуверенность', s.uncertainties));
   if (s.people.length > 0) {
-    lines.push('', `**People:** ${s.people.map(escapeMarkdown).join(', ')}`);
+    lines.push('', `**Люди:** ${s.people.map(escapeMarkdown).join(', ')}`);
   }
   if (s.places.length > 0) {
-    lines.push('', `**Places:** ${s.places.map(escapeMarkdown).join(', ')}`);
+    lines.push('', `**Места:** ${s.places.map(escapeMarkdown).join(', ')}`);
   }
   const transcript = reportTranscript(input);
   if (transcript !== null) {
@@ -227,13 +213,13 @@ export function renderStatus(input: StatusReportInput): string {
     `${input.recording ? '🟢' : '🔴'} <b>${heading}</b> — <code>${escapeHtml(input.hostName)}</code>`,
     '',
     `Запись: ${input.recording ? 'включена' : 'остановлена'}`,
-    `Последний audio frame: ${ago(input.lastFrameSecondsAgo, 'сек')}`,
+    `Последний аудиокадр: ${ago(input.lastFrameSecondsAgo, 'сек')}`,
     `Текущая сессия: ${escapeHtml(session)}`,
     `Последний закрытый файл: ${ago(input.lastClosedPartMinutesAgo, 'мин')}`,
-    `ASR backlog: ${input.asrBacklog}`,
-    `Telegram outbox: ${input.outboxPending}`,
+    `Очередь ASR: ${input.asrBacklog}`,
+    `Очередь Telegram: ${input.outboxPending}`,
     `Последняя доставка: ${ago(input.lastDeliveryMinutesAgo, 'мин')}`,
-    `Свободный диск: ${input.diskFreeGb.toFixed(0)} GB`,
+    `Свободный диск: ${input.diskFreeGb.toFixed(0)} ГБ`,
     `ASR: ${escapeHtml(input.asrStatus)}`,
     `LLM: ${escapeHtml(input.llmStatus)}`,
     `Версия: ${escapeHtml(input.version)}`,
@@ -246,6 +232,7 @@ export const HELP_TEXT = [
   'Команды:',
   '/status — подробное состояние демона',
   '/health — короткая сводка OK / WARN / ERROR',
+  '/settings — режим языка для следующих расшифровок',
   '/help — этот текст',
   '',
   'Пришлите голосовое сообщение или аудиофайл — бот распознает его локально.',

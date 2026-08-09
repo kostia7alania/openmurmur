@@ -233,6 +233,69 @@ describe('outbox delivery', () => {
     assert.equal(row.telegram_message_id, 777);
   });
 
+  it('delivers inline settings controls from the durable outbox', async () => {
+    let sentBody = '';
+    const captureFetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      sentBody = String(init?.body ?? '');
+      return okMessage(778);
+    }) as typeof fetch;
+    const d = deps(captureFetch);
+    d.outbox.enqueue({
+      deliveryPartId: 'settings:1',
+      kind: 'status',
+      ordinal: 0,
+      payload: {
+        type: 'text',
+        text: 'settings',
+        replyMarkup: {
+          inline_keyboard: [[{ text: '○ Авто', callback_data: 'asr-mode:v1:settings:auto' }]],
+        },
+      },
+    });
+
+    assert.equal(await drainOutbox(d), 1);
+    const body = JSON.parse(sentBody) as Record<string, unknown>;
+    assert.deepEqual(body['reply_markup'], {
+      inline_keyboard: [[{ text: '○ Авто', callback_data: 'asr-mode:v1:settings:auto' }]],
+    });
+  });
+
+  it('polls callback queries and acknowledges and edits their keyboard', async () => {
+    const calls: { method: string; body: Record<string, unknown> }[] = [];
+    const captureFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = url.slice(url.lastIndexOf('/') + 1);
+      calls.push({
+        method,
+        body: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>,
+      });
+      const result = method === 'getUpdates' ? [] : true;
+      return new Response(JSON.stringify({ ok: true, result }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const client = new TelegramClient({
+      token: 'tkn',
+      baseUrl: 'https://api.telegram.org',
+      fetchImpl: captureFetch,
+    });
+
+    await client.getUpdates(5, 0);
+    await client.setMyCommands([{ command: 'settings', description: 'Настройки' }]);
+    await client.answerCallbackQuery('callback-1', 'Сохранено');
+    await client.editMessageReplyMarkup(42, 7, {
+      inline_keyboard: [[{ text: '✅ Авто', callback_data: 'asr-mode:v1:transcript:auto' }]],
+    });
+
+    assert.deepEqual(calls[0]?.body['allowed_updates'], ['message', 'callback_query']);
+    assert.deepEqual(calls[1]?.body['commands'], [
+      { command: 'settings', description: 'Настройки' },
+    ]);
+    assert.equal(calls[2]?.body['callback_query_id'], 'callback-1');
+    assert.equal(calls[3]?.body['message_id'], 7);
+  });
+
   it('honours retry_after on 429 and stops draining', async () => {
     const { fetch: impl, calls } = scriptedFetch([() => rateLimited(30), () => okMessage()]);
     const d = deps(impl);

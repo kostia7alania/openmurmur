@@ -201,6 +201,41 @@ describe('chat allowlist', () => {
     assert.equal(action.kind, 'command');
   });
 
+  it('accepts /settings and callback buttons only from the allowlisted chat', () => {
+    const command = routeUpdate(
+      {
+        update_id: 10,
+        message: message({ chat: { id: ALLOWED, type: 'private' }, text: '/settings' }),
+      },
+      ALLOWED,
+    );
+    assert.equal(command.kind === 'command' ? command.command : '', '/settings');
+
+    const callback = {
+      id: 'callback-1',
+      from: { id: 7, is_bot: false, first_name: 'Owner' },
+      message: message({ chat: { id: ALLOWED, type: 'private' } }),
+      data: 'asr-mode:v1:settings:th',
+    };
+    assert.equal(
+      routeUpdate({ update_id: 11, callback_query: callback }, ALLOWED).kind,
+      'callback',
+    );
+    assert.equal(
+      routeUpdate(
+        {
+          update_id: 12,
+          callback_query: {
+            ...callback,
+            message: message({ chat: { id: ALLOWED + 1, type: 'private' } }),
+          },
+        },
+        ALLOWED,
+      ).kind,
+      'ignore',
+    );
+  });
+
   it('silently ignores every other chat', () => {
     for (const chatId of [ALLOWED + 1, -100123, 0]) {
       const action = routeUpdate(

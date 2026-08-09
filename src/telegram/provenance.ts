@@ -84,7 +84,7 @@ function provenanceLines(provenance: OutputProvenance, code: (value: string) => 
       `Демон: ${code(displayValue(provenance.hostName))}`,
       `Исходные дата/время: ${code(formatWallTime(provenance.originalAt, provenance.timezone))}`,
       `Часовой пояс записи: ${code(displayValue(provenance.timezone))}`,
-      `Session UID: ${code(provenance.sessionId)}`,
+      `UID сессии: ${code(provenance.sessionId)}`,
     ];
   }
 
@@ -105,18 +105,24 @@ function provenanceLines(provenance: OutputProvenance, code: (value: string) => 
   }
   lines.push(
     `Сообщение боту: ${code(formatWallTime(provenance.telegramMessageAt, 'UTC'))}`,
-    `Telegram update/message: ${code(`${displayNumber(provenance.updateId)}/${provenance.messageId}`)}`,
+    `ID обновления/сообщения Telegram: ${code(`${displayNumber(provenance.updateId)}/${provenance.messageId}`)}`,
   );
   if (provenance.claimedFilename !== null) {
     lines.push(`Исходное имя: ${code(displayUntrusted(provenance.claimedFilename))}`);
   }
-  lines.push(`File UID: ${code(provenance.fileUid)}`);
+  lines.push(`UID файла: ${code(provenance.fileUid)}`);
   return lines;
 }
 
 function attachmentLabel(attachmentType: IncomingTelegramProvenance['attachmentType']): string {
   if (attachmentType === null) return '';
-  return ` (${attachmentType})`;
+  const labels = {
+    voice: 'голосовое сообщение',
+    audio: 'аудио',
+    document: 'документ',
+    video_note: 'видеосообщение',
+  } as const;
+  return ` (${labels[attachmentType]})`;
 }
 
 function displayNumber(value: number | null): string {
@@ -131,7 +137,7 @@ function formatWallTime(value: string | null, timezone: string | null): string {
   if (value === null) return UNKNOWN;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return displayUntrusted(value);
-  if (timezone === null) return `${date.toISOString()} (${UNKNOWN} timezone)`;
+  if (timezone === null) return `${date.toISOString()} (часовой пояс ${UNKNOWN})`;
   try {
     const formatted = new Intl.DateTimeFormat('ru-RU', {
       year: 'numeric',

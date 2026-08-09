@@ -39,6 +39,16 @@ describe('config parsing', () => {
     );
   });
 
+  it('accepts auto or one forced ASR language, never a fake priority list', () => {
+    assert.deepEqual(parseConfig({ asr: { languageHints: [] } }).asr.languageHints, []);
+    assert.deepEqual(parseConfig({ asr: { languageHints: ['Thai'] } }).asr.languageHints, ['Thai']);
+    assert.throws(
+      () => parseConfig({ asr: { languageHints: ['Thai', 'Russian'] } }),
+      /at most one forced language/,
+    );
+    assert.throws(() => parseConfig({ asr: { languageHints: [42] } }), /non-empty strings/);
+  });
+
   it('rejects an unknown key instead of ignoring it', () => {
     // A typo in a threshold name must not silently leave the default in place.
     assert.throws(
@@ -466,7 +476,7 @@ describe('digest day boundaries', () => {
     };
     const markdown = renderDigestMarkdown(digest, 'America/New_York');
     const telegram = renderDigest(digest, 'America/New_York');
-    assert.match(markdown, /# OpenMurmur digest/);
+    assert.match(markdown, /# Дайджест OpenMurmur/);
     assert.match(markdown, /06:00/);
     assert.match(telegram, /06:00/);
     assert.doesNotMatch(markdown, /<script>/);
