@@ -1,14 +1,16 @@
 import { writeFile } from 'node:fs/promises';
 import { stdin, stdout } from 'node:process';
 import { createInterface } from 'node:readline/promises';
+import type { DatabaseSync } from 'node:sqlite';
 import { ensureDirectories } from '../config/load.ts';
 import type { Paths } from '../config/paths.ts';
 import { managedDirectories } from '../config/paths.ts';
 import { DEFAULT_CONFIG } from '../config/schema.ts';
 import { openDatabase } from '../database/db.ts';
+import type { TelegramUpdate } from '../telegram/client.ts';
 import { TelegramClient } from '../telegram/client.ts';
-import { keychain } from '../telegram/keychain.ts';
-import { writeOffset } from '../telegram/router.ts';
+import { keychain, type SecretsStore, type TelegramSecrets } from '../telegram/keychain.ts';
+import { nextOffsetFor, readOffset, writeOffset } from '../telegram/router.ts';
 
 /**
  * Reads a secret without echoing it and without leaving it in shell history.
@@ -130,55 +132,171 @@ export async function setupTelegram(
   const username = me.username ?? me.first_name;
   log(`  Bot: @${username} (id ${me.id})`);
 
+  // Establish the boundary before asking for /start. Otherwise a message left
+  // in this bot's queue by an earlier owner could silently become the allowlist.
+  const baselineOffset = await drainUpdateBacklog(client);
+
   log('');
   log(`Now open Telegram, find @${username}, and send it:  /start`);
   log('Waiting for the message...');
 
-  const chatId = await waitForStart(client);
+  const accepted = await waitForStart(client, baselineOffset, username);
+  const chatId = accepted.chatId;
+  const account = accepted.username === null ? accepted.firstName : `@${accepted.username}`;
+  log(`  Account: ${account} (user id ${accepted.userId})`);
   log(`  Chat ID: ${chatId}`);
+  if (!(await confirmTelegramOwner(`Use ${account}, chat ${chatId}? [y/N] `))) {
+    throw new Error('Telegram setup cancelled; nothing was stored');
+  }
 
-  await keychain.storeToken(token.trim());
-  await keychain.storeChatId(chatId);
-  log('  Stored the token and chat ID in the macOS Keychain (service io.openmurmur).');
-
-  // Persist the offset so the /start we consumed is not replayed at startup.
   const db = openDatabase({ file: paths.databaseFile });
   try {
-    const updates = await client.getUpdates(0, 0);
-    const next = updates.reduce((max, u) => Math.max(max, u.update_id + 1), 0);
-    writeOffset(db.handle, next);
+    await commitTelegramSetup(
+      db.handle,
+      keychain,
+      { token: token.trim(), chatId },
+      accepted.nextOffset,
+      () =>
+        client.sendMessage(
+          chatId,
+          '✅ OpenMurmur подключён.\n\n' +
+            'Этот чат будет получать аудио, транскрипты, отчёты и статус записи.\n' +
+            'Команды: /status, /health, /help',
+        ),
+    );
   } finally {
     db.close();
   }
-
-  await client.sendMessage(
-    chatId,
-    '✅ OpenMurmur подключён.\n\n' +
-      'Этот чат будет получать аудио, транскрипты, отчёты и статус записи.\n' +
-      'Команды: /status, /health, /help',
-  );
+  log('  Stored the token and chat ID in the macOS Keychain (service io.openmurmur).');
   log('  Sent a test message.');
 
   return { botUsername: username, chatId };
 }
 
-async function waitForStart(client: TelegramClient, attempts = 30): Promise<number> {
+/**
+ * Commits the allowlisted recipient and that bot's update cursor as one setup
+ * operation. Keychain and SQLite cannot share a crash-atomic transaction, but
+ * ordinary failures restore the previous pair or fail closed with no secrets.
+ */
+export async function commitTelegramSetup(
+  db: DatabaseSync,
+  store: SecretsStore,
+  secrets: TelegramSecrets,
+  nextOffset: number,
+  confirmDelivery: () => Promise<unknown>,
+): Promise<void> {
+  const previousSecrets = await store.load();
+  const previousOffset = readOffset(db);
+  let stored = false;
+  let offsetWritten = false;
+
+  try {
+    await store.storeSecrets(secrets);
+    stored = true;
+    writeOffset(db, nextOffset);
+    offsetWritten = true;
+    await confirmDelivery();
+  } catch (error) {
+    if (!stored) throw error;
+
+    const rollbackErrors: unknown[] = [];
+    try {
+      await store.clear();
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+
+    let offsetRestored = !offsetWritten;
+    try {
+      writeOffset(db, previousOffset);
+      offsetRestored = true;
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+
+    if (offsetRestored && previousSecrets !== null) {
+      try {
+        await store.storeSecrets(previousSecrets);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        'Telegram setup failed and its previous configuration could not be fully restored',
+      );
+    }
+    throw error;
+  }
+}
+
+interface UpdatePoller {
+  getUpdates(offset: number, timeoutSeconds: number): Promise<TelegramUpdate[]>;
+}
+
+export async function drainUpdateBacklog(client: UpdatePoller, maxBatches = 100): Promise<number> {
   let offset = 0;
+  for (let batch = 0; batch < maxBatches; batch += 1) {
+    const updates = await client.getUpdates(offset, 0);
+    if (updates.length === 0) return offset;
+    offset = nextOffsetFor(updates, offset);
+  }
+  throw new Error('Telegram update backlog is still growing; clear it before setup');
+}
+
+export async function waitForStart(
+  client: UpdatePoller,
+  baselineOffset: number,
+  botUsername: string,
+  attempts = 30,
+): Promise<{
+  chatId: number;
+  nextOffset: number;
+  userId: number;
+  username: string | null;
+  firstName: string;
+}> {
+  let offset = baselineOffset;
   for (let i = 0; i < attempts; i += 1) {
     const updates = await client.getUpdates(offset, 10);
     for (const update of updates) {
       offset = Math.max(offset, update.update_id + 1);
       const message = update.message;
       if (message === undefined) continue;
-      // Any message from a private chat identifies the owner; requiring the
-      // exact text "/start" would fail for users whose client localizes it.
-      if (message.chat.type === 'private') return message.chat.id;
+      if (message.chat.type !== 'private') continue;
+      if (message.from === undefined || message.from.is_bot) continue;
+
+      const command = (message.text ?? '').trim().split(/\s+/)[0]?.toLowerCase();
+      const direct = '/start';
+      const addressed = `/start@${botUsername.toLowerCase()}`;
+      if (command === direct || command === addressed) {
+        return {
+          chatId: message.chat.id,
+          nextOffset: offset,
+          userId: message.from.id,
+          username: message.from.username ?? null,
+          firstName: message.from.first_name,
+        };
+      }
     }
   }
   throw new Error(
     'No message arrived. Make sure you messaged the right bot, then run ' +
       '`openmurmur setup telegram` again.',
   );
+}
+
+export async function confirmTelegramOwner(prompt: string): Promise<boolean> {
+  if (!stdin.isTTY) return false;
+  const input = createInterface({ input: stdin, output: stdout });
+  try {
+    const answer = (await input.question(prompt)).trim().toLowerCase();
+    return answer === 'y' || answer === 'yes';
+  } finally {
+    input.close();
+  }
 }
 
 export function createPrompt() {

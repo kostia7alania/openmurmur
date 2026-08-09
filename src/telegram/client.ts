@@ -13,6 +13,8 @@ export interface TelegramApiError extends Error {
   readonly errorCode: number | undefined;
   readonly retryAfterSeconds: number | undefined;
   readonly method: string;
+  /** A local deadline or shutdown interrupted the request before Telegram answered. */
+  readonly retryWithoutAttempt: boolean | undefined;
 }
 
 export function isRetryable(error: unknown): boolean {
@@ -22,21 +24,28 @@ export function isRetryable(error: unknown): boolean {
   return e.errorCode >= 500;
 }
 
+export function shouldRetryWithoutAttempt(error: unknown): boolean {
+  return (error as Partial<TelegramApiError>)?.retryWithoutAttempt === true;
+}
+
 function apiError(
   method: string,
   message: string,
   errorCode?: number,
   retryAfterSeconds?: number,
+  retryWithoutAttempt?: boolean,
 ): TelegramApiError {
   const error = new Error(redact(message)) as Error & {
     errorCode: number | undefined;
     retryAfterSeconds: number | undefined;
     method: string;
+    retryWithoutAttempt: boolean | undefined;
   };
   error.name = 'TelegramApiError';
   error.errorCode = errorCode;
   error.retryAfterSeconds = retryAfterSeconds;
   error.method = method;
+  error.retryWithoutAttempt = retryWithoutAttempt;
   return error;
 }
 
@@ -95,41 +104,68 @@ export interface TelegramClientOptions {
   readonly token: string;
   readonly baseUrl: string;
   readonly fetchImpl?: typeof fetch;
+  /** Internal transport deadline. Long polls extend it to cover their requested wait. */
+  readonly requestTimeoutMs?: number;
+  /** Internal deadline for streamed uploads and downloads. */
+  readonly transferTimeoutMs?: number;
 }
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_TRANSFER_TIMEOUT_MS = 10 * 60 * 1000;
+const LONG_POLL_GRACE_MS = 5_000;
 
 export class TelegramClient {
   readonly #token: string;
   readonly #baseUrl: string;
   readonly #fetch: typeof fetch;
+  readonly #requestTimeoutMs: number;
+  readonly #transferTimeoutMs: number;
+  readonly #shutdown = new AbortController();
 
   constructor(options: TelegramClientOptions) {
     this.#token = options.token;
     this.#baseUrl = options.baseUrl.replace(/\/+$/, '');
     this.#fetch = options.fetchImpl ?? fetch;
+    this.#requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.#transferTimeoutMs = options.transferTimeoutMs ?? DEFAULT_TRANSFER_TIMEOUT_MS;
+    if (!Number.isFinite(this.#requestTimeoutMs) || this.#requestTimeoutMs <= 0) {
+      throw new Error('Telegram requestTimeoutMs must be a positive finite number');
+    }
+    if (!Number.isFinite(this.#transferTimeoutMs) || this.#transferTimeoutMs <= 0) {
+      throw new Error('Telegram transferTimeoutMs must be a positive finite number');
+    }
   }
 
   async #call<T>(
     method: string,
     body?: string | FormData,
     headers?: Record<string, string>,
+    timeoutMs = this.#requestTimeoutMs,
   ): Promise<T> {
+    this.#throwIfClosed(method);
     const url = `${this.#baseUrl}/bot${this.#token}/${method}`;
+    const signal = this.#requestSignal(timeoutMs);
     let response: Response;
     try {
       response = await this.#fetch(url, {
         method: 'POST',
+        redirect: 'error',
+        signal,
         ...(body !== undefined ? { body } : {}),
         ...(headers !== undefined ? { headers } : {}),
       });
     } catch (error) {
       // fetch embeds the URL — and therefore the token — in network errors.
-      throw apiError(method, `network failure calling ${method}: ${(error as Error).message}`);
+      throw this.#transportError(method, 'network failure', error, signal, timeoutMs);
     }
 
     let payload: ApiResponse<T>;
     try {
       payload = (await response.json()) as ApiResponse<T>;
-    } catch {
+    } catch (error) {
+      if (signal.aborted) {
+        throw this.#transportError(method, 'response interrupted', error, signal, timeoutMs);
+      }
       throw apiError(
         method,
         `${method} returned non-JSON (HTTP ${response.status})`,
@@ -148,8 +184,13 @@ export class TelegramClient {
     return payload.result;
   }
 
-  #json<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    return this.#call<T>(method, JSON.stringify(params), { 'content-type': 'application/json' });
+  #json<T>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T> {
+    return this.#call<T>(
+      method,
+      JSON.stringify(params),
+      { 'content-type': 'application/json' },
+      timeoutMs,
+    );
   }
 
   getMe(): Promise<TelegramUser> {
@@ -157,11 +198,15 @@ export class TelegramClient {
   }
 
   getUpdates(offset: number, timeoutSeconds: number): Promise<TelegramUpdate[]> {
-    return this.#json<TelegramUpdate[]>('getUpdates', {
-      offset,
-      timeout: timeoutSeconds,
-      allowed_updates: ['message'],
-    });
+    return this.#json<TelegramUpdate[]>(
+      'getUpdates',
+      {
+        offset,
+        timeout: timeoutSeconds,
+        allowed_updates: ['message'],
+      },
+      Math.max(this.#requestTimeoutMs, timeoutSeconds * 1000 + LONG_POLL_GRACE_MS),
+    );
   }
 
   sendMessage(
@@ -189,7 +234,7 @@ export class TelegramClient {
     // openAsBlob streams from disk instead of buffering a 50 MB file in RAM.
     const blob = await openAsBlob(filePath);
     form.set('document', blob, options.filename ?? basename(filePath));
-    return this.#call<TelegramMessage>('sendDocument', form);
+    return this.#call<TelegramMessage>('sendDocument', form, undefined, this.#transferTimeoutMs);
   }
 
   getFile(fileId: string): Promise<TelegramFile> {
@@ -201,10 +246,15 @@ export class TelegramClient {
    * it to quarantine; nothing here is buffered.
    */
   async downloadFile(filePath: string): Promise<Response> {
+    this.#throwIfClosed('downloadFile');
+    const signal = this.#requestSignal(this.#transferTimeoutMs);
     if (this.#isLocalServer() && isAbsolute(filePath)) {
       try {
         const blob = await openAsBlob(filePath);
-        return new Response(blob.stream());
+        const bounded = blob
+          .stream()
+          .pipeThrough(new TransformStream<Uint8Array, Uint8Array>(), { signal });
+        return new Response(bounded);
       } catch (error) {
         throw apiError('downloadFile', `local file download failed: ${(error as Error).message}`);
       }
@@ -213,9 +263,15 @@ export class TelegramClient {
     const url = `${this.#baseUrl}/file/bot${this.#token}/${filePath}`;
     let response: Response;
     try {
-      response = await this.#fetch(url);
+      response = await this.#fetch(url, { redirect: 'error', signal });
     } catch (error) {
-      throw apiError('downloadFile', `download failed: ${(error as Error).message}`);
+      throw this.#transportError(
+        'downloadFile',
+        'download failed',
+        error,
+        signal,
+        this.#transferTimeoutMs,
+      );
     }
     if (!response.ok) {
       throw apiError(
@@ -225,6 +281,42 @@ export class TelegramClient {
       );
     }
     return response;
+  }
+
+  /** Permanently stops this client and aborts every in-flight HTTP operation. */
+  close(): void {
+    if (!this.#shutdown.signal.aborted) this.#shutdown.abort();
+  }
+
+  #requestSignal(timeoutMs: number): AbortSignal {
+    return AbortSignal.any([this.#shutdown.signal, AbortSignal.timeout(timeoutMs)]);
+  }
+
+  #throwIfClosed(method: string): void {
+    if (!this.#shutdown.signal.aborted) return;
+    throw apiError(method, `${method} interrupted by client shutdown`, undefined, undefined, true);
+  }
+
+  #transportError(
+    method: string,
+    prefix: string,
+    error: unknown,
+    signal: AbortSignal,
+    timeoutMs: number,
+  ): TelegramApiError {
+    const interrupted = signal.aborted;
+    const detail = this.#shutdown.signal.aborted
+      ? 'client shutdown'
+      : interrupted
+        ? `request timed out after ${timeoutMs} ms`
+        : (error as Error).message;
+    return apiError(
+      method,
+      `${prefix} calling ${method}: ${detail}`,
+      undefined,
+      undefined,
+      interrupted,
+    );
   }
 
   #isLocalServer(): boolean {

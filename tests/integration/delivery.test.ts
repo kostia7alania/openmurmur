@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
@@ -13,8 +13,16 @@ import {
   TranscriptRepository,
   VadSegmentRepository,
 } from '../../src/database/repository.ts';
-import { enqueueSessionDelivery } from '../../src/jobs/delivery.ts';
-import { handleJob, reconcileSessionDelivery } from '../../src/jobs/pipeline.ts';
+import {
+  enqueueSessionAudio,
+  enqueueSessionDelivery,
+  enqueueSessionReport,
+} from '../../src/jobs/delivery.ts';
+import {
+  handleJob,
+  markAudioDelivered,
+  reconcileSessionDelivery,
+} from '../../src/jobs/pipeline.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
 import { FakeLlm } from '../../src/llm/ollama.ts';
 import { EMPTY_SUMMARY } from '../../src/llm/schema.ts';
@@ -102,6 +110,7 @@ describe('ASR job', () => {
     const transcript = new TranscriptRepository(db.handle).current('s1');
     assert.ok(transcript, 'a transcript revision must exist');
     assert.ok(transcript.text.length > 0);
+    assert.equal(jobs.pendingCount('deliver_transcript'), 1);
     assert.equal(jobs.pendingCount('summarize'), 1);
   });
 
@@ -124,6 +133,60 @@ describe('ASR job', () => {
     );
   });
 
+  it('replays an existing transcript into downstream jobs without retranscribing', async () => {
+    seedFinalizedSession('s1');
+    const asr = new FakeAsr();
+    const d = deps(asr);
+    const job = {
+      jobId: 'j1',
+      kind: 'asr' as const,
+      payload: { sessionId: 's1' },
+      attempts: 1,
+      maxAttempts: 5,
+    };
+    await handleJob(d, job);
+    asr.transcribe = async () => {
+      throw new Error('ASR must not run during crash replay');
+    };
+
+    await handleJob(d, job);
+
+    const revisions = db.handle
+      .prepare('SELECT count(*) AS c FROM transcript_revisions WHERE session_id = ?')
+      .get('s1') as { c: number };
+    assert.equal(revisions.c, 1, 'retry must not replace the delivered current revision');
+    assert.equal(d.jobs.pendingCount('deliver_transcript'), 1);
+    assert.equal(d.jobs.pendingCount('summarize'), 1);
+  });
+
+  it('does not duplicate a summary when the summarize job is replayed', async () => {
+    seedFinalizedSession('s1');
+    const d = deps();
+    await handleJob(d, {
+      jobId: 'asr',
+      kind: 'asr',
+      payload: { sessionId: 's1' },
+      attempts: 1,
+      maxAttempts: 5,
+    });
+    const summarize = {
+      jobId: 'summary',
+      kind: 'summarize' as const,
+      payload: { sessionId: 's1' },
+      attempts: 1,
+      maxAttempts: 5,
+    };
+
+    await handleJob(d, summarize);
+    await handleJob(d, summarize);
+
+    const count = db.handle
+      .prepare('SELECT count(*) AS count FROM summaries WHERE session_id = ?')
+      .get('s1') as { count: number };
+    assert.equal(count.count, 1);
+    assert.equal(d.jobs.pendingCount('deliver_report'), 1);
+  });
+
   it('rejects a session whose transcript is empty', async () => {
     seedFinalizedSession('s1');
     await handleJob(deps(new SilentFakeAsr()), {
@@ -138,6 +201,11 @@ describe('ASR job', () => {
     assert.equal(session?.state, 'REJECTED');
     assert.equal(session?.rejection_reason, 'asr_empty');
     assert.equal(new JobQueue(db.handle).pendingCount('summarize'), 0, 'nothing is delivered');
+    assert.equal(
+      new Outbox(db.handle).stateOf('session-status:asr-rejected:s1'),
+      'pending',
+      'the rejection and its truthful status commit together',
+    );
   });
 
   it('fails loudly when a session has no finalized audio', async () => {
@@ -234,7 +302,151 @@ describe('delivery enqueue', () => {
     );
   });
 
-  it('attaches a .md file when the transcript needs splitting', async () => {
+  it('does not invoke ffmpeg or overwrite a split artifact owned by a pending row', async () => {
+    seedFinalizedSession('s1', 1, 4096);
+    const part = db.handle
+      .prepare('SELECT part_id FROM audio_parts WHERE session_id = ?')
+      .get('s1') as { part_id: string };
+    const ownedPath = join(dir, 'tmp', 's1.p000.split000.flac');
+    const ownedBytes = Buffer.from('pending split artifact');
+    writeFileSync(ownedPath, ownedBytes);
+    new Outbox(db.handle).enqueue({
+      deliveryPartId: `audio:${part.part_id}:split0`,
+      kind: 'audio',
+      sessionId: 's1',
+      ordinal: 0,
+      payload: {
+        type: 'document',
+        path: ownedPath,
+        filename: 's1.p000.split000.flac',
+        partId: part.part_id,
+        deleteAfterSend: true,
+      },
+    });
+
+    const config = {
+      ...CONFIG,
+      audio: { ...CONFIG.audio, ffmpegPath: join(dir, 'ffmpeg-must-not-run') },
+      telegram: { ...CONFIG.telegram, maxOutgoingBytes: 1024 },
+    };
+    const plan = await enqueueSessionAudio(db.handle, {
+      sessionId: 's1',
+      config,
+      paths: paths(),
+    });
+
+    assert.equal(plan.audioRows, 0);
+    assert.deepEqual(plan.oversizeParts, [part.part_id]);
+    assert.deepEqual(readFileSync(ownedPath), ownedBytes, 'the live outbox row owns this path');
+  });
+
+  it('fails safely when a pending split row has lost its owned artifact', async () => {
+    seedFinalizedSession('s1', 1, 4096);
+    const part = db.handle
+      .prepare('SELECT part_id FROM audio_parts WHERE session_id = ?')
+      .get('s1') as { part_id: string };
+    const missingPath = join(dir, 'tmp', 'missing.split000.flac');
+    new Outbox(db.handle).enqueue({
+      deliveryPartId: `audio:${part.part_id}:split0`,
+      kind: 'audio',
+      sessionId: 's1',
+      ordinal: 0,
+      payload: {
+        type: 'document',
+        path: missingPath,
+        filename: 'missing.split000.flac',
+        partId: part.part_id,
+        deleteAfterSend: true,
+      },
+    });
+
+    await assert.rejects(
+      enqueueSessionAudio(db.handle, {
+        sessionId: 's1',
+        config: {
+          ...CONFIG,
+          audio: { ...CONFIG.audio, ffmpegPath: join(dir, 'ffmpeg-must-not-run') },
+          telegram: { ...CONFIG.telegram, maxOutgoingBytes: 1024 },
+        },
+        paths: paths(),
+      }),
+      /owned artifact is unavailable/,
+    );
+  });
+
+  it('fails explicitly when an unsplit live row no longer fits a reduced limit', async () => {
+    const [sourcePath] = seedFinalizedSession('s1', 1, 4096);
+    assert.ok(sourcePath);
+    const part = db.handle
+      .prepare('SELECT part_id FROM audio_parts WHERE session_id = ?')
+      .get('s1') as { part_id: string };
+    new Outbox(db.handle).enqueue({
+      deliveryPartId: `audio:${part.part_id}`,
+      kind: 'audio',
+      sessionId: 's1',
+      ordinal: 0,
+      payload: {
+        type: 'document',
+        path: sourcePath,
+        filename: 's1.p000.flac',
+        partId: part.part_id,
+      },
+    });
+
+    await assert.rejects(
+      enqueueSessionAudio(db.handle, {
+        sessionId: 's1',
+        config: {
+          ...CONFIG,
+          audio: { ...CONFIG.audio, ffmpegPath: join(dir, 'ffmpeg-must-not-run') },
+          telegram: { ...CONFIG.telegram, maxOutgoingBytes: 1024 },
+        },
+        paths: paths(),
+      }),
+      /unsplit audio delivery .* exceeds the current upload limit/,
+    );
+  });
+
+  for (const state of ['sent', 'dead'] as const) {
+    it(`does not recreate split artifacts for a ${state} delivery`, async () => {
+      seedFinalizedSession('s1', 1, 4096);
+      const part = db.handle
+        .prepare('SELECT part_id FROM audio_parts WHERE session_id = ?')
+        .get('s1') as { part_id: string };
+      const absentPath = join(dir, 'tmp', 's1.p000.split000.flac');
+      new Outbox(db.handle).enqueue({
+        deliveryPartId: `audio:${part.part_id}:split0`,
+        kind: 'audio',
+        sessionId: 's1',
+        ordinal: 0,
+        payload: {
+          type: 'document',
+          path: absentPath,
+          filename: 's1.p000.split000.flac',
+          partId: part.part_id,
+          deleteAfterSend: true,
+        },
+      });
+      db.handle
+        .prepare('UPDATE telegram_outbox SET state = ? WHERE delivery_part_id = ?')
+        .run(state, `audio:${part.part_id}:split0`);
+
+      const plan = await enqueueSessionAudio(db.handle, {
+        sessionId: 's1',
+        config: {
+          ...CONFIG,
+          audio: { ...CONFIG.audio, ffmpegPath: join(dir, 'ffmpeg-must-not-run') },
+          telegram: { ...CONFIG.telegram, maxOutgoingBytes: 1024 },
+        },
+        paths: paths(),
+      });
+
+      assert.equal(plan.audioRows, 0);
+      assert.equal(existsSync(absentPath), false);
+    });
+  }
+
+  it('sends only a .md file when the transcript exceeds the inline limit', async () => {
     seedFinalizedSession('s1');
     const sidecar = join(dir, 'audio', 's1.p000.expected.txt');
     writeFileSync(sidecar, 'слово '.repeat(2000));
@@ -251,16 +463,25 @@ describe('delivery enqueue', () => {
       .prepare("SELECT delivery_part_id, payload FROM telegram_outbox WHERE kind = 'transcript'")
       .all() as { delivery_part_id: string; payload: string }[];
 
-    assert.ok(rows.length > 2, 'a long transcript is split across messages');
+    assert.equal(rows.length, 1, 'a long transcript must not flood the chat with quote chunks');
     const md = rows.find((r) => r.delivery_part_id.startsWith('transcript-md:'));
-    assert.ok(md, 'a long transcript also travels as one .md file');
-    assert.ok(existsSync(join(dir, 'transcripts', 's1.md')));
+    assert.ok(md, 'a long transcript travels as one .md file');
+    const transcriptFile = join(dir, 'transcripts', 's1.md');
+    assert.ok(existsSync(transcriptFile));
+    const transcriptPayload = JSON.parse(md.payload) as { caption: string };
+    assert.equal(transcriptPayload.caption, '📝 Транскрипт с таймингами');
+    assert.match(readFileSync(transcriptFile, 'utf8'), /0:00 {2}слово/);
   });
 
-  it('still delivers the transcript when the audio is already gone', async () => {
+  it('still delivers the transcript when retention proved the audio was deleted', async () => {
     const files = seedFinalizedSession('s1');
     await transcribeAndSummarize('s1');
     rmSync(files[0] ?? '', { force: true });
+    db.handle
+      .prepare(
+        "UPDATE audio_parts SET deleted_at = '2026-01-01T00:00:00.000Z' WHERE session_id = ?",
+      )
+      .run('s1');
 
     const plan = await enqueueSessionDelivery(db.handle, {
       sessionId: 's1',
@@ -270,6 +491,24 @@ describe('delivery enqueue', () => {
     });
     assert.equal(plan.audioRows, 0);
     assert.ok(plan.transcriptRows >= 1, 'losing the audio must not lose the transcript');
+  });
+
+  it('publishes no partial manifest when one finalized source is missing', async () => {
+    const files = seedFinalizedSession('s1', 2);
+    rmSync(files[1] ?? '', { force: true });
+
+    await assert.rejects(
+      enqueueSessionAudio(db.handle, {
+        sessionId: 's1',
+        config: CONFIG,
+        paths: paths(),
+      }),
+      /finalized audio part .* is unavailable/,
+    );
+    const audio = db.handle
+      .prepare("SELECT count(*) AS c FROM telegram_outbox WHERE kind = 'audio'")
+      .get() as { c: number };
+    assert.equal(audio.c, 0, 'no surviving part may send before the manifest is complete');
   });
 
   it('moves the session to DELIVERING', async () => {
@@ -283,9 +522,112 @@ describe('delivery enqueue', () => {
     });
     assert.equal(new SessionRepository(db.handle).get('s1')?.state, 'DELIVERING');
   });
+
+  it('sends an oversized structured report as one Markdown file', async () => {
+    seedFinalizedSession('s1');
+    await transcribeAndSummarize('s1');
+    const reportRows = await enqueueSessionReport(db.handle, {
+      sessionId: 's1',
+      summary: { ...EMPTY_SUMMARY, summary: 'очень длинный отчёт '.repeat(400) },
+      config: CONFIG,
+      paths: paths(),
+    });
+
+    assert.equal(reportRows, 2, 'one compact summary quote plus one report file');
+    const rows = db.handle
+      .prepare("SELECT delivery_part_id, payload FROM telegram_outbox WHERE kind = 'report'")
+      .all() as { delivery_part_id: string; payload: string }[];
+    const preview = rows.find((row) => row.delivery_part_id === 'report-summary:s1');
+    assert.ok(preview);
+    assert.match(preview.payload, /blockquote expandable/);
+    const file = rows.find((row) => row.delivery_part_id === 'report:s1');
+    assert.ok(file);
+    const payload = JSON.parse(file.payload) as { type: string; path: string; filename: string };
+    assert.equal(payload.type, 'document');
+    assert.equal(payload.filename, 's1.report.md');
+    assert.ok(existsSync(payload.path));
+    const report = readFileSync(payload.path, 'utf8');
+    assert.match(report, /## Таймлайн\n/);
+    assert.doesNotMatch(report, /Голос 1:/, 'отчёт не должен выдумывать голоса');
+  });
 });
 
 describe('session completion and retention handoff', () => {
+  it('marks a split source delivered only after its last chunk is sent', () => {
+    seedFinalizedSession('s1');
+    const part = db.handle
+      .prepare('SELECT part_id FROM audio_parts WHERE session_id = ?')
+      .get('s1') as { part_id: string };
+    const outbox = new Outbox(db.handle);
+    for (let index = 0; index < 2; index += 1) {
+      outbox.enqueue({
+        deliveryPartId: `audio:${part.part_id}:split${index}`,
+        kind: 'audio',
+        sessionId: 's1',
+        ordinal: 0,
+        payload: {
+          type: 'document',
+          path: join(dir, `split${index}.flac`),
+          filename: `split${index}.flac`,
+          partId: part.part_id,
+        },
+      });
+    }
+
+    db.handle
+      .prepare("UPDATE telegram_outbox SET state = 'sent' WHERE delivery_part_id = ?")
+      .run(`audio:${part.part_id}:split0`);
+    markAudioDelivered(db.handle, part.part_id);
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT delivered FROM audio_parts WHERE part_id = ?')
+          .get(part.part_id) as { delivered: number }
+      ).delivered,
+      0,
+    );
+
+    db.handle
+      .prepare("UPDATE telegram_outbox SET state = 'sent' WHERE delivery_part_id = ?")
+      .run(`audio:${part.part_id}:split1`);
+    markAudioDelivered(db.handle, part.part_id);
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT delivered FROM audio_parts WHERE part_id = ?')
+          .get(part.part_id) as { delivered: number }
+      ).delivered,
+      1,
+    );
+  });
+
+  it('marks a direct source delivered after its single row is sent', () => {
+    seedFinalizedSession('s1');
+    const part = db.handle
+      .prepare('SELECT part_id, path FROM audio_parts WHERE session_id = ?')
+      .get('s1') as { part_id: string; path: string };
+    new Outbox(db.handle).enqueue({
+      deliveryPartId: `audio:${part.part_id}`,
+      kind: 'audio',
+      sessionId: 's1',
+      ordinal: 0,
+      payload: {
+        type: 'document',
+        path: part.path,
+        filename: 's1.p000.flac',
+        partId: part.part_id,
+      },
+    });
+    db.handle.prepare("UPDATE telegram_outbox SET state = 'sent'").run();
+
+    markAudioDelivered(db.handle, part.part_id);
+
+    const row = db.handle
+      .prepare('SELECT delivered FROM audio_parts WHERE part_id = ?')
+      .get(part.part_id) as { delivered: number };
+    assert.equal(row.delivered, 1);
+  });
+
   it('marks a session DONE only when every message is sent', async () => {
     seedFinalizedSession('s1');
     const d = deps();

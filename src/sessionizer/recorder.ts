@@ -4,9 +4,11 @@ import type { CaptureBackend, CaptureFrame } from '../capture/backend.ts';
 import { PartWriter, partPaths } from '../capture/writer.ts';
 import type { Paths } from '../config/paths.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
+import { transaction } from '../database/db.ts';
 import { PartRepository, SessionRepository } from '../database/repository.ts';
 import { JobQueue } from '../jobs/queue.ts';
 import type { Logger } from '../logging/logger.ts';
+import { Outbox } from '../telegram/outbox.ts';
 import { Sessionizer } from './machine.ts';
 import type { SessionIntent } from './types.ts';
 import type { Vad } from './vad.ts';
@@ -30,7 +32,9 @@ export interface RecorderOptions {
   readonly logger: Logger;
   /** Fired once the first valid audio frame arrives, never before. */
   readonly onFirstFrame?: () => void;
+  readonly onSessionStarted?: (sessionId: string) => void;
   readonly onSessionFinalized?: (sessionId: string) => void;
+  readonly onSessionRejected?: (sessionId: string, reason: string) => void;
 }
 
 interface OpenPart {
@@ -45,6 +49,7 @@ export class Recorder {
   readonly #sessions: SessionRepository;
   readonly #parts: PartRepository;
   readonly #jobs: JobQueue;
+  readonly #outbox: Outbox;
 
   /** Raw PCM held for pre-roll, aligned with the sessionizer's frame ring. */
   readonly #preRoll: CaptureFrame[] = [];
@@ -59,6 +64,7 @@ export class Recorder {
     this.#sessions = new SessionRepository(options.db);
     this.#parts = new PartRepository(options.db);
     this.#jobs = new JobQueue(options.db);
+    this.#outbox = new Outbox(options.db);
   }
 
   get state(): string {
@@ -108,7 +114,15 @@ export class Recorder {
    */
   async closeOpenSession(reason: string): Promise<string | null> {
     const sessionId = this.#machine.sessionId;
-    if (sessionId === null) return null;
+    if (sessionId === null) {
+      // A sleep gap can happen while speech is still only a candidate. Clear
+      // both timing and PCM pre-roll so audio from before sleep cannot open or
+      // prefix a session after wake.
+      this.#machine.forceFinalize();
+      this.#preRoll.length = 0;
+      this.#options.vad.reset();
+      return null;
+    }
 
     for (const intent of this.#machine.forceFinalize()) {
       await this.#applyIntent(intent, null);
@@ -116,6 +130,8 @@ export class Recorder {
     if (this.#openPart !== null) {
       await this.#closeOpenPart(Date.now(), this.#lastMonotonicMs);
     }
+    this.#preRoll.length = 0;
+    this.#options.vad.reset();
     this.#options.logger.info('closed an open session early', { sessionId, reason });
     return sessionId;
   }
@@ -133,7 +149,8 @@ export class Recorder {
 
     // Keep raw PCM for the pre-roll while no part is open. The sessionizer
     // tracks the same window in frame counts; this holds the actual bytes.
-    if (this.#openPart === null) {
+    const bufferedCurrentFrame = this.#openPart === null;
+    if (bufferedCurrentFrame) {
       this.#preRoll.push(frame);
       const capacityMs = this.#options.config.sessionizer.preRollSeconds * 1000;
       let held = this.#preRoll.reduce((sum, f) => sum + f.durationMs, 0);
@@ -146,9 +163,12 @@ export class Recorder {
       await this.#applyIntent(intent, frame);
     }
 
-    // Written after the intents so that a freshly opened part receives the
-    // pre-roll first and this frame second, in the right order.
-    if (this.#openPart !== null) {
+    // Written after the intents so rotations place this frame in the new part.
+    // A frame that opened a session was already replayed as the tail of pre-roll
+    // and must not be duplicated here.
+    const currentFrameWasReplayed =
+      bufferedCurrentFrame && intents.some((intent) => intent.kind === 'open_part');
+    if (this.#openPart !== null && !currentFrameWasReplayed) {
       await this.#openPart.writer.write(frame.pcm);
     }
   }
@@ -156,8 +176,16 @@ export class Recorder {
   async #applyIntent(intent: SessionIntent, frame: CaptureFrame | null): Promise<void> {
     switch (intent.kind) {
       case 'session_started':
-        this.#sessions.create(intent.sessionId, new Date(intent.startedWallMs).toISOString());
+        transaction(this.#options.db, () => {
+          this.#sessions.create(intent.sessionId, new Date(intent.startedWallMs).toISOString());
+          this.#enqueueLifecycleStatus(
+            intent.sessionId,
+            'started',
+            '🎙 Услышал речь — запись сессии началась.',
+          );
+        });
         this.#options.logger.info('session started', { sessionId: intent.sessionId });
+        this.#notify(() => this.#options.onSessionStarted?.(intent.sessionId));
         break;
 
       case 'open_part':
@@ -169,38 +197,118 @@ export class Recorder {
         break;
 
       case 'session_finalized': {
-        this.#sessions.finalize(
-          intent.sessionId,
-          new Date(intent.endedWallMs).toISOString(),
-          intent.durationMs,
-          intent.speechMs,
-          intent.partCount,
-        );
-        // Enqueue and return to the microphone immediately.
-        this.#jobs.enqueue({
-          kind: 'asr',
-          idempotencyKey: `asr:${intent.sessionId}`,
-          payload: { sessionId: intent.sessionId },
+        const finalizedParts = this.#parts
+          .listForSession(intent.sessionId)
+          .filter((part) => part.finalized === 1);
+        if (finalizedParts.length === 0) {
+          transaction(this.#options.db, () => {
+            this.#options.db
+              .prepare(
+                `UPDATE audio_sessions
+                    SET state = 'FAILED', rejection_reason = 'audio_finalize_failed',
+                        ended_at = ?, duration_ms = ?, speech_ms = ?, part_count = 0,
+                        updated_at = ?
+                  WHERE session_id = ?`,
+              )
+              .run(
+                new Date(intent.endedWallMs).toISOString(),
+                intent.durationMs,
+                intent.speechMs,
+                new Date().toISOString(),
+                intent.sessionId,
+              );
+            this.#enqueueLifecycleStatus(
+              intent.sessionId,
+              'failed',
+              '🔴 Сессию не удалось сохранить: финализация аудио завершилась ошибкой. Аудио не загружаю.',
+            );
+          });
+          this.#options.logger.error('session failed because no audio part was finalized', {
+            sessionId: intent.sessionId,
+            attemptedParts: intent.partCount,
+          });
+          break;
+        }
+
+        const partial = finalizedParts.length < intent.partCount;
+        transaction(this.#options.db, () => {
+          this.#sessions.finalize(
+            intent.sessionId,
+            new Date(intent.endedWallMs).toISOString(),
+            intent.durationMs,
+            intent.speechMs,
+            finalizedParts.length,
+          );
+          // Audio delivery is a separate job so Telegram can upload while ASR
+          // works, without putting filesystem or network I/O on this hot path.
+          this.#jobs.enqueue({
+            kind: 'deliver_audio',
+            idempotencyKey: `deliver-audio:${intent.sessionId}`,
+            payload: { sessionId: intent.sessionId },
+          });
+          this.#jobs.enqueue({
+            kind: 'asr',
+            idempotencyKey: `asr:${intent.sessionId}`,
+            payload: { sessionId: intent.sessionId },
+          });
+          this.#enqueueLifecycleStatus(
+            intent.sessionId,
+            'finalized',
+            partial
+              ? '⚠️ Сессия завершена не полностью — загружаю сохранившиеся части аудио и расшифровываю локально…'
+              : '⏳ Сессия завершена — загружаю аудио и параллельно расшифровываю локально…',
+          );
         });
         this.#options.logger.info('session finalized', {
           sessionId: intent.sessionId,
           speechMs: intent.speechMs,
-          parts: intent.partCount,
+          parts: finalizedParts.length,
+          partial,
         });
-        this.#options.onSessionFinalized?.(intent.sessionId);
+        this.#notify(() => this.#options.onSessionFinalized?.(intent.sessionId));
         break;
       }
 
       case 'session_rejected':
-        this.#sessions.reject(intent.sessionId, intent.reason, intent.speechMs, intent.partCount);
+        transaction(this.#options.db, () => {
+          this.#sessions.reject(intent.sessionId, intent.reason, intent.speechMs, intent.partCount);
+          this.#enqueueLifecycleStatus(
+            intent.sessionId,
+            'rejected',
+            'ℹ️ Сессия завершена, но фрагмент слишком короткий — аудио не отправляю.',
+          );
+        });
         this.#options.logger.info('session rejected', {
           sessionId: intent.sessionId,
           reason: intent.reason,
           speechMs: intent.speechMs,
         });
+        this.#notify(() => this.#options.onSessionRejected?.(intent.sessionId, intent.reason));
         break;
     }
     void frame;
+  }
+
+  #enqueueLifecycleStatus(
+    sessionId: string,
+    stage: 'started' | 'finalized' | 'rejected' | 'failed',
+    text: string,
+  ): void {
+    this.#outbox.enqueue({
+      deliveryPartId: `session-status:${stage}:${sessionId}`,
+      kind: 'status',
+      sessionId,
+      ordinal: -10,
+      payload: { type: 'text', text },
+    });
+  }
+
+  #notify(callback: () => void): void {
+    try {
+      callback();
+    } catch (error) {
+      this.#options.logger.warn('recorder observer failed', { error: (error as Error).message });
+    }
   }
 
   async #openNewPart(intent: Extract<SessionIntent, { kind: 'open_part' }>): Promise<void> {

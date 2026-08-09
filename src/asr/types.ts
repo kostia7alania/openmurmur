@@ -71,6 +71,10 @@ export interface DiarizationRequest {
 
 export interface AsrBackend {
   readonly name: string;
+  /** Non-intrusive snapshot: must not start/load/ping a worker. */
+  health():
+    | { readonly ok: true; readonly detail: string }
+    | { readonly ok: false; readonly reason: string };
   ready(): Promise<{ ok: true } | { ok: false; reason: string }>;
   transcribe(request: AsrRequest): Promise<AsrResult>;
   /**

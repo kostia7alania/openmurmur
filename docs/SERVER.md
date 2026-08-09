@@ -178,20 +178,23 @@ pnpm openmurmur telegram test
 
 ### If it later says Telegram is not configured
 
-Find out which of the two it is before acting:
+Find out which case applies before acting. The current credential pair is one
+versioned item:
 
 ```bash
-security find-generic-password -s io.openmurmur -a telegram-bot-token -w > /dev/null; echo "exit $?"
+security find-generic-password -s io.openmurmur -a telegram-secrets-v1 -w > /dev/null; echo "exit $?"
 ```
 
 | Exit | Meaning | Action |
 | --- | --- | --- |
-| 0 | Stored and readable | Something else is wrong |
+| 0 | Stored and readable | Something else is wrong; `server-preflight` also detects an empty value |
 | 44 | Genuinely not stored | Run `setup telegram` |
 | anything else | **Locked Keychain** — the token is intact | Enable automatic login (step 3), or `security unlock-keychain ~/Library/Keychains/login.keychain-db` |
 
-Do not re-create the bot on a locked Keychain. The daemon distinguishes these
-cases in its logs for exactly this reason.
+Older installations may still have `telegram-bot-token` and
+`telegram-chat-id`; the next successful load migrates a complete non-empty
+legacy pair. Do not re-create the bot on a locked Keychain. The daemon
+distinguishes these cases in its logs for exactly this reason.
 
 ## Step 7 — Start on boot
 

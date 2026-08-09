@@ -54,7 +54,7 @@ Anything that could expose a user's audio, transcripts or bot token:
 | Physical access to an unlocked Mac | Outside any application's control. |
 | Root or kernel compromise | Same. |
 | Recording without consent | A legal and operational issue — see `RECORDING_POLICY.md`. |
-| A user configuring a malicious `apiBaseUrl` | Self-inflicted; validation restricts it to https or localhost. |
+| An unsupported Telegram proxy | Configuration accepts only the official API root or a literal `127.0.0.1` local Bot API root. |
 | Vulnerabilities in FFmpeg, Ollama or model weights | Report upstream. Tell us if OpenMurmur's usage makes it materially worse. |
 | Denial of service against your own daemon | Not a meaningful threat for a single-user local tool. |
 
@@ -73,8 +73,9 @@ Where the defences are, so you can attack the right places:
 - Prompt fencing: `src/llm/ollama.ts` — delimiters, delimiter stripping, and a
   model that has no capabilities.
 - Retention: `src/retention/policy.ts` — pure SQL eligibility proof, no LLM.
-- Keychain: `src/telegram/keychain.ts` — secrets to `security` on stdin, never
-  argv.
+- Keychain: `src/telegram/keychain.ts` — secrets enter an `expect`-owned private
+  PTY from stdin and reach `/usr/bin/security` interactively, never through
+  argv, env or a file.
 
 The threat model is in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md), including
 a "known weaknesses" section that names the current gaps.

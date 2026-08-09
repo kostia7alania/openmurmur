@@ -21,6 +21,10 @@ import type {
 export class FakeAsr implements AsrBackend {
   readonly name = 'fake';
 
+  health(): { ok: true; detail: string } {
+    return { ok: true, detail: 'fake backend ready' };
+  }
+
   async ready(): Promise<{ ok: true }> {
     return { ok: true };
   }
@@ -71,6 +75,9 @@ export class FakeAsr implements AsrBackend {
 /** Returns an empty transcript, to exercise the `asr_empty` rejection path. */
 export class SilentFakeAsr implements AsrBackend {
   readonly name = 'fake-silent';
+  health(): { ok: true; detail: string } {
+    return { ok: true, detail: 'fake backend ready' };
+  }
   async ready(): Promise<{ ok: true }> {
     return { ok: true };
   }

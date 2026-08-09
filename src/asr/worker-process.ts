@@ -39,6 +39,7 @@ export class WorkerProcess {
   readonly #pending = new Map<string, Pending>();
   #child: ChildProcessWithoutNullStreams | null = null;
   #startPromise: Promise<void> | null = null;
+  #closed = false;
 
   constructor(options: WorkerProcessOptions) {
     this.#options = options;
@@ -49,6 +50,9 @@ export class WorkerProcess {
   }
 
   ensureStarted(): Promise<void> {
+    if (this.#closed) {
+      return Promise.reject(new Error(`${this.#options.label} worker is closed`));
+    }
     if (this.#child !== null) return Promise.resolve();
     if (this.#startPromise !== null) return this.#startPromise;
 
@@ -126,6 +130,7 @@ export class WorkerProcess {
   }
 
   async close(shutdownId: string): Promise<void> {
+    this.#closed = true;
     const child = this.#child;
     if (child === null) return;
     try {

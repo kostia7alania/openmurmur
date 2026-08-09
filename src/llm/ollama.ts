@@ -83,6 +83,7 @@ export class OllamaLlm implements LlmBackend {
   async ready(): Promise<{ ok: true; model: string } | { ok: false; reason: string }> {
     try {
       const response = await this.#fetch(`${this.#config.baseUrl}/api/tags`, {
+        redirect: 'error',
         signal: AbortSignal.timeout(5000),
       });
       if (!response.ok) return { ok: false, reason: `Ollama returned HTTP ${response.status}` };
@@ -115,6 +116,7 @@ export class OllamaLlm implements LlmBackend {
   async summarize(input: SummarizeInput): Promise<StructuredSummary> {
     const response = await this.#fetch(`${this.#config.baseUrl}/api/chat`, {
       method: 'POST',
+      redirect: 'error',
       headers: { 'content-type': 'application/json' },
       signal: AbortSignal.timeout(this.#config.requestTimeoutMs),
       body: JSON.stringify({

@@ -138,14 +138,17 @@ class ScriptedCapture implements CaptureBackend {
   }
 }
 
-function recorderFor(script: readonly ScriptedSegment[], overrides = {}) {
+function recorderFor(script: readonly ScriptedSegment[], overrides = {}, ffmpegPath = FFMPEG) {
   const config = {
     ...DEFAULT_CONFIG,
     sessionizer: { ...DEFAULT_CONFIG.sessionizer, ...overrides },
-    audio: { ...DEFAULT_CONFIG.audio, ffmpegPath: FFMPEG },
+    audio: { ...DEFAULT_CONFIG.audio, ffmpegPath },
   };
   const capture = new ScriptedCapture(script);
   let firstFrameSeen = false;
+  const startedSessions: string[] = [];
+  const finalizedSessions: string[] = [];
+  const rejectedSessions: string[] = [];
 
   const recorder = new Recorder({
     config,
@@ -157,15 +160,25 @@ function recorderFor(script: readonly ScriptedSegment[], overrides = {}) {
     onFirstFrame: () => {
       firstFrameSeen = true;
     },
+    onSessionStarted: (sessionId) => startedSessions.push(sessionId),
+    onSessionFinalized: (sessionId) => finalizedSessions.push(sessionId),
+    onSessionRejected: (sessionId) => rejectedSessions.push(sessionId),
   });
-  return { recorder, config, sawFirstFrame: () => firstFrameSeen };
+  return {
+    recorder,
+    config,
+    sawFirstFrame: () => firstFrameSeen,
+    startedSessions,
+    finalizedSessions,
+    rejectedSessions,
+  };
 }
 
 describe('end to end: capture through delivery, without a microphone', () => {
   it('records a session, writes a valid FLAC, transcribes and queues delivery', async (t) => {
     if (!hasFfmpeg) return t.skip('ffmpeg not available');
 
-    const { recorder, config, sawFirstFrame } = recorderFor([
+    const { recorder, config, sawFirstFrame, startedSessions, finalizedSessions } = recorderFor([
       { kind: 'silence', seconds: 3 },
       { kind: 'speech', seconds: 6 },
       { kind: 'silence', seconds: 61 },
@@ -184,6 +197,18 @@ describe('end to end: capture through delivery, without a microphone', () => {
     assert.equal(rows.length, 1, 'exactly one session');
     const sessionId = rows[0]?.session_id ?? '';
     assert.equal(rows[0]?.state, 'PROCESSING');
+    assert.deepEqual(startedSessions, [sessionId], 'one durable start event per session');
+    assert.deepEqual(finalizedSessions, [sessionId], 'one durable finish event per session');
+    const lifecycle = db.handle
+      .prepare(
+        "SELECT delivery_part_id FROM telegram_outbox WHERE kind = 'status' ORDER BY created_at, rowid",
+      )
+      .all() as { delivery_part_id: string }[];
+    assert.deepEqual(
+      lifecycle.map((row) => row.delivery_part_id),
+      [`session-status:started:${sessionId}`, `session-status:finalized:${sessionId}`],
+      'lifecycle notices are committed durably with the session transitions',
+    );
 
     // --- the file on disk is real -----------------------------------------
     const parts = new PartRepository(db.handle).listForSession(sessionId);
@@ -198,6 +223,10 @@ describe('end to end: capture through delivery, without a microphone', () => {
     assert.equal(probe?.codec, 'flac');
     assert.equal(probe?.sampleRate, 16_000);
     assert.equal(probe?.channels, 1);
+    assert.ok(
+      Math.abs((probe?.durationSeconds ?? 0) * 1000 - ((part.duration_ms ?? 0) - FRAME_MS)) < 2,
+      'the threshold-crossing frame must occur once, not in both pre-roll and live output',
+    );
 
     // Pre-roll means the file is longer than the speech that opened it.
     assert.ok(
@@ -207,6 +236,7 @@ describe('end to end: capture through delivery, without a microphone', () => {
 
     // --- the queued work --------------------------------------------------
     const jobs = new JobQueue(db.handle);
+    assert.equal(jobs.pendingCount('deliver_audio'), 1, 'audio delivery is ready immediately');
     assert.equal(jobs.pendingCount('asr'), 1, 'finalizing enqueues exactly one ASR job');
 
     // Give FakeAsr a realistic transcript for the file the recorder actually
@@ -227,20 +257,30 @@ describe('end to end: capture through delivery, without a microphone', () => {
       jobs,
       logger: nullLogger,
     };
+    const audioJob = jobs.claim(['deliver_audio']);
+    assert.ok(audioJob, 'audio delivery must not wait for ASR');
+    await handleJob(pipelineDeps, audioJob);
+    jobs.complete(audioJob.jobId);
+
     const asrJob = jobs.claim(['asr']);
     assert.ok(asrJob);
     await handleJob(pipelineDeps, asrJob);
     jobs.complete(asrJob.jobId);
+
+    const transcriptJob = jobs.claim(['deliver_transcript']);
+    assert.ok(transcriptJob, 'ASR must make the transcript independently deliverable');
+    await handleJob(pipelineDeps, transcriptJob);
+    jobs.complete(transcriptJob.jobId);
 
     const summarizeJob = jobs.claim(['summarize']);
     assert.ok(summarizeJob, 'ASR must queue the summarize step');
     await handleJob(pipelineDeps, summarizeJob);
     jobs.complete(summarizeJob.jobId);
 
-    const deliverJob = jobs.claim(['deliver']);
-    assert.ok(deliverJob);
-    await handleJob(pipelineDeps, deliverJob);
-    jobs.complete(deliverJob.jobId);
+    const reportJob = jobs.claim(['deliver_report']);
+    assert.ok(reportJob);
+    await handleJob(pipelineDeps, reportJob);
+    jobs.complete(reportJob.jobId);
 
     // --- what the user would receive --------------------------------------
     const outbox = new Outbox(db.handle);
@@ -260,7 +300,9 @@ describe('end to end: capture through delivery, without a microphone', () => {
       queued.some((q) => q.kind === 'report'),
       'the report is queued',
     );
-    assert.equal(outbox.claimNext()?.kind, 'audio', 'audio goes first');
+    assert.equal(outbox.claimNext()?.kind, 'status', 'the start notice is first');
+    assert.equal(outbox.claimNext()?.kind, 'status', 'the finish/upload notice follows');
+    assert.equal(outbox.claimNext()?.kind, 'audio', 'audio goes before transcript and report');
 
     assert.ok(
       new TranscriptRepository(db.handle).current(sessionId),
@@ -303,6 +345,43 @@ describe('end to end: capture through delivery, without a microphone', () => {
       0,
       'a rejected session must not be queued for transcription',
     );
+  });
+
+  it('reports a truthful failure and queues no work when no audio part finalizes', async () => {
+    const failingEncoder = join(dir, 'ffmpeg-always-fails');
+    writeFileSync(failingEncoder, '#!/bin/sh\ncat >/dev/null\nexit 1\n', { mode: 0o700 });
+    const { recorder } = recorderFor(
+      [
+        { kind: 'speech', seconds: 6 },
+        { kind: 'silence', seconds: 61 },
+      ],
+      {},
+      failingEncoder,
+    );
+
+    await recorder.run();
+
+    const session = db.handle
+      .prepare('SELECT session_id, state, rejection_reason FROM audio_sessions')
+      .get() as {
+      session_id: string;
+      state: string;
+      rejection_reason: string;
+    };
+    assert.equal(session.state, 'FAILED');
+    assert.equal(session.rejection_reason, 'audio_finalize_failed');
+    const jobs = new JobQueue(db.handle);
+    assert.equal(jobs.pendingCount('deliver_audio'), 0);
+    assert.equal(jobs.pendingCount('asr'), 0);
+    assert.equal(
+      new Outbox(db.handle).stateOf(`session-status:finalized:${session.session_id}`),
+      null,
+      'a failed archive must never claim that upload started',
+    );
+    const failure = db.handle
+      .prepare('SELECT payload FROM telegram_outbox WHERE delivery_part_id = ?')
+      .get(`session-status:failed:${session.session_id}`) as { payload: string };
+    assert.match(JSON.parse(failure.payload).text as string, /не удалось сохранить/);
   });
 
   it('keeps one session across a pause shorter than the timeout', async (t) => {
@@ -365,6 +444,60 @@ describe('end to end: capture through delivery, without a microphone', () => {
       parts.map((_, i) => i),
       'part indices are consecutive from zero',
     );
+  });
+
+  it('delivers surviving rotated parts with an honest partial status', async (t) => {
+    if (!hasFfmpeg) return t.skip('ffmpeg not available');
+
+    const wrapper = join(dir, 'ffmpeg-fails-after-first');
+    const marker = join(dir, 'first-encoder-started');
+    const shellLiteral = (value: string) => `'${value.replaceAll("'", "'\\\"'\\\"'")}'`;
+    writeFileSync(
+      wrapper,
+      [
+        '#!/bin/sh',
+        `if [ ! -e ${shellLiteral(marker)} ]; then`,
+        `  : > ${shellLiteral(marker)}`,
+        `  exec ${shellLiteral(FFMPEG)} "$@"`,
+        'fi',
+        'cat >/dev/null',
+        'exit 1',
+        '',
+      ].join('\n'),
+      { mode: 0o700 },
+    );
+    const { recorder } = recorderFor(
+      [
+        { kind: 'speech', seconds: 8 },
+        { kind: 'silence', seconds: 6 },
+      ],
+      { maxPartSeconds: 5, silenceTimeoutSeconds: 5 },
+      wrapper,
+    );
+
+    await recorder.run();
+
+    const session = db.handle
+      .prepare('SELECT session_id, state, part_count FROM audio_sessions')
+      .get() as {
+      session_id: string;
+      state: string;
+      part_count: number;
+    };
+    assert.equal(session.state, 'PROCESSING');
+    assert.equal(session.part_count, 1, 'only the surviving source is advertised');
+    const parts = new PartRepository(db.handle).listForSession(session.session_id);
+    assert.deepEqual(
+      parts.map((part) => part.finalized),
+      [1, 0],
+    );
+    const jobs = new JobQueue(db.handle);
+    assert.equal(jobs.pendingCount('deliver_audio'), 1);
+    assert.equal(jobs.pendingCount('asr'), 1);
+    const status = db.handle
+      .prepare('SELECT payload FROM telegram_outbox WHERE delivery_part_id = ?')
+      .get(`session-status:finalized:${session.session_id}`) as { payload: string };
+    assert.match(JSON.parse(status.payload).text as string, /сохранившиеся части/);
   });
 
   it('leaves a valid file behind when the daemon stops mid-session', async (t) => {

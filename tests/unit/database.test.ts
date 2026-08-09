@@ -186,6 +186,43 @@ describe('immutable transcript revisions', () => {
     assert.equal(segments[1]?.timestampSource, 'vad', 'Thai never claims aligner timings');
   });
 
+  it('rolls back the revision when an atomic downstream fact fails', () => {
+    const sessions = new SessionRepository(db.handle);
+    const transcripts = new TranscriptRepository(db.handle);
+    sessions.create('s1', new Date().toISOString());
+
+    assert.throws(
+      () =>
+        transcripts.append(
+          {
+            sessionId: 's1',
+            engine: 'e',
+            model: 'm',
+            languages: ['ru'],
+            text: 'атомарный транскрипт',
+            segments: [
+              {
+                startMs: 0,
+                endMs: 1000,
+                timestampSource: 'aligner',
+                language: 'ru',
+                text: 'атомарный',
+              },
+            ],
+          },
+          () => {
+            throw new Error('downstream insert failed');
+          },
+        ),
+      /downstream insert failed/,
+    );
+    assert.equal(transcripts.current('s1'), undefined);
+    const rows = db.handle.prepare('SELECT count(*) AS c FROM transcript_segments').get() as {
+      c: number;
+    };
+    assert.equal(rows.c, 0, 'segments roll back with their revision');
+  });
+
   it('refuses a transcript that belongs to nothing', () => {
     assert.throws(
       () =>
@@ -246,6 +283,18 @@ describe('job queue', () => {
     jobs.enqueue({ kind: 'summarize', idempotencyKey: 'sum:s1', payload: {} });
     assert.equal(jobs.claim(['asr']), null);
     assert.ok(jobs.claim(['summarize']));
+  });
+
+  it('prepares audio delivery before starting the slower ASR job', () => {
+    const jobs = new JobQueue(db.handle);
+    jobs.enqueue({ kind: 'asr', idempotencyKey: 'asr:s1', payload: { sessionId: 's1' } });
+    jobs.enqueue({
+      kind: 'deliver_audio',
+      idempotencyKey: 'deliver-audio:s1',
+      payload: { sessionId: 's1' },
+    });
+
+    assert.equal(jobs.claim(['asr', 'deliver_audio'])?.kind, 'deliver_audio');
   });
 
   it('recovers a lease abandoned by a crashed worker', () => {

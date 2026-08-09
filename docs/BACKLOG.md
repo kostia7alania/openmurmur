@@ -47,7 +47,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Acceptance:** An unknown key or a wrong type produces a `ConfigError` naming
   the exact path; all problems are reported at once.
 - **Dependencies:** P0-02 · **Risk:** low · **Estimate:** S
-- **Tests:** 14 config tests including a walk proving no field can hold a secret.
+- **Tests:** Config and path tests include a schema walk proving no field can
+  hold a secret.
 
 ### P0-04 ✅ SQLite migrations
 
@@ -61,7 +62,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
   actual SQLite runtime version is reported, not assumed.
 - **Dependencies:** P0-02 · **Risk:** low (Node 26.7.0 bundles the 3.53.4
   target — see ADR-0004) · **Estimate:** M
-- **Tests:** 13 database tests including idempotency and FK enforcement.
+- **Tests:** Database tests cover migrations, transaction rollback,
+  idempotency, FK enforcement and transcript/job persistence.
 
 ### P0-05 ✅ FFmpeg capture
 
@@ -87,8 +89,9 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Acceptance:** Speech in a noisy room is detected; a television alone does
   not sustain a session past the minimum-speech gate.
 - **Dependencies:** P0-05, P0-11 · **Risk:** medium · **Estimate:** M
-- **Tests:** Segment assembly fully tested in Python (7 tests). **The ONNX model
-  itself has not been run** — `silero-vad` is not in the CI-installed subset.
+- **Tests:** Segment assembly fully tested in Python (7 tests). The ONNX model
+  is not in the CI-installed subset; a historical same-machine smoke run is
+  recorded in `docs/DEPENDENCIES.md`, but it was not repeated on this revision.
 
 ### P0-07 ✅ Sessionizer state machine
 
@@ -99,7 +102,7 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Acceptance:** All transitions behave per `docs/SESSIONIZER.md`; a wall-clock
   jump cannot open or close a session.
 - **Dependencies:** P0-03 · **Risk:** low · **Estimate:** M
-- **Tests:** 43 tests with a fake clock.
+- **Tests:** 29 tests with a fake clock.
 
 ### P0-08 ✅ Five-second pre-roll
 
@@ -121,7 +124,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
   every return of speech.
 - **Acceptance:** Speech at 59 s continues the same session; 60 s finalizes.
 - **Dependencies:** P0-07 · **Risk:** low · **Estimate:** S
-- **Tests:** 6 tests, including 5 consecutive near-timeout cycles.
+- **Tests:** Fake-clock tests cover the exact timeout boundary and repeated
+  near-timeout speech returns.
 
 ### P0-10 ✅ Fifteen-minute physical rotation
 
@@ -149,7 +153,9 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Dependencies:** P0-02 · **Risk:** high (model behaviour unverified here)
   · **Estimate:** L
 - **Tests:** Protocol framing, dispatch, error paths and result normalization —
-  26 Python tests, all without MLX. **Inference itself is unverified.**
+  36 Python tests, all without MLX. A historical same-machine inference smoke
+  run is recorded in `docs/DEPENDENCIES.md`; the current revision still needs
+  an end-to-end rerun.
 
 ### P0-12 ✅ Transcript revisions
 
@@ -160,7 +166,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Acceptance:** A second ASR run appends rather than overwrites; the original
   text is still readable.
 - **Dependencies:** P0-04 · **Risk:** low · **Estimate:** S
-- **Tests:** 3 revision tests.
+- **Tests:** Revision tests cover append-only history, current-pointer changes,
+  segment provenance and transaction rollback.
 
 ### P0-13 🟡 Ollama structured summary
 
@@ -172,8 +179,9 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Acceptance:** A real transcript yields a useful summary; Ollama being absent
   degrades the report without blocking delivery.
 - **Dependencies:** P0-12 · **Risk:** medium · **Estimate:** M
-- **Tests:** Schema parsing, clamping and injection fencing tested with the fake
-  backend. **Ollama was not installed on the development machine.**
+- **Tests:** Schema parsing, clamping and injection fencing are tested with the
+  fake backend. `docs/DEPENDENCIES.md` records an earlier same-machine Ollama
+  smoke run; the complete live path was not repeated on this revision.
 
 ### P0-14 🟡 Telegram onboarding
 
@@ -203,12 +211,14 @@ dependencies, risk, estimate (S/M/L), release, tests.
 
 - **Epic:** Telegram
 - **User value:** Readable transcripts regardless of length.
-- **Scope:** Inline under 3500 chars; numbered HTML messages plus a `.md`
-  attachment above it; HTML escaping; grapheme-safe splitting.
-- **Acceptance:** No message exceeds 4096 chars; no surrogate pair is split;
-  every part carries the session id.
+- **Scope:** Collapsed expandable quote under 3500 chars; one `.md` attachment
+  above it; HTML escaping; grapheme-safe inline formatting.
+- **Acceptance:** No message exceeds 4096 UTF-16 code units; no surrogate pair
+  is split; an inline message carries the session id; an over-limit transcript
+  produces one complete, trusted-name document and no duplicate chat chunks.
 - **Dependencies:** P0-12 · **Risk:** low · **Estimate:** M
-- **Tests:** 10 formatting tests including emoji, Thai and combining marks.
+- **Tests:** Formatting tests cover HTML escaping, emoji, Thai, combining marks,
+  grapheme-safe splitting and timed transcript blocks.
 
 ### P0-17 ✅ Structured report delivery
 
@@ -217,7 +227,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Scope:** The documented report format; empty sections omitted; every
   speech-derived value escaped.
 - **Dependencies:** P0-13 · **Risk:** low · **Estimate:** S
-- **Tests:** 3 report tests including HTML injection through summary fields.
+- **Tests:** Report tests cover the documented shape, omitted empty sections,
+  HTML injection and safe Markdown file rendering.
 
 ### P0-18 ✅ `/status`
 
@@ -232,7 +243,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Epic:** Health · **Estimate:** S · **Risk:** low
 - **Scope:** `OK`, or one `WARN:`/`ERROR:` line per unhealthy component.
 - **Acceptance:** A healthy system returns exactly `OK`.
-- **Dependencies:** P0-23 · **Tests:** 8 health tests.
+- **Dependencies:** P0-23 · **Tests:** Health tests cover healthy, degraded and
+  failed component combinations, including exhausted work.
 
 ### P0-20 🟡 Incoming Telegram audio transcription
 
@@ -267,7 +279,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Acceptance:** Undelivered audio is never listed; every retained file has a
   stated reason.
 - **Dependencies:** P0-15 · **Risk:** high (irreversible) · **Estimate:** M
-- **Tests:** 8 "must never delete" cases plus dry-run/apply agreement.
+- **Tests:** A dedicated "must never delete" matrix covers every required proof,
+  alongside dry-run/apply agreement.
 
 ### P0-23 ✅ Health transitions
 
@@ -301,6 +314,351 @@ dependencies, risk, estimate (S/M/L), release, tests.
   warning.
 - **Acceptance:** A new user follows it without reading source.
 - **Dependencies:** all P0 · **Risk:** low · **Estimate:** S
+
+---
+
+## Audited repair plan — 2026-08-09
+
+This section records defects confirmed by a code-and-documentation audit of
+`main`. It does not retroactively change the status of the original backlog
+items above: each old status still requires its own stated evidence. Work is
+ordered by data-loss/privacy risk and implementation dependency.
+
+The 2026-08-09 repair pass implemented the yellow items below with offline
+tests. They remain yellow where their full fault-injection matrix or a live
+microphone/model/Telegram/launchd check is still outstanding. AR-06 and AR-11
+are green because their bounded guarantees are covered entirely by the offline
+suite. AR-07 and AR-14 remain untouched.
+
+### Current UX slice
+
+#### UX-01 🟡 Honest session lifecycle notifications
+
+- **Severity:** P0 · **Epic:** Recorder UX · **Estimate:** M · **Release:** next
+  repair release
+- **User value:** The bot immediately says when speech opened a real recording
+  and when that recording finished and started uploading.
+- **Scope:** After the first real speech frame has opened and persisted a
+  session, enqueue a non-blocking "speech heard / recording started" status.
+  After every part is atomically finalized, enqueue a "recording finished /
+  uploading" status. Notification work must never run on or delay the recorder
+  hot path.
+- **Non-goals:** Claiming that recording or upload succeeded before the
+  corresponding state is true; per-frame progress messages.
+- **Acceptance:** One start status per logical session, only after a real frame
+  and persisted `ACTIVE` state; one finish/upload status after durable
+  finalization; retries or process restarts do not duplicate either status.
+- **Dependencies:** AR-02, AR-07.
+- **Tests:** Recorder/daemon integration tests for ordering, deduplication,
+  restart recovery, no notification for a rejected speech candidate, and proof
+  that a delayed Telegram request cannot delay frame consumption.
+
+#### UX-02 🟡 Audio-first delivery concurrent with ASR
+
+- **Severity:** P0 · **Epic:** Delivery · **Estimate:** M · **Release:** next
+  repair release
+- **User value:** The finished source audio starts uploading immediately;
+  transcription continues in parallel and arrives when ready.
+- **Scope:** Durable finalization atomically makes both the audio delivery and
+  ASR work eligible. Audio delivery must not wait for ASR, summary, or report.
+  Transcript and report are delivered later through their own ordered stages.
+- **Non-goals:** Re-encoding the source audio; blocking session finalization on
+  Telegram or a model; promising exact network completion time.
+- **Acceptance:** A blocked/slow ASR worker does not delay the first audio
+  upload attempt; ASR failure does not suppress source audio; transcript is
+  sent once it exists; ordering remains deterministic within each session.
+- **Dependencies:** AR-01, AR-02, AR-09.
+- **Tests:** Integration tests with a deliberately blocked fake ASR worker, a
+  successful audio sender, restart between finalization and both consumers,
+  and multiple concurrent sessions.
+
+#### UX-03 🟡 Long reports delivered as Markdown files
+
+- **Severity:** P1 · **Epic:** Telegram UX · **Estimate:** S · **Release:** next
+  repair release
+- **User value:** Large reports arrive as readable `.md` documents instead of
+  dozens of chat messages or an over-limit failure.
+- **Scope:** Keep short reports inline; render a bounded short introduction plus
+  a UTF-8 `.md` attachment when the rendered report exceeds the inline limit.
+  Use the same escaping and untrusted-input boundary as transcript delivery.
+- **Non-goals:** Truncating report content; sending transcript-derived filenames
+  or paths; changing the source summary schema.
+- **Acceptance:** No Telegram text exceeds 4096 UTF-16 code units; a maximal
+  valid summary produces one safe `.md` attachment; filenames contain only
+  trusted session metadata; retry remains idempotent.
+- **Dependencies:** AR-09.
+- **Tests:** Boundary tests at 4095/4096/4097 UTF-16 code units, maximal schema
+  output, emoji/combining marks, HTML/Markdown injection, and retry after a
+  transient Telegram failure.
+
+#### UX-04 🟡 Collapsed transcript and report presentation
+
+- **Severity:** P1 · **Epic:** Telegram UX · **Estimate:** S · **Release:** next
+  repair release
+- **User value:** A completed session does not fill the chat screen with text,
+  while its summary, details and full artefacts stay one tap away.
+- **Scope:** Render a short transcript as one expandable block quote. Render a
+  short summary and report as separate expandable block quotes. For a long
+  transcript send only one `.md`; for a long report send one compact summary
+  quote and one `.report.md`. Include ASR timings, and `Голос N` labels only
+  when diarization assigned them.
+- **Non-goals:** Guessing participant names, semantic roles or missing speaker
+  labels; hiding source audio; nesting a spoiler that requires a second tap
+  after expanding the quote.
+- **Acceptance:** Short text is collapsed by default in Telegram; long text
+  produces no duplicate chat chunks; every file contains the complete text;
+  unattributed speech is never presented as an invented speaker.
+- **Dependencies:** UX-03, P0-22.
+- **Tests:** HTML escaping and expandable-quote rendering; compact preview
+  bound; long transcript file-only delivery; report preview plus file; timed
+  transcript with and without diarization labels. Live Telegram rendering is
+  still unverified.
+
+### Blocking correctness and privacy repairs
+
+#### AR-01 🟡 Own one bounded ASR worker lifecycle
+
+- **Severity:** P0 · **Epic:** ASR/runtime · **Estimate:** M
+- **Risk:** A new persistent Python worker is created per job and not closed,
+  causing repeated model loads, leaked child processes, and memory exhaustion.
+- **Acceptance:** The daemon owns one reusable ASR backend (or an explicitly
+  bounded pool), creates it once, restarts it after a proven crash, and closes
+  it during every shutdown path. Incoming Telegram and recorded-session jobs
+  use the same lifecycle policy. Once shutdown is latched, concurrent or later
+  work cannot respawn a worker between close phases. Documentation describes
+  the implemented lifecycle rather than the intended one.
+- **Dependencies:** none.
+- **Tests:** Worker-process spawn-count test over multiple jobs, crash/restart
+  test, graceful shutdown and close/start race tests proving the shutdown latch,
+  and a repeated-job resource-leak regression test.
+
+#### AR-02 🟡 Make state transitions crash-consistent
+
+- **Severity:** P0 · **Epic:** Storage/orchestration · **Estimate:** L
+- **Risk:** A crash can strand work at four boundaries: `PROCESSING` before ASR
+  job creation; archive rename before the part is finalized in SQLite; outbox
+  `sent` before its delivery callback updates domain state; Telegram update
+  deduplication before its job or reply is durably created.
+- **Acceptance:** Each boundary is either one SQLite transaction or has an
+  explicit, idempotent startup reconciliation path. Recovery proves that every
+  finalized archive has a matching database fact and eligible job, every sent
+  delivery reaches its domain state, and every recorded Telegram update has a
+  durable outcome. Archive reconciliation must not infer deletion eligibility.
+- **Dependencies:** AR-01 for worker recovery semantics.
+- **Tests:** Kill/fault injection before and after every write in all four
+  boundaries; restart repeatedly until the stable result is reached; assertions
+  for no lost jobs, orphaned archives, duplicate domain transitions, or skipped
+  Telegram updates.
+- **Remaining evidence gap:** Recovery proves and republishes a FLAC renamed
+  before its database update, but cannot reconstruct the exact monotonic
+  `duration_ms` / `speech_ms` lost in that crash window. Keep AR-02 yellow until
+  those facts are journaled before publication or the limitation has an
+  explicit data-model contract and fault-injection test.
+
+#### AR-03 🟡 Make incoming Telegram retry and deduplication recoverable
+
+- **Severity:** P0 · **Epic:** Telegram ingestion · **Estimate:** M
+- **Risk:** A retry downloads to a new UUID while the unique Telegram file row
+  still points at the first UUID; later transcript insertion can fail its FK and
+  every retry can leak quarantine files.
+- **Acceptance:** One Telegram unique file id resolves to one stable durable
+  record; retries reuse or explicitly replace its owned paths transactionally;
+  transient ASR/download/normalization failures can recover; every temporary or
+  superseded file has a proof-based cleanup path; duplicate updates do not
+  duplicate transcripts or replies.
+- **Dependencies:** AR-01, AR-02.
+- **Tests:** Fault injection after download, insert, normalization, ASR, and
+  transcript insert; same-file resend; process restart on every state; FK and
+  quarantine-leak assertions.
+
+#### AR-04 🟡 Enforce a safe daemon singleton and PID identity
+
+- **Severity:** P0 · **Epic:** Operations · **Estimate:** M
+- **Risk:** Multiple daemons can run against one database, and a stale reused
+  PID can make `stop` signal an unrelated process. Capture failure can also exit
+  successfully, defeating launchd restart policy.
+- **Acceptance:** Startup holds an atomic single-instance lock; status and stop
+  verify process identity, not just PID liveness; stale metadata is recovered
+  safely; all unexpected capture exits return failure for launchd; repeated
+  signals cannot bypass orderly recorder finalization.
+- **Dependencies:** AR-02.
+- **Tests:** Concurrent-start race, stale/reused PID, capture startup failure,
+  capture EOF, first and second signal during slow finalization, and launchd
+  exit-status contract tests.
+
+#### AR-05 🟡 Bind Telegram only to a fresh explicit `/start`
+
+- **Severity:** P0 · **Epic:** Privacy/onboarding · **Estimate:** S
+- **Risk:** Setup starts from update offset zero and can bind to an old private
+  message from the wrong person.
+- **Acceptance:** Setup establishes a fresh update boundary, accepts only a new
+  explicit `/start`, displays the selected account/chat identity for
+  confirmation, and persists the token/chat-id pair only after confirmation.
+  The pair is one versioned Keychain item, so it cannot be half-configured;
+  ordinary setup failures restore the previous complete pair and SQLite offset
+  (or leave no pair at all). Historical and non-private updates cannot bind the
+  bot.
+- **Dependencies:** none.
+- **Tests:** Scripted update histories containing old private messages, group
+  messages, multiple users, a fresh `/start`, cancellation, restart before
+  Keychain persistence, atomic pair-write failure, and rollback after the
+  matching SQLite offset or confirmation fails.
+- **Remaining evidence gap:** Keychain and SQLite cannot share a crash-atomic
+  transaction. A hard process death between publishing a new credential pair
+  and its offset can leave a complete new pair with the previous bot's cursor;
+  keep AR-05 yellow until startup detects and reconciles credential identity.
+  The 2026-08-09 repair also fixed a real macOS integration defect: a piped
+  `security ... -w` stored an empty password. Setup now drives the two-prompt
+  Keychain flow through a private PTY, while the credential itself remains on
+  stdin and outside argv/env/files. The PTY path was exercised against a
+  disposable Keychain item; a fresh real-bot setup is still required.
+
+#### AR-06 ✅ Enforce local-only LLM endpoints
+
+- **Severity:** P0 · **Epic:** Privacy/config · **Estimate:** S
+- **Risk:** Configuration accepts a remote `llm.baseUrl`, contradicting the
+  local-only processing boundary and allowing transcripts to leave the Mac.
+- **Acceptance:** Validation accepts only loopback endpoints supported by the
+  ADR, rejects redirects or resolved destinations that escape loopback, and
+  fails closed before sending transcript content. ADR, schema, and doctor state
+  the same boundary.
+- **Dependencies:** none.
+- **Tests:** Literal `127.0.0.1` positive; hostname/IPv6/public host, alternate
+  notation, credentials, malformed URL, and redirect negatives; assertion that
+  rejected configuration makes no request.
+
+#### AR-07 ⬜ Remove processing and timestamp distortion from the recorder hot path
+
+- **Severity:** P0 · **Epic:** Capture/sessionizer · **Estimate:** L
+- **Risk:** Per-frame VAD and writer awaits can block capture for seconds, while
+  timestamps are assigned when buffered bytes are consumed rather than when
+  captured; silence, pre-roll, rotation, and health timings can become false.
+- **Acceptance:** Capture drains continuously into a bounded pipeline; slow or
+  failed VAD/encoding cannot block the microphone reader; overload has an
+  explicit observable policy; frame monotonic timestamps preserve capture
+  cadence under downstream stalls; part close/fsync/hash runs off the hot path
+  without weakening atomic publication.
+- **Dependencies:** none.
+- **Tests:** Delayed/wedged VAD, pipe backpressure, slow part close, queue
+  saturation, encoder early exit, and monotonic timing tests using a fake clock
+  rather than sleeps.
+
+### Delivery, operations, and observability repairs
+
+#### AR-08 🟡 Make digest and retention scheduling real and timezone-correct
+
+- **Severity:** P1 · **Epic:** Operations/privacy · **Estimate:** M
+- **Risk:** The launchd digest command stores but does not deliver; it can race
+  the daemon and suppress delivery. The configured timezone is unused, late
+  sessions can be omitted, and retention limits are not automatically applied.
+- **Acceptance:** Exactly one owner schedules each operation; digest creation
+  and outbox enqueue are recoverably linked; configured local day/time and DST
+  are honored; late-completing sessions have a documented inclusion policy;
+  retention runs on a documented schedule through the existing proof-based
+  dry-run/apply boundary, with failures visible to health.
+- **Dependencies:** AR-02, AR-09, AR-10.
+- **Tests:** Launchd/daemon ownership, missed-window restart, month/year/DST
+  boundaries, session finishing after digest time, duplicate scheduler wakeup,
+  and scheduled-retention proof tests with undelivered files.
+
+#### AR-09 🟡 Bound Telegram messages and define honest delivery semantics
+
+- **Severity:** P1 · **Epic:** Telegram delivery · **Estimate:** M
+- **Risk:** A valid report can greatly exceed 4096 characters and die on a 400;
+  global ordinal ordering can starve old transcript/report work; documentation
+  promises duplicate-free delivery although the network boundary is
+  at-least-once.
+- **Acceptance:** Every text request is bounded before enqueue/send; long
+  reports use UX-03; fairness prevents later audio from indefinitely starving
+  older session output while preserving per-session audio-first ordering;
+  every Bot API request and file download has a bounded client-side deadline
+  (with long polling given its configured server wait plus transport headroom);
+  retries are idempotent where Telegram provides a key and explicitly
+  documented as at-least-once otherwise; dead rows remain observable.
+- **Dependencies:** AR-02.
+- **Tests:** Maximal report, Telegram 400 classification, cross-session sustained
+  backlog fairness, crash after accepted HTTP response but before `markSent`,
+  retry/deduplication, never-resolving fetch aborts for JSON/upload/download and
+  long-poll headroom, and dead-row visibility.
+
+#### AR-10 🟡 Report real worker, queue, outbox, digest, and Keychain health
+
+- **Severity:** P1 · **Epic:** Health · **Estimate:** M
+- **Risk:** `workerReady` is inferred from queue size, Ollama is always reported
+  ready, dead work is excluded from counts, digest failures are not evaluated,
+  and Keychain secrets are never retried after startup.
+- **Acceptance:** Readiness comes from real bounded probes; pending and dead
+  counts/ages are separate; worker crashes, missing digest, dead outbox/jobs,
+  recorder stalls, and unavailable Keychain produce edge-triggered alerts;
+  unlocking Keychain recovers delivery without daemon restart.
+- **Dependencies:** AR-01, AR-08, AR-09.
+- **Tests:** Each unhealthy condition and recovery edge, dead-only queues,
+  locked-then-unlocked Keychain, worker crash, stale recorder, missing digest,
+  and alert cooldown/deduplication.
+
+#### AR-11 ✅ Remove the duplicated session-opening frame
+
+- **Severity:** P1 · **Epic:** Sessionizer · **Estimate:** S
+- **Risk:** The threshold-crossing frame is stored in pre-roll and then written
+  again after `open_part`, duplicating audio and backdating session start.
+- **Acceptance:** Every captured PCM frame appears at most once in a part;
+  pre-roll retains the configured history including the correct boundary;
+  rotation still receives no pre-roll; sleep/wake clears any uncommitted speech
+  candidate so a session cannot span sleep.
+- **Dependencies:** AR-07.
+- **Tests:** Decode generated part PCM and compare exact sample sequence at the
+  open threshold; empty/full pre-roll boundaries, rotation, and sleep during
+  `SPEECH_CANDIDATE`.
+
+#### AR-12 🟡 Clean split artifacts and verify every produced upload chunk
+
+- **Severity:** P1 · **Epic:** Delivery/storage · **Estimate:** S
+- **Risk:** Lossless split files remain in temp forever, and the size estimate
+  does not prove every produced chunk fits Telegram's configured limit.
+- **Acceptance:** Every derived split path has durable ownership and cleanup
+  after success, rejection, retry exhaustion, and startup recovery; each output
+  is measured before enqueue; an oversize output is split again or fails with a
+  recoverable explicit state; source FLAC is never deleted by this cleanup.
+- **Dependencies:** AR-02, AR-09.
+- **Tests:** Success, transient failure, dead delivery, process crash, stale temp
+  recovery, underestimated bitrate, and assertions for chunk size/codec/source
+  preservation.
+
+### Contract and documentation repairs
+
+#### AR-13 🟡 Remove dead configuration and synchronize CI/docs with runtime
+
+- **Severity:** P1 · **Epic:** Maintenance · **Estimate:** M
+- **Risk:** `maxConcurrentIncomingJobs`, `summarizeIncoming`, `digest.timezone`,
+  and `vadFrameMs` are documented/configurable but not honored; incoming-audio
+  docs promise behaviour not implemented; CI and doctor validate Node versions
+  below the declared 26.7.0 floor; verified/unverified claims conflict across
+  README, dependency docs, and the original backlog.
+- **Acceptance:** Every public config field is either implemented and tested or
+  removed through an explicit migration; incoming attachment/summary behaviour
+  matches code; CI, `.nvmrc`, `package.json`, bootstrap, and doctor validate the
+  same minimum Node/SQLite versions; one evidence table is authoritative for
+  real model, bot, microphone, launchd, and sleep/wake verification. Existing
+  backlog statuses change only when their acceptance evidence is rerun.
+- **Dependencies:** UX-01 through UX-03 and AR-01 through AR-12 where their
+  behaviour is documented.
+- **Tests:** Config field usage/round-trip checks, unknown/deprecated key tests,
+  incoming UX tests, CI version assertion, doctor fixtures at the exact version
+  boundary, documentation link/checklist review, and full repository checks.
+
+#### AR-14 ⬜ Review jurisdiction-specific recording guidance
+
+- **Severity:** P2 · **Epic:** Legal/documentation · **Estimate:** S (engineering
+  changes only; legal review external)
+- **Risk:** `RECORDING_POLICY.md` makes jurisdiction-specific legal assertions
+  without dated primary sources and can be mistaken for current legal advice.
+- **Acceptance:** Product docs clearly separate technical safeguards from legal
+  advice; jurisdiction claims have dated authoritative sources and qualified
+  review, or are replaced with a concise instruction to obtain local advice;
+  limitations and user responsibility are visible during onboarding.
+- **Dependencies:** Qualified legal review before asserting jurisdiction rules.
+- **Tests:** Documentation review for source/date coverage and onboarding-copy
+  snapshot; no automated test is presented as legal verification.
 
 ---
 
@@ -346,7 +704,7 @@ dependencies, risk, estimate (S/M/L), release, tests.
 | Item | Why it matters |
 | --- | --- |
 | ⬜ Sandbox FFmpeg decode of incoming files | The most plausible RCE path (T3 in the threat model). |
-| ⬜ Run the real MLX ASR end-to-end | P0-11 and P0-06 are the two largest unverified areas. |
+| ⬜ Repeat the real MLX ASR end-to-end on the current revision | P0-11 and P0-06 have historical same-machine smoke evidence, not a post-repair live run. |
 | ⬜ Verify live Telegram delivery with a real bot | Closes P0-14, P0-18, P0-20. |
 | ⬜ Verify launchd under a real login session | Closes P0-21; TCC under launchd is the known risk. |
 | ⬜ Test sleep/wake behaviour | Documented in the README from design intent, not from observation. |

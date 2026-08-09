@@ -1,14 +1,20 @@
 import { spawn } from 'node:child_process';
-import { stat, writeFile } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { Paths } from '../config/paths.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
+import { transaction } from '../database/db.ts';
 import { PartRepository, SessionRepository, TranscriptRepository } from '../database/repository.ts';
 import type { StructuredSummary } from '../llm/schema.ts';
-import { renderTimedTranscriptMessages } from '../telegram/format.ts';
+import { formatTimedTranscript, renderTimedTranscriptMessages } from '../telegram/format.ts';
 import { Outbox } from '../telegram/outbox.ts';
-import { renderSessionReport } from '../telegram/report.ts';
+import {
+  renderSessionReport,
+  renderSessionReportMarkdown,
+  renderSessionSummaryPreview,
+} from '../telegram/report.ts';
+import { writeTextAtomically } from '../util/atomic-file.ts';
 
 /**
  * Turns a finished, transcribed session into an ordered set of outbox rows.
@@ -24,9 +30,12 @@ import { renderSessionReport } from '../telegram/report.ts';
 
 export interface EnqueueDeliveryInput {
   readonly sessionId: string;
-  readonly summary: StructuredSummary;
   readonly config: OpenMurmurConfig;
   readonly paths: Paths;
+}
+
+export interface EnqueueReportInput extends EnqueueDeliveryInput {
+  readonly summary: StructuredSummary;
 }
 
 export interface DeliveryPlan {
@@ -38,32 +47,58 @@ export interface DeliveryPlan {
 
 export async function enqueueSessionDelivery(
   db: DatabaseSync,
-  input: EnqueueDeliveryInput,
+  input: EnqueueReportInput,
 ): Promise<DeliveryPlan> {
-  const sessions = new SessionRepository(db);
+  const audio = await enqueueSessionAudio(db, input);
+  const transcriptRows = await enqueueSessionTranscript(db, input);
+  const reportRows = await enqueueSessionReport(db, input);
+  return {
+    audioRows: audio.audioRows,
+    transcriptRows,
+    reportRows,
+    oversizeParts: audio.oversizeParts,
+  };
+}
+
+export async function enqueueSessionAudio(
+  db: DatabaseSync,
+  input: EnqueueDeliveryInput,
+): Promise<Pick<DeliveryPlan, 'audioRows' | 'oversizeParts'>> {
   const parts = new PartRepository(db);
-  const transcripts = new TranscriptRepository(db);
   const outbox = new Outbox(db);
 
-  const session = sessions.get(input.sessionId);
-  if (session === undefined) throw new Error(`unknown session ${input.sessionId}`);
-  const transcript = transcripts.current(input.sessionId);
-  if (transcript === undefined) throw new Error(`session ${input.sessionId} has no transcript`);
+  if (new SessionRepository(db).get(input.sessionId) === undefined) {
+    throw new Error(`unknown session ${input.sessionId}`);
+  }
 
   const partRows = parts.listForSession(input.sessionId).filter((p) => p.finalized === 1);
   const oversizeParts: string[] = [];
   let audioRows = 0;
+  const availableParts: { part: (typeof partRows)[number]; bytes: number }[] = [];
 
   for (const part of partRows) {
+    // A retention proof is the only valid reason for a finalized source to be
+    // absent. Preflight every part before publishing any row, otherwise the
+    // outbox could send the first half of a multi-part manifest while this job
+    // later discovers that the second source disappeared.
+    if (part.deleted_at !== null) continue;
+
     // The recorded size is a record of the past; the *file* is what gets
     // uploaded, so its live size is what the limit is checked against.
     let bytes: number;
     try {
-      bytes = (await stat(part.path)).size;
-    } catch {
-      continue; // already retained away; the transcript still goes out
+      const info = await stat(part.path);
+      if (!info.isFile()) throw new Error('path is not a regular file');
+      bytes = info.size;
+    } catch (error) {
+      throw new Error(`finalized audio part ${part.part_id} is unavailable: ${part.path}`, {
+        cause: error,
+      });
     }
+    availableParts.push({ part, bytes });
+  }
 
+  for (const { part, bytes } of availableParts) {
     if (bytes <= input.config.telegram.maxOutgoingBytes) {
       const enqueued = outbox.enqueue({
         deliveryPartId: `audio:${part.part_id}`,
@@ -84,6 +119,9 @@ export async function enqueueSessionDelivery(
     // Over the limit: split losslessly rather than re-encoding to a lossy
     // format. The user asked for their source audio, so they get FLAC.
     oversizeParts.push(part.part_id);
+    if (await replayUsesExistingAudioDeliveries(db, part.part_id)) {
+      continue;
+    }
     const chunks = await splitFlacLossless(
       input.config.audio.ffmpegPath,
       part.path,
@@ -91,24 +129,151 @@ export async function enqueueSessionDelivery(
       input.config.telegram.maxOutgoingBytes,
       part.duration_ms ?? 0,
     );
-    chunks.forEach((chunk, index) => {
-      const enqueued = outbox.enqueue({
-        deliveryPartId: `audio:${part.part_id}:split${index}`,
-        kind: 'audio',
-        sessionId: input.sessionId,
-        ordinal: 0,
-        payload: {
-          type: 'document',
-          path: chunk,
-          filename: basename(chunk),
-          partId: part.part_id,
-        },
-      });
-      if (enqueued) audioRows += 1;
+    const terminalConflictPaths: string[] = [];
+    transaction(db, () => {
+      for (const [index, chunk] of chunks.entries()) {
+        const deliveryPartId = `audio:${part.part_id}:split${index}`;
+        const enqueued = outbox.enqueue({
+          deliveryPartId,
+          kind: 'audio',
+          sessionId: input.sessionId,
+          ordinal: 0,
+          payload: {
+            type: 'document',
+            path: chunk,
+            filename: basename(chunk),
+            partId: part.part_id,
+            deleteAfterSend: true,
+          },
+        });
+        if (enqueued) {
+          audioRows += 1;
+          continue;
+        }
+
+        const state = outbox.stateOf(deliveryPartId);
+        if (state === 'sent' || state === 'dead') {
+          terminalConflictPaths.push(chunk);
+          continue;
+        }
+        throw new Error(
+          `audio delivery ${deliveryPartId} appeared while its split manifest was being published`,
+        );
+      }
     });
+    // Filesystem work must not run inside the transaction. A terminal conflict
+    // has no live owner, so its recreated deterministic artifact is now stale.
+    for (const path of terminalConflictPaths) {
+      await rm(path, { force: true });
+    }
   }
 
-  // --- Transcript --------------------------------------------------------
+  return { audioRows, oversizeParts };
+}
+
+type ExistingDeliveryState = 'pending' | 'sending' | 'sent' | 'failed' | 'dead';
+
+interface ExistingAudioDelivery {
+  readonly delivery_part_id: string;
+  readonly state: ExistingDeliveryState;
+  readonly payload: string;
+}
+
+/**
+ * A retried delivery job must not replace deterministic split paths already
+ * referenced by the outbox. Live split rows own those files until Telegram
+ * reaches a terminal result; terminal split rows make replay a no-op without
+ * recreating artifacts that may already have been cleaned up.
+ *
+ * The direct id is checked separately. It can exist when maxOutgoingBytes was
+ * lowered after the source row was queued. Silently accepting a live direct row
+ * here would let it fail the new size check and permanently block completion,
+ * while creating split rows beside it would leave that dead row in the same
+ * session manifest. Refuse the ambiguous migration explicitly instead.
+ */
+async function replayUsesExistingAudioDeliveries(
+  db: DatabaseSync,
+  partId: string,
+): Promise<boolean> {
+  const directId = `audio:${partId}`;
+  const splitPrefix = `${directId}:split`;
+  const rows = db
+    .prepare(
+      `SELECT delivery_part_id, state, payload
+         FROM telegram_outbox
+        WHERE kind = 'audio'
+          AND (delivery_part_id = ? OR substr(delivery_part_id, 1, ?) = ?)`,
+    )
+    .all(directId, splitPrefix.length, splitPrefix) as unknown as ExistingAudioDelivery[];
+  if (rows.length === 0) return false;
+
+  for (const row of rows) {
+    if (row.delivery_part_id === directId) {
+      if (row.state === 'sent' || row.state === 'dead') continue;
+      if (row.state === 'pending' || row.state === 'sending') {
+        throw new Error(
+          `unsplit audio delivery ${directId} is ${row.state} but the source now exceeds the current upload limit; refusing to publish a second manifest`,
+        );
+      }
+      throw new Error(`unsplit audio delivery ${directId} has unsupported state ${row.state}`);
+    }
+
+    if (row.state === 'sent' || row.state === 'dead') continue;
+    if (row.state !== 'pending' && row.state !== 'sending') {
+      throw new Error(
+        `audio delivery ${row.delivery_part_id} has unsupported replay state ${row.state}`,
+      );
+    }
+
+    const path = ownedAudioPath(row, partId);
+    try {
+      const info = await stat(path);
+      if (!info.isFile()) throw new Error('path is not a regular file');
+    } catch (error) {
+      throw new Error(
+        `audio delivery ${row.delivery_part_id} is ${row.state} but its owned artifact is unavailable: ${path}`,
+        { cause: error },
+      );
+    }
+  }
+  return true;
+}
+
+function ownedAudioPath(row: ExistingAudioDelivery, partId: string): string {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.payload);
+  } catch (error) {
+    throw new Error(`audio delivery ${row.delivery_part_id} has invalid payload JSON`, {
+      cause: error,
+    });
+  }
+  if (typeof payload !== 'object' || payload === null) {
+    throw new Error(`audio delivery ${row.delivery_part_id} has a non-object payload`);
+  }
+  const record = payload as Record<string, unknown>;
+  if (
+    record['type'] !== 'document' ||
+    typeof record['path'] !== 'string' ||
+    record['partId'] !== partId
+  ) {
+    throw new Error(`audio delivery ${row.delivery_part_id} does not own a valid part artifact`);
+  }
+  return record['path'];
+}
+
+export async function enqueueSessionTranscript(
+  db: DatabaseSync,
+  input: EnqueueDeliveryInput,
+): Promise<number> {
+  const sessions = new SessionRepository(db);
+  const transcripts = new TranscriptRepository(db);
+  const outbox = new Outbox(db);
+  const session = sessions.get(input.sessionId);
+  if (session === undefined) throw new Error(`unknown session ${input.sessionId}`);
+  const transcript = transcripts.current(input.sessionId);
+  if (transcript === undefined) throw new Error(`session ${input.sessionId} has no transcript`);
+
   // Timestamped blocks, not one wall of text. The segments are already stored
   // with their timings; a recorded session is the *main* output and was the
   // only path still sending the flat blob, while audio sent to the bot got the
@@ -127,41 +292,77 @@ export async function enqueueSessionDelivery(
     input.config.telegram.transcriptInlineLimit,
   );
   let transcriptRows = 0;
-  for (const message of messages) {
-    const enqueued = outbox.enqueue({
-      deliveryPartId: `transcript:${input.sessionId}:${message.partNumber}`,
-      kind: 'transcript',
-      sessionId: input.sessionId,
-      ordinal: 10,
-      payload: { type: 'text', text: message.text, parseMode: 'HTML' },
-    });
-    if (enqueued) transcriptRows += 1;
+  if (messages.length === 1) {
+    const message = messages[0];
+    if (message !== undefined) {
+      const enqueued = outbox.enqueue({
+        deliveryPartId: `transcript:${input.sessionId}:1`,
+        kind: 'transcript',
+        sessionId: input.sessionId,
+        ordinal: 10,
+        payload: { type: 'text', text: message.text, parseMode: 'HTML' },
+      });
+      if (enqueued) transcriptRows += 1;
+    }
   }
 
-  // A transcript that needed splitting also travels as one .md file, so the
-  // user has a single searchable artefact rather than nine chat messages.
+  // A long transcript travels only as one .md file: sending the same content
+  // as many quote chunks would still flood the chat even when each chunk can
+  // be collapsed.
   if (messages.length > 1) {
     const mdPath = join(input.paths.transcriptsDir, `${input.sessionId}.md`);
-    await writeFile(
+    const segments = transcripts.segments(transcript.revision_id).map((segment) => ({
+      startMs: segment.startMs,
+      endMs: segment.endMs,
+      text: segment.text,
+      speaker: segment.speaker ?? null,
+    }));
+    const hasSpeakers = segments.some((segment) => segment.speaker !== null);
+    await writeTextAtomically(
       mdPath,
-      renderTranscriptMarkdown(input.sessionId, session.started_at, transcript.text),
-      {
-        mode: 0o600,
-      },
+      renderTranscriptMarkdown(input.sessionId, session.started_at, transcript.text, segments),
     );
     const enqueued = outbox.enqueue({
       deliveryPartId: `transcript-md:${input.sessionId}`,
       kind: 'transcript',
       sessionId: input.sessionId,
       ordinal: 11,
-      payload: { type: 'document', path: mdPath, filename: `${input.sessionId}.md` },
+      payload: {
+        type: 'document',
+        path: mdPath,
+        filename: `${input.sessionId}.md`,
+        caption: `📝 Транскрипт с таймингами${hasSpeakers ? ' и голосами' : ''}`,
+      },
     });
     if (enqueued) transcriptRows += 1;
   }
 
-  // --- Structured report --------------------------------------------------
+  sessions.setState(input.sessionId, 'DELIVERING');
+  return transcriptRows;
+}
+
+export async function enqueueSessionReport(
+  db: DatabaseSync,
+  input: EnqueueReportInput,
+): Promise<number> {
+  const sessions = new SessionRepository(db);
+  const transcripts = new TranscriptRepository(db);
+  const outbox = new Outbox(db);
+  const session = sessions.get(input.sessionId);
+  if (session === undefined) throw new Error(`unknown session ${input.sessionId}`);
+
   const languages = session.languages === null ? [] : (JSON.parse(session.languages) as string[]);
-  const report = renderSessionReport({
+  const transcript = transcripts.current(input.sessionId);
+  const transcriptSegments =
+    transcript === undefined
+      ? []
+      : transcripts.segments(transcript.revision_id).map((segment) => ({
+          startMs: segment.startMs,
+          endMs: segment.endMs,
+          text: segment.text,
+          speaker: segment.speaker ?? null,
+        }));
+  const reportInput = {
     sessionId: input.sessionId,
     startedWallMs: Date.parse(session.started_at),
     endedWallMs: session.ended_at === null ? Date.now() : Date.parse(session.ended_at),
@@ -170,26 +371,68 @@ export async function enqueueSessionDelivery(
     languages,
     partCount: session.part_count,
     summary: input.summary,
-  });
-  const reportRows = outbox.enqueue({
-    deliveryPartId: `report:${input.sessionId}`,
-    kind: 'report',
-    sessionId: input.sessionId,
-    ordinal: 20,
-    payload: { type: 'text', text: report, parseMode: 'HTML' },
-  })
-    ? 1
-    : 0;
+    transcript: transcript?.text ?? '',
+    transcriptSegments,
+  };
+  const report = renderSessionReport(reportInput);
+  let reportRows = 0;
+  if (report.length <= input.config.telegram.transcriptInlineLimit) {
+    reportRows = outbox.enqueue({
+      deliveryPartId: `report:${input.sessionId}`,
+      kind: 'report',
+      sessionId: input.sessionId,
+      ordinal: 20,
+      payload: { type: 'text', text: report, parseMode: 'HTML' },
+    })
+      ? 1
+      : 0;
+  } else {
+    const reportPath = join(input.paths.transcriptsDir, `${input.sessionId}.report.md`);
+    await writeTextAtomically(reportPath, renderSessionReportMarkdown(reportInput));
+    const preview = renderSessionSummaryPreview(reportInput);
+    if (preview.length > 0) {
+      reportRows += outbox.enqueue({
+        deliveryPartId: `report-summary:${input.sessionId}`,
+        kind: 'report',
+        sessionId: input.sessionId,
+        ordinal: 20,
+        payload: { type: 'text', text: preview, parseMode: 'HTML' },
+      })
+        ? 1
+        : 0;
+    }
+    reportRows = outbox.enqueue({
+      deliveryPartId: `report:${input.sessionId}`,
+      kind: 'report',
+      sessionId: input.sessionId,
+      ordinal: 21,
+      payload: {
+        type: 'document',
+        path: reportPath,
+        filename: `${input.sessionId}.report.md`,
+        caption: '📄 Полный отчёт по сессии',
+      },
+    })
+      ? reportRows + 1
+      : reportRows;
+  }
 
   sessions.setState(input.sessionId, 'DELIVERING');
-  return { audioRows, transcriptRows, reportRows, oversizeParts };
+  return reportRows;
 }
 
 export function renderTranscriptMarkdown(
   sessionId: string,
   startedAt: string,
   text: string,
+  segments: readonly {
+    readonly startMs: number | null;
+    readonly endMs: number | null;
+    readonly text: string;
+    readonly speaker?: number | null;
+  }[] = [],
 ): string {
+  const timed = formatTimedTranscript(segments);
   return [
     '# OpenMurmur transcript',
     '',
@@ -198,7 +441,7 @@ export function renderTranscriptMarkdown(
     '',
     '---',
     '',
-    text,
+    timed.length > 0 ? timed : text,
     '',
   ].join('\n');
 }
@@ -224,30 +467,58 @@ export async function splitFlacLossless(
   const durationSeconds = durationMs > 0 ? durationMs / 1000 : 1;
   const bytesPerSecond = info.size / durationSeconds;
   // 85% of the limit absorbs per-chunk header overhead and bitrate variation.
-  const chunkSeconds = Math.max(30, Math.floor((maxBytes * 0.85) / bytesPerSecond));
+  // The estimate is only a starting point: FLAC bitrate is content-dependent,
+  // so every produced file is measured and retried with shorter segments.
+  let chunkSeconds = Math.max(1, Math.floor((maxBytes * 0.85) / bytesPerSecond));
 
   const stem = basename(sourcePath).replace(/\.flac$/i, '');
   const pattern = join(tempDir, `${stem}.split%03d.flac`);
 
-  await runFfmpeg(ffmpegPath, [
-    '-hide_banner',
-    '-loglevel',
-    'error',
-    '-nostdin',
-    '-i',
-    sourcePath,
-    '-c',
-    'copy',
-    '-f',
-    'segment',
-    '-segment_time',
-    String(chunkSeconds),
-    '-reset_timestamps',
-    '1',
-    '-y',
-    pattern,
-  ]);
+  for (;;) {
+    await removeSplitArtifacts(tempDir, stem);
+    try {
+      await runFfmpeg(ffmpegPath, [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-nostdin',
+        '-i',
+        sourcePath,
+        '-c',
+        'copy',
+        '-f',
+        'segment',
+        '-segment_time',
+        String(chunkSeconds),
+        '-reset_timestamps',
+        '1',
+        '-y',
+        pattern,
+      ]);
+    } catch (error) {
+      await removeSplitArtifacts(tempDir, stem);
+      throw error;
+    }
 
+    const produced = await listSplitArtifacts(tempDir, stem);
+    if (produced.length === 0) {
+      throw new Error(`ffmpeg produced no FLAC chunks for ${sourcePath}`);
+    }
+
+    const sizes = await Promise.all(produced.map(async (path) => (await stat(path)).size));
+    if (sizes.every((size) => size <= maxBytes)) return produced;
+
+    await removeSplitArtifacts(tempDir, stem);
+    if (chunkSeconds === 1) {
+      throw new Error(
+        `cannot split ${sourcePath} below the Telegram limit of ${maxBytes} bytes without re-encoding`,
+      );
+    }
+    chunkSeconds = Math.max(1, Math.floor(chunkSeconds / 2));
+  }
+}
+
+async function listSplitArtifacts(tempDir: string, stem: string): Promise<string[]> {
   const produced: string[] = [];
   for (let index = 0; index < 1000; index += 1) {
     const candidate = join(tempDir, `${stem}.split${String(index).padStart(3, '0')}.flac`);
@@ -258,7 +529,13 @@ export async function splitFlacLossless(
       break;
     }
   }
-  return produced.length > 0 ? produced : [sourcePath];
+  return produced;
+}
+
+async function removeSplitArtifacts(tempDir: string, stem: string): Promise<void> {
+  for (const path of await listSplitArtifacts(tempDir, stem)) {
+    await rm(path, { force: true });
+  }
 }
 
 function runFfmpeg(ffmpegPath: string, args: readonly string[]): Promise<void> {

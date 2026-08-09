@@ -2,7 +2,17 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { transaction } from '../database/db.ts';
 
-export type JobKind = 'asr' | 'summarize' | 'deliver' | 'incoming_audio' | 'digest' | 'retention';
+export type JobKind =
+  | 'deliver_audio'
+  | 'asr'
+  | 'deliver_transcript'
+  | 'summarize'
+  | 'deliver_report'
+  /** Kept so jobs created by releases before the staged delivery pipeline still drain. */
+  | 'deliver'
+  | 'incoming_audio'
+  | 'digest'
+  | 'retention';
 
 export interface Job {
   readonly jobId: string;
@@ -80,7 +90,17 @@ export class JobQueue {
           `SELECT job_id, kind, payload, attempts, max_attempts
              FROM jobs
             WHERE state = 'pending' AND run_after <= ? AND kind IN (${placeholders})
-            ORDER BY run_after
+            ORDER BY CASE kind
+                       WHEN 'deliver_audio' THEN 0
+                       WHEN 'deliver_transcript' THEN 1
+                       WHEN 'asr' THEN 2
+                       WHEN 'incoming_audio' THEN 2
+                       WHEN 'summarize' THEN 3
+                       WHEN 'deliver_report' THEN 4
+                       ELSE 5
+                     END,
+                     run_after,
+                     created_at
             LIMIT 1`,
         )
         .get(nowIso(), ...kinds) as
@@ -176,6 +196,13 @@ export class JobQueue {
               "SELECT count(*) AS c FROM jobs WHERE state IN ('pending','leased') AND kind = ?",
             )
             .get(kind) as { c: number });
+    return row.c;
+  }
+
+  deadCount(): number {
+    const row = this.#db.prepare("SELECT count(*) AS c FROM jobs WHERE state = 'dead'").get() as {
+      c: number;
+    };
     return row.c;
   }
 

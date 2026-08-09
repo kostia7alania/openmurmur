@@ -136,8 +136,8 @@ export function planRetention(
   }
 
   // --- Rejected sessions --------------------------------------------------
-  // Never delivered, so the delivery conditions do not apply; a short
-  // retention window still lets a user check what was thrown away.
+  // The duration gate rejects before delivery is scheduled. ASR rejection is
+  // different: audio delivery was promised and must be proven before deletion.
   const rejected = db
     .prepare(
       `SELECT p.part_id, p.path, COALESCE(p.bytes, 0) AS bytes
@@ -145,8 +145,45 @@ export function planRetention(
          JOIN audio_sessions s ON s.session_id = p.session_id
         WHERE p.deleted_at IS NULL
           AND s.state = 'REJECTED'
+          AND p.finalized = 1
+          AND p.sha256 IS NOT NULL
           AND s.ended_at IS NOT NULL
-          AND s.ended_at <= ?`,
+          AND s.ended_at <= ?
+          AND (
+                s.rejection_reason = 'insufficient_speech'
+                OR (
+                     s.rejection_reason IN ('asr_empty','insufficient_words')
+                     AND p.delivered = 1
+                     AND EXISTS (
+                           SELECT 1 FROM telegram_outbox sent_audio
+                            WHERE sent_audio.session_id = s.session_id
+                              AND sent_audio.kind = 'audio'
+                              AND sent_audio.state = 'sent'
+                              AND (
+                                    sent_audio.delivery_part_id = 'audio:' || p.part_id
+                                    OR sent_audio.delivery_part_id LIKE
+                                         'audio:' || p.part_id || ':split%'
+                                  )
+                         )
+                     AND EXISTS (
+                           SELECT 1 FROM jobs audio_job
+                            WHERE audio_job.kind = 'deliver_audio'
+                              AND audio_job.idempotency_key =
+                                    'deliver-audio:' || s.session_id
+                              AND audio_job.state = 'done'
+                         )
+                   )
+              )
+          AND NOT EXISTS (
+                SELECT 1 FROM telegram_outbox o
+                 WHERE o.session_id = s.session_id
+                   AND o.kind = 'audio' AND o.state <> 'sent'
+              )
+          AND NOT EXISTS (
+                SELECT 1 FROM jobs j
+                 WHERE j.state IN ('pending','leased')
+                   AND j.idempotency_key LIKE '%' || s.session_id
+              )`,
     )
     .all(hoursAgoIso(config.rejectedSessionHours, now)) as {
     part_id: string;
@@ -160,7 +197,7 @@ export function planRetention(
       id: row.part_id,
       path: row.path,
       bytes: row.bytes,
-      reason: `rejected as noise, older than ${config.rejectedSessionHours}h`,
+      reason: `rejected audio, older than ${config.rejectedSessionHours}h`,
     });
   }
 
@@ -170,7 +207,7 @@ export function planRetention(
       `SELECT file_uid, quarantine_path, normalized_path, COALESCE(actual_bytes, 0) AS bytes
          FROM incoming_telegram_files
         WHERE deleted_at IS NULL
-          AND state IN ('delivered','transcribed')
+          AND state = 'delivered'
           AND updated_at <= ?
           AND EXISTS (
                 SELECT 1 FROM transcript_revisions r WHERE r.incoming_file_id = file_uid

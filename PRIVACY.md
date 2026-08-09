@@ -20,7 +20,7 @@ Everything lives under `~/Library/Application Support/OpenMurmur/`, mode `0700`:
 | --- | --- |
 | `audio/YYYY-MM-DD/` | Session FLAC files |
 | `openmurmur.db` | Transcripts, summaries, session metadata, job and delivery state |
-| `transcripts/` | `.md` exports of long transcripts |
+| `transcripts/` | `.md` exports of long transcripts, long reports (`<session_id>.report.md`) and long daily digests (`digest-YYYY-MM-DD.md`) |
 | `quarantine/` | Files sent to the bot, before validation |
 | `logs/` | NDJSON logs, with secrets redacted |
 | `tmp/` | In-progress writes |
@@ -34,13 +34,16 @@ The bot token and chat ID are in the **macOS Keychain**, service `io.openmurmur`
 
 - Source FLAC audio of each session
 - Full transcripts
-- Structured summaries
+- Structured summaries: short reports inline, long reports as one `.report.md`
+- Daily digests: short digests inline, long digests as one
+  `digest-YYYY-MM-DD.md`
 - Health and status messages
 - Transcripts of audio you send the bot
 
-**Nothing else, to nowhere else.** VAD, ASR and summarization run entirely on
-your Mac. There is no telemetry, no analytics, no crash reporting, no update
-check, and no OpenMurmur server — there is no OpenMurmur server to have.
+**Nothing else, to nowhere else.** VAD and ASR run entirely on your Mac. The LLM
+endpoint is validated as loopback-only before transcript content can be sent to
+it. There is no telemetry, no analytics, no crash reporting, no update check,
+and no OpenMurmur server — there is no OpenMurmur server to have.
 
 ## The Telegram caveat, stated plainly
 
@@ -56,17 +59,19 @@ tool, and no configuration changes that.
 
 ## How long it is kept
 
-| Data | Default retention |
+| Data | Default retention eligibility threshold |
 | --- | --- |
 | Session audio | 48 hours after confirmed delivery |
 | Transcripts | Indefinitely |
 | Summaries | Indefinitely |
 | Rejected-session audio | 6 hours |
-| Incoming Telegram audio | 24 hours after transcription |
+| Incoming Telegram audio | 24 hours after confirmed transcript delivery |
 | Quarantined/failed files | 7 days |
 | Logs | Until you delete them |
 
-All configurable in `openmurmur.json`.
+All configurable in `openmurmur.json`. These values are eligibility thresholds,
+not permission to delete without proof. The running daemon evaluates the same
+proof-based retention plan hourly.
 
 Audio is deleted only when the database can prove it is safe: finalized,
 checksummed, delivered, transcript delivered, no pending work. `openmurmur
@@ -83,12 +88,18 @@ rm -rf ~/"Library/Application Support/OpenMurmur"
 ```
 
 ```bash
+security delete-generic-password -s io.openmurmur -a telegram-secrets-v1
 security delete-generic-password -s io.openmurmur -a telegram-bot-token
 security delete-generic-password -s io.openmurmur -a telegram-chat-id
 ```
 
 Messages already delivered to Telegram must be deleted in Telegram. OpenMurmur
 cannot and does not delete them for you.
+
+Telegram delivery is at-least-once. If the daemon crashes after Telegram accepts
+a message but before local SQLite records that acknowledgement, retry can create
+a visible duplicate. Stable local ids prevent duplicate enqueue but cannot make
+Telegram and SQLite one transaction.
 
 ## Other people
 

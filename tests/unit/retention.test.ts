@@ -32,6 +32,7 @@ afterEach(() => {
  */
 interface SessionOptions {
   state?: string;
+  rejectionReason?: string | null;
   finalized?: number;
   delivered?: number;
   sha256?: string | null;
@@ -44,6 +45,7 @@ interface SessionOptions {
 function seedDeliveredSession(id: string, options: SessionOptions = {}): string {
   const {
     state = 'DONE',
+    rejectionReason = null,
     finalized = 1,
     delivered = 1,
     sha256 = 'abc123',
@@ -58,11 +60,12 @@ function seedDeliveredSession(id: string, options: SessionOptions = {}): string 
 
   db.handle
     .prepare(
-      `INSERT INTO audio_sessions (session_id, state, started_at, ended_at, duration_ms,
-                                   speech_ms, part_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 60000, 30000, 1, ?, ?)`,
+      `INSERT INTO audio_sessions
+         (session_id, state, started_at, ended_at, duration_ms, speech_ms,
+          part_count, rejection_reason, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 60000, 30000, 1, ?, ?, ?)`,
     )
-    .run(id, state, OLD, OLD, OLD, OLD);
+    .run(id, state, OLD, OLD, rejectionReason, OLD, OLD);
 
   db.handle
     .prepare(
@@ -135,6 +138,7 @@ describe('retention: what may be deleted', () => {
   it('deletes rejected-noise audio on its own shorter schedule', () => {
     seedDeliveredSession('noise', {
       state: 'REJECTED',
+      rejectionReason: 'insufficient_speech',
       delivered: 0,
       withTranscript: false,
       transcriptSent: false,
@@ -143,6 +147,99 @@ describe('retention: what may be deleted', () => {
     const plan = planRetention(db.handle, RETENTION);
     assert.equal(plan.candidates.length, 1);
     assert.equal(plan.candidates[0]?.kind, 'rejected_session_audio');
+  });
+
+  it('keeps ASR-rejected audio until its audio-first delivery is confirmed', () => {
+    seedDeliveredSession('asr-empty', {
+      state: 'REJECTED',
+      rejectionReason: 'asr_empty',
+      delivered: 0,
+      withTranscript: false,
+      transcriptSent: false,
+    });
+    db.handle
+      .prepare(
+        `INSERT INTO telegram_outbox
+           (outbox_id, delivery_part_id, session_id, kind, ordinal, payload,
+            state, run_after, created_at, updated_at)
+         VALUES ('audio-pending', 'audio:asr-empty-p0', 'asr-empty', 'audio', 0, '{}',
+                 'pending', ?, ?, ?)`,
+      )
+      .run(OLD, OLD, OLD);
+    db.handle
+      .prepare(
+        `INSERT INTO jobs
+           (job_id, kind, idempotency_key, payload, state, run_after, created_at, updated_at)
+         VALUES ('audio-job', 'deliver_audio', 'deliver-audio:asr-empty', '{}', 'done', ?, ?, ?)`,
+      )
+      .run(OLD, OLD, OLD);
+
+    assert.equal(planRetention(db.handle, RETENTION).candidates.length, 0);
+
+    db.handle.prepare("UPDATE telegram_outbox SET state = 'sent'").run();
+    db.handle.prepare('UPDATE audio_parts SET delivered = 1').run();
+    assert.equal(planRetention(db.handle, RETENTION).candidates.length, 1);
+  });
+
+  it('keeps ASR-rejected audio when the delivery job or sent row is missing', () => {
+    seedDeliveredSession('asr-words', {
+      state: 'REJECTED',
+      rejectionReason: 'insufficient_words',
+      delivered: 1,
+      withTranscript: false,
+      transcriptSent: false,
+    });
+
+    assert.equal(planRetention(db.handle, RETENTION).candidates.length, 0);
+
+    db.handle
+      .prepare(
+        `INSERT INTO telegram_outbox
+           (outbox_id, delivery_part_id, session_id, kind, ordinal, payload,
+            state, run_after, created_at, updated_at)
+         VALUES ('audio-sent', 'audio:asr-words-p0', 'asr-words', 'audio', 0, '{}',
+                 'sent', ?, ?, ?)`,
+      )
+      .run(OLD, OLD, OLD);
+    db.handle
+      .prepare(
+        `INSERT INTO jobs
+           (job_id, kind, idempotency_key, payload, state, run_after, created_at, updated_at)
+         VALUES ('audio-dead', 'deliver_audio', 'deliver-audio:asr-words', '{}', 'dead', ?, ?, ?)`,
+      )
+      .run(OLD, OLD, OLD);
+
+    assert.equal(planRetention(db.handle, RETENTION).candidates.length, 0);
+
+    db.handle.prepare("UPDATE jobs SET state = 'done'").run();
+    assert.equal(planRetention(db.handle, RETENTION).candidates.length, 1);
+  });
+
+  it('keeps incoming audio until every transcript message is confirmed delivered', () => {
+    const path = join(dir, 'incoming.ogg');
+    writeFileSync(path, Buffer.alloc(100));
+    db.handle
+      .prepare(
+        `INSERT INTO incoming_telegram_files
+           (file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id,
+            actual_bytes, state, quarantine_path, created_at, updated_at)
+         VALUES ('incoming', 'f', 'u', 42, 1, 100, 'transcribed', ?, ?, ?)`,
+      )
+      .run(path, OLD, OLD);
+    db.handle
+      .prepare(
+        `INSERT INTO transcript_revisions
+           (revision_id, incoming_file_id, revision_number, engine, model, languages,
+            text, word_count, is_current, created_at)
+         VALUES ('incoming-r1', 'incoming', 1, 'e', 'm', '[]', 'text', 1, 1, ?)`,
+      )
+      .run(OLD);
+
+    assert.equal(planRetention(db.handle, RETENTION).candidates.length, 0);
+    db.handle
+      .prepare("UPDATE incoming_telegram_files SET state = 'delivered', updated_at = ?")
+      .run(OLD);
+    assert.equal(planRetention(db.handle, RETENTION).candidates.length, 1);
   });
 });
 
@@ -346,7 +443,9 @@ describe('health evaluation', () => {
     ollamaDetail: 'ready',
     activeSessionMs: null,
     asrBacklogMinutes: 0,
+    deadJobs: 0,
     outboxAgeMinutes: 0,
+    deadOutbox: 0,
     diskFreeGb: 200,
     sqliteWritable: true,
     hoursSinceLastDigest: 1,
@@ -382,6 +481,15 @@ describe('health evaluation', () => {
   it('warns on ASR backlog', () => {
     const report = evaluateHealth({ ...base, asrBacklogMinutes: 63 }, DEFAULT_CONFIG.health);
     assert.match(renderHealthLines(report), /WARN: asr_backlog — oldest job 63 min old/);
+  });
+
+  it('makes exhausted jobs and messages visible', () => {
+    const report = evaluateHealth({ ...base, deadJobs: 2, deadOutbox: 1 }, DEFAULT_CONFIG.health);
+    assert.equal(report.checks.find((check) => check.component === 'dead_jobs')?.status, 'failed');
+    assert.equal(
+      report.checks.find((check) => check.component === 'dead_outbox')?.status,
+      'degraded',
+    );
   });
 
   it('treats a missing LLM as degraded, never as a stop', () => {

@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Daily digest at 23:30 local time.
+  Daily digest scheduler fallback.
 
-  The daemon also produces a digest when it is running; this agent is a safety
-  net for machines that are asleep at that hour. The digest table has a UNIQUE
-  constraint on the date, so running both cannot produce two digests.
+  The command wakes every five minutes and evaluates digest.enabled,
+  digest.atLocalTime and digest.timezone from the real config. The daemon uses
+  the same stable delivery identity, so both paths converge on one digest.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -17,18 +17,14 @@
         <string>__NODE_BIN__</string>
         <string>__REPO_DIR__/src/cli/main.ts</string>
         <string>digest</string>
+        <string>scheduled</string>
     </array>
 
     <key>WorkingDirectory</key>
     <string>__REPO_DIR__</string>
 
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>23</integer>
-        <key>Minute</key>
-        <integer>30</integer>
-    </dict>
+    <key>StartInterval</key>
+    <integer>300</integer>
 
     <key>RunAtLoad</key>
     <false/>

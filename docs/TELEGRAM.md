@@ -13,11 +13,16 @@ openmurmur setup telegram
 2. The CLI asks for the token with **hidden input** (raw terminal mode, no echo,
    not even a mask character — the length should not leak either).
 3. The token is verified with `getMe`.
-4. You send the bot `/start`.
-5. The CLI finds your chat ID via `getUpdates` and shows it.
-6. Token and chat ID go into the **macOS Keychain** (service `io.openmurmur`).
-7. The `getUpdates` offset is persisted so the `/start` is not replayed.
-8. A test message confirms the whole path.
+4. The CLI drains the existing update backlog and establishes a fresh offset.
+5. You send the bot a new `/start` from a **private** chat. Historical messages,
+   group messages, bot senders and arbitrary private text are not accepted for
+   binding.
+6. The CLI shows the sender account, user id and chat id and requires an explicit
+   `y`/`yes` confirmation.
+7. Only after confirmation do token and chat ID go into one atomically replaced,
+   versioned **macOS Keychain** item (service `io.openmurmur`).
+8. The `getUpdates` offset is persisted so the `/start` is not replayed.
+9. A test message confirms the whole path.
 
 ### Where the token is never allowed
 
@@ -30,7 +35,9 @@ openmurmur setup telegram
 | Shell history | Persists indefinitely in plain text. |
 | Logs | Redaction exists precisely because this is the most common leak. |
 
-The token is passed to `security` on **stdin**, never as an argument.
+The credential pair enters an `expect`-owned private terminal from **stdin**;
+`/usr/bin/security` receives it through its interactive prompt, never argv,
+environment variables or a file.
 
 Log redaction happens at the logger boundary, not at call sites, so no
 individual `logger.info` has to remember. It covers bare tokens, tokens inside
@@ -52,7 +59,7 @@ found its username.
 | `sendDocument` | 50 MB | Size re-checked against the live file immediately before upload. Oversize parts are split losslessly with `-c copy` — never re-encoded to a lossy format. |
 | `getFile` via Cloud Bot API | **20 MB** | Larger files are refused with an explanation naming Telegram as the source of the limit. |
 | `getFile` via local Bot API server | Configured by `telegram.maxIncomingBytes`, capped at 2 GB by OpenMurmur | Large files are streamed into quarantine with the same byte-count and ffprobe validation. |
-| Message text | 4096 chars | Long transcripts split into numbered messages plus a `.md` attachment. |
+| Message text | 4096 UTF-16 code units | Short transcripts and reports use collapsed expandable quotes. Long transcripts and reports become one Markdown document. |
 | Rate limiting | HTTP 429 | `retry_after` honoured exactly; the drain stops rather than hammering; no attempt is burned. |
 
 The 20 MB incoming limit is a hard constraint of the official Cloud Bot API.
@@ -60,18 +67,24 @@ OpenMurmur will not work around it with an unsafe external downloader. A local
 Telegram Bot API server is the supported escape hatch: point `telegram.apiBaseUrl`
 at `http://127.0.0.1:<port>` and raise `telegram.maxIncomingBytes`.
 
-## Delivery order
+## Delivery stages and queue order
 
-Each session's messages are queued with an `ordinal` and sent strictly in order:
+Session finalization creates independent durable `deliver_audio` and `asr` jobs.
+The outbox can upload source audio while ASR runs. Successful ASR schedules
+transcript delivery immediately and summarization separately; the report follows
+the summary when it is ready:
 
-| Ordinal | Content |
-| --- | --- |
-| 0 | Original FLAC parts, via `sendDocument` |
-| 1 | Status notices |
-| 5 | Health alerts |
-| 10 | Transcript messages (and `.md` when long) |
-| 20 | Structured report |
-| 30 | Daily digest |
+```
+finalized ─┬─▶ deliver_audio ─────────────────────────▶ outbox
+           └─▶ ASR ─┬─▶ deliver_transcript ──────────▶ outbox
+                    └─▶ summarize ─▶ deliver_report ─▶ outbox
+```
+
+Ready outbox rows are sent FIFO by creation/insertion order. `run_after` keeps a
+backoff row ineligible until its retry time without allowing newly created audio
+to starve older ready transcript/report rows. Stable `delivery_part_id` values
+deduplicate enqueue for audio, lifecycle status, transcript, report, alert and
+digest units.
 
 **The source FLAC is sent, never a derived MP3/M4A.** A lossy preview copy may
 be added later, but the lossless source is what is stored and what is delivered.
@@ -108,28 +121,59 @@ Session ID: 01J...
 
 Empty sections are omitted rather than printed as empty headings.
 
+Reports at or below `transcriptInlineLimit` (default 3500) are sent as one HTML
+message: the short summary and the detailed report are separate collapsed
+expandable quotes. A longer report is sent as a compact collapsed summary plus
+one UTF-8 `<session_id>.report.md` document with a bounded trusted caption,
+rather than a wall of messages. The document includes the timed transcript and
+`Голос N` labels only when diarization actually attributed speakers. It never
+infers names or roles, and transcript content is never used in a filename or
+path.
+
 ### Transcript
 
-Under `transcriptInlineLimit` (default 3500) characters: one message.
+Under `transcriptInlineLimit` (default 3500) characters: one collapsed
+expandable quote carrying the `session_id`.
 
-Over it: numbered HTML messages (`📝 Transcript 2/5`), each carrying the
-`session_id`, plus the whole transcript as a `.md` attachment so there is one
-searchable artefact.
+Over it: one `.md` attachment, without duplicate numbered chat messages, so
+the chat stays compact and the transcript remains a searchable artefact. The
+file contains timestamps when ASR supplied them and `Голос N` only when
+diarization supplied a speaker label.
 
 ### Status messages
 
 ```
-🟢 Запись включена          — sent only after a real audio frame arrives
+🟢 Запись включена          — recorder capability, only after a real frame
+🎙 Услышал речь — запись сессии началась.
+⏳ Сессия завершена — загружаю аудио и параллельно расшифровываю локально…
+⚠️ Сессия завершена не полностью — загружаю сохранившиеся части аудио и расшифровываю локально…
+🔴 Сессию не удалось сохранить: финализация аудио завершилась ошибкой. Аудио не загружаю.
+ℹ️ Сессия завершена, но фрагмент слишком короткий — аудио не отправляю.
+ℹ️ Аудио сохранено, но в расшифровке слишком мало слов — транскрипт и отчёт не отправляю.
 🟡 Запись временно недоступна
 🔴 Запись остановлена
 🟢 Запись восстановлена
 ```
 
+Recorder lifecycle rows use stable ids derived from session id and stage
+(`started`, `finalized`, `rejected`, `failed`). Partial finalization retains the
+`finalized` stage with honest wording; total finalization failure uses `failed`
+and queues neither audio nor ASR. The post-ASR rejection uses its own stable
+`asr-rejected` id. Each row is queued only after the corresponding database
+transition is true. Queueing is local and does not wait for Telegram; retries
+and restarts cannot enqueue a second copy of the same stage.
+
+The short-fragment notice is the pre-delivery speech-duration gate. The
+post-ASR word-count gate runs after source audio became independently eligible,
+so it suppresses only an empty transcript and report; it does not retract audio
+that may already be uploading or delivered.
+
 ## HTML escaping
 
-All messages use `parse_mode: HTML`, and **every interpolated value that can
-originate from speech is escaped**: the summary, every list item, language
-names, session ids.
+Inline formatted messages use `parse_mode: HTML`, and **every interpolated value
+that can originate from speech is escaped**: the summary, every list item,
+language names, session ids. Markdown document contents are escaped separately;
+their filenames and captions come only from trusted session/date metadata.
 
 This is not optional politeness. A transcript containing `<b>` would corrupt the
 message and Telegram would reject it with a 400 — turning someone's spoken words
@@ -203,8 +247,7 @@ supported extension or an `audio/*` MIME type. Formats: `.ogg` `.opus` `.mp3`
 10. Normalize to 16 kHz mono WAV.
 11. Transcribe with the local ASR.
 12. Send the transcript (with a `.md` attachment when long).
-13. Optionally summarize.
-14. Delete after the retention window.
+13. Delete after the retention window.
 
 ### Path traversal
 
@@ -219,8 +262,14 @@ Nine hostile filenames are covered by tests.
 ### Other protections
 
 - Only the allowlisted chat ID.
-- Bounded concurrent jobs (`maxConcurrentIncomingJobs`).
+- One leased incoming-audio job at a time in the current daemon.
 - Duration and post-decode size limits.
+- Timeouts on `ffprobe` and `ffmpeg`, with bounded
+  `-probesize`/`-analyzeduration` so a crafted file cannot make ffprobe read
+  gigabytes.
+- Quarantine directory, mode `0600`.
+- **No command is ever taken from a transcript.** Audio and transcripts are
+  untrusted data throughout.
 
 ## Local Bot API server for large incoming files
 
@@ -273,26 +322,37 @@ pnpm openmurmur stop
 launchctl kickstart -k gui/$(id -u)/io.openmurmur.daemon
 pnpm openmurmur doctor
 ```
-- Timeouts on `ffprobe` and `ffmpeg`, with bounded `-probesize`/`-analyzeduration`
-  so a crafted file cannot make ffprobe read gigabytes.
-- Quarantine directory, mode `0600`.
-- **No command is ever taken from a transcript.** Audio and transcripts are
-  untrusted data throughout.
 
 ## Reliability
 
 Every send is a row in `telegram_outbox` with a unique `delivery_part_id`.
-Network delivery is at-least-once; the uniqueness constraint makes the *effect*
-exactly-once. A crash between "uploaded" and "marked sent" causes a retry, and
-that retry is a primary-key conflict rather than a duplicate message.
+The uniqueness constraint prevents duplicate **enqueue**, not duplicate network
+effect. A crash after Telegram accepted a request but before SQLite committed
+`sent` causes a retry and may visibly duplicate the message because Telegram's
+Bot API does not accept an idempotency key. Delivery is at-least-once across
+that unavoidable acknowledgement window.
 
 | Failure | Behaviour |
 | --- | --- |
 | 429 | Deferred by `retry_after`; drain stops; attempt not burned. |
 | 5xx / network | Retried with exponential backoff, capped at 10 minutes. |
+| Local request deadline / daemon shutdown | JSON is bounded at 30 seconds, long polling gets its requested wait plus 5 seconds, and file transfer is bounded at 10 minutes. Abort returns the row to `pending` without burning an attempt; shutdown cancels immediately. |
 | 4xx (not 429) | Marked `dead` immediately — a malformed message will never succeed. |
 | Crash mid-send | Row recovered from `sending` to `pending` at startup. |
 | Oversize file | Rejected before any network call. |
+
+The setup flow is intentionally narrower than normal bot routing: only a fresh
+private `/start` from an identifiable non-bot sender, observed after setup
+established its baseline and explicitly confirmed by the user, can become the
+allowlisted chat.
+
+Daily digests follow the same text bound as reports: a short digest is one HTML
+message; a long one is one trusted `digest-YYYY-MM-DD.md` document. The stable
+`digest:<date>` delivery id is shared by daemon scheduling and the digest CLI
+safety net. The launchd fallback checks the real enabled/time/timezone config
+every five minutes; automatic snapshots wait for already-running sessions and
+include only `DONE` sessions. They are not revised for a session that starts
+after the date's digest was already delivered (tracked in AR-08).
 
 ## Privacy summary
 

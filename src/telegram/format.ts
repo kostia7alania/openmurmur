@@ -113,17 +113,18 @@ export function renderTranscriptMessages(
     total === 1
       ? `📝 <b>Transcript</b>\n<code>${escapeHtml(sessionId)}</code>\n\n`
       : `📝 <b>Transcript ${n}/${total}</b>\n<code>${escapeHtml(sessionId)}</code>\n\n`;
+  const quote = (body: string) => `<blockquote expandable>${body}</blockquote>`;
 
   const escaped = escapeHtml(transcript);
-  if (escaped.length + header(1, 1).length <= inlineLimit) {
-    return [{ text: header(1, 1) + escaped, partNumber: 1, partCount: 1 }];
+  if (quote(escaped).length + header(1, 1).length <= inlineLimit) {
+    return [{ text: header(1, 1) + quote(escaped), partNumber: 1, partCount: 1 }];
   }
 
   // Reserve room for the largest possible header before splitting the body.
-  const reserve = header(99, 99).length;
+  const reserve = header(99, 99).length + quote('').length;
   const bodies = splitOnBoundaries(escaped, Math.max(1, TELEGRAM_MESSAGE_LIMIT - reserve));
   return bodies.map((body, index) => ({
-    text: header(index + 1, bodies.length) + body,
+    text: header(index + 1, bodies.length) + quote(body),
     partNumber: index + 1,
     partCount: bodies.length,
   }));

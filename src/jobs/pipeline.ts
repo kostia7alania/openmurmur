@@ -5,6 +5,7 @@ import { assignSpeaker, offsetTurns, speakerCount } from '../asr/speakers.ts';
 import type { AsrBackend, SpeakerTurn } from '../asr/types.ts';
 import type { Paths } from '../config/paths.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
+import { transaction } from '../database/db.ts';
 import {
   countWords,
   PartRepository,
@@ -18,13 +19,20 @@ import type { LlmBackend } from '../llm/ollama.ts';
 import { EMPTY_SUMMARY } from '../llm/schema.ts';
 import type { Logger } from '../logging/logger.ts';
 import { Outbox } from '../telegram/outbox.ts';
-import { enqueueSessionDelivery } from './delivery.ts';
+import {
+  enqueueSessionAudio,
+  enqueueSessionDelivery,
+  enqueueSessionReport,
+  enqueueSessionTranscript,
+} from './delivery.ts';
 import type { Job, JobQueue } from './queue.ts';
 
 /**
  * Job handlers for the post-silence pipeline:
  *
- *   asr  ->  summarize  ->  deliver
+ *   deliver_audio ────────────────┐
+ *   asr -> deliver_transcript     ├─> Telegram outbox
+ *       └-> summarize -> report   ┘
  *
  * Each stage is a separate job so that a failing LLM cannot cost the user
  * their transcript, and a failing Telegram cannot cost them either.
@@ -42,11 +50,20 @@ export interface PipelineDeps {
 
 export async function handleJob(deps: PipelineDeps, job: Job): Promise<void> {
   switch (job.kind) {
+    case 'deliver_audio':
+      await handleDeliverAudio(deps, job);
+      return;
     case 'asr':
       await handleAsr(deps, job);
       return;
+    case 'deliver_transcript':
+      await handleDeliverTranscript(deps, job);
+      return;
     case 'summarize':
       await handleSummarize(deps, job);
+      return;
+    case 'deliver_report':
+      await handleDeliverReport(deps, job);
       return;
     case 'deliver':
       await handleDeliver(deps, job);
@@ -54,6 +71,20 @@ export async function handleJob(deps: PipelineDeps, job: Job): Promise<void> {
     default:
       throw new Error(`no handler for job kind ${job.kind}`);
   }
+}
+
+async function handleDeliverAudio(deps: PipelineDeps, job: Job): Promise<void> {
+  const sessionId = sessionIdOf(job);
+  const plan = await enqueueSessionAudio(deps.db, {
+    sessionId,
+    config: deps.config,
+    paths: deps.paths,
+  });
+  deps.logger.info('audio delivery enqueued', {
+    sessionId,
+    audio: plan.audioRows,
+    oversizeParts: plan.oversizeParts.length,
+  });
 }
 
 function sessionIdOf(job: Job): string {
@@ -176,6 +207,11 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
     throw new Error(`session ${sessionId} has no finalized audio parts`);
   }
 
+  if (replayStoredTranscript(deps, sessions, sessionId)) {
+    deps.logger.info('existing transcript replayed into downstream jobs', { sessionId });
+    return;
+  }
+
   await runFinalVadPass(deps, sessionId, finalized);
   const turns = await runDiarization(deps, sessionId, finalized);
 
@@ -225,16 +261,7 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
 
   // Second rejection gate: enough speech by duration, but nothing meaningful
   // was said. Rejecting here rather than sending keeps the chat usable.
-  if (words < deps.config.sessionizer.minTranscriptWords) {
-    sessions.reject(
-      sessionId,
-      words === 0 ? 'asr_empty' : 'insufficient_words',
-      0,
-      finalized.length,
-    );
-    deps.logger.info('session rejected after ASR', { sessionId, words });
-    return;
-  }
+  if (rejectInsufficientTranscript(deps, sessions, sessionId, words, finalized.length)) return;
 
   // The model reports the language it settled on, which is incomplete on
   // genuinely mixed speech: a real Thai-English conversation came back as
@@ -259,30 +286,101 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
     });
   }
 
-  transcripts.append({
-    sessionId,
-    engine,
-    model,
-    languages: reconciled,
-    text,
-    segments: segments.map((segment) => ({
-      ...segment,
-      speaker: assignSpeaker(segment.startMs, segment.endMs, turns),
-    })),
-  });
-  sessions.setLanguages(sessionId, reconciled);
-
-  deps.jobs.enqueue({
-    kind: 'summarize',
-    idempotencyKey: `summarize:${sessionId}`,
-    payload: { sessionId },
-  });
+  transcripts.append(
+    {
+      sessionId,
+      engine,
+      model,
+      languages: reconciled,
+      text,
+      segments: segments.map((segment) => ({
+        ...segment,
+        speaker: assignSpeaker(segment.startMs, segment.endMs, turns),
+      })),
+    },
+    () => {
+      sessions.setLanguages(sessionId, reconciled);
+      enqueuePostAsrJobs(deps, sessionId);
+    },
+  );
   deps.logger.info('transcript stored', {
     sessionId,
     words,
     languages: reconciled,
     speakers: speakerCount(turns),
   });
+}
+
+function rejectInsufficientTranscript(
+  deps: PipelineDeps,
+  sessions: SessionRepository,
+  sessionId: string,
+  words: number,
+  finalizedParts: number,
+): boolean {
+  if (words >= deps.config.sessionizer.minTranscriptWords) return false;
+
+  const reason = words === 0 ? 'asr_empty' : 'insufficient_words';
+  transaction(deps.db, () => {
+    sessions.reject(sessionId, reason, 0, finalizedParts);
+    new Outbox(deps.db).enqueue({
+      deliveryPartId: `session-status:asr-rejected:${sessionId}`,
+      kind: 'status',
+      sessionId,
+      ordinal: 15,
+      payload: {
+        type: 'text',
+        text: 'ℹ️ Аудио сохранено, но в расшифровке слишком мало слов — транскрипт и отчёт не отправляю.',
+      },
+    });
+  });
+  deps.logger.info('session rejected after ASR', { sessionId, words });
+  return true;
+}
+
+function replayStoredTranscript(
+  deps: PipelineDeps,
+  sessions: SessionRepository,
+  sessionId: string,
+): boolean {
+  const existing = deps.db
+    .prepare(
+      `SELECT languages FROM transcript_revisions
+        WHERE session_id = ? AND is_current = 1`,
+    )
+    .get(sessionId) as { languages: string } | undefined;
+  if (existing === undefined) return false;
+
+  const languages = JSON.parse(existing.languages) as string[];
+  transaction(deps.db, () => {
+    sessions.setLanguages(sessionId, languages);
+    enqueuePostAsrJobs(deps, sessionId);
+  });
+  return true;
+}
+
+/** Makes transcript delivery and summarization independently replayable. */
+function enqueuePostAsrJobs(deps: PipelineDeps, sessionId: string): void {
+  deps.jobs.enqueue({
+    kind: 'deliver_transcript',
+    idempotencyKey: `deliver-transcript:${sessionId}`,
+    payload: { sessionId },
+  });
+  deps.jobs.enqueue({
+    kind: 'summarize',
+    idempotencyKey: `summarize:${sessionId}`,
+    payload: { sessionId },
+  });
+}
+
+async function handleDeliverTranscript(deps: PipelineDeps, job: Job): Promise<void> {
+  const sessionId = sessionIdOf(job);
+  const rows = await enqueueSessionTranscript(deps.db, {
+    sessionId,
+    config: deps.config,
+    paths: deps.paths,
+  });
+  deps.logger.info('transcript delivery enqueued', { sessionId, transcript: rows });
 }
 
 async function handleSummarize(deps: PipelineDeps, job: Job): Promise<void> {
@@ -294,6 +392,22 @@ async function handleSummarize(deps: PipelineDeps, job: Job): Promise<void> {
   if (current === undefined) throw new Error(`session ${sessionId} has no transcript`);
   const session = sessions.get(sessionId);
   if (session === undefined) throw new Error(`unknown session ${sessionId}`);
+
+  const existing = deps.db
+    .prepare(
+      `SELECT payload FROM summaries
+        WHERE session_id = ? AND revision_id = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+    )
+    .get(sessionId, current.revision_id) as { payload: string } | undefined;
+  if (existing !== undefined) {
+    deps.jobs.enqueue({
+      kind: 'deliver_report',
+      idempotencyKey: `deliver-report:${sessionId}`,
+      payload: { sessionId },
+    });
+    return;
+  }
 
   const segments = transcripts.segments(current.revision_id).map((s) => s.text);
   let summary = EMPTY_SUMMARY;
@@ -313,32 +427,54 @@ async function handleSummarize(deps: PipelineDeps, job: Job): Promise<void> {
     });
   }
 
-  deps.db
-    .prepare(
-      `INSERT INTO summaries (summary_id, session_id, revision_id, engine, model, payload, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      randomUUID(),
-      sessionId,
-      current.revision_id,
-      deps.llm.name,
-      deps.config.llm.model,
-      JSON.stringify(summary),
-      new Date().toISOString(),
-    );
+  transaction(deps.db, () => {
+    deps.db
+      .prepare(
+        `INSERT INTO summaries
+           (summary_id, session_id, revision_id, engine, model, payload, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        randomUUID(),
+        sessionId,
+        current.revision_id,
+        deps.llm.name,
+        deps.config.llm.model,
+        JSON.stringify(summary),
+        new Date().toISOString(),
+      );
 
-  deps.jobs.enqueue({
-    kind: 'deliver',
-    idempotencyKey: `deliver:${sessionId}`,
-    payload: { sessionId },
+    deps.jobs.enqueue({
+      kind: 'deliver_report',
+      idempotencyKey: `deliver-report:${sessionId}`,
+      payload: { sessionId },
+    });
   });
+}
+
+async function handleDeliverReport(deps: PipelineDeps, job: Job): Promise<void> {
+  const sessionId = sessionIdOf(job);
+  const row = deps.db
+    .prepare(
+      'SELECT payload FROM summaries WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1',
+    )
+    .get(sessionId) as { payload: string } | undefined;
+  const summary = row === undefined ? EMPTY_SUMMARY : JSON.parse(row.payload);
+  const rows = await enqueueSessionReport(deps.db, {
+    sessionId,
+    summary,
+    config: deps.config,
+    paths: deps.paths,
+  });
+  deps.logger.info('report delivery enqueued', { sessionId, report: rows });
 }
 
 async function handleDeliver(deps: PipelineDeps, job: Job): Promise<void> {
   const sessionId = sessionIdOf(job);
   const row = deps.db
-    .prepare('SELECT payload FROM summaries WHERE session_id = ? ORDER BY created_at DESC LIMIT 1')
+    .prepare(
+      'SELECT payload FROM summaries WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1',
+    )
     .get(sessionId) as { payload: string } | undefined;
 
   const summary = row === undefined ? EMPTY_SUMMARY : JSON.parse(row.payload);
@@ -379,7 +515,11 @@ export function reconcileSessionDelivery(
     .get(sessionId) as { c: number };
   if (pending.c > 0) return;
 
-  if (!outbox.allDelivered(sessionId, 'audio') || !outbox.allDelivered(sessionId, 'transcript')) {
+  if (
+    !outbox.allDelivered(sessionId, 'audio') ||
+    !outbox.allDelivered(sessionId, 'transcript') ||
+    !outbox.allDelivered(sessionId, 'report')
+  ) {
     return;
   }
 
@@ -389,5 +529,18 @@ export function reconcileSessionDelivery(
 
 /** Marks the audio parts confirmed by a successful `audio` outbox send. */
 export function markAudioDelivered(db: DatabaseSync, partId: string): void {
-  new PartRepository(db).markDelivered(partId);
+  const directId = `audio:${partId}`;
+  const splitPrefix = `${directId}:split`;
+  const rows = db
+    .prepare(
+      `SELECT count(*) AS total,
+              SUM(CASE WHEN state = 'sent' THEN 1 ELSE 0 END) AS sent
+         FROM telegram_outbox
+        WHERE kind = 'audio'
+          AND (delivery_part_id = ? OR substr(delivery_part_id, 1, ?) = ?)`,
+    )
+    .get(directId, splitPrefix.length, splitPrefix) as { total: number; sent: number | null };
+  if (rows.total > 0 && rows.sent === rows.total) {
+    new PartRepository(db).markDelivered(partId);
+  }
 }

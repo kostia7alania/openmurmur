@@ -15,8 +15,8 @@ actually executed is marked explicitly rather than assumed.
 | `@types/node` | 26.1.2 | ✅ | Latest published. |
 | SQLite (`node:sqlite`) | **3.53.4** | ✅ queried at runtime | Compiled into Node 26.7.0 — see [ADR-0004](adr/0004-sqlite-driver.md). |
 | FFmpeg / ffprobe | 8.1.2 | ✅ used in integration tests | `brew install ffmpeg`. |
-| Python | 3.14.6 | ✅ 36 tests pass | Newest with wheels across the whole stack. |
-| uv | 0.12.2 | ✅ `uv sync` succeeded | |
+| Python | 3.14.5 | ✅ 36 tests pass | Current project interpreter with wheels across the whole stack. |
+| uv | 0.11.14 | ✅ current `uv --version`; `uv sync` succeeded | |
 
 ## Node packages
 

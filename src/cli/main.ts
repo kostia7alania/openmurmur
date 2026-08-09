@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
-import { access, readFile, rm } from 'node:fs/promises';
+import { access, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { FfmpegCapture } from '../capture/ffmpeg.ts';
@@ -8,19 +8,29 @@ import { normalizeToWav, probeAudio } from '../capture/probe.ts';
 import { recoverAfterCrash, renderRecoveryReport } from '../capture/recovery.ts';
 import { ensureDirectories, loadConfig } from '../config/load.ts';
 import { ConfigError } from '../config/schema.ts';
-import { openDatabase } from '../database/db.ts';
+import { openDatabase, transaction } from '../database/db.ts';
 import { TranscriptRepository } from '../database/repository.ts';
 import { renderSearchResults, searchTranscripts } from '../database/search.ts';
-import { buildDigest, renderDigest, storeDigest } from '../digest/daily.ts';
+import {
+  buildDigest,
+  hasUnfinishedSessionsForDate,
+  renderDigest,
+  renderDigestMarkdown,
+  scheduledDigestDate,
+  storeDigest,
+  zonedDateTime,
+} from '../digest/daily.ts';
 import { createLogger } from '../logging/logger.ts';
 import { applyRetention, planRetention } from '../retention/policy.ts';
 import { EnergyVad, rmsDbfs } from '../sessionizer/vad.ts';
 import { TelegramClient } from '../telegram/client.ts';
 import { keychain } from '../telegram/keychain.ts';
+import { Outbox, type OutboxPayload } from '../telegram/outbox.ts';
 import { nextOffsetFor, readOffset, routeUpdate, writeOffset } from '../telegram/router.ts';
+import { writeTextAtomically } from '../util/atomic-file.ts';
 import { systemClock } from '../util/clock.ts';
 import { createAsrBackend } from './backends.ts';
-import { Daemon } from './daemon.ts';
+import { Daemon, inspectDaemonProcess, readDaemonPid } from './daemon.ts';
 import { doctorExitCode, formatChecks, runDoctor } from './doctor.ts';
 import { applySetup, planSetup, renderSetupPlan, setupTelegram } from './setup.ts';
 import { VERSION } from './version.ts';
@@ -109,40 +119,19 @@ async function main(argv: readonly string[]): Promise<number> {
       return setupCommand(loaded, positionals[1], values['yes'] === true);
 
     case 'capture':
-      if (positionals[1] !== 'test') {
-        process.stderr.write('Unknown subcommand. Did you mean `capture test`?\n');
-        return 1;
-      }
-      return captureTest(loaded.config.audio.ffmpegPath, loaded.config.audio.captureDevice);
+      return captureCommand(
+        positionals[1],
+        loaded.config.audio.ffmpegPath,
+        loaded.config.audio.captureDevice,
+      );
 
     case 'start': {
       await ensureDirectories(loaded.paths);
-      const daemon = new Daemon({ loaded, logger });
-      const shutdown = () => {
-        void daemon.stop().then(() => process.exit(0));
-      };
-      process.on('SIGINT', shutdown);
-      process.on('SIGTERM', shutdown);
-      await daemon.start();
-      return 0;
+      return startDaemon(loaded, logger);
     }
 
-    case 'stop': {
-      const pid = await readPid(loaded.paths.pidFile);
-      if (pid === null) {
-        process.stdout.write('No running daemon found.\n');
-        return 1;
-      }
-      try {
-        process.kill(pid, 'SIGTERM');
-        process.stdout.write(`Sent SIGTERM to pid ${pid}.\n`);
-        return 0;
-      } catch (error) {
-        process.stderr.write(`Could not stop pid ${pid}: ${(error as Error).message}\n`);
-        await rm(loaded.paths.pidFile, { force: true });
-        return 1;
-      }
-    }
+    case 'stop':
+      return stopDaemon(loaded);
 
     case 'recover': {
       await ensureDirectories(loaded.paths);
@@ -152,12 +141,20 @@ async function main(argv: readonly string[]): Promise<number> {
         // agreeing to delete it.
         const report = await recoverAfterCrash(db.handle, loaded.paths, logger, {
           remove: values['yes'] === true,
+          repair: values['yes'] === true,
         });
         process.stdout.write(
           asJson ? `${JSON.stringify(report, null, 2)}\n` : `${renderRecoveryReport(report)}\n`,
         );
-        if (report.orphans.length > 0 && values['yes'] !== true) {
-          process.stdout.write('\nRe-run with --yes to remove them.\n');
+        if (
+          values['yes'] !== true &&
+          (report.orphans.length > 0 ||
+            report.recoveredPublishedParts.length > 0 ||
+            report.stalledSessions.length > 0)
+        ) {
+          process.stdout.write(
+            '\nRe-run with --yes to repair the database and remove temp files.\n',
+          );
         }
         return 0;
       } finally {
@@ -190,18 +187,7 @@ async function main(argv: readonly string[]): Promise<number> {
     }
 
     case 'digest': {
-      const date = positionals[1] ?? new Date().toISOString().slice(0, 10);
-      const db = openDatabase({ file: loaded.paths.databaseFile });
-      try {
-        const digest = buildDigest(db.handle, date, new Date().getTimezoneOffset());
-        storeDigest(db.handle, digest);
-        process.stdout.write(
-          asJson ? `${JSON.stringify(digest, null, 2)}\n` : `${renderDigest(digest)}\n`,
-        );
-        return 0;
-      } finally {
-        db.close();
-      }
+      return digestCommand(loaded, positionals[1], asJson);
     }
 
     case 'retention':
@@ -210,6 +196,57 @@ async function main(argv: readonly string[]): Promise<number> {
     default:
       process.stderr.write(`Unknown command "${command}".\n\n${USAGE}`);
       return 1;
+  }
+}
+
+async function digestCommand(
+  loaded: Awaited<ReturnType<typeof loadConfig>>,
+  requestedDate: string | undefined,
+  asJson: boolean,
+): Promise<number> {
+  const scheduled = requestedDate === 'scheduled';
+  const date = scheduled
+    ? scheduledDigestDate(Date.now(), loaded.config.digest)
+    : (requestedDate ?? zonedDateTime(Date.now(), loaded.config.digest.timezone).date);
+  if (date === null) return 0;
+
+  await ensureDirectories(loaded.paths);
+  const db = openDatabase({ file: loaded.paths.databaseFile });
+  try {
+    if (scheduled) {
+      const existing = db.handle
+        .prepare('SELECT 1 AS present FROM digests WHERE digest_date = ?')
+        .get(date);
+      if (
+        existing !== undefined ||
+        hasUnfinishedSessionsForDate(db.handle, date, loaded.config.digest.timezone)
+      ) {
+        return 0;
+      }
+    }
+
+    const digest = buildDigest(db.handle, date, loaded.config.digest.timezone);
+    const rendered = renderDigest(digest, loaded.config.digest.timezone);
+    let payload: OutboxPayload = { type: 'text', text: rendered, parseMode: 'HTML' };
+    if (rendered.length > loaded.config.telegram.transcriptInlineLimit) {
+      const filename = `digest-${date}.md`;
+      const path = join(loaded.paths.transcriptsDir, filename);
+      await writeTextAtomically(path, renderDigestMarkdown(digest, loaded.config.digest.timezone));
+      payload = { type: 'document', path, filename, caption: `📅 Дайджест за ${date}` };
+    }
+    transaction(db.handle, () => {
+      storeDigest(db.handle, digest);
+      new Outbox(db.handle).enqueue({
+        deliveryPartId: `digest:${date}`,
+        kind: 'digest',
+        ordinal: 30,
+        payload,
+      });
+    });
+    process.stdout.write(asJson ? `${JSON.stringify(digest, null, 2)}\n` : `${rendered}\n`);
+    return 0;
+  } finally {
+    db.close();
   }
 }
 
@@ -275,12 +312,78 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function readPid(pidFile: string): Promise<number | null> {
+function captureCommand(
+  subcommand: string | undefined,
+  ffmpegPath: string,
+  captureDevice: string,
+): Promise<number> | number {
+  if (subcommand !== 'test') {
+    process.stderr.write('Unknown subcommand. Did you mean `capture test`?\n');
+    return 1;
+  }
+  return captureTest(ffmpegPath, captureDevice);
+}
+
+async function startDaemon(
+  loaded: Awaited<ReturnType<typeof loadConfig>>,
+  logger: ReturnType<typeof createLogger>,
+): Promise<number> {
+  const daemon = new Daemon({ loaded, logger });
+  let shutdownPromise: Promise<void> | null = null;
+  const shutdown = () => {
+    shutdownPromise ??= daemon.stop();
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
   try {
-    const pid = Number.parseInt((await readFile(pidFile, 'utf8')).trim(), 10);
-    return Number.isFinite(pid) ? pid : null;
-  } catch {
-    return null;
+    await daemon.start();
+    if (shutdownPromise === null) {
+      // `start()` only returns by itself when capture has failed or ended.
+      // A healthy daemon remains here until a signal asks it to stop.
+      return 1;
+    }
+    await shutdownPromise;
+    return 0;
+  } catch (error) {
+    await daemon.stop();
+    throw error;
+  } finally {
+    process.off('SIGINT', shutdown);
+    process.off('SIGTERM', shutdown);
+  }
+}
+
+async function stopDaemon(loaded: Awaited<ReturnType<typeof loadConfig>>): Promise<number> {
+  const record = await readDaemonPid(loaded.paths.pidFile);
+  if (record === null) {
+    process.stdout.write('No running daemon found.\n');
+    return 1;
+  }
+  if (record.root !== null && record.root !== loaded.paths.root) {
+    process.stderr.write(`PID file belongs to a different OpenMurmur root: ${record.root}\n`);
+    return 1;
+  }
+  const state = await inspectDaemonProcess(record.pid);
+  if (!state.alive) {
+    process.stderr.write(
+      `Daemon pid ${record.pid} is no longer running; removed stale PID file.\n`,
+    );
+    await rm(loaded.paths.pidFile, { force: true });
+    return 1;
+  }
+  if (!state.identityMatches) {
+    process.stderr.write(
+      `Refusing to signal pid ${record.pid}: it is not recognisable as an OpenMurmur daemon.\n`,
+    );
+    return 1;
+  }
+  try {
+    process.kill(record.pid, 'SIGTERM');
+    process.stdout.write(`Sent SIGTERM to pid ${record.pid}.\n`);
+    return 0;
+  } catch (error) {
+    process.stderr.write(`Could not stop pid ${record.pid}: ${(error as Error).message}\n`);
+    return 1;
   }
 }
 
@@ -399,16 +502,10 @@ async function localStatus(
 ): Promise<number> {
   const db = openDatabase({ file: loaded.paths.databaseFile });
   try {
-    const pid = await readPid(loaded.paths.pidFile);
-    let alive = false;
-    if (pid !== null) {
-      try {
-        process.kill(pid, 0);
-        alive = true;
-      } catch {
-        alive = false;
-      }
-    }
+    const pidRecord = await readDaemonPid(loaded.paths.pidFile);
+    const pidState = pidRecord === null ? null : await inspectDaemonProcess(pidRecord.pid);
+    const alive = pidState?.alive === true && pidState.identityMatches;
+    const pid = pidRecord?.pid ?? null;
 
     const counts = db.handle
       .prepare(

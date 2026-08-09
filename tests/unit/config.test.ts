@@ -2,10 +2,18 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { decodeResponse, encodeRequest, LineSplitter } from '../../src/asr/protocol.ts';
 import { sessionIdFromDeliveryPart } from '../../src/cli/daemon.ts';
-import { parseAvfoundationDevices } from '../../src/cli/doctor.ts';
+import { nodeVersionIsSupported, parseAvfoundationDevices } from '../../src/cli/doctor.ts';
 import { managedDirectories, resolvePaths } from '../../src/config/paths.ts';
 import { ConfigError, DEFAULT_CONFIG, parseConfig } from '../../src/config/schema.ts';
-import { localDayBounds } from '../../src/digest/daily.ts';
+import { openDatabase } from '../../src/database/db.ts';
+import {
+  buildDigest,
+  hasUnfinishedSessionsForDate,
+  localDayBounds,
+  renderDigest,
+  renderDigestMarkdown,
+  scheduledDigestDate,
+} from '../../src/digest/daily.ts';
 import { EnergyVad, rmsDbfs } from '../../src/sessionizer/vad.ts';
 
 describe('config parsing', () => {
@@ -88,10 +96,97 @@ describe('config parsing', () => {
     }
   });
 
-  it('refuses a non-https Telegram endpoint that is not localhost', () => {
-    assert.throws(() => parseConfig({ telegram: { apiBaseUrl: 'http://evil.example' } }), /https/);
-    // A local Bot API server is the one legitimate exception.
+  it('allows only the official or a structurally local Telegram endpoint', () => {
+    assert.doesNotThrow(() =>
+      parseConfig({ telegram: { apiBaseUrl: 'https://api.telegram.org' } }),
+    );
     assert.doesNotThrow(() => parseConfig({ telegram: { apiBaseUrl: 'http://127.0.0.1:8081' } }));
+    for (const apiBaseUrl of [
+      'https://evil.example',
+      'http://evil.example',
+      'https://api.telegram.org.evil.example',
+      'https://user:password@api.telegram.org',
+      'https://api.telegram.org/proxy',
+      'https://api.telegram.org?target=remote',
+      'http://localhost:8081',
+      'http://2130706433:8081',
+      'http://127.0.0.1:8081/proxy',
+    ]) {
+      assert.throws(
+        () => parseConfig({ telegram: { apiBaseUrl } }),
+        /telegram\.apiBaseUrl/,
+        apiBaseUrl,
+      );
+    }
+  });
+
+  it('keeps the Ollama endpoint structurally local-only', () => {
+    assert.doesNotThrow(() =>
+      parseConfig({ llm: { baseUrl: 'http://127.0.0.1:11434', backend: 'ollama' } }),
+    );
+    for (const baseUrl of [
+      'https://127.0.0.1:11434',
+      'http://localhost:11434',
+      'http://2130706433:11434',
+      'http://0177.0.0.1:11434',
+      'http://127.1:11434',
+      'http://user:password@127.0.0.1:11434',
+      'http://127.0.0.1:11434/proxy',
+      'http://127.0.0.1:11434?target=remote',
+      'http://127.0.0.1:11434#remote',
+      'https://example.com',
+      'not a URL',
+    ]) {
+      assert.throws(
+        () => parseConfig({ llm: { baseUrl, backend: 'ollama' } }),
+        /llm\.baseUrl/,
+        baseUrl,
+      );
+    }
+  });
+
+  it('rejects unsafe timeout, interval and retention values', () => {
+    const invalidConfigs = [
+      { asr: { pythonWorkerTimeoutMs: 0 } },
+      { llm: { contextTokens: 0 } },
+      { llm: { requestTimeoutMs: -1 } },
+      { telegram: { transcriptInlineLimit: 0 } },
+      { telegram: { pollIntervalMs: 0 } },
+      { telegram: { longPollSeconds: -1 } },
+      { telegram: { maxIncomingDurationSeconds: 0 } },
+      { telegram: { maxConcurrentIncomingJobs: 0 } },
+      { retention: { sessionAudioHours: -1 } },
+      { retention: { incomingAudioHours: -1 } },
+      { retention: { quarantineHours: -1 } },
+      { retention: { rejectedSessionHours: -1 } },
+      { health: { pollIntervalMs: 0 } },
+      { health: { recorderStaleSeconds: 0 } },
+      { health: { asrBacklogMinutes: -1 } },
+      { health: { outboxStaleMinutes: -1 } },
+      { health: { diskFreeWarnGb: -1 } },
+      { health: { alertCooldownMinutes: 0 } },
+    ];
+
+    for (const config of invalidConfigs) {
+      assert.throws(() => parseConfig(config), ConfigError, JSON.stringify(config));
+    }
+
+    assert.doesNotThrow(() =>
+      parseConfig({
+        telegram: { longPollSeconds: 0 },
+        retention: {
+          sessionAudioHours: 0,
+          incomingAudioHours: 0,
+          quarantineHours: 0,
+          rejectedSessionHours: 0,
+        },
+        health: {
+          asrBacklogMinutes: 0,
+          outboxStaleMinutes: 0,
+          diskFreeWarnGb: 0,
+        },
+      }),
+    );
   });
 
   it('reports every problem at once rather than one at a time', () => {
@@ -107,6 +202,8 @@ describe('config parsing', () => {
   it('validates the digest time format', () => {
     assert.throws(() => parseConfig({ digest: { atLocalTime: '25:00' } }), /HH:MM/);
     assert.throws(() => parseConfig({ digest: { atLocalTime: '9:5' } }), /HH:MM/);
+    assert.throws(() => parseConfig({ digest: { timezone: 'Mars/Olympus_Mons' } }), /IANA/);
+    assert.doesNotThrow(() => parseConfig({ digest: { timezone: 'Europe/Moscow' } }));
     assert.doesNotThrow(() => parseConfig({ digest: { atLocalTime: '23:30' } }));
   });
 
@@ -133,6 +230,14 @@ describe('config parsing', () => {
       }
     };
     walk(DEFAULT_CONFIG, '');
+  });
+});
+
+describe('runtime requirements', () => {
+  it('enforces the exact Node 26.7.0 runtime floor', () => {
+    assert.equal(nodeVersionIsSupported('26.6.1'), false);
+    assert.equal(nodeVersionIsSupported('26.7.0'), true);
+    assert.equal(nodeVersionIsSupported('27.0.0'), true);
   });
 });
 
@@ -250,6 +355,110 @@ describe('digest day boundaries', () => {
 
   it('rejects a malformed date', () => {
     assert.throws(() => localDayBounds('29-07-2026', 0), /YYYY-MM-DD/);
+  });
+
+  it('uses real IANA timezone boundaries across daylight saving changes', () => {
+    const spring = localDayBounds('2026-03-08', 'America/New_York');
+    const fall = localDayBounds('2026-11-01', 'America/New_York');
+    assert.equal(Date.parse(spring.toIso) - Date.parse(spring.fromIso), 23 * 60 * 60 * 1000);
+    assert.equal(Date.parse(fall.toIso) - Date.parse(fall.fromIso), 25 * 60 * 60 * 1000);
+  });
+
+  it('starts at the first existing local time when midnight is skipped', () => {
+    const santiago = localDayBounds('2026-09-06', 'America/Santiago');
+    const cairo = localDayBounds('2026-04-24', 'Africa/Cairo');
+
+    assert.deepEqual(santiago, {
+      fromIso: '2026-09-06T04:00:00.000Z',
+      toIso: '2026-09-07T03:00:00.000Z',
+    });
+    assert.deepEqual(cairo, {
+      fromIso: '2026-04-23T22:00:00.000Z',
+      toIso: '2026-04-24T21:00:00.000Z',
+    });
+  });
+
+  it('selects the most recent due date in the configured timezone', () => {
+    const schedule = {
+      enabled: true,
+      atLocalTime: '23:30',
+      timezone: 'Europe/Moscow',
+    };
+    assert.equal(scheduledDigestDate(Date.parse('2026-08-09T20:29:00Z'), schedule), '2026-08-08');
+    assert.equal(scheduledDigestDate(Date.parse('2026-08-09T20:30:00Z'), schedule), '2026-08-09');
+    assert.equal(
+      scheduledDigestDate(Date.parse('2026-08-09T21:10:00Z'), schedule),
+      '2026-08-09',
+      '00:10 in Moscow still retries the previous due date',
+    );
+    assert.equal(
+      scheduledDigestDate(Date.parse('2026-08-09T21:00:00Z'), { ...schedule, enabled: false }),
+      null,
+    );
+  });
+
+  it('defers snapshots until every session for the date is done', () => {
+    const db = openDatabase({ file: ':memory:' });
+    try {
+      const now = '2026-08-09T12:00:00.000Z';
+      db.handle
+        .prepare(
+          `INSERT INTO audio_sessions
+             (session_id, state, started_at, created_at, updated_at)
+           VALUES ('done', 'DONE', ?, ?, ?), ('pending', 'ACTIVE', ?, ?, ?)`,
+        )
+        .run(now, now, now, now, now, now);
+
+      for (const state of ['ACTIVE', 'FINALIZING', 'PROCESSING', 'DELIVERING']) {
+        db.handle
+          .prepare("UPDATE audio_sessions SET state = ? WHERE session_id = 'pending'")
+          .run(state);
+        assert.equal(hasUnfinishedSessionsForDate(db.handle, '2026-08-09', 'UTC'), true);
+      }
+
+      db.handle
+        .prepare("UPDATE audio_sessions SET state = 'DONE' WHERE session_id = 'pending'")
+        .run();
+      assert.equal(hasUnfinishedSessionsForDate(db.handle, '2026-08-09', 'UTC'), false);
+      assert.equal(buildDigest(db.handle, '2026-08-09', 'UTC').sessionCount, 2);
+
+      db.handle
+        .prepare("UPDATE audio_sessions SET state = 'DELIVERING' WHERE session_id = 'pending'")
+        .run();
+      assert.equal(buildDigest(db.handle, '2026-08-09', 'UTC').sessionCount, 1);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('rejects a calendar date that does not exist', () => {
+    assert.throws(() => localDayBounds('2026-02-30', 'UTC'), /does not exist/);
+  });
+
+  it('renders a complete safe Markdown artifact for a large digest', () => {
+    const digest = {
+      date: '2026-08-09',
+      sessionCount: 1,
+      totalSpeechMs: 60_000,
+      rows: [
+        {
+          sessionId: 's1',
+          startedAt: '2026-08-09T10:00:00.000Z',
+          speechMs: 60_000,
+          summary: '<script>alert(1)</script> **heading**',
+          decisions: ['ship [now](https://example.com)'],
+          tasks: [],
+          questions: [],
+        },
+      ],
+    };
+    const markdown = renderDigestMarkdown(digest, 'America/New_York');
+    const telegram = renderDigest(digest, 'America/New_York');
+    assert.match(markdown, /# OpenMurmur digest/);
+    assert.match(markdown, /06:00/);
+    assert.match(telegram, /06:00/);
+    assert.doesNotMatch(markdown, /<script>/);
+    assert.doesNotMatch(markdown, /\*\*heading\*\*/);
   });
 });
 

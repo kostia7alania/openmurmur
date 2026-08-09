@@ -13,7 +13,11 @@ import {
   splitOnBoundaries,
   TELEGRAM_MESSAGE_LIMIT,
 } from '../../src/telegram/format.ts';
-import { renderSessionReport } from '../../src/telegram/report.ts';
+import {
+  renderSessionReport,
+  renderSessionReportMarkdown,
+  renderSessionSummaryPreview,
+} from '../../src/telegram/report.ts';
 
 describe('HTML escaping', () => {
   it('escapes the characters Telegram treats as markup', () => {
@@ -102,6 +106,7 @@ describe('transcript messages', () => {
     assert.equal(messages.length, 1);
     assert.equal(messages[0]?.partCount, 1);
     assert.ok(messages[0]?.text.includes(sessionId));
+    assert.ok(messages[0]?.text.includes('<blockquote expandable>'));
   });
 
   it('numbers the parts of a long transcript', () => {
@@ -112,6 +117,7 @@ describe('transcript messages', () => {
       assert.equal(message.partNumber, index + 1);
       assert.equal(message.partCount, messages.length);
       assert.ok(message.text.includes(`${index + 1}/${messages.length}`));
+      assert.ok(message.text.includes('<blockquote expandable>'));
     });
   });
 
@@ -204,6 +210,7 @@ describe('session report', () => {
     assert.ok(report.includes('русский, английский'));
     assert.ok(report.includes('Выпустить публичный MVP.'));
     assert.ok(report.includes('sess-1'));
+    assert.equal(report.match(/<blockquote expandable>/g)?.length, 2);
   });
 
   it('omits empty sections rather than printing empty headings', () => {
@@ -221,6 +228,59 @@ describe('session report', () => {
     assert.ok(!report.includes('<script>'));
     assert.ok(!report.includes('<img'));
     assert.ok(report.includes('&lt;script&gt;'));
+  });
+
+  it('renders a complete Markdown artifact for file delivery', () => {
+    const report = renderSessionReportMarkdown({
+      ...base,
+      summary: { ...EMPTY_SUMMARY, summary: 'Краткий итог', tasks: ['Позвонить завтра'] },
+      transcript: 'fallback',
+      transcriptSegments: [
+        { startMs: 0, endMs: 1000, text: 'Начали обсуждение.', speaker: 0 },
+        { startMs: 1000, endMs: 2000, text: 'Продолжили.', speaker: 1 },
+      ],
+    });
+    assert.match(report, /^# OpenMurmur session report/);
+    assert.match(report, /## Summary\n\nКраткий итог/);
+    assert.match(report, /## Tasks\n\n- Позвонить завтра/);
+    assert.match(report, /## Таймлайн и голоса/);
+    assert.match(report, /0:00 {2}Голос 1: Начали обсуждение\\\./);
+    assert.match(report, /0:01 {2}Голос 2: Продолжили\\\./);
+  });
+
+  it('keeps a long summary preview compact and collapsible', () => {
+    const preview = renderSessionSummaryPreview({
+      ...base,
+      summary: { ...EMPTY_SUMMARY, summary: '<важно> '.repeat(1000) },
+    });
+    assert.ok(preview.includes('<blockquote expandable>'));
+    assert.ok(preview.includes('&lt;важно&gt;'));
+    assert.ok(preview.length < TELEGRAM_MESSAGE_LIMIT);
+    assert.ok(preview.endsWith('…</blockquote>'));
+  });
+
+  it('bounds a preview containing multi-code-unit graphemes', () => {
+    const preview = renderSessionSummaryPreview({
+      ...base,
+      summary: { ...EMPTY_SUMMARY, summary: '👨‍👩‍👧‍👦'.repeat(1000) },
+    });
+    assert.ok(preview.length <= TELEGRAM_MESSAGE_LIMIT);
+    assert.ok(preview.endsWith('…</blockquote>'));
+  });
+
+  it('keeps transcript-derived Markdown as literal text', () => {
+    const report = renderSessionReportMarkdown({
+      ...base,
+      summary: {
+        ...EMPTY_SUMMARY,
+        summary: '<script># heading</script>',
+        tasks: ['[click](https://example.com)'],
+      },
+    });
+    assert.ok(!report.includes('<script>'));
+    assert.ok(!report.includes('[click](https://example.com)'));
+    assert.match(report, /&lt;script/);
+    assert.match(report, /\\\[click\\\]/);
   });
 });
 

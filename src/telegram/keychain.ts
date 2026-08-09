@@ -4,13 +4,19 @@ import { spawn } from 'node:child_process';
  * Secrets live in the macOS Keychain, never in the config file, argv, the
  * environment, launchd plists or shell history.
  *
- * The token is passed to `security` on **stdin**, not as an argument, because
- * argv is world-readable via `ps` on macOS.
+ * The token is passed through an `expect`-owned pseudo-terminal on **stdin**,
+ * not as an argument, because argv is world-readable via `ps` on macOS.
  */
 
 const SERVICE = 'io.openmurmur';
+const ACCOUNT_SECRETS = 'telegram-secrets-v1';
 const ACCOUNT_TOKEN = 'telegram-bot-token';
 const ACCOUNT_CHAT_ID = 'telegram-chat-id';
+const SECURITY_COMMAND_TIMEOUT_MS = 5_000;
+const SECURITY_BIN = '/usr/bin/security';
+const EXPECT_BIN = '/usr/bin/expect';
+/** `security` exit code for errSecItemNotFound — the only benign failure. */
+const ITEM_NOT_FOUND = 44;
 
 export class KeychainError extends Error {
   constructor(message: string) {
@@ -25,11 +31,20 @@ interface RunResult {
   stderr: string;
 }
 
-function run(args: readonly string[], stdin?: string): Promise<RunResult> {
+function run(command: string, args: readonly string[], stdin?: string): Promise<RunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn('security', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (result: RunResult | Error): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      if (result instanceof Error) reject(result);
+      else resolve(result);
+    };
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
@@ -38,39 +53,88 @@ function run(args: readonly string[], stdin?: string): Promise<RunResult> {
     child.stderr.on('data', (chunk: string) => {
       stderr += chunk;
     });
-    child.on('error', reject);
-    child.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }));
+    child.on('error', (error) => settle(error));
+    child.on('close', (code) => settle({ code: code ?? -1, stdout, stderr }));
+    child.stdin.on('error', (error) => settle(error));
+    timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      settle(
+        new KeychainError(
+          `macOS Keychain command timed out after ${SECURITY_COMMAND_TIMEOUT_MS} ms`,
+        ),
+      );
+    }, SECURITY_COMMAND_TIMEOUT_MS);
     if (stdin !== undefined) child.stdin.write(stdin);
     child.stdin.end();
   });
 }
 
+export interface KeychainWriteInvocation {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly stdin: string;
+}
+
+/**
+ * `security add-generic-password -w` only reads from a terminal prompt. With a
+ * plain pipe it succeeds while storing an empty password, which looks exactly
+ * like a completed setup until the first restart. `expect` supplies a private
+ * PTY while the encoded secret itself still travels only over stdin.
+ */
+export function keychainWriteInvocation(account: string, value: string): KeychainWriteInvocation {
+  if (!/^[a-z0-9-]+$/.test(account)) throw new KeychainError('invalid Keychain account');
+  const promptScript = `
+log_user 0
+set timeout 5
+if {[catch {
+  gets stdin encoded
+  set secret [binary format H* $encoded]
+  spawn ${SECURITY_BIN} add-generic-password -U -a ${account} -s ${SERVICE} -l {OpenMurmur ${account}} -w
+  expect {
+    -re {password data for} {}
+    timeout { exit 70 }
+    eof { exit 71 }
+  }
+  send -- "$secret\\r"
+  expect {
+    -re {retype password} {}
+    timeout { exit 72 }
+    eof { exit 73 }
+  }
+  send -- "$secret\\r"
+  expect eof
+  set result [wait]
+  set exitCode [lindex $result 3]
+} message]} {
+  puts stderr $message
+  exit 74
+}
+exit $exitCode
+`.trim();
+  return {
+    command: EXPECT_BIN,
+    args: ['-c', promptScript],
+    stdin: `${Buffer.from(value, 'utf8').toString('hex')}\n`,
+  };
+}
+
 async function setSecret(account: string, value: string): Promise<void> {
-  // -w with no value makes `security` read the secret from stdin.
-  const result = await run(
-    [
-      'add-generic-password',
-      '-U',
-      '-a',
-      account,
-      '-s',
-      SERVICE,
-      '-l',
-      `OpenMurmur ${account}`,
-      '-w',
-    ],
-    `${value}\n`,
-  );
-  if (result.code !== 0) {
+  const invocation = keychainWriteInvocation(account, value);
+  const result = await run(invocation.command, invocation.args, invocation.stdin);
+  if (result.code !== 0 || result.stderr.length > 0) {
     throw new KeychainError(`Failed to store ${account} in Keychain: ${result.stderr.trim()}`);
   }
 }
 
-/** `security` exit code for errSecItemNotFound — the only benign failure. */
-const ITEM_NOT_FOUND = 44;
-
 async function getSecret(account: string): Promise<string | null> {
-  const result = await run(['find-generic-password', '-a', account, '-s', SERVICE, '-w']);
+  const result = await run(SECURITY_BIN, [
+    'find-generic-password',
+    '-a',
+    account,
+    '-s',
+    SERVICE,
+    '-w',
+  ]);
 
   if (result.code === 0) {
     const value = result.stdout.trim();
@@ -104,9 +168,10 @@ async function getSecret(account: string): Promise<string | null> {
   );
 }
 
-async function deleteSecret(account: string): Promise<boolean> {
-  const result = await run(['delete-generic-password', '-a', account, '-s', SERVICE]);
-  return result.code === 0;
+async function deleteSecret(account: string): Promise<void> {
+  const result = await run(SECURITY_BIN, ['delete-generic-password', '-a', account, '-s', SERVICE]);
+  if (result.code === 0 || result.code === ITEM_NOT_FOUND) return;
+  throw new KeychainError(`Failed to remove ${account} from Keychain: ${result.stderr.trim()}`);
 }
 
 export interface TelegramSecrets {
@@ -114,26 +179,110 @@ export interface TelegramSecrets {
   readonly chatId: number;
 }
 
-export const keychain = {
-  async storeToken(token: string): Promise<void> {
-    await setSecret(ACCOUNT_TOKEN, token);
-  },
-  async storeChatId(chatId: number): Promise<void> {
-    await setSecret(ACCOUNT_CHAT_ID, String(chatId));
-  },
-  async load(): Promise<TelegramSecrets | null> {
-    const token = await getSecret(ACCOUNT_TOKEN);
-    const chatIdRaw = await getSecret(ACCOUNT_CHAT_ID);
-    if (token === null || chatIdRaw === null) return null;
-    const chatId = Number.parseInt(chatIdRaw, 10);
-    if (!Number.isFinite(chatId)) return null;
-    return { token, chatId };
-  },
-  async clear(): Promise<void> {
-    await deleteSecret(ACCOUNT_TOKEN);
-    await deleteSecret(ACCOUNT_CHAT_ID);
-  },
+export interface SecretStorageBackend {
+  get(account: string): Promise<string | null>;
+  set(account: string, value: string): Promise<void>;
+  delete(account: string): Promise<void>;
+}
+
+export interface SecretsStore {
+  storeSecrets(secrets: TelegramSecrets): Promise<void>;
+  load(): Promise<TelegramSecrets | null>;
+  clear(): Promise<void>;
+}
+
+export function encodeTelegramSecrets(secrets: TelegramSecrets): string {
+  if (secrets.token.trim().length === 0) throw new KeychainError('Telegram bot token is empty');
+  if (!Number.isSafeInteger(secrets.chatId) || secrets.chatId === 0) {
+    throw new KeychainError('Telegram chat ID is invalid');
+  }
+  return JSON.stringify({ version: 1, token: secrets.token, chatId: secrets.chatId });
+}
+
+export function decodeTelegramSecrets(value: string): TelegramSecrets {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value);
+  } catch {
+    throw new KeychainError('Telegram credentials in Keychain are not valid JSON');
+  }
+  if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) {
+    throw new KeychainError('Telegram credentials in Keychain have an invalid shape');
+  }
+  const record = decoded as Record<string, unknown>;
+  if (record['version'] !== 1) {
+    throw new KeychainError('Telegram credentials in Keychain use an unsupported version');
+  }
+  const token = record['token'];
+  const chatId = record['chatId'];
+  if (typeof token !== 'string' || token.trim().length === 0) {
+    throw new KeychainError('Telegram credentials in Keychain contain an empty token');
+  }
+  if (typeof chatId !== 'number' || !Number.isSafeInteger(chatId) || chatId === 0) {
+    throw new KeychainError('Telegram credentials in Keychain contain an invalid chat ID');
+  }
+  return { token, chatId };
+}
+
+function decodeLegacySecrets(token: string, chatIdRaw: string): TelegramSecrets {
+  if (!/^-?\d+$/.test(chatIdRaw)) {
+    throw new KeychainError('Legacy Telegram chat ID in Keychain is invalid');
+  }
+  const chatId = Number(chatIdRaw);
+  return decodeTelegramSecrets(encodeTelegramSecrets({ token, chatId }));
+}
+
+export function createTelegramKeychain(backend: SecretStorageBackend): SecretsStore {
+  return {
+    async storeSecrets(secrets: TelegramSecrets): Promise<void> {
+      await backend.set(ACCOUNT_SECRETS, encodeTelegramSecrets(secrets));
+    },
+    async load(): Promise<TelegramSecrets | null> {
+      const encoded = await backend.get(ACCOUNT_SECRETS);
+      if (encoded !== null) return decodeTelegramSecrets(encoded);
+
+      const token = await backend.get(ACCOUNT_TOKEN);
+      const chatIdRaw = await backend.get(ACCOUNT_CHAT_ID);
+      if (token === null && chatIdRaw === null) return null;
+      if (token === null || chatIdRaw === null) {
+        throw new KeychainError(
+          'Legacy Telegram credentials in Keychain are incomplete; run setup again',
+        );
+      }
+      const legacy = decodeLegacySecrets(token, chatIdRaw);
+
+      // Publish the combined item first. Once it exists it is authoritative, so
+      // interrupted cleanup can leave duplicate legacy items but never a mixed pair.
+      try {
+        await backend.set(ACCOUNT_SECRETS, encodeTelegramSecrets(legacy));
+        await Promise.all([backend.delete(ACCOUNT_TOKEN), backend.delete(ACCOUNT_CHAT_ID)]);
+      } catch {
+        // A read-only/locked Keychain must not make an otherwise valid legacy
+        // installation unusable. A later load retries this best-effort migration.
+      }
+      return legacy;
+    },
+    async clear(): Promise<void> {
+      const failures: unknown[] = [];
+      for (const account of [ACCOUNT_SECRETS, ACCOUNT_TOKEN, ACCOUNT_CHAT_ID]) {
+        try {
+          await backend.delete(account);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (failures.length > 0) throw failures[0];
+    },
+  };
+}
+
+const securityBackend: SecretStorageBackend = {
+  get: getSecret,
+  set: setSecret,
+  delete: deleteSecret,
 };
+
+export const keychain = createTelegramKeychain(securityBackend);
 
 /**
  * Secrets provider indirection so tests, `--dry-run` and CI never touch the

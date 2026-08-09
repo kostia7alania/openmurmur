@@ -54,7 +54,8 @@ because "local-first" could otherwise be read as implying more than it does.
 - The LLM has no tools, no filesystem access and no network access.
 - The Python worker receives no secrets — only audio file paths.
 - Ollama is configured to `127.0.0.1` and validated to be local.
-- `telegram.apiBaseUrl` must be `https://`, or a local Bot API server on
-  `127.0.0.1`.
+- `telegram.apiBaseUrl` must be the official `https://api.telegram.org` root,
+  or an unauthenticated local Bot API root on literal `127.0.0.1`; redirects
+  are rejected.
 - There is no code path from a transcript to a network request other than the
   outbox, which sends only to the one configured chat.

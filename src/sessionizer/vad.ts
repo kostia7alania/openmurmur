@@ -13,6 +13,7 @@ export interface Vad {
   /** Speech probability 0..1 for one frame of 16-bit mono PCM. */
   probability(frame: Uint8Array): number | Promise<number>;
   reset(): void;
+  close?(): Promise<void>;
 }
 
 /**

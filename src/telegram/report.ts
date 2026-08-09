@@ -1,5 +1,12 @@
 import type { StructuredSummary } from '../llm/schema.ts';
-import { escapeHtml, formatClock, formatDuration } from './format.ts';
+import {
+  escapeHtml,
+  formatClock,
+  formatDuration,
+  formatTimedTranscript,
+  TELEGRAM_MESSAGE_LIMIT,
+  type TimedTranscriptSegment,
+} from './format.ts';
 
 export interface SessionReportInput {
   readonly sessionId: string;
@@ -11,6 +18,8 @@ export interface SessionReportInput {
   readonly partCount: number;
   readonly summary: StructuredSummary;
   readonly timezone?: string | undefined;
+  readonly transcript?: string | undefined;
+  readonly transcriptSegments?: readonly TimedTranscriptSegment[] | undefined;
 }
 
 const LANGUAGE_NAMES: Record<string, string> = {
@@ -33,6 +42,17 @@ function bulletList(title: string, items: readonly string[]): string[] {
   return ['', `<b>${title}</b>`, ...items.map((item) => `• ${escapeHtml(item)}`)];
 }
 
+function markdownList(title: string, items: readonly string[]): string[] {
+  if (items.length === 0) return [];
+  return ['', `## ${title}`, '', ...items.map((item) => `- ${escapeMarkdown(item)}`)];
+}
+
+function escapeMarkdown(text: string): string {
+  return escapeHtml(text)
+    .replaceAll('\\', '\\\\')
+    .replace(/([`*_{}[\]()#+.!|>-])/g, '\\$1');
+}
+
 /**
  * Renders the structured Telegram report.
  *
@@ -41,9 +61,7 @@ function bulletList(title: string, items: readonly string[]): string[] {
  * writes itself are live markup.
  */
 export function renderSessionReport(input: SessionReportInput): string {
-  const lines: string[] = [
-    '🎙 <b>Сессия завершена</b>',
-    '',
+  const details: string[] = [
     `Время: ${formatClock(input.startedWallMs, input.timezone)}–${formatClock(input.endedWallMs, input.timezone)}`,
     `Продолжительность: ${formatDuration(input.durationMs)}`,
     `Речь: ${formatDuration(input.speechMs)}`,
@@ -52,27 +70,117 @@ export function renderSessionReport(input: SessionReportInput): string {
   ];
 
   const s = input.summary;
-  if (s.summary.length > 0) {
-    lines.push('', '<b>Кратко:</b>', escapeHtml(s.summary));
-  }
-
-  lines.push(...bulletList('Решения:', s.decisions));
-  lines.push(...bulletList('Задачи:', s.tasks));
-  lines.push(...bulletList('Обязательства:', s.commitments));
-  lines.push(...bulletList('Расходы:', s.expenses));
-  lines.push(...bulletList('Идеи:', s.ideas));
-  lines.push(...bulletList('Вопросы:', s.questions));
-  lines.push(...bulletList('Неуверенность:', s.uncertainties));
+  details.push(...bulletList('Решения:', s.decisions));
+  details.push(...bulletList('Задачи:', s.tasks));
+  details.push(...bulletList('Обязательства:', s.commitments));
+  details.push(...bulletList('Расходы:', s.expenses));
+  details.push(...bulletList('Идеи:', s.ideas));
+  details.push(...bulletList('Вопросы:', s.questions));
+  details.push(...bulletList('Неуверенность:', s.uncertainties));
 
   if (s.people.length > 0) {
-    lines.push('', `Люди: ${escapeHtml(s.people.join(', '))}`);
+    details.push('', `Люди: ${escapeHtml(s.people.join(', '))}`);
   }
   if (s.places.length > 0) {
-    lines.push(`Места: ${escapeHtml(s.places.join(', '))}`);
+    details.push(`Места: ${escapeHtml(s.places.join(', '))}`);
   }
 
-  lines.push('', `Session ID: <code>${escapeHtml(input.sessionId)}</code>`);
+  const transcript = reportTranscript(input);
+  if (transcript !== null) {
+    details.push('', `<b>${transcript.title}:</b>`, escapeHtml(transcript.text));
+  }
+
+  details.push('', `Session ID: <code>${escapeHtml(input.sessionId)}</code>`);
+
+  const lines: string[] = ['🎙 <b>Сессия завершена</b>'];
+  if (s.summary.length > 0) {
+    lines.push(
+      '',
+      '🧠 <b>Кратко</b>',
+      `<blockquote expandable>${escapeHtml(s.summary)}</blockquote>`,
+    );
+  }
+  lines.push('', '📋 <b>Отчёт</b>', `<blockquote expandable>${details.join('\n')}</blockquote>`);
   return lines.join('\n');
+}
+
+/** Compact companion message sent before a long Markdown report attachment. */
+export function renderSessionSummaryPreview(input: SessionReportInput): string {
+  if (input.summary.summary.length === 0) return '';
+  const prefix = '🧠 <b>Кратко</b>\n<blockquote expandable>';
+  const suffix = '</blockquote>';
+  const summary = compactPreview(
+    input.summary.summary,
+    500,
+    TELEGRAM_MESSAGE_LIMIT - prefix.length - suffix.length,
+  );
+  return `${prefix}${escapeHtml(summary)}${suffix}`;
+}
+
+/** Full report artifact used when the Telegram-sized HTML rendering is too long. */
+export function renderSessionReportMarkdown(input: SessionReportInput): string {
+  const lines: string[] = [
+    '# OpenMurmur session report',
+    '',
+    `- Session: \`${input.sessionId}\``,
+    `- Time: ${formatClock(input.startedWallMs, input.timezone)}–${formatClock(input.endedWallMs, input.timezone)}`,
+    `- Duration: ${formatDuration(input.durationMs)}`,
+    `- Speech: ${formatDuration(input.speechMs)}`,
+    `- Languages: ${languageLabel(input.languages)}`,
+    `- Audio parts: ${input.partCount}`,
+  ];
+
+  const s = input.summary;
+  if (s.summary.length > 0) lines.push('', '## Summary', '', escapeMarkdown(s.summary));
+  lines.push(...markdownList('Decisions', s.decisions));
+  lines.push(...markdownList('Tasks', s.tasks));
+  lines.push(...markdownList('Commitments', s.commitments));
+  lines.push(...markdownList('Expenses', s.expenses));
+  lines.push(...markdownList('Ideas', s.ideas));
+  lines.push(...markdownList('Questions', s.questions));
+  lines.push(...markdownList('Uncertainties', s.uncertainties));
+  if (s.people.length > 0) {
+    lines.push('', `**People:** ${s.people.map(escapeMarkdown).join(', ')}`);
+  }
+  if (s.places.length > 0) {
+    lines.push('', `**Places:** ${s.places.map(escapeMarkdown).join(', ')}`);
+  }
+  const transcript = reportTranscript(input);
+  if (transcript !== null) {
+    lines.push('', `## ${transcript.title}`, '', escapeMarkdown(transcript.text));
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function reportTranscript(
+  input: SessionReportInput,
+): { readonly title: string; readonly text: string } | null {
+  const segments = input.transcriptSegments ?? [];
+  const timed = formatTimedTranscript(segments);
+  if (timed.length > 0) {
+    const hasSpeakers = segments.some((segment) => (segment.speaker ?? null) !== null);
+    return { title: hasSpeakers ? 'Таймлайн и голоса' : 'Таймлайн', text: timed };
+  }
+  const fallback = input.transcript?.trim() ?? '';
+  return fallback.length > 0 ? { title: 'Транскрипт', text: fallback } : null;
+}
+
+function compactPreview(text: string, maxGraphemes: number, maxEscapedLength: number): string {
+  const segments = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)];
+  let raw = '';
+  let escapedLength = 0;
+  let count = 0;
+
+  for (const { segment } of segments) {
+    const segmentLength = escapeHtml(segment).length;
+    if (count >= maxGraphemes || escapedLength + segmentLength + 1 > maxEscapedLength) {
+      return `${raw}…`;
+    }
+    raw += segment;
+    escapedLength += segmentLength;
+    count += 1;
+  }
+  return raw;
 }
 
 export interface StatusReportInput {

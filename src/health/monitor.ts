@@ -20,7 +20,9 @@ export interface HealthInputs {
   readonly ollamaDetail: string;
   readonly activeSessionMs: number | null;
   readonly asrBacklogMinutes: number;
+  readonly deadJobs: number;
   readonly outboxAgeMinutes: number;
+  readonly deadOutbox: number;
   readonly diskFreeGb: number;
   readonly sqliteWritable: boolean;
   readonly hoursSinceLastDigest: number | null;
@@ -64,6 +66,14 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
     detail: inputs.workerDetail,
   });
 
+  if (inputs.deadJobs > 0) {
+    checks.push({
+      component: 'dead_jobs',
+      status: 'failed',
+      detail: `${inputs.deadJobs} job(s) exhausted retries`,
+    });
+  }
+
   // A missing LLM degrades the report to "transcript only"; it never blocks
   // recording or audio delivery, so it is degraded rather than failed.
   checks.push({
@@ -71,6 +81,14 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
     status: inputs.ollamaReady ? 'healthy' : 'degraded',
     detail: inputs.ollamaDetail,
   });
+
+  if (inputs.deadOutbox > 0) {
+    checks.push({
+      component: 'dead_outbox',
+      status: 'degraded',
+      detail: `${inputs.deadOutbox} message(s) exhausted retries`,
+    });
+  }
 
   checks.push({
     component: 'asr_backlog',

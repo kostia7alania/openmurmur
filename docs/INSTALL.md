@@ -170,7 +170,7 @@ Read the output. It is the difference between "it should work" and "it does":
 ✅ sqlite             node:sqlite runtime 3.53.4 (target >= 3.53.4)
 ✅ ffmpeg             ffmpeg version 8.1.2
 ✅ audio_devices      [0] MacBook Pro Microphone
-✅ uv                 uv 0.12.2
+✅ uv                 uv 0.11.14
 ✅ speech_detection   Silero VAD answered in 1291 ms
 ✅ ollama             qwen3.6:27b available at http://127.0.0.1:11434
 ⚠️  state_directory    ... (missing or not writable)
@@ -220,10 +220,12 @@ prompts, and keep the token.
 pnpm openmurmur setup telegram
 ```
 
-It asks for the token with **hidden input** and stores it in the macOS Keychain.
-The token is never written to the config file, argv, an environment variable, a
-launchd plist, or a log. Then message your new bot — it binds to the first chat
-that talks to it and ignores every other.
+It asks for the token with **hidden input** and stores the complete token/chat
+pair in one versioned macOS Keychain item. The value enters
+`/usr/bin/security` through its private interactive prompt and is never written
+to the config file, argv, an environment variable, a launchd plist, or a log.
+Then send the bot a fresh `/start`; setup shows the selected account and asks
+for confirmation before binding it.
 
 ```bash
 pnpm openmurmur telegram test
@@ -287,15 +289,14 @@ tail -f ~/Library/Application\ Support/OpenMurmur/logs/daemon.err.log
 rm -rf ~/Library/Application\ Support/OpenMurmur
 ```
 
-The Keychain items are separate and deliberately survive, so an accidental
-`rm -rf` does not lose your bot token. They live under the service
-`io.openmurmur` — find them in Keychain Access by searching for `OpenMurmur`, or
-delete them directly:
+The Keychain item is separate and deliberately survives, so an accidental
+`rm -rf` does not lose your bot token. It lives under the service
+`io.openmurmur` — find it in Keychain Access by searching for `OpenMurmur`, or
+delete it directly. The last two commands remove legacy compatibility items if
+an older setup left them behind:
 
 ```bash
+security delete-generic-password -s io.openmurmur -a telegram-secrets-v1
 security delete-generic-password -s io.openmurmur -a telegram-bot-token
-```
-
-```bash
 security delete-generic-password -s io.openmurmur -a telegram-chat-id
 ```

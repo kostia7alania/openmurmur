@@ -3,7 +3,8 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, resolve, sep } from 'node:path';
 import { describe, it } from 'node:test';
-import { buildUserPrompt } from '../../src/llm/ollama.ts';
+import { DEFAULT_CONFIG } from '../../src/config/schema.ts';
+import { buildUserPrompt, OllamaLlm } from '../../src/llm/ollama.ts';
 import { parseSummary } from '../../src/llm/schema.ts';
 import { createLogger } from '../../src/logging/logger.ts';
 import { REDACTED, redact, redactValue } from '../../src/logging/redact.ts';
@@ -377,5 +378,44 @@ describe('prompt injection through the transcript', () => {
       assert.doesNotThrow(() => parseSummary(raw));
     }
     assert.equal(parseSummary(null).summary, '');
+  });
+});
+
+describe('local-only Ollama transport', () => {
+  it('refuses redirects for readiness and transcript-bearing requests', async () => {
+    const redirects: (string | undefined)[] = [];
+    const llm = new OllamaLlm(DEFAULT_CONFIG.llm, async (input, init) => {
+      redirects.push(init?.redirect);
+      if (String(input).endsWith('/api/tags')) {
+        return Response.json({ models: [{ name: DEFAULT_CONFIG.llm.model }] });
+      }
+      return Response.json({ message: { content: '{}' } });
+    });
+
+    assert.deepEqual(await llm.ready(), { ok: true, model: DEFAULT_CONFIG.llm.model });
+    await llm.summarize({ transcript: 'private text', segments: [], languages: [], durationMs: 1 });
+    assert.deepEqual(redirects, ['error', 'error']);
+  });
+});
+
+describe('Telegram transport boundary', () => {
+  it('refuses redirects for Bot API calls and file downloads', async () => {
+    const redirects: (string | undefined)[] = [];
+    const client = new TelegramClient({
+      token: '123456:secret',
+      baseUrl: 'https://api.telegram.org',
+      fetchImpl: async (input, init) => {
+        redirects.push(init?.redirect);
+        if (String(input).includes('/file/')) return new Response('audio');
+        return Response.json({
+          ok: true,
+          result: { id: 1, is_bot: true, first_name: 'OpenMurmur' },
+        });
+      },
+    });
+
+    await client.getMe();
+    await client.downloadFile('voice/file.ogg');
+    assert.deepEqual(redirects, ['error', 'error']);
   });
 });

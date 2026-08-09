@@ -22,8 +22,14 @@ fi
 
 # --- Node ---------------------------------------------------------------
 command -v node >/dev/null 2>&1 || die "Node is not installed. Install Node 26.7.0 or newer: https://nodejs.org"
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-[ "$NODE_MAJOR" -ge 26 ] || die "Node $NODE_MAJOR found; OpenMurmur needs Node 26.7.0 or newer (see .nvmrc)."
+node -e '
+const actual = process.versions.node.split(".").map(Number);
+const minimum = [26, 7, 0];
+for (let i = 0; i < minimum.length; i += 1) {
+  if ((actual[i] ?? 0) === minimum[i]) continue;
+  process.exit((actual[i] ?? 0) < minimum[i] ? 1 : 0);
+}
+' || die "Node $(node -v) found; OpenMurmur needs Node 26.7.0 or newer (see .nvmrc)."
 node - <<'NODE' || die "This Node embeds an older node:sqlite runtime; run: nvm install && nvm use"
 const minimum = '3.53.4';
 const actual = process.versions.sqlite ?? '0.0.0';

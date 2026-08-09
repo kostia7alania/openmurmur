@@ -37,6 +37,7 @@ export class MlxAsr implements AsrBackend {
   readonly #options: MlxAsrOptions;
   readonly #worker: WorkerProcess;
   #loaded = false;
+  #workerFailed = false;
 
   constructor(options: MlxAsrOptions) {
     this.#options = options;
@@ -48,8 +49,17 @@ export class MlxAsr implements AsrBackend {
       label: 'ASR',
       onExit: () => {
         this.#loaded = false;
+        this.#workerFailed = true;
       },
     });
+  }
+
+  health(): { ok: true; detail: string } | { ok: false; reason: string } {
+    if (this.#workerFailed && !this.#worker.running) {
+      return { ok: false, reason: 'ASR worker exited; the queued job will restart it' };
+    }
+    if (!this.#worker.running) return { ok: true, detail: 'idle; starts on demand' };
+    return { ok: true, detail: this.#loaded ? 'model loaded' : 'worker starting' };
   }
 
   async ready(): Promise<{ ok: true } | { ok: false; reason: string }> {
@@ -58,6 +68,7 @@ export class MlxAsr implements AsrBackend {
       const pong = await this.#worker.send({ id: randomUUID(), op: 'ping' }, 30_000);
       if (!pong.ok) return { ok: false, reason: pong.error };
       await this.#ensureLoaded();
+      this.#workerFailed = false;
       return { ok: true };
     } catch (error) {
       return { ok: false, reason: (error as Error).message };
@@ -67,6 +78,7 @@ export class MlxAsr implements AsrBackend {
   async transcribe(request: AsrRequest): Promise<AsrResult> {
     await this.#worker.ensureStarted();
     await this.#ensureLoaded();
+    this.#workerFailed = false;
 
     const response = await this.#worker.send(
       {

@@ -2,7 +2,7 @@
 
 The sessionizer decides what a "session" is. It is the piece of OpenMurmur most
 likely to be wrong in a way users notice, so it is pure, fully specified here,
-and covered by 43 tests driven from a fake clock.
+and covered by 29 tests driven from a fake clock.
 
 Implementation: [`src/sessionizer/machine.ts`](../src/sessionizer/machine.ts).
 
@@ -175,9 +175,12 @@ Two gates, applied at different times, keep the chat usable.
 
 Both are configurable. Both record the reason in `audio_sessions.rejection_reason`.
 
-A rejected session **still gets its audio part closed properly** — the file is
-valid on disk and kept for `rejectedSessionHours` (default 6) so you can check
-what was discarded, before retention removes it.
+A speech-duration rejection **still gets its audio part closed properly**, but
+does not enqueue it for Telegram. The word-count gate is later: audio delivery
+is already independent of ASR, so that gate suppresses only the empty transcript
+and report and cannot retract audio already queued or sent. Rejected audio stays
+valid on disk and is kept for `rejectedSessionHours` (default 6) before it can
+become retention-eligible.
 
 Word counting handles Thai, which is written without spaces: a plain
 space-delimited count would reject every Thai session. See `countWords` in
@@ -230,7 +233,7 @@ rejects a configuration where a session could rotate before it could close.
 
 ## Test coverage
 
-[`tests/unit/sessionizer.test.ts`](../tests/unit/sessionizer.test.ts) — 43 tests,
+[`tests/unit/sessionizer.test.ts`](../tests/unit/sessionizer.test.ts) — 29 tests,
 no sleeping, no I/O:
 
 opening and false candidates; candidate re-arming; configurable thresholds;

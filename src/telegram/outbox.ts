@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { stat } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
 import type { DatabaseSync } from 'node:sqlite';
 import { transaction } from '../database/db.ts';
 import type { Logger } from '../logging/logger.ts';
-import { isRetryable, type TelegramClient } from './client.ts';
+import { isRetryable, shouldRetryWithoutAttempt, type TelegramClient } from './client.ts';
 
 /**
  * Transactional outbox for every Telegram send.
@@ -31,13 +31,15 @@ export type OutboxPayload =
       readonly filename: string;
       readonly caption?: string;
       readonly partId?: string;
+      /** Ephemeral delivery artifact, safe to remove only after Telegram accepted it. */
+      readonly deleteAfterSend?: boolean;
     };
 
 export interface EnqueueMessage {
   readonly deliveryPartId: string;
   readonly kind: OutboxKind;
   readonly sessionId?: string | undefined;
-  /** Sends are ordered by (ordinal, created_at): audio first, then text. */
+  /** Breaks ties between rows created together; readiness time is the primary order. */
   readonly ordinal: number;
   readonly payload: OutboxPayload;
 }
@@ -51,6 +53,8 @@ interface OutboxRow {
   attempts: number;
   max_attempts: number;
 }
+
+export type OutboxState = 'pending' | 'sending' | 'sent' | 'dead';
 
 const nowIso = () => new Date().toISOString();
 const isoIn = (ms: number) => new Date(Date.now() + ms).toISOString();
@@ -93,7 +97,7 @@ export class Outbox {
           `SELECT outbox_id, delivery_part_id, session_id, kind, payload, attempts, max_attempts
              FROM telegram_outbox
             WHERE state = 'pending' AND run_after <= ?
-            ORDER BY ordinal, created_at
+            ORDER BY created_at, rowid, ordinal
             LIMIT 1`,
         )
         .get(nowIso()) as OutboxRow | undefined;
@@ -109,13 +113,16 @@ export class Outbox {
     });
   }
 
-  markSent(outboxId: string, messageId: number | null): void {
-    this.#db
-      .prepare(
-        `UPDATE telegram_outbox SET state = 'sent', telegram_message_id = ?, updated_at = ?
-          WHERE outbox_id = ?`,
-      )
-      .run(messageId, nowIso(), outboxId);
+  markSent(outboxId: string, messageId: number | null, afterMark?: () => void): void {
+    transaction(this.#db, () => {
+      this.#db
+        .prepare(
+          `UPDATE telegram_outbox SET state = 'sent', telegram_message_id = ?, updated_at = ?
+            WHERE outbox_id = ?`,
+        )
+        .run(messageId, nowIso(), outboxId);
+      afterMark?.();
+    });
   }
 
   markFailed(
@@ -173,6 +180,20 @@ export class Outbox {
     return row.c;
   }
 
+  deadCount(): number {
+    const row = this.#db
+      .prepare("SELECT count(*) AS c FROM telegram_outbox WHERE state = 'dead'")
+      .get() as { c: number };
+    return row.c;
+  }
+
+  stateOf(deliveryPartId: string): OutboxState | null {
+    const row = this.#db
+      .prepare('SELECT state FROM telegram_outbox WHERE delivery_part_id = ?')
+      .get(deliveryPartId) as { state: OutboxState } | undefined;
+    return row?.state ?? null;
+  }
+
   oldestPendingAgeMinutes(): number {
     const row = this.#db
       .prepare(
@@ -208,7 +229,11 @@ export interface OutboxWorkerDeps {
   readonly chatId: number;
   readonly logger: Logger;
   readonly maxOutgoingBytes: number;
-  readonly onDelivered?: (row: { deliveryPartId: string; payload: OutboxPayload }) => void;
+  readonly onDelivered?: (row: {
+    deliveryPartId: string;
+    sessionId: string | null;
+    payload: OutboxPayload;
+  }) => void;
 }
 
 /**
@@ -226,13 +251,28 @@ export async function drainOutbox(deps: OutboxWorkerDeps, budget = 25): Promise<
     const payload = JSON.parse(row.payload) as OutboxPayload;
     try {
       const messageId = await sendPayload(deps, payload);
-      deps.outbox.markSent(row.outbox_id, messageId);
-      deps.onDelivered?.({ deliveryPartId: row.delivery_part_id, payload });
+      deps.outbox.markSent(row.outbox_id, messageId, () => {
+        deps.onDelivered?.({
+          deliveryPartId: row.delivery_part_id,
+          sessionId: row.session_id,
+          payload,
+        });
+      });
+      await cleanupEphemeralPayload(payload, deps.logger);
       sent += 1;
     } catch (error) {
       const err = error as Error & { retryAfterSeconds?: number };
+      if (shouldRetryWithoutAttempt(err)) {
+        deps.outbox.defer(row.outbox_id, 1000, err.message);
+        deps.logger.info('telegram send interrupted; returned to the outbox', {
+          kind: row.kind,
+          deliveryPartId: row.delivery_part_id,
+        });
+        break;
+      }
       if (!isRetryable(err)) {
         deps.outbox.markFailed(row.outbox_id, err.message, row.max_attempts, row.max_attempts);
+        await cleanupEphemeralPayload(payload, deps.logger);
         deps.logger.error('telegram send permanently failed', {
           kind: row.kind,
           deliveryPartId: row.delivery_part_id,
@@ -256,6 +296,7 @@ export async function drainOutbox(deps: OutboxWorkerDeps, budget = 25): Promise<
         row.attempts,
         row.max_attempts,
       );
+      if (outcome === 'dead') await cleanupEphemeralPayload(payload, deps.logger);
       deps.logger.warn('telegram send failed', {
         kind: row.kind,
         outcome,
@@ -265,6 +306,18 @@ export async function drainOutbox(deps: OutboxWorkerDeps, budget = 25): Promise<
     }
   }
   return sent;
+}
+
+async function cleanupEphemeralPayload(payload: OutboxPayload, logger: Logger): Promise<void> {
+  if (payload.type !== 'document' || payload.deleteAfterSend !== true) return;
+  try {
+    await rm(payload.path, { force: true });
+  } catch (error) {
+    logger.warn('could not remove a finished temporary delivery file', {
+      path: payload.path,
+      error: (error as Error).message,
+    });
+  }
 }
 
 async function sendPayload(deps: OutboxWorkerDeps, payload: OutboxPayload): Promise<number | null> {

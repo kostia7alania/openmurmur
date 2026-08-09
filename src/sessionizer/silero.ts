@@ -29,6 +29,7 @@ export const FRAME_BYTES = FRAME_SAMPLES * 2;
 /** The transport for one batch of frames. Injectable so tests need no process. */
 export interface FrameScorer {
   score(pcm: Uint8Array, reset: boolean): Promise<readonly number[]>;
+  close?(): Promise<void>;
 }
 
 export class WorkerFrameScorer implements FrameScorer {
@@ -54,6 +55,10 @@ export class WorkerFrameScorer implements FrameScorer {
     if (!response.ok) throw new Error(response.error);
     if (response.op !== 'vad_stream') throw new Error('worker replied to the wrong operation');
     return response.probabilities;
+  }
+
+  async close(): Promise<void> {
+    await this.#worker.close(randomUUID());
   }
 }
 
@@ -144,6 +149,10 @@ export class SileroStreamVad implements Vad {
   reset(): void {
     this.#pendingReset = true;
     this.#fallback.reset();
+  }
+
+  async close(): Promise<void> {
+    await this.#options.scorer.close?.();
   }
 
   #onFailure(reason: string): void {

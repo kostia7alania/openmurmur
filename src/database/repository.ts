@@ -200,7 +200,7 @@ export class TranscriptRepository {
    * Appends a new immutable revision. The previous current revision is demoted
    * rather than deleted, so a bad model upgrade is always recoverable.
    */
-  append(input: TranscriptInput): string {
+  append(input: TranscriptInput, afterStored?: (revisionId: string) => void): string {
     return transaction(this.#db, () => {
       const owner = input.sessionId ?? input.incomingFileId;
       if (owner === undefined) {
@@ -260,6 +260,11 @@ export class TranscriptRepository {
           segment.speaker ?? null,
         );
       });
+
+      // Some pipeline facts (for example the session language and downstream
+      // jobs) must become durable with the revision, not in a later crash
+      // window. The callback deliberately runs inside this transaction.
+      afterStored?.(revisionId);
 
       return revisionId;
     });

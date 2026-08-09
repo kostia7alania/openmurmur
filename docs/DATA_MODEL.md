@@ -39,8 +39,8 @@ One row per logical session.
 | `started_at`, `ended_at` | UTC. `started_at` is backdated by the pre-roll. |
 | `duration_ms` | From the **monotonic** span, not from the wall-clock difference. |
 | `speech_ms` | Total speech, not elapsed time. |
-| `part_count` | Number of physical files. |
-| `rejection_reason` | `insufficient_speech`, `insufficient_words`, `asr_empty`, `asr_failed`. |
+| `part_count` | Number of successfully finalized archive parts. After a partial encoder/finalization failure this is the surviving deliverable count, not the number of attempted `audio_parts` rows. |
+| `rejection_reason` | `insufficient_speech`, `insufficient_words`, `asr_empty`; terminal failures currently use `asr_failed` or `audio_finalize_failed` in the same diagnostic column. |
 | `languages` | JSON array, filled after ASR. |
 
 ### `audio_parts`
@@ -61,6 +61,12 @@ One row per physical FLAC file.
 The three flags `finalized`, `sha256 IS NOT NULL` and `delivered` are checked
 independently by retention rather than being inferred from session state,
 because each represents a distinct way to lose a user's recording.
+
+Atomic rename necessarily precedes the SQLite update. If the process dies in
+that gap, startup scans non-finalized part rows whose archive path now exists,
+hashes the complete published FLAC, fills size/SHA-256/finalized, then reconciles
+the session's durable `deliver_audio` and `asr` jobs. A missing archive path is
+never treated as proof that a recording was safely delivered or deletable.
 
 ### `vad_segments`
 
@@ -99,7 +105,7 @@ substring search, where whitespace tokenization does not.
 
 | Column | Notes |
 | --- | --- |
-| `idempotency_key` | `UNIQUE`. Natural key, e.g. `asr:<sessionId>`. |
+| `idempotency_key` | `UNIQUE`. Natural key, e.g. `deliver-audio:<sessionId>` or `asr:<sessionId>`. |
 | `state` | `pending` → `leased` → `done` / `failed` / `dead`. |
 | `lease_owner`, `lease_expires_at` | A crashed worker's job returns to the pool when the lease expires. |
 | `attempts`, `max_attempts` | Exhausted jobs become `dead`, visible, not silently dropped. |
@@ -108,23 +114,51 @@ substring search, where whitespace tokenization does not.
 Enqueue is `ON CONFLICT (idempotency_key) DO NOTHING`, which is what makes the
 whole pipeline safe to re-drive after a crash.
 
+Recorded sessions use staged jobs rather than one serial delivery job:
+`deliver_audio` is eligible alongside `asr`; ASR creates
+`deliver_transcript` and `summarize`; summarize creates `deliver_report`.
+Session finalization and the first two job inserts share one transaction, so a
+persisted `PROCESSING` session cannot exist without its audio and ASR work.
+
 ### `telegram_outbox`
 
 | Column | Notes |
 | --- | --- |
 | `delivery_part_id` | `UNIQUE`. Stable per logical delivery unit. |
-| `ordinal` | Send order: `0` audio, `1` status, `5` alerts, `10` transcript, `20` report, `30` digest. |
+| `ordinal` | Delivery-stage metadata retained for stable rows; it does not let a newly queued row overtake older ready work. |
 | `state` | `pending` → `sending` → `sent` / `failed` / `dead`. |
 | `telegram_message_id` | Recorded on success. |
 
-The uniqueness of `delivery_part_id` is what makes at-least-once network
-delivery safe: re-enqueueing after a crash is a primary-key conflict, not a
-duplicate message.
+The claim query selects `pending` rows whose `run_after` is ready, FIFO by
+creation time and insertion order. `delivery_part_id` makes re-enqueueing the
+same logical unit a conflict. It cannot make the Telegram network effect
+exactly-once: a crash after Telegram accepts a request but before `sent` commits
+causes a retry and may produce a visible duplicate.
+
+Lifecycle status rows use stable keys
+`session-status:<started|finalized|rejected|failed>:<sessionId>`. The recorder
+enqueues them after the corresponding session transition; no Telegram I/O
+occurs there. If only some rotated parts finalize, the normal `finalized` row
+truthfully says that only the surviving parts will be uploaded. If none
+finalize, the session becomes `FAILED`, queues the `failed` row, and creates no
+audio or ASR work.
+
+Session content uses `transcript:<sessionId>:1` for an inline transcript or
+`transcript-md:<sessionId>` for its document. Reports use
+`report:<sessionId>`; when a long report also has a compact collapsed summary,
+that companion row is `report-summary:<sessionId>`. Replaying a delivery stage
+therefore cannot create a second logical copy of either presentation.
+
+Long reports and digests are document payloads pointing only at trusted
+`<sessionId>.report.md` and `digest-YYYY-MM-DD.md` paths.
 
 ### `telegram_updates` and `telegram_offset`
 
-`telegram_updates.update_id` is Telegram's own id as the primary key, so a
-redelivered update is rejected by the database rather than reprocessed.
+`telegram_updates.update_id` is Telegram's own id as the primary key. A row is
+first recorded as unhandled, then marked handled only after its durable action
+exists. Redelivery of a handled update is ignored; an unhandled row is replayed
+so a crash between deduplication and enqueue cannot silently skip it. The work
+created during replay has its own stable idempotency key.
 
 `telegram_offset` is a single-row table (`CHECK (id = 1)`) holding the
 `getUpdates` offset. Persisting it means a restart neither replays an hour of
@@ -150,6 +184,14 @@ poll every 5 seconds would send hundreds of "disk is low" messages per hour.
 Append-only records, a JSON summary payload per session, one digest per local
 date (`UNIQUE`, upserted), and the applied-migration ledger.
 
+Digest day bounds use the configured `digest.timezone`, including IANA-zone DST
+transitions. Digest storage and enqueue of `digest:<date>` share one transaction,
+so the daemon and CLI/launchd safety net converge on one delivery unit. A long
+digest document uses the trusted path `digest-YYYY-MM-DD.md`. Automatic digests
+select only `DONE` sessions and defer while a session already belonging to that
+date is unfinished. The stable row is a cutoff: sessions starting after it was
+stored require the late-session revision policy tracked in AR-08.
+
 ## Invariants
 
 These are enforced by schema constraints, by code, or by both — and are covered
@@ -163,9 +205,11 @@ by tests.
 5. A transcript revision belongs to a session **or** an incoming file, never
    both and never neither (`CHECK`).
 6. `jobs.idempotency_key` is unique, so a unit of work exists at most once.
-7. `telegram_outbox.delivery_part_id` is unique, so a message is sent at most
-   once.
-8. `telegram_updates.update_id` is unique, so an update is handled at most once.
+7. `telegram_outbox.delivery_part_id` is unique, so a logical delivery unit is
+   enqueued at most once. Telegram acceptance remains at-least-once across the
+   network/SQLite acknowledgement window.
+8. `telegram_updates.update_id` is unique; handled updates are ignored and
+   unhandled updates are safely re-driven through idempotent work keys.
 9. `deleted_at` is set only after `rm` succeeded.
 10. All timestamps are UTC.
 
@@ -192,9 +236,15 @@ The LLM has no involvement. Eligibility is pure SQL over recorded facts.
 
 ## Concurrency
 
-One writer. Write transactions use `BEGIN IMMEDIATE`, which takes the write lock
-up front so two writers fail fast with `SQLITE_BUSY` instead of deadlocking
-after doing work. No transaction performs I/O, so all of them are short.
+One daemon owns a data root. It claims the PID file with exclusive creation and
+records the root and process start metadata; `status` and `stop` verify live
+process identity before trusting it. This prevents a second daemon from becoming
+another database writer and prevents a stale reused PID from being signalled.
+
+Inside that daemon, one writer at a time. Write transactions use
+`BEGIN IMMEDIATE`, which takes the write lock up front so two writers fail fast
+with `SQLITE_BUSY` instead of deadlocking after doing work. No transaction
+performs I/O, so all of them are short.
 
 Readers (health checks, `/status`, `openmurmur status`) use WAL snapshots and
 never block the recorder.

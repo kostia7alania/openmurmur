@@ -33,6 +33,7 @@ export interface FinalizedPart {
 export class PartWriter {
   readonly #options: PartWriterOptions;
   #child: ChildProcessByStdio<Writable, null, Readable> | null = null;
+  #exitPromise: Promise<number> | null = null;
   #stderr = '';
   #closed = false;
 
@@ -75,6 +76,13 @@ export class PartWriter {
     child.stderr.on('data', (chunk: string) => {
       this.#stderr = (this.#stderr + chunk).slice(-4096);
     });
+    this.#exitPromise = new Promise<number>((resolve) => {
+      child.once('error', (error) => {
+        this.#stderr = (this.#stderr + error.message).slice(-4096);
+        resolve(-1);
+      });
+      child.once('close', (exitCode) => resolve(exitCode ?? -1));
+    });
     // A dead encoder must not crash the recorder; close() surfaces the error.
     child.stdin.on('error', () => {});
     this.#child = child;
@@ -99,14 +107,16 @@ export class PartWriter {
    */
   async close(): Promise<FinalizedPart> {
     const child = this.#child;
-    if (child === null || this.#closed) throw new Error('part writer is not open');
+    const exitPromise = this.#exitPromise;
+    if (child === null || exitPromise === null || this.#closed) {
+      throw new Error('part writer is not open');
+    }
     this.#closed = true;
 
     child.stdin.end();
-    const code = await new Promise<number>((resolve) => {
-      child.on('close', (exitCode) => resolve(exitCode ?? -1));
-    });
+    const code = await exitPromise;
     this.#child = null;
+    this.#exitPromise = null;
 
     if (code !== 0) {
       await rm(this.#options.tempPath, { force: true });
@@ -130,6 +140,7 @@ export class PartWriter {
       child.stdin.destroy();
       child.kill('SIGKILL');
       this.#child = null;
+      this.#exitPromise = null;
     }
     await rm(this.#options.tempPath, { force: true });
   }

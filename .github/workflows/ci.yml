@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NODE_VERSION: '26.5.0'
+  NODE_VERSION: '26.7.0'
   PNPM_VERSION: '10.19.0'
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
         # 26.x is the project target (Current). 24.x is the latest Active LTS,
         # checked so a gratuitous incompatibility surfaces early — see
         # docs/adr/0001-node-26.md.
-        node: ['26.5.0', '24']
+        node: ['26.7.0', '24']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

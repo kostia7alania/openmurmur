@@ -320,6 +320,9 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
   const positive = (label: string, n: number) => {
     if (!Number.isFinite(n) || n <= 0) issues.push(`${label} must be a positive number`);
   };
+  const nonNegative = (label: string, n: number) => {
+    if (!Number.isFinite(n) || n < 0) issues.push(`${label} must be a non-negative number`);
+  };
 
   const s = c.sessionizer;
   positive('sessionizer.preRollSeconds', s.preRollSeconds);
@@ -327,11 +330,11 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
   positive('sessionizer.silenceTimeoutSeconds', s.silenceTimeoutSeconds);
   positive('sessionizer.maxPartSeconds', s.maxPartSeconds);
   positive('sessionizer.vadFrameMs', s.vadFrameMs);
-  if (s.vadThreshold <= 0 || s.vadThreshold >= 1) {
+  if (!Number.isFinite(s.vadThreshold) || s.vadThreshold <= 0 || s.vadThreshold >= 1) {
     issues.push('sessionizer.vadThreshold must be strictly between 0 and 1');
   }
-  if (s.minSpeechSeconds < 0) issues.push('sessionizer.minSpeechSeconds must be >= 0');
-  if (s.minTranscriptWords < 0) issues.push('sessionizer.minTranscriptWords must be >= 0');
+  nonNegative('sessionizer.minSpeechSeconds', s.minSpeechSeconds);
+  nonNegative('sessionizer.minTranscriptWords', s.minTranscriptWords);
   if (s.maxPartSeconds <= s.silenceTimeoutSeconds) {
     issues.push('sessionizer.maxPartSeconds must exceed sessionizer.silenceTimeoutSeconds');
   }
@@ -351,22 +354,51 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
   if (d.maxSpeakers < 1 || d.maxSpeakers > 20) {
     issues.push('diarization.maxSpeakers must be between 1 and 20');
   }
-  if (d.minTurnSeconds < 0) issues.push('diarization.minTurnSeconds must be >= 0');
+  nonNegative('diarization.minTurnSeconds', d.minTurnSeconds);
 
   if (c.asr.backend !== 'mlx' && c.asr.backend !== 'fake') {
     issues.push('asr.backend must be "mlx" or "fake"');
   }
+  positive('asr.pythonWorkerTimeoutMs', c.asr.pythonWorkerTimeoutMs);
   if (c.llm.backend !== 'ollama' && c.llm.backend !== 'fake') {
     issues.push('llm.backend must be "ollama" or "fake"');
   }
-  if (c.llm.temperature < 0 || c.llm.temperature > 2) {
+  if (c.llm.backend === 'ollama' && !isLocalOllamaUrl(c.llm.baseUrl)) {
+    issues.push(
+      'llm.baseUrl must be an unauthenticated http URL on 127.0.0.1 with no path, query or fragment',
+    );
+  }
+  positive('llm.contextTokens', c.llm.contextTokens);
+  positive('llm.requestTimeoutMs', c.llm.requestTimeoutMs);
+  if (!Number.isFinite(c.llm.temperature) || c.llm.temperature < 0 || c.llm.temperature > 2) {
     issues.push('llm.temperature must be between 0 and 2');
   }
 
-  validateTelegram(c.telegram, issues, positive);
+  validateTelegram(c.telegram, issues, positive, nonNegative);
+
+  const retention = c.retention;
+  nonNegative('retention.sessionAudioHours', retention.sessionAudioHours);
+  nonNegative('retention.incomingAudioHours', retention.incomingAudioHours);
+  nonNegative('retention.quarantineHours', retention.quarantineHours);
+  nonNegative('retention.rejectedSessionHours', retention.rejectedSessionHours);
+
+  const health = c.health;
+  positive('health.pollIntervalMs', health.pollIntervalMs);
+  positive('health.recorderStaleSeconds', health.recorderStaleSeconds);
+  nonNegative('health.asrBacklogMinutes', health.asrBacklogMinutes);
+  nonNegative('health.outboxStaleMinutes', health.outboxStaleMinutes);
+  nonNegative('health.diskFreeWarnGb', health.diskFreeWarnGb);
+  positive('health.alertCooldownMinutes', health.alertCooldownMinutes);
 
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(c.digest.atLocalTime)) {
     issues.push('digest.atLocalTime must be HH:MM in 24-hour form');
+  }
+  if (c.digest.timezone !== 'local') {
+    try {
+      new Intl.DateTimeFormat('en', { timeZone: c.digest.timezone });
+    } catch {
+      issues.push('digest.timezone must be "local" or a valid IANA timezone');
+    }
   }
 
   if (!['debug', 'info', 'warn', 'error'].includes(c.logLevel)) {
@@ -378,8 +410,10 @@ function validateTelegram(
   t: TelegramConfig,
   issues: string[],
   positive: (label: string, n: number) => void,
+  nonNegative: (label: string, n: number) => void,
 ): void {
   const localBotApi = isLocalBotApiUrl(t.apiBaseUrl);
+  const officialBotApi = isOfficialBotApiUrl(t.apiBaseUrl);
   if (t.maxOutgoingBytes > 50 * 1024 * 1024) {
     issues.push('telegram.maxOutgoingBytes cannot exceed the 50 MB Bot API sendDocument limit');
   }
@@ -394,16 +428,67 @@ function validateTelegram(
   if (t.transcriptInlineLimit > 4096) {
     issues.push('telegram.transcriptInlineLimit must be <= 4096 (Telegram message length limit)');
   }
+  positive('telegram.transcriptInlineLimit', t.transcriptInlineLimit);
+  positive('telegram.pollIntervalMs', t.pollIntervalMs);
+  nonNegative('telegram.longPollSeconds', t.longPollSeconds);
+  positive('telegram.maxIncomingDurationSeconds', t.maxIncomingDurationSeconds);
   positive('telegram.maxConcurrentIncomingJobs', t.maxConcurrentIncomingJobs);
-  if (!t.apiBaseUrl.startsWith('https://') && !localBotApi) {
-    issues.push('telegram.apiBaseUrl must be https, or a local Bot API server on 127.0.0.1');
+  if (!officialBotApi && !localBotApi) {
+    issues.push(
+      'telegram.apiBaseUrl must be https://api.telegram.org or an unauthenticated root URL on http://127.0.0.1',
+    );
+  }
+}
+
+function isLocalOllamaUrl(value: string): boolean {
+  if (!/^http:\/\/127\.0\.0\.1(?::\d+)?\/?$/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'http:' &&
+      url.hostname === '127.0.0.1' &&
+      url.username === '' &&
+      url.password === '' &&
+      url.pathname === '/' &&
+      url.search === '' &&
+      url.hash === ''
+    );
+  } catch {
+    return false;
   }
 }
 
 function isLocalBotApiUrl(value: string): boolean {
+  if (!/^http:\/\/127\.0\.0\.1(?::\d+)?\/?$/.test(value)) return false;
   try {
     const url = new URL(value);
-    return url.protocol === 'http:' && url.hostname === '127.0.0.1';
+    return (
+      url.protocol === 'http:' &&
+      url.hostname === '127.0.0.1' &&
+      url.username === '' &&
+      url.password === '' &&
+      url.pathname === '/' &&
+      url.search === '' &&
+      url.hash === ''
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isOfficialBotApiUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'https:' &&
+      url.hostname === 'api.telegram.org' &&
+      url.port === '' &&
+      url.username === '' &&
+      url.password === '' &&
+      url.pathname === '/' &&
+      url.search === '' &&
+      url.hash === ''
+    );
   } catch {
     return false;
   }

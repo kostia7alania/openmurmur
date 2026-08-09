@@ -49,11 +49,13 @@ export function routeUpdate(update: TelegramUpdate, allowedChatId: number): Rout
 }
 
 /**
- * Records an update id, returning false when it has been seen before.
+ * Records an update id, returning whether it still needs handling.
  *
  * Telegram re-delivers updates that were not acknowledged; without this, a
  * crash between "download the voice note" and "advance the offset" would
- * transcribe and send the same file on every restart.
+ * transcribe and send the same file on every restart. An update recorded but
+ * not marked handled is deliberately replayed: the work it enqueues has its
+ * own idempotency key, so this closes the crash window without duplicating it.
  */
 export function recordUpdate(db: DatabaseSync, updateId: number, kind: string): boolean {
   const result = db
@@ -63,7 +65,12 @@ export function recordUpdate(db: DatabaseSync, updateId: number, kind: string): 
        ON CONFLICT (update_id) DO NOTHING`,
     )
     .run(updateId, new Date().toISOString(), kind);
-  return result.changes > 0;
+  if (result.changes > 0) return true;
+
+  const row = db
+    .prepare('SELECT handled FROM telegram_updates WHERE update_id = ?')
+    .get(updateId) as { handled: number } | undefined;
+  return row?.handled === 0;
 }
 
 export function markUpdateHandled(db: DatabaseSync, updateId: number): void {

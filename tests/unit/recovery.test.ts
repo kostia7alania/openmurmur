@@ -105,6 +105,34 @@ describe('crash recovery', () => {
     );
   });
 
+  it('removes stale split artifacts but keeps one still owned by the outbox', async () => {
+    const stale = seedOrphan('session.p000.split000.flac', 100);
+    const owned = seedOrphan('session.p000.split001.flac', 100);
+    const now = nowIso();
+    db.handle
+      .prepare(
+        `INSERT INTO telegram_outbox
+           (outbox_id, delivery_part_id, kind, ordinal, payload, run_after, created_at, updated_at)
+         VALUES ('owned', 'audio:p:split1', 'audio', 0, ?, ?, ?, ?)`,
+      )
+      .run(
+        JSON.stringify({
+          type: 'document',
+          path: owned,
+          filename: 'session.p000.split001.flac',
+          deleteAfterSend: true,
+        }),
+        now,
+        now,
+        now,
+      );
+
+    const report = await recoverAfterCrash(db.handle, paths(), nullLogger, { remove: true });
+    assert.equal(report.removed, 1);
+    assert.equal(existsSync(stale), false);
+    assert.equal(existsSync(owned), true);
+  });
+
   it('fails a session that was interrupted before any audio landed', async () => {
     seedLiveSession('A', 0);
     const report = await recoverAfterCrash(db.handle, paths(), nullLogger);
@@ -122,12 +150,47 @@ describe('crash recovery', () => {
     seedLiveSession('B', 1);
     const report = await recoverAfterCrash(db.handle, paths(), nullLogger);
 
-    assert.deepEqual(report.stalledSessions, [], 'B is recovered, not failed');
+    assert.deepEqual(report.stalledSessions, ['B']);
     const row = db.handle
       .prepare('SELECT state FROM audio_sessions WHERE session_id = ?')
       .get('B') as { state: string };
     assert.equal(row.state, 'PROCESSING');
     assert.equal(new JobQueue(db.handle).pendingCount('asr'), 1, 'and is queued for transcription');
+    assert.equal(
+      new JobQueue(db.handle).pendingCount('deliver_audio'),
+      1,
+      'and its surviving audio is queued without waiting for ASR',
+    );
+    const status = db.handle
+      .prepare('SELECT payload FROM telegram_outbox WHERE delivery_part_id = ?')
+      .get('session-status:finalized:B') as { payload: string } | undefined;
+    assert.ok(status, 'recovery must restore the stable finish/upload lifecycle notice');
+    assert.match(JSON.parse(status.payload).text as string, /сохранившиеся части/);
+  });
+
+  it('reconciles a complete archive file published just before a crash', async () => {
+    seedLiveSession('published', 0);
+    const archived = join(paths().audioDir, 'published.p000.flac');
+    writeFileSync(archived, Buffer.from('complete archive bytes'));
+    const at = nowIso();
+    db.handle
+      .prepare(
+        `INSERT INTO audio_parts
+           (part_id, session_id, part_index, path, started_at, finalized, created_at)
+         VALUES ('published-p0', 'published', 0, ?, ?, 0, ?)`,
+      )
+      .run(archived, at, at);
+
+    const report = await recoverAfterCrash(db.handle, paths(), nullLogger);
+    assert.deepEqual(report.recoveredPublishedParts, ['published-p0']);
+    const part = db.handle
+      .prepare('SELECT finalized, bytes, sha256 FROM audio_parts WHERE part_id = ?')
+      .get('published-p0') as { finalized: number; bytes: number; sha256: string };
+    assert.equal(part.finalized, 1);
+    assert.equal(part.bytes, Buffer.byteLength('complete archive bytes'));
+    assert.match(part.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(new JobQueue(db.handle).pendingCount('deliver_audio'), 1);
+    assert.equal(new JobQueue(db.handle).pendingCount('asr'), 1);
   });
 
   it('is idempotent, so running it twice queues nothing extra', async () => {
@@ -136,6 +199,48 @@ describe('crash recovery', () => {
     await recoverAfterCrash(db.handle, paths(), nullLogger);
 
     assert.equal(new JobQueue(db.handle).pendingCount('asr'), 1);
+    const statuses = db.handle
+      .prepare(
+        "SELECT count(*) AS c FROM telegram_outbox WHERE delivery_part_id = 'session-status:finalized:B'",
+      )
+      .get() as { c: number };
+    assert.equal(statuses.c, 1);
+  });
+
+  it('does not disguise a non-file archive path as a missing temp write', async () => {
+    seedLiveSession('invalid-published', 0);
+    const at = nowIso();
+    db.handle
+      .prepare(
+        `INSERT INTO audio_parts
+           (part_id, session_id, part_index, path, started_at, finalized, created_at)
+         VALUES ('invalid-p0', 'invalid-published', 0, ?, ?, 0, ?)`,
+      )
+      .run(paths().audioDir, at, at);
+
+    await assert.rejects(
+      recoverAfterCrash(db.handle, paths(), nullLogger),
+      /could not reconcile published audio part invalid-p0/,
+    );
+    const session = db.handle
+      .prepare('SELECT state FROM audio_sessions WHERE session_id = ?')
+      .get('invalid-published') as { state: string };
+    assert.equal(session.state, 'ACTIVE', 'ambiguous I/O must not rewrite session state');
+  });
+
+  it('does not change database state or queue jobs in report-only mode', async () => {
+    seedLiveSession('dry', 1);
+    const report = await recoverAfterCrash(db.handle, paths(), nullLogger, {
+      remove: false,
+      repair: false,
+    });
+
+    assert.deepEqual(report.stalledSessions, ['dry']);
+    const row = db.handle
+      .prepare('SELECT state FROM audio_sessions WHERE session_id = ?')
+      .get('dry') as { state: string };
+    assert.equal(row.state, 'ACTIVE');
+    assert.equal(new JobQueue(db.handle).pendingCount(), 0);
   });
 
   it('leaves already-finished sessions alone', async () => {

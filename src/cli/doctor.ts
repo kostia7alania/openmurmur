@@ -19,6 +19,8 @@ export interface Check {
   readonly fix?: string;
 }
 
+export const MINIMUM_NODE_VERSION = '26.7.0';
+
 async function commandVersion(command: string, args: string[]): Promise<string | null> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -57,14 +59,17 @@ function checkPlatform(): Check {
 }
 
 function checkNode(): Check {
-  const major = Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10);
-  const ok = major >= 26;
+  const ok = nodeVersionIsSupported(process.versions.node);
   return {
     name: 'node',
     level: ok ? 'ok' : 'fail',
     detail: `v${process.versions.node}`,
-    ...(ok ? {} : { fix: 'Install Node 26 or newer (see .nvmrc).' }),
+    ...(ok ? {} : { fix: `Install Node ${MINIMUM_NODE_VERSION} or newer (see .nvmrc).` }),
   };
+}
+
+export function nodeVersionIsSupported(version: string): boolean {
+  return compareVersions(version, MINIMUM_NODE_VERSION) >= 0;
 }
 
 function checkSqlite(): Check {

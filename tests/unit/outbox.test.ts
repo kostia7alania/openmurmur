@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { type Database, openDatabase } from '../../src/database/db.ts';
+import { SessionRepository } from '../../src/database/repository.ts';
 import { nullLogger } from '../../src/logging/logger.ts';
 import { isRetryable, TelegramClient } from '../../src/telegram/client.ts';
 import { drainOutbox, Outbox } from '../../src/telegram/outbox.ts';
@@ -45,6 +46,19 @@ function scriptedFetch(responses: readonly (() => Response)[]): {
   return { fetch: impl, calls };
 }
 
+const abortableHangingFetch = (async (
+  _input: string | URL | Request,
+  init?: RequestInit,
+): Promise<Response> => {
+  const signal = init?.signal;
+  if (signal === undefined || signal === null) throw new Error('request signal is required');
+  return new Promise<Response>((_resolve, reject) => {
+    const rejectFromSignal = () => reject(signal.reason);
+    if (signal.aborted) rejectFromSignal();
+    else signal.addEventListener('abort', rejectFromSignal, { once: true });
+  });
+}) as typeof fetch;
+
 const okMessage = (messageId = 1) =>
   new Response(
     JSON.stringify({
@@ -77,10 +91,19 @@ const badRequest = () =>
     },
   );
 
-function deps(fetchImpl: typeof fetch, maxOutgoingBytes = 50 * 1024 * 1024) {
+function deps(
+  fetchImpl: typeof fetch,
+  maxOutgoingBytes = 50 * 1024 * 1024,
+  requestTimeoutMs?: number,
+) {
   return {
     outbox: new Outbox(db.handle),
-    client: new TelegramClient({ token: 'tkn', baseUrl: 'https://api.telegram.org', fetchImpl }),
+    client: new TelegramClient({
+      token: 'tkn',
+      baseUrl: 'https://api.telegram.org',
+      fetchImpl,
+      ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
+    }),
     chatId: 42,
     logger: nullLogger,
     maxOutgoingBytes,
@@ -106,7 +129,7 @@ describe('outbox idempotency', () => {
     assert.equal(outbox.pendingCount(), 1);
   });
 
-  it('sends in ordinal order: audio before transcript before report', () => {
+  it('does not let newly queued audio starve older ready messages', () => {
     const outbox = new Outbox(db.handle);
     outbox.enqueue({
       deliveryPartId: 'report:s1',
@@ -127,9 +150,30 @@ describe('outbox idempotency', () => {
       payload: { type: 'text', text: 'audio' },
     });
 
-    assert.equal(outbox.claimNext()?.kind, 'audio');
-    assert.equal(outbox.claimNext()?.kind, 'transcript');
     assert.equal(outbox.claimNext()?.kind, 'report');
+    assert.equal(outbox.claimNext()?.kind, 'transcript');
+    assert.equal(outbox.claimNext()?.kind, 'audio');
+  });
+
+  it('commits the sent row and its delivery facts atomically', () => {
+    const outbox = new Outbox(db.handle);
+    outbox.enqueue({
+      deliveryPartId: 'a',
+      kind: 'status',
+      ordinal: 0,
+      payload: { type: 'text', text: 'x' },
+    });
+    const row = db.handle.prepare('SELECT outbox_id FROM telegram_outbox').get() as {
+      outbox_id: string;
+    };
+
+    assert.throws(() =>
+      outbox.markSent(row.outbox_id, 1, () => {
+        throw new Error('delivery fact failed');
+      }),
+    );
+    const state = db.handle.prepare('SELECT state FROM telegram_outbox').get() as { state: string };
+    assert.equal(state.state, 'pending', 'a failed delivery callback rolls back markSent too');
   });
 
   it('re-queues rows a crash left in flight', () => {
@@ -152,14 +196,26 @@ describe('outbox delivery', () => {
   it('sends a pending message and records the Telegram message id', async () => {
     const { fetch: impl } = scriptedFetch([() => okMessage(777)]);
     const d = deps(impl);
+    let deliveredSession: string | null = null;
+    new SessionRepository(db.handle).create('s1', new Date().toISOString());
     d.outbox.enqueue({
       deliveryPartId: 'a',
       kind: 'status',
+      sessionId: 's1',
       ordinal: 0,
       payload: { type: 'text', text: 'hi' },
     });
 
-    assert.equal(await drainOutbox(d), 1);
+    assert.equal(
+      await drainOutbox({
+        ...d,
+        onDelivered: ({ sessionId }) => {
+          deliveredSession = sessionId;
+        },
+      }),
+      1,
+    );
+    assert.equal(deliveredSession, 's1', 'audio-last delivery can reconcile its session');
 
     const row = db.handle
       .prepare('SELECT state, telegram_message_id FROM telegram_outbox')
@@ -236,6 +292,62 @@ describe('outbox delivery', () => {
     assert.equal(row.state, 'pending');
   });
 
+  it('returns a timed-out send to pending without burning its last attempt', async () => {
+    const d = deps(abortableHangingFetch, 50 * 1024 * 1024, 20);
+    d.outbox.enqueue({
+      deliveryPartId: 'timeout',
+      kind: 'status',
+      ordinal: 0,
+      payload: { type: 'text', text: 'retry me' },
+    });
+    db.handle
+      .prepare(
+        `UPDATE telegram_outbox
+            SET attempts = max_attempts - 1
+          WHERE delivery_part_id = 'timeout'`,
+      )
+      .run();
+
+    assert.equal(await drainOutbox(d), 0);
+    const row = db.handle
+      .prepare(
+        `SELECT state, attempts, max_attempts, last_error
+           FROM telegram_outbox WHERE delivery_part_id = 'timeout'`,
+      )
+      .get() as { state: string; attempts: number; max_attempts: number; last_error: string };
+    assert.equal(row.state, 'pending');
+    assert.equal(row.attempts, row.max_attempts - 1);
+    assert.match(row.last_error, /request timed out after 20 ms/);
+  });
+
+  it('aborts an in-flight send when its client closes', async () => {
+    const client = new TelegramClient({
+      token: 'tkn',
+      baseUrl: 'https://api.telegram.org',
+      fetchImpl: abortableHangingFetch,
+      requestTimeoutMs: 60_000,
+    });
+    const request = client.getMe();
+
+    client.close();
+
+    await assert.rejects(request, (error: unknown) => {
+      assert.match((error as Error).message, /client shutdown/);
+      return true;
+    });
+  });
+
+  it('bounds Telegram file downloads with the transfer deadline', async () => {
+    const client = new TelegramClient({
+      token: 'tkn',
+      baseUrl: 'https://api.telegram.org',
+      fetchImpl: abortableHangingFetch,
+      transferTimeoutMs: 20,
+    });
+
+    await assert.rejects(client.downloadFile('voice/file.ogg'), /request timed out after 20 ms/);
+  });
+
   it('classifies errors correctly', () => {
     assert.equal(isRetryable({ errorCode: 429 }), true);
     assert.equal(isRetryable({ errorCode: 500 }), true);
@@ -287,6 +399,49 @@ describe('outbox delivery', () => {
     assert.equal(calls.length, 0);
   });
 
+  it('removes an ephemeral split only after Telegram accepts it', async () => {
+    const filePath = join(dir, 'split.flac');
+    writeFileSync(filePath, Buffer.alloc(100));
+    const { fetch: impl } = scriptedFetch([() => okMessage()]);
+    const d = deps(impl, 500);
+    d.outbox.enqueue({
+      deliveryPartId: 'audio:p1:split0',
+      kind: 'audio',
+      ordinal: 0,
+      payload: {
+        type: 'document',
+        path: filePath,
+        filename: 'split.flac',
+        deleteAfterSend: true,
+      },
+    });
+
+    assert.equal(await drainOutbox(d), 1);
+    assert.equal(existsSync(filePath), false);
+  });
+
+  it('removes an ephemeral split when delivery permanently fails', async () => {
+    const path = join(dir, 'dead.split000.flac');
+    writeFileSync(path, Buffer.alloc(100));
+    const { fetch: impl } = scriptedFetch([badRequest]);
+    const d = deps(impl);
+    d.outbox.enqueue({
+      deliveryPartId: 'audio:dead:split0',
+      kind: 'audio',
+      ordinal: 0,
+      payload: {
+        type: 'document',
+        path,
+        filename: 'dead.split000.flac',
+        deleteAfterSend: true,
+      },
+    });
+
+    assert.equal(await drainOutbox(d), 0);
+    assert.equal(existsSync(path), false);
+    assert.equal(d.outbox.deadCount(), 1);
+  });
+
   it('reports the age of the oldest pending message', () => {
     const outbox = new Outbox(db.handle);
     assert.equal(outbox.oldestPendingAgeMinutes(), 0);
@@ -303,19 +458,23 @@ describe('outbox delivery', () => {
 });
 
 describe('update deduplication and offset persistence', () => {
-  it('accepts an update id once', () => {
+  it('replays an update until its durable work is marked handled', () => {
     assert.equal(recordUpdate(db.handle, 500, 'command'), true);
     assert.equal(
       recordUpdate(db.handle, 500, 'command'),
-      false,
-      'a redelivered update must not be processed twice',
+      true,
+      'a crash after recording the update must not skip its work',
     );
+    markUpdateHandled(db.handle, 500);
+    assert.equal(recordUpdate(db.handle, 500, 'command'), false);
   });
 
   it('treats each distinct update independently', () => {
     assert.equal(recordUpdate(db.handle, 1, 'audio'), true);
     assert.equal(recordUpdate(db.handle, 2, 'audio'), true);
+    markUpdateHandled(db.handle, 1);
     assert.equal(recordUpdate(db.handle, 1, 'audio'), false);
+    assert.equal(recordUpdate(db.handle, 2, 'audio'), true);
   });
 
   it('marks an update handled', () => {

@@ -105,19 +105,44 @@ else
 fi
 
 # --- keychain ------------------------------------------------------------
-# Distinguishes "no token yet" from "token present but unreadable", which is
-# the failure that wastes the most time on a server.
-security find-generic-password -s io.openmurmur -a telegram-bot-token -w >/dev/null 2>&1
+# Distinguishes missing, locked and the historical empty-password setup bug.
+# The secret goes straight to grep and is never printed or stored in a shell
+# variable. Exit 65 means the item exists but contains an empty value.
+check_keychain_item() {
+  /usr/bin/security find-generic-password -s io.openmurmur -a "$1" -w 2>/dev/null | grep -q .
+  local statuses=("${PIPESTATUS[@]}")
+  if [ "${statuses[0]}" -ne 0 ]; then return "${statuses[0]}"; fi
+  if [ "${statuses[1]}" -ne 0 ]; then return 65; fi
+  return 0
+}
+
+check_keychain_item telegram-secrets-v1
 kc=$?
-case $kc in
-  0)  ok "keychain" "Telegram token stored and readable" ;;
-  44) warn "keychain" "no Telegram token stored yet"
-      human "Create a bot with @BotFather, then run: pnpm openmurmur setup telegram" ;;
-  *)  fail "keychain" "token exists but cannot be read (exit $kc)"
-      note "This is a locked login Keychain, not a missing token."
-      note "Fix: enable automatic login, or run"
-      note "  security unlock-keychain ~/Library/Keychains/login.keychain-db" ;;
-esac
+if [ "$kc" -eq 44 ]; then
+  check_keychain_item telegram-bot-token
+  legacy_token=$?
+  check_keychain_item telegram-chat-id
+  legacy_chat=$?
+  if [ "$legacy_token" -eq 0 ] && [ "$legacy_chat" -eq 0 ]; then
+    ok "keychain" "legacy Telegram pair stored and readable; next load will migrate it"
+  elif [ "$legacy_token" -eq 44 ] && [ "$legacy_chat" -eq 44 ]; then
+    warn "keychain" "no Telegram credentials stored yet"
+    human "Create a bot with @BotFather, then run: pnpm openmurmur setup telegram"
+  elif [ "$legacy_token" -eq 65 ] || [ "$legacy_chat" -eq 65 ]; then
+    fail "keychain" "legacy Telegram credentials are empty; run setup again"
+  else
+    fail "keychain" "legacy credentials are incomplete or unreadable"
+  fi
+elif [ "$kc" -eq 0 ]; then
+  ok "keychain" "Telegram credential pair stored and readable"
+elif [ "$kc" -eq 65 ]; then
+  fail "keychain" "Telegram credential pair is empty; run setup again"
+else
+  fail "keychain" "credentials exist but cannot be read (exit $kc)"
+  note "This is usually a locked login Keychain, not a missing token."
+  note "Fix: enable automatic login, or run"
+  note "  security unlock-keychain ~/Library/Keychains/login.keychain-db"
+fi
 
 # --- launch agent --------------------------------------------------------
 if launchctl print "gui/$(id -u)/io.openmurmur.daemon" >/dev/null 2>&1; then
