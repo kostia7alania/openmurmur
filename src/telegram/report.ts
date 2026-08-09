@@ -184,6 +184,7 @@ function compactPreview(text: string, maxGraphemes: number, maxEscapedLength: nu
 }
 
 export interface StatusReportInput {
+  readonly hostName: string;
   readonly recording: boolean;
   readonly lastFrameSecondsAgo: number | null;
   readonly sessionState: string;
@@ -206,9 +207,10 @@ export function renderStatus(input: StatusReportInput): string {
     input.sessionElapsedMs === null
       ? input.sessionState
       : `${input.sessionState}, ${formatDuration(input.sessionElapsedMs)}`;
+  const heading = input.recording ? 'OpenMurmur работает' : 'OpenMurmur не записывает';
 
   return [
-    input.recording ? '🟢 <b>OpenMurmur работает</b>' : '🔴 <b>OpenMurmur не записывает</b>',
+    `${input.recording ? '🟢' : '🔴'} <b>${heading}</b> — <code>${escapeHtml(input.hostName)}</code>`,
     '',
     `Запись: ${input.recording ? 'включена' : 'остановлена'}`,
     `Последний audio frame: ${ago(input.lastFrameSecondsAgo, 'сек')}`,

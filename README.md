@@ -403,7 +403,7 @@ Neither needs a microphone, a model, or a network.
 
 Honesty matters more than a green badge, so:
 
-**Verified on this revision by offline automated tests (346 TypeScript + 36
+**Verified on this revision by offline automated tests (347 TypeScript + 36
 Python tests):** sessionizer state machine with a fake clock, pre-roll,
 60-second close, 15-minute rotation, atomic FLAC and Markdown publication,
 lossless splitting, ffprobe validation of real media, staged audio-first

@@ -233,8 +233,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
 ### P0-18 ✅ `/status`
 
 - **Epic:** Telegram · **Estimate:** S · **Risk:** low
-- **Scope:** Recorder state, last frame age, current session, ASR backlog,
-  outbox depth, last delivery, free disk, model status, version.
+- **Scope:** Daemon host name, recorder state, last frame age, current session,
+  ASR backlog, outbox depth, last delivery, free disk, model status, version.
 - **Acceptance:** Output matches the documented format.
 - **Dependencies:** P0-14 · **Tests:** Renderer tested; live command not run.
 

@@ -200,7 +200,7 @@ across messages.
 
 | Command | Effect |
 | --- | --- |
-| `/status` | Recorder state, last frame age, current session, ASR backlog, outbox depth, last delivery, free disk, model status, version. |
+| `/status` | Daemon host name, recorder state, last frame age, current session, ASR backlog, outbox depth, last delivery, free disk, model status, version. |
 | `/health` | `OK`, or one `WARN:`/`ERROR:` line per unhealthy component. |
 | `/help` | Available commands. |
 | `/start` | Same as `/help`. |

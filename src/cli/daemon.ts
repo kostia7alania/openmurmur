@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { access, readFile, rm, writeFile } from 'node:fs/promises';
+import { hostname } from 'node:os';
 import { join } from 'node:path';
 import type { AsrBackend, AsrSegment } from '../asr/types.ts';
 import { FfmpegCapture } from '../capture/ffmpeg.ts';
@@ -628,6 +629,7 @@ export class Daemon {
 
     this.#enqueueText(
       renderStatus({
+        hostName: hostname(),
         recording: this.#recorder.running && this.#recorderFailure === null,
         lastFrameSecondsAgo:
           this.#capture.msSinceLastFrame() === null

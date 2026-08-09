@@ -17,6 +17,7 @@ import {
   renderSessionReport,
   renderSessionReportMarkdown,
   renderSessionSummaryPreview,
+  renderStatus,
 } from '../../src/telegram/report.ts';
 
 describe('HTML escaping', () => {
@@ -301,5 +302,31 @@ describe('formatting helpers', () => {
     assert.equal(formatBytes(512), '512 B');
     assert.equal(formatBytes(1536), '1.5 KB');
     assert.equal(formatBytes(50 * 1024 * 1024), '50.0 MB');
+  });
+});
+
+describe('status report', () => {
+  it('shows the escaped daemon host in the heading', () => {
+    const report = renderStatus({
+      hostName: 'Kostia <Mac> & Studio',
+      recording: true,
+      lastFrameSecondsAgo: 1,
+      sessionState: 'IDLE',
+      sessionElapsedMs: null,
+      lastClosedPartMinutesAgo: 2,
+      asrBacklog: 0,
+      outboxPending: 0,
+      lastDeliveryMinutesAgo: 3,
+      diskFreeGb: 100,
+      asrStatus: 'ready',
+      llmStatus: 'ready',
+      version: '0.1.0',
+    });
+
+    assert.match(
+      report,
+      /^🟢 <b>OpenMurmur работает<\/b> — <code>Kostia &lt;Mac&gt; &amp; Studio<\/code>/,
+    );
+    assert.ok(!report.includes('<Mac>'));
   });
 });
