@@ -647,6 +647,7 @@ export class Daemon {
           this.#enqueueText(
             `Неизвестная команда. ${HELP_TEXT}`,
             scopedUpdateKey('cmd', botScope, update.update_id),
+            'HTML',
           );
           break;
         case 'audio':
@@ -673,7 +674,7 @@ export class Daemon {
   ): Promise<void> {
     const botScope = this.#botScope ?? 'legacy';
     if (command === '/help' || command === '/start') {
-      this.#enqueueText(HELP_TEXT, scopedUpdateKey('help', botScope, updateId));
+      this.#enqueueText(HELP_TEXT, scopedUpdateKey('help', botScope, updateId), 'HTML');
       return;
     }
     if (command === '/settings') {

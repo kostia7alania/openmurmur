@@ -19,11 +19,20 @@ import {
   renderProvenancePlain,
 } from '../../src/telegram/provenance.ts';
 import {
+  HELP_TEXT,
   renderSessionReport,
   renderSessionReportMarkdown,
   renderSessionSummaryPreview,
   renderStatus,
 } from '../../src/telegram/report.ts';
+
+describe('help text', () => {
+  it('keeps commands visible while using Telegram HTML markup', () => {
+    assert.match(HELP_TEXT, /^<b>OpenMurmur<\/b>/);
+    assert.match(HELP_TEXT, /^\/status — подробное состояние демона$/m);
+    assert.match(HELP_TEXT, /^\/help — этот текст$/m);
+  });
+});
 
 describe('output provenance', () => {
   it('labels a live capture with its persisted host, timezone, wall time and UID', () => {
