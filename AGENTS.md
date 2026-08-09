@@ -53,8 +53,8 @@ Maintain that.
 
 Checking real versions rather than assuming them has already caught: `gh` on
 PATH being an unrelated npm package, TypeScript 7 shipping `tsc` rather than
-`tsgo`, Node bundling SQLite 3.53.3 rather than 3.53.4, and onnxruntime capping
-Python at 3.14.
+`tsgo`, older Node 26 builds bundling SQLite 3.53.3 rather than 3.53.4, and
+onnxruntime capping Python at 3.14.
 
 ## Gotchas that have already bitten
 

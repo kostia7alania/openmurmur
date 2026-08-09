@@ -59,8 +59,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
   only transcript is worse than the problem).
 - **Acceptance:** Re-running migrations applies nothing and loses nothing; the
   actual SQLite runtime version is reported, not assumed.
-- **Dependencies:** P0-02 · **Risk:** medium (Node bundles 3.53.3, below the
-  3.53.4 target — see ADR-0004) · **Estimate:** M
+- **Dependencies:** P0-02 · **Risk:** low (Node 26.7.0 bundles the 3.53.4
+  target — see ADR-0004) · **Estimate:** M
 - **Tests:** 13 database tests including idempotency and FK enforcement.
 
 ### P0-05 ✅ FFmpeg capture
@@ -350,4 +350,4 @@ dependencies, risk, estimate (S/M/L), release, tests.
 | ⬜ Verify live Telegram delivery with a real bot | Closes P0-14, P0-18, P0-20. |
 | ⬜ Verify launchd under a real login session | Closes P0-21; TCC under launchd is the known risk. |
 | ⬜ Test sleep/wake behaviour | Documented in the README from design intent, not from observation. |
-| ⬜ Bump SQLite when Node ships ≥ 3.53.4 | Removes the ADR-0004 gap. |
+| ✅ Bump SQLite when Node ships ≥ 3.53.4 | Done by pinning Node 26.7.0. |

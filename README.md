@@ -25,7 +25,7 @@ destination, and you configure it yourself.
 
 | Situation | Start here |
 | --- | --- |
-| A Mac you sit at, with Homebrew and Node 26 already installed | [Quick start](#quick-start), below |
+| A Mac you sit at, with Homebrew and Node 26.7.0 already installed | [Quick start](#quick-start), below |
 | A Mac with none of that yet | [docs/INSTALL.md](docs/INSTALL.md) — assumes nothing, starts at `xcode-select` |
 | A headless Mac reached over SSH, set up by an agent | [docs/SERVER.md](docs/SERVER.md) — and run `./scripts/server-preflight` first |
 
@@ -52,7 +52,7 @@ works on real hardware. Real Telegram delivery, launchd and sleep/wake are
 | Hardware | Apple Silicon (M-series). MLX requires Metal; Intel Macs are not supported. |
 | Memory | 64 GB recommended. Development and the verification above were done on 36 GB (M4 Max, ~28 GB usable by the GPU), where a 27B LLM and a resident 1.7B ASR model fit but leave little headroom. 16 GB will struggle. |
 | macOS | 14 or newer. |
-| Node.js | 26.x (`.nvmrc` included). |
+| Node.js | 26.7.0 or newer (`.nvmrc` included). |
 | Python | 3.14, installed automatically by `uv`. |
 | FFmpeg | 8.x (`brew install ffmpeg`). |
 | Ollama | Optional but recommended, for summaries. |
@@ -71,7 +71,7 @@ summaries are kept indefinitely — they are small.
 
 ## Quick start
 
-This assumes Homebrew, Node 26 and FFmpeg are already installed. Starting from a
+This assumes Homebrew, Node 26.7.0 and FFmpeg are already installed. Starting from a
 Mac that has none of them? Follow [docs/INSTALL.md](docs/INSTALL.md) instead —
 same destination, nothing assumed.
 

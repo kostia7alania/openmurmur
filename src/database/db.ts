@@ -6,12 +6,9 @@ import { fileURLToPath } from 'node:url';
 /**
  * Minimum SQLite runtime we are willing to run against.
  *
- * Node 26.5.0 currently bundles 3.53.3 — one patch below this target. We do not
- * silently accept it: `openMurmurDatabase` records the actual version and
- * `openmurmur doctor` reports the gap. Nothing in this schema depends on a
- * 3.53.4-only feature (STRICT tables landed in 3.37, FTS5 trigram in 3.34), so
- * the gap is a supply-chain freshness concern rather than a functional one.
- * See docs/adr/0004-sqlite-driver.md.
+ * Node 26.7.0 bundles 3.53.4, matching this target. We still query the actual
+ * runtime because `node:sqlite` is compiled into Node; a Homebrew sqlite3
+ * upgrade does not change it. See docs/adr/0004-sqlite-driver.md.
  */
 export const MINIMUM_SQLITE_VERSION = '3.53.4';
 

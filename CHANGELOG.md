@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   characters in a Thai transcript are the model drifting, not code-switching.
   Reported, never edited out: silently rewriting a transcript would be worse
   than an odd one.
+- Pinned Node to `26.7.0`, the first verified runtime here with
+  `node:sqlite` 3.53.4, and made bootstrap reject older embedded SQLite
+  runtimes instead of leaving the fix to `doctor`.
 - **The daemon now really uses Silero VAD to decide what a speech session is.**
   It was wired to `EnergyVad` — the loudness gate the source itself documents as
   "explicitly not a substitute" — while the docs claimed the daemon path used
@@ -124,8 +127,6 @@ Initial public MVP.
 - Ollama was not installed on the development machine.
 - Live microphone capture, real Telegram delivery, launchd under a login
   session, and sleep/wake behaviour are unverified.
-- Node 26 bundles SQLite 3.53.3, one patch below the 3.53.4 target. Surfaced by
-  `doctor`; see `docs/adr/0004-sqlite-driver.md`.
 
 [Unreleased]: https://github.com/kostia7alania/openmurmur/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/kostia7alania/openmurmur/releases/tag/v0.1.0

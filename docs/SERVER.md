@@ -53,7 +53,7 @@ Exit 0 means nothing is blocking. Re-run it after each step below.
 
 Follow [INSTALL.md](INSTALL.md) steps 1–7. All of it works over SSH:
 Command Line Tools, Homebrew (**including the two PATH lines it prints**),
-FFmpeg, Node 26, Ollama, `./scripts/bootstrap`, and then the model stack:
+FFmpeg, Node 26.7.0 or newer, Ollama, `./scripts/bootstrap`, and then the model stack:
 
 ```bash
 uv sync --project python/openmurmur_audio --extra mlx
@@ -75,11 +75,10 @@ pnpm openmurmur doctor --json
 The JSON form is the one to parse. Every entry has `name`, `level`
 (`ok`/`warn`/`fail`/`info`) and `detail`. Proceed when no entry is `fail`.
 
-Two warnings are expected and neither blocks anything:
+One warning is expected and does not block anything:
 
-- `sqlite ... 3.53.3 (target >= 3.53.4)` — the SQLite compiled into Node.
-  Nothing in the schema needs the newer one. See [ADR-0004](adr/0004-sqlite-driver.md).
-- `state_directory ... missing` — until step 2.
+- `state_directory ... missing` — until step 2. `sqlite` should be green with
+  the pinned Node from `.nvmrc`.
 
 ## Step 2 — State directory
 

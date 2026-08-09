@@ -77,10 +77,11 @@ Capture and every audio conversion go through it.
 brew install ffmpeg
 ```
 
-## 4. Node 26
+## 4. Node 26.7.0
 
-OpenMurmur runs TypeScript directly, with no build step — that needs Node 26 or
-newer. Node 24 will not start it.
+OpenMurmur runs TypeScript directly, with no build step — that needs Node 26.7.0
+or newer. Node 24 will not start it, and earlier Node 26 builds embed an older
+`node:sqlite` than the project target.
 
 ```bash
 brew install node
@@ -139,7 +140,8 @@ git clone https://github.com/kostia7alania/openmurmur.git ~/openmurmur && cd ~/o
 
 `bootstrap` installs pnpm (via corepack), `uv`, the Node dependencies and the
 CI-safe Python subset. It is idempotent — re-run it whenever something looks
-wrong. It deliberately installs **no models** and never touches the Keychain.
+wrong. It deliberately installs **no models**, preserves an already-installed
+local model stack, and never touches the Keychain.
 
 ## 7. The local model stack
 
@@ -164,10 +166,11 @@ Read the output. It is the difference between "it should work" and "it does":
 
 ```
 ✅ platform           darwin/arm64
-✅ node               v26.5.0
-✅ ffmpeg             ffmpeg version 8.1.1
+✅ node               v26.7.0
+✅ sqlite             node:sqlite runtime 3.53.4 (target >= 3.53.4)
+✅ ffmpeg             ffmpeg version 8.1.2
 ✅ audio_devices      [0] MacBook Pro Microphone
-✅ uv                 uv 0.11.14
+✅ uv                 uv 0.12.2
 ✅ speech_detection   Silero VAD answered in 1291 ms
 ✅ ollama             qwen3.6:27b available at http://127.0.0.1:11434
 ⚠️  state_directory    ... (missing or not writable)
@@ -176,11 +179,9 @@ Read the output. It is the difference between "it should work" and "it does":
 `speech_detection` really starts the worker and scores a frame, so a green tick
 there means Silero loads on your machine, not that the config says it should.
 
-`state_directory` is expected to warn before step 9. One more warning you can
-ignore: `sqlite ... 3.53.3 (target >= 3.53.4)` — that is the SQLite compiled
-into Node, nothing in the schema needs the newer one, and installing sqlite3
-from Homebrew does not change it. See
-[ADR 0004](adr/0004-sqlite-driver.md).
+`state_directory` is expected to warn before step 9. `sqlite` should be green
+with the pinned Node from `.nvmrc`; if it is not, run `nvm install && nvm use`
+and check [ADR 0004](adr/0004-sqlite-driver.md).
 
 ## 9. Create the state directory
 

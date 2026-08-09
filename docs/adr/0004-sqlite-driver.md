@@ -1,4 +1,4 @@
-# ADR-0004: node:sqlite, and the 3.53.3 version gap
+# ADR-0004: node:sqlite, pinned through Node 26.7.0
 
 **Status:** Accepted · **Date:** 2026-07-29
 
@@ -6,7 +6,11 @@
 
 The brief sets a minimum SQLite version of **3.53.4**.
 
-Node 26.5.0 bundles **3.53.3** — one patch below:
+`node:sqlite` uses the SQLite library compiled into the Node binary. Installing
+a newer `sqlite3` via Homebrew does not change it, and assuming otherwise is a
+common and dangerous mistake.
+
+Node 26.5.0 bundled **3.53.3** — one patch below:
 
 ```
 $ node -e "const{DatabaseSync}=require('node:sqlite');
@@ -15,25 +19,28 @@ $ node -e "const{DatabaseSync}=require('node:sqlite');
 3.53.3
 ```
 
-This is the SQLite **compiled into the Node binary**. Installing a newer
-`sqlite3` via Homebrew does not change it, and assuming otherwise is a common
-and dangerous mistake.
+That gap was surfaced by `doctor` rather than hidden. Node 26.7.0 now bundles
+**3.53.4**, so the repository pins that runtime in `.nvmrc` and `package.json`.
 
 The brief is explicit that this must not be hidden.
 
 ## Decision
 
-Use `node:sqlite`, and surface the gap rather than paper over it:
+Use `node:sqlite`, and verify the actual runtime rather than inferring it:
 
 1. `MINIMUM_SQLITE_VERSION = '3.53.4'` is declared in code.
-2. `openDatabase()` queries the **actual runtime version** and emits a warning
-   naming both versions and explaining that Homebrew will not fix it.
-3. `openmurmur doctor` reports it as a `⚠️` with that explanation.
-4. `openDatabase({ strictVersion: true })` turns the warning into a hard failure
+2. `.nvmrc` pins Node 26.7.0, the first verified local runtime here with
+   `node:sqlite` 3.53.4.
+3. `package.json` requires Node `>=26.7.0`.
+4. `openDatabase()` queries the **actual runtime version** and emits a warning
+   if it is below target, naming both versions and explaining that Homebrew will
+   not fix it.
+5. `openmurmur doctor` reports that runtime value.
+6. `openDatabase({ strictVersion: true })` turns the warning into a hard failure
    for anyone who needs that.
-5. This ADR records why it is accepted.
+7. This ADR records why the dependency is pinned through Node.
 
-## Why the gap is acceptable here
+## Why the previous gap was acceptable before Node 26.7.0
 
 Nothing in the schema depends on a feature newer than 3.53.3:
 
@@ -49,8 +56,8 @@ attack surface a SQLite patch release typically addresses does not apply. This
 is a supply-chain freshness concern, not a functional or security one **for this
 usage**.
 
-The gap closes on its own when Node ships a newer SQLite. It is tracked in the
-backlog under cross-cutting debt.
+That made the temporary warning acceptable while no Node 26 release had 3.53.4.
+Now that Node 26.7.0 does, the gap is closed and the runtime is pinned.
 
 ## Consequences
 
@@ -72,6 +79,7 @@ barrier and a real supply-chain surface — a worse trade than one patch version
 **Pretend Homebrew's sqlite3 matters.** It does not affect `node:sqlite` at all.
 Documenting it as a fix would be actively misleading.
 
-**Block startup below 3.53.4.** Would make the project unusable on every
-current Node release for no security benefit given the usage. Available as
-`strictVersion` for anyone who wants it.
+**Block startup below 3.53.4.** Rejected for normal database opens so an older
+runtime can still report a helpful diagnostic; available as `strictVersion` for
+callers that want a hard stop. `bootstrap` and `doctor` are the user-facing
+guards.

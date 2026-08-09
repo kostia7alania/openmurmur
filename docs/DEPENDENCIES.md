@@ -1,23 +1,22 @@
 # Dependencies
 
-All versions below were **verified on the development machine on 2026-07-29**
-(macOS 26.5.2, Apple Silicon), and the model stack was re-verified by running it
-on **2026-08-06**, unless the row says otherwise. Anything not actually executed
-is marked explicitly rather than assumed.
+All versions below were **verified on the development machine on 2026-08-09**
+(macOS 26.5.2, Apple Silicon), unless the row says otherwise. Anything not
+actually executed is marked explicitly rather than assumed.
 
 ## Runtime
 
 | Component | Pinned | Verified | Notes |
 | --- | --- | --- | --- |
-| Node.js | 26.5.0 | ✅ executed | Current, **not yet LTS** — see [ADR-0001](adr/0001-node-26.md). |
+| Node.js | 26.7.0 | ✅ executed | Current, **not yet LTS** — see [ADR-0001](adr/0001-node-26.md). |
 | TypeScript | 7.0.2 | ✅ `tsc --noEmit` exits 0 | Ships as `tsc`, not `tsgo`. |
 | pnpm | 10.19.0 | ✅ `pnpm install` succeeded | 11.17.0 is the latest published version; 10.19.0 is what is installed here and what `packageManager` pins, so the lockfile matches a manager that was actually run. |
 | Biome | 2.5.6 | ✅ `biome check` exits 0 | Replaces ESLint + Prettier — see [ADR-0005](adr/0005-biome-over-eslint.md). |
 | `@types/node` | 26.1.2 | ✅ | Latest published. |
-| SQLite (`node:sqlite`) | **3.53.3** | ✅ queried at runtime | Below the 3.53.4 target — see [ADR-0004](adr/0004-sqlite-driver.md). |
-| FFmpeg / ffprobe | 8.1.1 | ✅ used in integration tests | `brew install ffmpeg`. |
-| Python | 3.14.5 | ✅ 36 tests pass | Newest with wheels across the whole stack. |
-| uv | 0.11.14 | ✅ `uv sync` succeeded | |
+| SQLite (`node:sqlite`) | **3.53.4** | ✅ queried at runtime | Compiled into Node 26.7.0 — see [ADR-0004](adr/0004-sqlite-driver.md). |
+| FFmpeg / ffprobe | 8.1.2 | ✅ used in integration tests | `brew install ffmpeg`. |
+| Python | 3.14.6 | ✅ 36 tests pass | Newest with wheels across the whole stack. |
+| uv | 0.12.2 | ✅ `uv sync` succeeded | |
 
 ## Node packages
 

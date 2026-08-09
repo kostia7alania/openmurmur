@@ -18,11 +18,10 @@ durations are **milliseconds**.
 
 ### SQLite version
 
-The target minimum is **3.53.4**. Node 26.5.0 bundles **3.53.3** — one patch
-below. This is surfaced, not hidden: `openDatabase` reports it, `doctor` shows a
-warning, and [ADR-0004](adr/0004-sqlite-driver.md) explains why we accept it.
-Nothing in this schema needs a 3.53.4-only feature (`STRICT` landed in 3.37,
-FTS5 trigram in 3.34).
+The target minimum is **3.53.4**. Node 26.7.0 bundles **3.53.4**, and
+`openDatabase` still queries the actual runtime so the value is reported rather
+than assumed. [ADR-0004](adr/0004-sqlite-driver.md) explains why the runtime is
+tied to Node.
 
 Note that `node:sqlite` uses the SQLite compiled into Node. Installing a newer
 `sqlite3` via Homebrew does not change it.

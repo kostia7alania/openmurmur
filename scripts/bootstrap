@@ -21,9 +21,21 @@ if [ "$(uname -m)" != "arm64" ]; then
 fi
 
 # --- Node ---------------------------------------------------------------
-command -v node >/dev/null 2>&1 || die "Node is not installed. Install Node 26: https://nodejs.org"
+command -v node >/dev/null 2>&1 || die "Node is not installed. Install Node 26.7.0 or newer: https://nodejs.org"
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-[ "$NODE_MAJOR" -ge 26 ] || die "Node $NODE_MAJOR found; OpenMurmur needs Node 26 or newer (see .nvmrc)."
+[ "$NODE_MAJOR" -ge 26 ] || die "Node $NODE_MAJOR found; OpenMurmur needs Node 26.7.0 or newer (see .nvmrc)."
+node - <<'NODE' || die "This Node embeds an older node:sqlite runtime; run: nvm install && nvm use"
+const minimum = '3.53.4';
+const actual = process.versions.sqlite ?? '0.0.0';
+const left = actual.split('.').map(Number);
+const right = minimum.split('.').map(Number);
+
+for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
+  const x = left[i] ?? 0;
+  const y = right[i] ?? 0;
+  if (x !== y) process.exit(x < y ? 1 : 0);
+}
+NODE
 ok "Node $(node -v)"
 
 # --- pnpm ---------------------------------------------------------------
@@ -57,7 +69,7 @@ bold "Installing Node dependencies"
 pnpm install --frozen-lockfile
 
 bold "Installing the Python audio worker (CI-safe subset)"
-uv sync --project python/openmurmur_audio
+uv sync --project python/openmurmur_audio --inexact
 ok "Python worker ready"
 
 echo
