@@ -513,4 +513,12 @@ describe('digest missing schedule', () => {
       .run(new Date(atDue).toISOString());
     assert.equal(expectedDigestIsMissing(db.handle, atDue, schedule), false);
   });
+
+  it('does not report missing during the scheduler grace window', () => {
+    const shortlyAfterDue = Date.parse('2026-08-09T18:01:00.000Z');
+    const afterGrace = Date.parse('2026-08-09T18:06:00.000Z');
+
+    assert.equal(expectedDigestIsMissing(db.handle, shortlyAfterDue, schedule, 305_000), false);
+    assert.equal(expectedDigestIsMissing(db.handle, afterGrace, schedule, 305_000), true);
+  });
 });

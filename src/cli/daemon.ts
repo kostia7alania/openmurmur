@@ -29,6 +29,7 @@ import {
   renderDigestMarkdown,
   scheduledDigestDate,
   storeDigest,
+  zonedDateTime,
 } from '../digest/daily.ts';
 import { AlertEvaluator, type AlertId, renderAlert } from '../health/alerts.ts';
 import {
@@ -88,6 +89,8 @@ import {
 import { writeTextAtomically } from '../util/atomic-file.ts';
 import { createAsrBackend, createLlmBackend, createVadBackend } from './backends.ts';
 import { VERSION } from './version.ts';
+
+const DIGEST_TICK_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
  * The long-running daemon.
@@ -283,7 +286,7 @@ export class Daemon {
       }
       this.#loop('health', () => this.#tickHealth(), config.health.pollIntervalMs);
       this.#loop('sleep', () => this.#tickSleep(), 2000);
-      this.#loop('digest', () => this.#tickDigest(), 5 * 60 * 1000);
+      this.#loop('digest', () => this.#tickDigest(), DIGEST_TICK_INTERVAL_MS);
       this.#loop('retention', () => this.#tickRetention(), 60 * 60 * 1000);
 
       // Creating the ONNX session takes about a second. Paying that on the first
@@ -993,7 +996,12 @@ export class Daemon {
       diskFreeGb: await diskFreeGb(paths.root),
       sqliteWritable: sqliteWritable(this.#db.handle),
       hoursSinceLastDigest: config.digest.enabled ? hoursSinceLastDigest(this.#db.handle) : null,
-      digestExpectedMissing: expectedDigestIsMissing(this.#db.handle, Date.now(), config.digest),
+      digestExpectedMissing: expectedDigestIsMissing(
+        this.#db.handle,
+        Date.now(),
+        config.digest,
+        DIGEST_TICK_INTERVAL_MS + config.health.pollIntervalMs,
+      ),
     };
   }
 
@@ -1120,15 +1128,34 @@ export class Daemon {
 
   async #tickDigest(): Promise<void> {
     const { config } = this.#options.loaded;
-    if (!config.digest.enabled) return;
+    const digestLogger = this.#options.logger.child('digest');
+    if (!config.digest.enabled) {
+      digestLogger.debug('digest scheduler skipped because it is disabled');
+      return;
+    }
 
     const date = scheduledDigestDate(Date.now(), config.digest);
-    if (date === null) return;
+    if (date === null) {
+      digestLogger.debug('digest scheduler skipped because no date is due', {
+        atLocalTime: config.digest.atLocalTime,
+        timezone: config.digest.timezone,
+      });
+      return;
+    }
     const existing = this.#db.handle
       .prepare('SELECT 1 AS present FROM digests WHERE digest_date = ?')
       .get(date);
-    if (existing !== undefined) return;
-    if (hasUnfinishedSessionsForDate(this.#db.handle, date, config.digest.timezone)) return;
+    if (existing !== undefined) {
+      digestLogger.debug('digest already exists', { date });
+      return;
+    }
+    if (hasUnfinishedSessionsForDate(this.#db.handle, date, config.digest.timezone)) {
+      digestLogger.info('digest scheduler waiting for unfinished sessions', {
+        date,
+        timezone: config.digest.timezone,
+      });
+      return;
+    }
 
     const digest = buildDigest(this.#db.handle, date, config.digest.timezone);
     const rendered = renderDigest(digest, config.digest.timezone);
@@ -1147,6 +1174,12 @@ export class Daemon {
         ordinal: 30,
         payload,
       });
+    });
+    digestLogger.info('digest stored and enqueued', {
+      date,
+      sessionCount: digest.sessionCount,
+      speechMs: digest.totalSpeechMs,
+      payloadType: payload.type,
     });
   }
 
@@ -1372,12 +1405,29 @@ export function expectedDigestIsMissing(
   db: Database['handle'],
   epochMs: number,
   schedule: { readonly enabled: boolean; readonly atLocalTime: string; readonly timezone: string },
+  graceMs = 0,
 ): boolean {
   const date = scheduledDigestDate(epochMs, schedule);
   if (date === null) return false;
+  const dueAgeMs = scheduledDigestDueAgeMs(epochMs, schedule);
+  if (dueAgeMs !== null && dueAgeMs < graceMs) return false;
   return (
     db.prepare('SELECT 1 AS present FROM digests WHERE digest_date = ?').get(date) === undefined
   );
+}
+
+function scheduledDigestDueAgeMs(
+  epochMs: number,
+  schedule: { readonly enabled: boolean; readonly atLocalTime: string; readonly timezone: string },
+): number | null {
+  if (!schedule.enabled) return null;
+  const local = zonedDateTime(epochMs, schedule.timezone);
+  const [dueHour, dueMinute] = schedule.atLocalTime.split(':').map(Number);
+  const dueMinutes = (dueHour ?? 0) * 60 + (dueMinute ?? 0);
+  const localMinutes = local.hour * 60 + local.minute;
+  const elapsedMinutes =
+    localMinutes >= dueMinutes ? localMinutes - dueMinutes : 24 * 60 + localMinutes - dueMinutes;
+  return elapsedMinutes * 60 * 1000;
 }
 
 export interface DaemonPidRecord {
