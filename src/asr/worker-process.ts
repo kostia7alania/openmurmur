@@ -73,7 +73,7 @@ export class WorkerProcess {
       const splitter = new LineSplitter();
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk: string) => {
-        for (const line of splitter.push(chunk)) this.#dispatch(line);
+        for (const line of splitter.push(chunk)) this.#dispatch(child, line);
       });
 
       child.stderr.setEncoding('utf8');
@@ -84,15 +84,17 @@ export class WorkerProcess {
       });
 
       child.on('error', (error) => {
-        this.#failAll(new Error(`${this.#options.label} worker failed to start: ${error.message}`));
-        reject(new Error(missingWorkerHint(this.#options.command, error.message)));
+        const failure = new Error(missingWorkerHint(this.#options.command, error.message));
+        this.#retireChild(child, failure, false);
+        reject(failure);
       });
 
       child.on('close', (code) => {
-        this.#child = null;
-        this.#startPromise = null;
-        this.#failAll(new Error(`${this.#options.label} worker exited with code ${code}`));
-        this.#options.onExit?.();
+        this.#retireChild(
+          child,
+          new Error(`${this.#options.label} worker exited with code ${code}`),
+          false,
+        );
       });
 
       this.#child = child;
@@ -111,17 +113,27 @@ export class WorkerProcess {
     }
 
     return new Promise<WorkerResponse>((resolve, reject) => {
+      const timeoutError = new Error(
+        `${this.#options.label} worker did not answer "${request.op}" within ${timeoutMs} ms`,
+      );
       const timer = setTimeout(() => {
-        this.#pending.delete(request.id);
-        reject(
-          new Error(
-            `${this.#options.label} worker did not answer "${request.op}" within ${timeoutMs} ms`,
-          ),
-        );
+        if (this.#pending.get(request.id) !== pending) return;
+        this.#options.logger.warn(`${this.#options.label} worker request timed out`, {
+          requestId: request.id,
+          operation: request.op,
+          timeoutMs,
+        });
+        // A worker is single-threaded. If one request times out, every request
+        // behind it is blocked too, and reusing that process would only burn
+        // more job attempts. Fence it before rejecting anything so a caller can
+        // immediately start a fresh process without stale events reaching it.
+        this.#retireChild(child, timeoutError, true);
       }, timeoutMs);
-      this.#pending.set(request.id, { resolve, reject, timer });
+      const pending = { resolve, reject, timer };
+      this.#pending.set(request.id, pending);
       child.stdin.write(encodeRequest(request), (error) => {
         if (!error) return;
+        if (this.#pending.get(request.id) !== pending) return;
         this.#pending.delete(request.id);
         clearTimeout(timer);
         reject(new Error(`could not write to the ${this.#options.label} worker: ${error.message}`));
@@ -138,11 +150,11 @@ export class WorkerProcess {
     } catch {
       // Already gone or wedged; SIGTERM below is the fallback.
     }
-    child.kill('SIGTERM');
-    this.#child = null;
+    this.#retireChild(child, new Error(`${this.#options.label} worker closed`), true);
   }
 
-  #dispatch(line: string): void {
+  #dispatch(child: ChildProcessWithoutNullStreams, line: string): void {
+    if (this.#child !== child) return;
     let response: WorkerResponse;
     try {
       response = decodeResponse(line);
@@ -155,6 +167,14 @@ export class WorkerProcess {
     this.#pending.delete(response.id);
     clearTimeout(pending.timer);
     pending.resolve(response);
+  }
+
+  #retireChild(child: ChildProcessWithoutNullStreams, error: Error, terminate: boolean): void {
+    if (this.#child !== child) return;
+    this.#child = null;
+    this.#failAll(error);
+    this.#options.onExit?.();
+    if (terminate) child.kill('SIGTERM');
   }
 
   #failAll(error: Error): void {

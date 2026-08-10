@@ -369,6 +369,9 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
       'llm.baseUrl must be an unauthenticated http URL on 127.0.0.1 with no path, query or fragment',
     );
   }
+  if (!isSafeOllamaModel(c.llm.model)) {
+    issues.push('llm.model must be a command-safe Ollama model identifier');
+  }
   positive('llm.contextTokens', c.llm.contextTokens);
   positive('llm.requestTimeoutMs', c.llm.requestTimeoutMs);
   if (!Number.isFinite(c.llm.temperature) || c.llm.temperature < 0 || c.llm.temperature > 2) {
@@ -471,6 +474,10 @@ function isLocalOllamaUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+export function isSafeOllamaModel(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$/.test(value);
 }
 
 function isLocalBotApiUrl(value: string): boolean {

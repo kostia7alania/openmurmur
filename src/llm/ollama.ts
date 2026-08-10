@@ -108,7 +108,8 @@ export class OllamaLlm implements LlmBackend {
         ok: false,
         reason:
           `Ollama is not reachable at ${this.#config.baseUrl}: ${(error as Error).message}\n` +
-          '  brew install ollama && ollama serve',
+          '  brew install ollama\n' +
+          '  brew services start ollama',
       };
     }
   }

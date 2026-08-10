@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { AsrPreferenceRepository, effectiveAsrLanguage } from '../../src/asr/preferences.ts';
 import {
@@ -18,6 +19,7 @@ import {
   TranscriptRepository,
 } from '../../src/database/repository.ts';
 import { backoffMs, JobQueue } from '../../src/jobs/queue.ts';
+import { Outbox } from '../../src/telegram/outbox.ts';
 
 let dir: string;
 let db: Database;
@@ -115,6 +117,12 @@ describe('migrations', () => {
     );
     assert.ok(sessionColumns.has('capture_host'));
     assert.ok(sessionColumns.has('capture_timezone'));
+    const alertColumns = new Set(
+      (db.handle.prepare('PRAGMA table_info(alert_state)').all() as { name: string }[]).map(
+        (row) => row.name,
+      ),
+    );
+    assert.ok(alertColumns.has('fingerprint'));
     for (const column of [
       'bot_scope',
       'update_id',
@@ -138,6 +146,63 @@ describe('migrations', () => {
         .map((column) => column.name),
       ['bot_scope', 'update_id'],
     );
+  });
+
+  it('upgrades a 005 database without replaying the legacy dead-job backlog alert', () => {
+    const legacyPath = join(dir, 'legacy-005.db');
+    const legacy = new DatabaseSync(legacyPath);
+    legacy.exec(`
+      CREATE TABLE schema_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      ) STRICT
+    `);
+    for (const name of [
+      '001_initial.sql',
+      '002_speaker_diarization.sql',
+      '003_output_provenance.sql',
+      '004_telegram_bot_scope.sql',
+      '005_asr_preferences.sql',
+    ]) {
+      legacy.exec(
+        readFileSync(new URL(`../../src/database/migrations/${name}`, import.meta.url), 'utf8'),
+      );
+      legacy
+        .prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)')
+        .run(name, '2026-08-09T00:00:00.000Z');
+    }
+    legacy
+      .prepare(
+        `INSERT INTO alert_state
+           (alert_id, active, last_sent_at, last_changed_at, occurrences)
+         VALUES ('asr_backlog', 1, ?, ?, 8)`,
+      )
+      .run('2026-08-10T10:00:00.000Z', '2026-08-10T10:00:00.000Z');
+    legacy
+      .prepare(
+        `INSERT INTO telegram_outbox
+           (outbox_id, delivery_part_id, kind, ordinal, payload, state, run_after,
+            created_at, updated_at)
+         VALUES ('old-alert', 'alert:asr_backlog:raise:1', 'alert', 5, '{}', 'pending', ?, ?, ?)`,
+      )
+      .run('2026-08-10T10:00:00.000Z', '2026-08-10T10:00:00.000Z', '2026-08-10T10:00:00.000Z');
+    legacy.close();
+
+    const upgraded = openDatabase({ file: legacyPath });
+    try {
+      const alert = upgraded.handle
+        .prepare("SELECT active, fingerprint FROM alert_state WHERE alert_id = 'asr_backlog'")
+        .get() as { active: number; fingerprint: string | null };
+      const outbox = upgraded.handle
+        .prepare("SELECT state, last_error FROM telegram_outbox WHERE outbox_id = 'old-alert'")
+        .get() as { state: string; last_error: string | null };
+      assert.equal(alert?.active, 0);
+      assert.equal(alert?.fingerprint, null);
+      assert.equal(outbox.state, 'failed');
+      assert.match(outbox.last_error ?? '', /dedicated dead-job diagnostics/);
+    } finally {
+      upgraded.close();
+    }
   });
 });
 
@@ -451,6 +516,84 @@ describe('job queue', () => {
     };
     assert.equal(row.state, 'dead', 'an exhausted job stays visible, not silently dropped');
     assert.match(row.last_error, /model unavailable again/);
+  });
+
+  it('lists exhausted work with its cause and explicitly re-queues it', () => {
+    const jobs = new JobQueue(db.handle);
+    jobs.enqueue({
+      kind: 'summarize',
+      idempotencyKey: 'summarize:s1',
+      payload: { sessionId: 's1' },
+      maxAttempts: 1,
+    });
+    const claimed = jobs.claim(['summarize']);
+    assert.ok(claimed);
+    assert.equal(jobs.fail(claimed.jobId, 'Ollama is not reachable'), 'dead');
+
+    assert.deepEqual(jobs.deadJobs(), [
+      {
+        jobId: claimed.jobId,
+        kind: 'summarize',
+        idempotencyKey: 'summarize:s1',
+        attempts: 1,
+        maxAttempts: 1,
+        updatedAt: jobs.deadJobs()[0]?.updatedAt,
+        lastError: 'Ollama is not reachable',
+      },
+    ]);
+    assert.equal(jobs.retryDead(claimed.jobId), 'requeued');
+    assert.equal(jobs.deadCount(), 0);
+    assert.equal(
+      jobs.claim(['summarize'])?.attempts,
+      1,
+      'manual retry starts a fresh attempt budget',
+    );
+    assert.equal(jobs.retryDead('missing'), 'not_found');
+  });
+
+  it('revives an ASR session and retires its stale failure notice with the job', () => {
+    const sessions = new SessionRepository(db.handle);
+    sessions.create('s1', new Date().toISOString());
+    db.handle
+      .prepare(
+        "UPDATE audio_sessions SET state = 'FAILED', rejection_reason = 'asr_failed' WHERE session_id = 's1'",
+      )
+      .run();
+    const outbox = new Outbox(db.handle);
+    outbox.enqueue({
+      deliveryPartId: 'session-status:asr-failed:s1',
+      kind: 'status',
+      sessionId: 's1',
+      ordinal: 1,
+      payload: { type: 'text', text: 'failed' },
+    });
+    const jobs = new JobQueue(db.handle);
+    jobs.enqueue({
+      kind: 'asr',
+      idempotencyKey: 'asr:s1',
+      payload: { sessionId: 's1' },
+      maxAttempts: 1,
+    });
+    const claimed = jobs.claim(['asr']);
+    assert.ok(claimed);
+    jobs.fail(claimed.jobId, 'model missing');
+
+    assert.equal(jobs.retryDead(claimed.jobId), 'requeued');
+    const session = sessions.get('s1');
+    assert.equal(session?.state, 'PROCESSING');
+    assert.equal(session?.rejection_reason, null);
+    assert.equal(outbox.stateOf('session-status:asr-failed:s1'), 'failed');
+  });
+
+  it('refuses to re-queue a legacy kind that no daemon worker can claim', () => {
+    const jobs = new JobQueue(db.handle);
+    jobs.enqueue({ kind: 'retention', idempotencyKey: 'retention:legacy', payload: {} });
+    const claimed = jobs.claim(['retention']);
+    assert.ok(claimed);
+    db.handle.prepare("UPDATE jobs SET state = 'dead' WHERE job_id = ?").run(claimed.jobId);
+
+    assert.equal(jobs.retryDead(claimed.jobId), 'unsupported');
+    assert.equal(jobs.deadCount(), 1);
   });
 
   it('grows the backoff and caps it', () => {

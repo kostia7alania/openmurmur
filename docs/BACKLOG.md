@@ -290,11 +290,15 @@ dependencies, risk, estimate (S/M/L), release, tests.
   recovery messages. Delivery-channel failures stay visible in local logs and
   `/health` but do not enqueue warnings into the failed channel itself; one
   recovery edge is sent after the backlog clears. New pending alert states
-  supersede older unsent reminders.
-- **Acceptance:** A condition true for an hour produces at most one message per
-  cooldown; clearing produces exactly one recovery message.
+  supersede older unsent reminders. Exhausted jobs have their own fingerprinted
+  alert instead of being mislabeled as an ASR backlog.
+- **Acceptance:** A changing runtime condition produces at most one message per
+  cooldown; an unchanged exhausted-job set is reported once, a changed set is
+  reported once, and clearing produces exactly one recovery message.
 - **Dependencies:** P0-04 · **Risk:** low · **Estimate:** M
-- **Tests:** 6 alert-deduplication tests.
+- **Tests:** 8 alert-deduplication tests, including unchanged and changed
+  exhausted-job fingerprints and rollback when durable notification creation
+  fails.
 
 ### P0-24 ✅ CI
 
@@ -504,6 +508,29 @@ suite. AR-07 and AR-14 remain untouched.
   rejection copy still need the same stable Russian error boundary, so this
   item is not complete.
 
+#### UX-09 🟡 Diagnose and safely retry exhausted jobs
+
+- **Severity:** P0 · **Epic:** Operations · **Estimate:** S
+- **User value:** A failed request says which Mac and pipeline stage failed,
+  why it failed, how to repair a missing local dependency, and how to retry the
+  exact request without another half-hourly flood.
+- **Scope:** Separate dead jobs from the ASR backlog; fingerprint the complete
+  dead-job set; show bounded, token-redacted errors, daemon host, job kind and
+  id; provide `jobs failed` and one-job-at-a-time `jobs retry JOB_ID` local CLI
+  commands. Reviving an ASR job restores its failed session to `PROCESSING` and
+  retires a pending stale failure notice atomically.
+- **Non-goals:** Installing packages, starting services, or running shell
+  commands from Telegram; automatically resetting attempt budgets forever;
+  cross-host retries from the one input-owner bot.
+- **Acceptance:** An unchanged dead job alerts once regardless of cooldown; a
+  new/removed dead job changes the fingerprint and alerts once; the alert names
+  the host, kind, bounded cause, dependency repair path and exact local retry
+  command; only an explicitly selected dead job is re-queued.
+- **Tests:** Fingerprint transitions, secret/error bounding, ASR/Ollama repair
+  hints, dead-row diagnostics, fresh attempt budget, ASR session revival and
+  stale-notice retirement. Offline tests only; real dependency recovery and
+  Telegram rendering remain unverified on this revision.
+
 ### Blocking correctness and privacy repairs
 
 #### AR-01 🟡 Own one bounded ASR worker lifecycle
@@ -520,7 +547,8 @@ suite. AR-07 and AR-14 remain untouched.
 - **Dependencies:** none.
 - **Tests:** Worker-process spawn-count test over multiple jobs, crash/restart
   test, graceful shutdown and close/start race tests proving the shutdown latch,
-  and a repeated-job resource-leak regression test.
+  timeout fencing with a fresh child, and a repeated-job resource-leak
+  regression test.
 
 #### AR-02 🟡 Make state transitions crash-consistent
 
@@ -705,6 +733,10 @@ suite. AR-07 and AR-14 remain untouched.
 - **Tests:** Each unhealthy condition and recovery edge, dead-only queues,
   locked-then-unlocked Keychain, worker crash, stale recorder, missing digest,
   and alert cooldown/deduplication.
+- **Current evidence:** Pending/dead counts are separate in local and Telegram
+  status; exhausted jobs expose bounded local diagnostics and fingerprinted
+  alerts with explicit retry. Full live Keychain/worker/digest recovery evidence
+  is still outstanding, so the item remains yellow.
 
 #### AR-11 ✅ Remove the duplicated session-opening frame
 

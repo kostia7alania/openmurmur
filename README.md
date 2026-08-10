@@ -323,6 +323,8 @@ openmurmur recover             # report what an unclean shutdown left behind
 openmurmur start               # run the daemon
 openmurmur stop                # stop a running daemon
 openmurmur status              # local status, no network
+openmurmur jobs failed         # show exhausted jobs and their causes
+openmurmur jobs retry JOB_ID   # retry one job after fixing its cause
 openmurmur telegram test       # send a test message
 openmurmur telegram poll       # poll once and show routing decisions
 openmurmur search TEXT         # search every stored transcript
@@ -413,8 +415,8 @@ Neither needs a microphone, a model, or a network.
 
 Honesty matters more than a green badge, so:
 
-**Verified on this revision by offline automated tests (375 TypeScript + 36
-Python tests):** sessionizer state machine with a fake clock, pre-roll,
+**Verified on this revision by the offline TypeScript and Python test suites:**
+sessionizer state machine with a fake clock, pre-roll,
 60-second close, 15-minute rotation, atomic FLAC and Markdown publication,
 lossless splitting, ffprobe validation of real media, staged audio-first
 delivery, lifecycle-status ordering, transcript revisions, job leases and crash

@@ -410,6 +410,33 @@ describe('alert deduplication', () => {
     assert.equal(repeated.transition, 'repeated');
   });
 
+  it('does not repeat an unchanged dead-job set and reports only real changes', () => {
+    const now = { value: Date.now() };
+    const alerts = evaluator(now);
+
+    assert.equal(alerts.evaluate('dead_jobs', true, 'job-set-a').transition, 'raised');
+    now.value += 24 * 60 * 60_000;
+    assert.equal(alerts.evaluate('dead_jobs', true, 'job-set-a').send, false);
+    assert.equal(alerts.evaluate('dead_jobs', true, 'job-set-b').transition, 'changed');
+    assert.equal(alerts.evaluate('dead_jobs', false, '').transition, 'cleared');
+    assert.equal(alerts.evaluate('dead_jobs', true, 'job-set-b').transition, 'raised');
+  });
+
+  it('does not consume an alert edge when durable notification creation fails', () => {
+    const now = { value: Date.now() };
+    const alerts = evaluator(now);
+
+    assert.throws(
+      () =>
+        alerts.evaluate('dead_jobs', true, 'job-set-a', () => {
+          throw new Error('outbox insert failed');
+        }),
+      /outbox insert failed/,
+    );
+    assert.equal(alerts.isActive('dead_jobs'), false);
+    assert.equal(alerts.evaluate('dead_jobs', true, 'job-set-a').transition, 'raised');
+  });
+
   it('tracks each alert independently', () => {
     const now = { value: Date.now() };
     const alerts = evaluator(now);
@@ -429,6 +456,14 @@ describe('alert deduplication', () => {
     assert.notEqual(raise.deliveryPartId, clear.deliveryPartId);
     assert.match(raise.text, /🟡 Запись временно недоступна/);
     assert.match(clear.text, /🟢 Запись восстановлена/);
+    assert.match(
+      renderAlert('dead_jobs', 'raised', 'Причина: model missing', 12345).text,
+      /остановилась после повторных ошибок/,
+    );
+    assert.match(
+      renderAlert('llm_unavailable', 'raised', 'Причина: not reachable', 12345).text,
+      /Структурный отчёт временно недоступен/,
+    );
   });
 });
 

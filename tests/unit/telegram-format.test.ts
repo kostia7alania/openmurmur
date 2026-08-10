@@ -395,7 +395,9 @@ describe('status report', () => {
       sessionElapsedMs: null,
       lastClosedPartMinutesAgo: 2,
       asrBacklog: 0,
+      failedJobs: 1,
       outboxPending: 0,
+      failedOutbox: 2,
       lastDeliveryMinutesAgo: 3,
       diskFreeGb: 100,
       asrStatus: 'ready',
@@ -408,5 +410,7 @@ describe('status report', () => {
       /^🟢 <b>OpenMurmur работает<\/b> — <code>Kostia &lt;Mac&gt; &amp; Studio<\/code>/,
     );
     assert.ok(!report.includes('<Mac>'));
+    assert.match(report, /Ошибочные задачи: 1/);
+    assert.match(report, /Недоставленные сообщения: 2/);
   });
 });

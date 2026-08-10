@@ -114,15 +114,13 @@ Optional but you want it — without it you get audio and transcripts, no summar
 brew install ollama
 ```
 
-Start it and leave it running (it also installs itself as a background service
-with `brew services start ollama`):
+Start the Homebrew service so it keeps running after this terminal closes:
 
 ```bash
-ollama serve
+brew services start ollama
 ```
 
-In another terminal, pull the model. **~17 GB — start it now and continue
-reading.**
+Then pull the model. **~17 GB — start it now and continue reading.**
 
 ```bash
 ollama pull qwen3.6:27b
@@ -274,7 +272,7 @@ tail -f ~/Library/Application\ Support/OpenMurmur/logs/daemon.err.log
 | `speech_detection` fails in `doctor` | Step 7 was skipped: `uv sync --project python/openmurmur_audio --extra mlx` |
 | `macOS denied microphone access` | Step 10, from a terminal. System Settings → Privacy & Security → Microphone must list the terminal you launch from. |
 | Nothing recorded, no error | Genuinely no speech: Silero rejects a fan, traffic and music by design, and a session under 3 seconds of speech is dropped as noise. `pnpm openmurmur status` shows the rejected count. |
-| `ollama` warns in `doctor` | `ollama serve` is not running, or the model is not pulled. Audio and transcripts are still delivered; only summaries stop. |
+| `ollama` warns in `doctor` | Run `brew services start ollama`, then pull the configured model. Audio and transcripts are still delivered; only summaries stop. |
 | Node version errors | `node -v` must be 26+. See step 4. |
 | Telegram silent | `pnpm openmurmur telegram test`. Undelivered messages queue in the outbox and are retried; nothing is lost while it is offline. |
 | It stopped recording after a macOS update | Major updates can reset TCC. Re-run step 10. |

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
 import { access, rm } from 'node:fs/promises';
+import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { FfmpegCapture } from '../capture/ffmpeg.ts';
@@ -20,6 +21,8 @@ import {
   storeDigest,
   zonedDateTime,
 } from '../digest/daily.ts';
+import { compactJobError, renderDeadJobAlert } from '../jobs/diagnostics.ts';
+import { canRetryDeadJob, JobQueue } from '../jobs/queue.ts';
 import { createLogger } from '../logging/logger.ts';
 import { applyRetention, planRetention } from '../retention/policy.ts';
 import { EnergyVad, rmsDbfs } from '../sessionizer/vad.ts';
@@ -56,6 +59,8 @@ Telegram
   telegram poll          Poll once and print what would be handled.
 
 Work
+  jobs failed            Show exhausted background jobs and their causes.
+  jobs retry JOB_ID      Re-queue one exhausted job after fixing its cause.
   search TEXT            Search every stored transcript.
   transcribe FILE        Transcribe one audio file locally and print the text.
   digest DATE            Build and print the digest for YYYY-MM-DD.
@@ -167,6 +172,9 @@ async function main(argv: readonly string[]): Promise<number> {
 
     case 'telegram':
       return telegramCommand(loaded, positionals[1]);
+
+    case 'jobs':
+      return jobsCommand(loaded, positionals[1], positionals[2], asJson);
 
     case 'search': {
       const query = positionals.slice(1).join(' ');
@@ -514,7 +522,9 @@ async function localStatus(
            (SELECT count(*) FROM audio_sessions WHERE state = 'DONE')               AS done,
            (SELECT count(*) FROM audio_sessions WHERE state = 'REJECTED')           AS rejected,
            (SELECT count(*) FROM jobs WHERE state IN ('pending','leased'))          AS jobs,
+           (SELECT count(*) FROM jobs WHERE state = 'dead')                         AS failed_jobs,
            (SELECT count(*) FROM telegram_outbox WHERE state IN ('pending','sending')) AS outbox,
+           (SELECT count(*) FROM telegram_outbox WHERE state = 'dead')              AS failed_outbox,
            (SELECT count(*) FROM audio_parts WHERE deleted_at IS NULL)              AS parts`,
       )
       .get() as Record<string, number>;
@@ -531,10 +541,89 @@ async function localStatus(
         `Sessions:          ${counts['sessions']} (${counts['done']} delivered, ${counts['rejected']} rejected)`,
         `Audio parts on disk: ${counts['parts']}`,
         `Jobs pending:      ${counts['jobs']}`,
+        `Jobs failed:       ${counts['failed_jobs']}`,
         `Telegram outbox:   ${counts['outbox']}`,
+        `Telegram failed:   ${counts['failed_outbox']}`,
+        ...((counts['failed_jobs'] ?? 0) > 0
+          ? ['Failed job details: pnpm openmurmur jobs failed']
+          : []),
         `SQLite:            ${db.sqliteVersion}`,
         '',
       ].join('\n'),
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+function jobsCommand(
+  loaded: Awaited<ReturnType<typeof loadConfig>>,
+  subcommand: string | undefined,
+  jobId: string | undefined,
+  asJson: boolean,
+): number {
+  if (subcommand !== 'failed' && subcommand !== 'retry') {
+    process.stderr.write('Usage: openmurmur jobs <failed|retry JOB_ID>\n');
+    return 1;
+  }
+
+  const db = openDatabase({ file: loaded.paths.databaseFile });
+  try {
+    const jobs = new JobQueue(db.handle);
+    if (subcommand === 'failed') {
+      const failed = jobs.deadJobs();
+      if (asJson) {
+        process.stdout.write(
+          `${JSON.stringify(
+            {
+              hostName: hostname(),
+              failedJobs: failed.map((job) => ({
+                ...job,
+                lastError: compactJobError(job.lastError),
+              })),
+            },
+            null,
+            2,
+          )}\n`,
+        );
+      } else if (failed.length === 0) {
+        process.stdout.write('No failed jobs.\n');
+      } else {
+        process.stdout.write(
+          `${
+            renderDeadJobAlert(hostname(), failed, loaded.config.llm.model, {
+              technicalDetails: true,
+            }).detail
+          }\n`,
+        );
+        for (const job of failed.slice(1).filter((candidate) => canRetryDeadJob(candidate.kind))) {
+          process.stdout.write(`Retry ${job.kind}: pnpm openmurmur jobs retry ${job.jobId}\n`);
+        }
+      }
+      return 0;
+    }
+
+    if (jobId === undefined) {
+      process.stderr.write('Usage: openmurmur jobs retry JOB_ID\n');
+      return 1;
+    }
+    const outcome = jobs.retryDead(jobId);
+    if (outcome === 'not_found') {
+      process.stderr.write(`No failed job found with id ${jobId}.\n`);
+      return 1;
+    }
+    if (outcome === 'unsupported') {
+      process.stderr.write(
+        `Failed job ${jobId} has no daemon worker and cannot be retried. Run: pnpm openmurmur doctor\n`,
+      );
+      return 1;
+    }
+    const result = { jobId, requeued: true };
+    process.stdout.write(
+      asJson
+        ? `${JSON.stringify(result, null, 2)}\n`
+        : `Re-queued ${jobId}. It will run when the OpenMurmur daemon is running.\n`,
     );
     return 0;
   } finally {

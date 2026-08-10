@@ -191,7 +191,9 @@ export interface StatusReportInput {
   readonly sessionElapsedMs: number | null;
   readonly lastClosedPartMinutesAgo: number | null;
   readonly asrBacklog: number;
+  readonly failedJobs: number;
   readonly outboxPending: number;
+  readonly failedOutbox: number;
   readonly lastDeliveryMinutesAgo: number | null;
   readonly diskFreeGb: number;
   readonly asrStatus: string;
@@ -217,7 +219,9 @@ export function renderStatus(input: StatusReportInput): string {
     `Текущая сессия: ${escapeHtml(session)}`,
     `Последний закрытый файл: ${ago(input.lastClosedPartMinutesAgo, 'мин')}`,
     `Очередь ASR: ${input.asrBacklog}`,
+    `Ошибочные задачи: ${input.failedJobs}`,
     `Очередь Telegram: ${input.outboxPending}`,
+    `Недоставленные сообщения: ${input.failedOutbox}`,
     `Последняя доставка: ${ago(input.lastDeliveryMinutesAgo, 'мин')}`,
     `Свободный диск: ${input.diskFreeGb.toFixed(0)} ГБ`,
     `ASR: ${escapeHtml(input.asrStatus)}`,

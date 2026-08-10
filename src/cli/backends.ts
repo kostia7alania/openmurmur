@@ -13,7 +13,13 @@ import { EnergyVad, type Vad } from '../sessionizer/vad.ts';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const PYTHON_PROJECT = join(REPO_ROOT, 'python', 'openmurmur_audio');
-const WORKER_ARGS = ['run', '--project', PYTHON_PROJECT, 'openmurmur-audio-worker'] as const;
+export const WORKER_ARGS = [
+  'run',
+  '--no-sync',
+  '--project',
+  PYTHON_PROJECT,
+  'openmurmur-audio-worker',
+] as const;
 
 /**
  * Backend selection.

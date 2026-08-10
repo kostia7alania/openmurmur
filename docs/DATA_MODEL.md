@@ -119,13 +119,18 @@ substring search, where whitespace tokenization does not.
 | Column | Notes |
 | --- | --- |
 | `idempotency_key` | `UNIQUE`. Natural key, e.g. `deliver-audio:<sessionId>` or `asr:<sessionId>`. |
-| `state` | `pending` → `leased` → `done` / `failed` / `dead`. |
+| `state` | `pending` → `leased` → `done`; a failed lease returns to `pending` with backoff until exhaustion changes it to `dead`. |
 | `lease_owner`, `lease_expires_at` | A crashed worker's job returns to the pool when the lease expires. |
 | `attempts`, `max_attempts` | Exhausted jobs become `dead`, visible, not silently dropped. |
 | `run_after` | Exponential backoff, capped at 15 minutes. |
 
 Enqueue is `ON CONFLICT (idempotency_key) DO NOTHING`, which is what makes the
 whole pipeline safe to re-drive after a crash.
+
+An operator may explicitly return one supported `dead` job to `pending` with
+`openmurmur jobs retry JOB_ID`. This resets its attempt budget only for that
+selected row. Legacy kinds without a daemon handler are refused rather than
+reported as runnable.
 
 Recorded sessions use staged jobs rather than one serial delivery job:
 `deliver_audio` is eligible alongside `asr`; ASR creates
@@ -201,9 +206,13 @@ or `rejected` / `failed`.
 
 ### `alert_state`
 
-One row per alert identity. Proactive Telegram messages are sent only when
-`active` changes, and never more often than the cooldown. Without this, a health
-poll every 5 seconds would send hundreds of "disk is low" messages per hour.
+One row per alert identity. Proactive Telegram messages are sent when `active`
+changes and no more often than the cooldown. Set-valued failures such as dead
+jobs also persist a fingerprint: an unchanged set is silent, while a changed
+failure generation produces one new edge. Alert state and its durable outbox
+row are written in one transaction, so a failed enqueue cannot consume the
+notification. Without this, a health poll every 5 seconds would send hundreds
+of duplicate messages.
 
 ### `health_events`, `summaries`, `digests`, `schema_migrations`
 

@@ -8,7 +8,7 @@ import type { LoadedConfig } from '../config/load.ts';
 import { compareVersions, MINIMUM_SQLITE_VERSION, sqliteVersionOf } from '../database/db.ts';
 import { diskFreeGb } from '../health/monitor.ts';
 import { nullLogger } from '../logging/logger.ts';
-import { PYTHON_PROJECT, REPO_ROOT } from './backends.ts';
+import { REPO_ROOT, WORKER_ARGS } from './backends.ts';
 
 export type CheckLevel = 'ok' | 'warn' | 'fail' | 'info';
 
@@ -159,7 +159,7 @@ async function checkSpeechDetection(loaded: LoadedConfig): Promise<Check> {
   );
   const worker = new WorkerProcess({
     command: 'uv',
-    args: ['run', '--project', PYTHON_PROJECT, 'openmurmur-audio-worker'],
+    args: [...WORKER_ARGS],
     cwd: REPO_ROOT,
     logger: nullLogger,
     label: 'VAD',
@@ -262,7 +262,9 @@ async function checkOllama(loaded: LoadedConfig): Promise<Check> {
       : {
           fix:
             'Summaries need a local LLM. Audio and transcripts are delivered without it.\n' +
-            `  brew install ollama && ollama serve && ollama pull ${model}`,
+            '  brew install ollama\n' +
+            '  brew services start ollama\n' +
+            `  ollama pull ${model}`,
         }),
   };
 }

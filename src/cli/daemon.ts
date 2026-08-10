@@ -40,6 +40,12 @@ import {
   sqliteWritable,
 } from '../health/monitor.ts';
 import { renderSleepMessage, SleepDetector } from '../health/sleep.ts';
+import {
+  failureCategory,
+  renderAsrUnavailableDetail,
+  renderDeadJobAlert,
+  renderLlmUnavailableDetail,
+} from '../jobs/diagnostics.ts';
 import { handleJob, markAudioDelivered, reconcileSessionDelivery } from '../jobs/pipeline.ts';
 import { type JobKind, JobQueue } from '../jobs/queue.ts';
 import type { LlmBackend } from '../llm/ollama.ts';
@@ -724,7 +730,9 @@ export class Daemon {
         lastClosedPartMinutesAgo:
           lastPart?.ended_at == null ? null : (Date.now() - Date.parse(lastPart.ended_at)) / 60_000,
         asrBacklog: this.#jobs.pendingCount('asr'),
+        failedJobs: this.#jobs.deadCount(),
         outboxPending: this.#outbox.pendingCount(),
+        failedOutbox: this.#outbox.deadCount(),
         lastDeliveryMinutesAgo:
           lastDelivery === null ? null : (Date.now() - Date.parse(lastDelivery)) / 60_000,
         diskFreeGb: await diskFreeGb(this.#options.loaded.paths.root),
@@ -978,6 +986,7 @@ export class Daemon {
     const parts = new PartRepository(this.#db.handle);
     const lastPart = parts.lastFinalized();
     const snapshot = this.#recorder.snapshot();
+    const deadJobs = this.#jobs.deadJobs();
 
     return {
       recorderRunning: this.#recorder.running && this.#recorderFailure === null,
@@ -990,7 +999,8 @@ export class Daemon {
       ollamaDetail: this.#llmReadiness.detail,
       activeSessionMs: snapshot.sessionStartedMonotonicMs,
       asrBacklogMinutes: this.#jobs.oldestPendingAgeMinutes('asr'),
-      deadJobs: this.#jobs.deadCount(),
+      deadJobs: deadJobs.length,
+      deadJobAlert: renderDeadJobAlert(hostname(), deadJobs, config.llm.model),
       outboxAgeMinutes: this.#outbox.oldestPendingAgeMinutes(),
       deadOutbox: this.#outbox.deadCount(),
       diskFreeGb: await diskFreeGb(paths.root),
@@ -1033,7 +1043,12 @@ export class Daemon {
       if (check.status !== 'healthy') recordHealthEvent(this.#db.handle, check);
     }
 
-    const conditions: { id: AlertId; active: boolean; detail: string }[] = [
+    const conditions: {
+      id: AlertId;
+      active: boolean;
+      detail: string;
+      fingerprint?: string;
+    }[] = [
       {
         id: 'recorder_stale',
         active:
@@ -1047,7 +1062,16 @@ export class Daemon {
       {
         id: 'worker_crashed',
         active: !inputs.workerReady,
-        detail: inputs.workerDetail,
+        detail: renderAsrUnavailableDetail(hostname(), inputs.workerDetail),
+        fingerprint: inputs.workerReady ? '' : `asr:${failureCategory(inputs.workerDetail)}`,
+      },
+      {
+        id: 'llm_unavailable',
+        active: !inputs.ollamaReady,
+        detail: renderLlmUnavailableDetail(hostname(), inputs.ollamaDetail, config.llm.model),
+        fingerprint: inputs.ollamaReady
+          ? ''
+          : `ollama:${config.llm.model}:${failureCategory(inputs.ollamaDetail)}`,
       },
       {
         id: 'disk_low',
@@ -1056,18 +1080,21 @@ export class Daemon {
       },
       {
         id: 'asr_backlog',
-        active: inputs.asrBacklogMinutes > config.health.asrBacklogMinutes || inputs.deadJobs > 0,
-        detail:
-          inputs.deadJobs > 0
-            ? `задач без попыток: ${inputs.deadJobs}`
-            : `старейшая задача ${Math.round(inputs.asrBacklogMinutes)} мин`,
+        active: inputs.asrBacklogMinutes > config.health.asrBacklogMinutes,
+        detail: `старейшая задача ${Math.round(inputs.asrBacklogMinutes)} мин`,
+      },
+      {
+        id: 'dead_jobs',
+        active: inputs.deadJobAlert.active,
+        detail: inputs.deadJobAlert.detail,
+        fingerprint: inputs.deadJobAlert.fingerprint,
       },
       {
         id: 'telegram_delivery',
         active: inputs.outboxAgeMinutes > config.health.outboxStaleMinutes || inputs.deadOutbox > 0,
         detail:
           inputs.deadOutbox > 0
-            ? `сообщений без попыток: ${inputs.deadOutbox}`
+            ? `сообщений с исчерпанными попытками: ${inputs.deadOutbox}`
             : `старейшее сообщение ${Math.round(inputs.outboxAgeMinutes)} мин`,
       },
       {
@@ -1089,8 +1116,12 @@ export class Daemon {
     }
   }
 
-  #processHealthAlert(condition: { id: AlertId; active: boolean; detail: string }): void {
-    const decision = this.#alerts.evaluate(condition.id, condition.active);
+  #processHealthAlert(condition: {
+    id: AlertId;
+    active: boolean;
+    detail: string;
+    fingerprint?: string;
+  }): void {
     if (condition.id === 'telegram_delivery' && condition.active) {
       retirePendingAlertDeliveries(
         this.#db.handle,
@@ -1098,20 +1129,20 @@ export class Daemon {
         'Telegram delivery alerts stay local while delivery is delayed',
       );
     }
-    if (!decision.send || decision.transition === 'none') return;
-    if (!shouldEnqueueHealthAlert(condition.id, decision.transition)) {
-      this.#options.logger.warn('Telegram delivery is delayed; alert kept local', {
-        detail: condition.detail,
-      });
-      return;
-    }
-    const alert = renderAlert(
-      condition.id,
-      decision.transition,
-      condition.active ? condition.detail : '',
-      Date.now(),
-    );
-    transaction(this.#db.handle, () => {
+    this.#alerts.evaluate(condition.id, condition.active, condition.fingerprint, (decision) => {
+      if (decision.transition === 'none') return;
+      if (!shouldEnqueueHealthAlert(condition.id, decision.transition)) {
+        this.#options.logger.warn('Telegram delivery is delayed; alert kept local', {
+          detail: condition.detail,
+        });
+        return;
+      }
+      const alert = renderAlert(
+        condition.id,
+        decision.transition,
+        condition.active ? condition.detail : '',
+        Date.now(),
+      );
       retirePendingAlertDeliveries(
         this.#db.handle,
         condition.id,
@@ -1361,7 +1392,7 @@ export function retirePendingAlertDeliveries(
 
 export function shouldEnqueueHealthAlert(
   alertId: AlertId,
-  transition: 'raised' | 'cleared' | 'repeated',
+  transition: 'raised' | 'cleared' | 'changed' | 'repeated',
 ): boolean {
   // An outage cannot report itself through the unavailable channel. Queueing
   // the warning only makes a stale warning arrive after recovery and can grow

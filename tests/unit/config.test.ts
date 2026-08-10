@@ -167,6 +167,16 @@ describe('config parsing', () => {
     }
   });
 
+  it('accepts only command-safe Ollama model identifiers', () => {
+    assert.equal(
+      parseConfig({ llm: { model: 'registry/team-model:27b' } }).llm.model,
+      'registry/team-model:27b',
+    );
+    for (const model of ['qwen3.6:27b\nopen -a Calculator', '-danger', 'model;whoami', '']) {
+      assert.throws(() => parseConfig({ llm: { model } }), /llm\.model/, model);
+    }
+  });
+
   it('rejects unsafe timeout, interval and retention values', () => {
     const invalidConfigs = [
       { asr: { pythonWorkerTimeoutMs: 0 } },
