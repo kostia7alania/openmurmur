@@ -12,6 +12,7 @@ import { JobQueue } from '../jobs/queue.ts';
 import type { Logger } from '../logging/logger.ts';
 import { formatBytes } from '../telegram/format.ts';
 import { Outbox } from '../telegram/outbox.ts';
+import { proveTemporaryAudioOwnership } from '../telegram/outbox-recovery.ts';
 import { sha256File } from './writer.ts';
 
 /**
@@ -111,60 +112,29 @@ interface TemporaryAudioOwnershipProof {
   readonly paths: ReadonlySet<string>;
 }
 
-function ownedTemporaryAudioPaths(db: DatabaseSync, logger: Logger): TemporaryAudioOwnershipProof {
-  let rows: { outbox_id: string; payload: string }[];
+function ownedTemporaryAudioPaths(
+  db: DatabaseSync,
+  paths: Paths,
+  logger: Logger,
+): TemporaryAudioOwnershipProof {
+  let proof: ReturnType<typeof proveTemporaryAudioOwnership>;
   try {
-    rows = db
-      .prepare(
-        "SELECT outbox_id, payload FROM telegram_outbox WHERE state IN ('pending','sending') AND kind = 'audio'",
-      )
-      .all() as { outbox_id: string; payload: string }[];
+    proof = proveTemporaryAudioOwnership(db, paths);
   } catch (error) {
-    logger.error('active audio outbox ownership is unreadable; preserving every split artifact', {
+    logger.error('audio outbox ownership is unreadable; preserving every split artifact', {
       error: (error as Error).message,
       action: 'Repair the outbox database error before rerunning split recovery.',
     });
     return { certain: false, paths: new Set() };
   }
-
-  const owned = new Set<string>();
-  const ambiguousOutboxIds: string[] = [];
-
-  for (const row of rows) {
-    let payload: unknown;
-    try {
-      payload = JSON.parse(row.payload);
-    } catch {
-      ambiguousOutboxIds.push(row.outbox_id);
-      continue;
-    }
-    if (typeof payload !== 'object' || payload === null) {
-      ambiguousOutboxIds.push(row.outbox_id);
-      continue;
-    }
-    const record = payload as Record<string, unknown>;
-    if (
-      record['type'] !== 'document' ||
-      typeof record['path'] !== 'string' ||
-      record['path'].length === 0
-    ) {
-      ambiguousOutboxIds.push(row.outbox_id);
-      continue;
-    }
-
-    // deleteAfterSend controls terminal cleanup, not whether an in-flight
-    // delivery still needs the file it names.
-    owned.add(resolve(record['path']));
-  }
-
-  if (ambiguousOutboxIds.length > 0) {
-    logger.error('active audio outbox ownership is ambiguous; preserving every split artifact', {
-      outboxIds: ambiguousOutboxIds,
+  if (!proof.certain) {
+    logger.error('audio outbox ownership is ambiguous; preserving every split artifact', {
+      outboxIds: proof.ambiguousOutboxIds,
       action: 'Repair or retire the listed outbox rows before rerunning split recovery.',
     });
-    return { certain: false, paths: owned };
+    return { certain: false, paths: proof.paths };
   }
-  return { certain: true, paths: owned };
+  return { certain: true, paths: proof.paths };
 }
 
 export async function findOrphanedParts(
@@ -183,7 +153,7 @@ export async function findOrphanedParts(
   const orphans: OrphanedPart[] = [];
   const hasSplitArtifacts = entries.some((entry) => SPLIT_ARTIFACT_PATTERN.test(entry));
   const ownedSplitPaths = hasSplitArtifacts
-    ? ownedTemporaryAudioPaths(db, logger)
+    ? ownedTemporaryAudioPaths(db, paths, logger)
     : { certain: true, paths: new Set<string>() };
   for (const entry of entries) {
     const path = join(paths.tempDir, entry);
@@ -682,7 +652,7 @@ export async function recoverAfterCrash(
   if (options.remove) {
     for (const orphan of orphans) {
       if (SPLIT_ARTIFACT_PATTERN.test(orphan.path)) {
-        const ownership = ownedTemporaryAudioPaths(db, logger);
+        const ownership = ownedTemporaryAudioPaths(db, paths, logger);
         if (!ownership.certain || ownership.paths.has(resolve(orphan.path))) {
           preservedPaths.add(orphan.path);
           continue;

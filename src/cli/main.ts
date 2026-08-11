@@ -40,6 +40,11 @@ import { TelegramClient, type TelegramUpdate } from '../telegram/client.ts';
 import { keychain, telegramBotScope } from '../telegram/keychain.ts';
 import { Outbox, type OutboxPayload } from '../telegram/outbox.ts';
 import {
+  inspectDeadOutbox,
+  renderDeadOutboxReport,
+  retryDeadOutbox,
+} from '../telegram/outbox-recovery.ts';
+import {
   applyTelegramDeliveryReconciliation,
   listUnacknowledgedTelegramDeliveries,
   renderUnacknowledgedTelegramDeliveries,
@@ -92,6 +97,8 @@ Work
   jobs failed            Show exhausted background jobs and their causes.
   jobs retry JOB_ID      Re-queue one exhausted job after fixing its cause.
   jobs retry JOB_ID --language CODE  Retry ASR/incoming audio as ru, th, en or zh.
+  outbox failed          Safely inspect exhausted Telegram deliveries.
+  outbox retry DELIVERY_PART_ID  Re-queue one exact dead Telegram delivery after duplicate-risk acknowledgement.
   delivery reconcile     Report legacy delivered audio held without an exact ACK time.
   delivery reconcile apply  Set a selected exact ACK with confirmation and audit evidence.
   delivery reconcile-remote  Report outbox rows whose remote Telegram status is unknown.
@@ -107,6 +114,7 @@ Options
   --root DIR             Override the state directory (default: OPENMURMUR_HOME).
   --json                 Machine-readable output where supported.
   --yes                  Skip the confirmation prompt.
+  --accept-duplicate-risk  Required with --yes for JSON outbox retry.
   --limit N              Maximum search results (default 20).
   --since ISO --until ISO  Restrict search to a time range.
   --language CODE        Force ru, th, en or zh when retrying ASR/incoming audio.
@@ -125,6 +133,7 @@ async function main(argv: readonly string[]): Promise<number> {
       root: { type: 'string' },
       json: { type: 'boolean', default: false },
       yes: { type: 'boolean', default: false },
+      'accept-duplicate-risk': { type: 'boolean', default: false },
       limit: { type: 'string' },
       since: { type: 'string' },
       until: { type: 'string' },
@@ -223,6 +232,9 @@ async function main(argv: readonly string[]): Promise<number> {
 
     case 'jobs':
       return jobsCommand(loaded, positionals[1], positionals[2], values['language'], asJson);
+
+    case 'outbox':
+      return outboxCommand(loaded, positionals.slice(1), values, values['yes'] === true, asJson);
 
     case 'delivery':
       return deliveryCommand(
@@ -711,6 +723,112 @@ function jobsCommand(
   }
 }
 
+async function outboxCommand(
+  loaded: Awaited<ReturnType<typeof loadConfig>>,
+  args: readonly string[],
+  values: Record<string, unknown>,
+  yes: boolean,
+  asJson: boolean,
+): Promise<number> {
+  const parsed = parseOutboxCommand(args, values['delivery-part']);
+  if ('error' in parsed) {
+    process.stderr.write(`${parsed.error}\n`);
+    return 1;
+  }
+  const { subcommand, selector } = parsed;
+  const db = openDatabase({ file: loaded.paths.databaseFile });
+  try {
+    const report = inspectDeadOutbox(db.handle, loaded.paths, {
+      ...(selector === undefined ? {} : { deliveryPartId: selector }),
+    });
+    if (subcommand === 'failed') {
+      process.stdout.write(
+        asJson ? `${JSON.stringify(report, null, 2)}\n` : `${renderDeadOutboxReport(report)}\n`,
+      );
+      return 0;
+    }
+
+    const expected = report.deliveries[0];
+    if (expected === undefined) {
+      process.stderr.write('No dead Telegram delivery found for that exact id.\n');
+      return 1;
+    }
+    if (!expected.retryable) {
+      process.stderr.write(
+        `Dead Telegram delivery cannot be retried safely: ${expected.blockedReason ?? 'unknown reason'}.\n`,
+      );
+      return 1;
+    }
+    if (asJson && (!yes || values['accept-duplicate-risk'] !== true)) {
+      process.stderr.write(
+        'JSON retry requires --yes and --accept-duplicate-risk after independent ACK reconciliation.\n',
+      );
+      return 1;
+    }
+    if (!asJson) {
+      process.stdout.write(`${renderDeadOutboxReport(report)}\n\n`);
+      process.stdout.write(`Warning: ${OUTBOX_RETRY_WARNING}\n`);
+    }
+    if (!(await confirmOutboxRetry(yes, expected.deliveryPartId))) {
+      process.stdout.write('Cancelled. No outbox facts were changed.\n');
+      return 1;
+    }
+
+    await assertDaemonStoppedForOutboxMutation(loaded, 'retrying a dead Telegram delivery');
+    const result = retryDeadOutbox(
+      db.handle,
+      loaded.paths,
+      selector ?? '',
+      expected.snapshotSha256,
+    );
+    process.stdout.write(
+      asJson
+        ? `${JSON.stringify({ ...result, requeued: true, warning: OUTBOX_RETRY_WARNING }, null, 2)}\n`
+        : `Re-queued ${result.deliveryPartId}. It will run when the OpenMurmur daemon is running.\n`,
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+const OUTBOX_RETRY_WARNING =
+  'Telegram remote status is unknown. Reconcile an independently proven ACK first; retrying may duplicate a message Telegram already accepted.';
+
+async function confirmOutboxRetry(yes: boolean, deliveryPartId: string): Promise<boolean> {
+  return yes || (await confirm(`\nRe-queue exact Telegram delivery ${deliveryPartId}? [y/N] `));
+}
+
+type ParsedOutboxCommand =
+  | { readonly subcommand: 'failed'; readonly selector: string | undefined }
+  | { readonly subcommand: 'retry'; readonly selector: string }
+  | { readonly error: string };
+
+function parseOutboxCommand(args: readonly string[], option: unknown): ParsedOutboxCommand {
+  const [subcommand, positional, ...extra] = args;
+  if (subcommand !== 'failed' && subcommand !== 'retry') {
+    return {
+      error: 'Usage: pnpm openmurmur outbox <failed [--delivery-part ID]|retry DELIVERY_PART_ID>',
+    };
+  }
+  if (extra.length > 0) {
+    return { error: 'Outbox commands do not accept extra positional arguments.' };
+  }
+  const selected = typeof option === 'string' ? option.trim() : undefined;
+  if (selected !== undefined && selected.length === 0) {
+    return { error: '--delivery-part requires one non-empty exact id.' };
+  }
+  if (subcommand === 'failed') {
+    return positional === undefined
+      ? { subcommand, selector: selected }
+      : { error: 'Use --delivery-part ID to scope the failed outbox report.' };
+  }
+  if (positional === undefined || positional.trim().length === 0 || selected !== undefined) {
+    return { error: 'Retry requires one exact positional DELIVERY_PART_ID.' };
+  }
+  return { subcommand, selector: positional.trim() };
+}
+
 function retryDeadJob(
   jobs: JobQueue,
   jobId: string | undefined,
@@ -886,16 +1004,15 @@ function remoteReconciliationProof(values: Record<string, unknown>): {
   return { telegramMessageId, acknowledgedAt, operatorId, evidence };
 }
 
-async function assertDaemonStoppedForReconciliation(
+async function assertDaemonStoppedForOutboxMutation(
   loaded: Awaited<ReturnType<typeof loadConfig>>,
+  action: string,
 ): Promise<void> {
   const record = await readDaemonPid(loaded.paths.pidFile);
   if (record === null) return;
   const state = await inspectDaemonProcess(record.pid, record.processBirth);
   if (state.alive) {
-    throw new Error(
-      `stop the OpenMurmur daemon before reconciling remote delivery (pid ${record.pid})`,
-    );
+    throw new Error(`stop the OpenMurmur daemon before ${action} (pid ${record.pid})`);
   }
 }
 
@@ -994,7 +1111,7 @@ async function telegramDeliveryReconciliationCommand(
       return 1;
     }
 
-    await assertDaemonStoppedForReconciliation(loaded);
+    await assertDaemonStoppedForOutboxMutation(loaded, 'reconciling remote delivery');
     const result = applyTelegramDeliveryReconciliation(db.handle, {
       deliveryPartId: deliveryPartId ?? '',
       telegramMessageId: proof.telegramMessageId,

@@ -668,7 +668,7 @@ describe('outbox delivery', () => {
     assert.equal(existsSync(filePath), false);
   });
 
-  it('removes an ephemeral split when delivery permanently fails', async () => {
+  it('retains an ephemeral split when delivery permanently fails', async () => {
     const path = join(dir, 'dead.split000.flac');
     writeFileSync(path, Buffer.alloc(100));
     const { fetch: impl } = scriptedFetch([badRequest]);
@@ -686,7 +686,7 @@ describe('outbox delivery', () => {
     });
 
     assert.equal(await drainOutbox(d), 0);
-    assert.equal(existsSync(path), false);
+    assert.equal(existsSync(path), true, 'a dead row still owns its exact retry artifact');
     assert.equal(d.outbox.deadCount(), 1);
   });
 

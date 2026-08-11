@@ -340,7 +340,6 @@ export async function drainOutbox(deps: OutboxWorkerDeps, budget = 25): Promise<
           });
           continue;
         }
-        await cleanupEphemeralPayload(payload, deps.logger);
         deps.logger.error('telegram send reached a terminal outcome', {
           kind: row.kind,
           deliveryPartId: row.delivery_part_id,
@@ -361,7 +360,6 @@ export async function drainOutbox(deps: OutboxWorkerDeps, budget = 25): Promise<
         break;
       }
       const outcome = deps.outbox.markFailed(row, err.message, row.attempts, row.max_attempts);
-      if (outcome === 'dead') await cleanupEphemeralPayload(payload, deps.logger);
       deps.logger.warn('telegram send failed', {
         kind: row.kind,
         outcome,

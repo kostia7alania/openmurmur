@@ -103,16 +103,26 @@ function seedAudioOutbox(
   id: string,
   state: 'pending' | 'sending' | 'sent' | 'dead',
   payload: Record<string, unknown>,
+  identity: { readonly deliveryPartId?: string; readonly sessionId?: string } = {},
 ): void {
   const now = nowIso();
   db.handle
     .prepare(
       `INSERT INTO telegram_outbox
-         (outbox_id, delivery_part_id, kind, ordinal, payload, state,
+         (outbox_id, delivery_part_id, session_id, kind, ordinal, payload, state,
           run_after, created_at, updated_at)
-       VALUES (?, ?, 'audio', 0, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, 'audio', 0, ?, ?, ?, ?, ?)`,
     )
-    .run(id, `audio:${id}`, JSON.stringify(payload), state, now, now, now);
+    .run(
+      id,
+      identity.deliveryPartId ?? `audio:${id}`,
+      identity.sessionId ?? null,
+      JSON.stringify(payload),
+      state,
+      now,
+      now,
+      now,
+    );
 }
 
 describe('crash recovery', () => {
@@ -161,34 +171,62 @@ describe('crash recovery', () => {
     );
   });
 
-  it('keeps live outbox-owned splits and removes unowned or terminal ones', async () => {
+  it('keeps pending, sending, and dead outbox-owned splits while removing unowned ones', async () => {
     const stale = seedOrphan('session.p000.split000.flac', 100);
-    const pending = seedOrphan('session.p000.split001.flac', 100);
-    const sending = seedOrphan('session.p000.split002.flac', 100);
-    const dead = seedOrphan('session.p000.split003.flac', 100);
-    seedAudioOutbox('pending-owner', 'pending', {
-      type: 'document',
-      path: pending,
-      filename: 'session.p000.split001.flac',
-    });
-    seedAudioOutbox('sending-owner', 'sending', {
-      type: 'document',
-      path: sending,
-      filename: 'session.p000.split002.flac',
-      deleteAfterSend: true,
-    });
-    seedAudioOutbox('dead-owner', 'dead', {
-      type: 'document',
-      path: dead,
-      filename: 'session.p000.split003.flac',
-      deleteAfterSend: true,
-    });
+    const pending = seedOrphan('pending.p000.split000.flac', 100);
+    const sending = seedOrphan('sending.p000.split000.flac', 100);
+    const dead = seedOrphan('dead.p000.split000.flac', 100);
+    for (const sessionId of ['pending', 'sending', 'dead']) {
+      seedLiveSession(sessionId, 1);
+      db.handle
+        .prepare("UPDATE audio_sessions SET state = 'DONE' WHERE session_id = ?")
+        .run(sessionId);
+    }
+    seedAudioOutbox(
+      'pending-owner',
+      'pending',
+      {
+        type: 'document',
+        path: pending,
+        filename: 'pending.p000.split000.flac',
+        partId: 'pending-p0',
+        deleteAfterSend: true,
+      },
+      { deliveryPartId: 'audio:pending-p0:split0', sessionId: 'pending' },
+    );
+    seedAudioOutbox(
+      'sending-owner',
+      'sending',
+      {
+        type: 'document',
+        path: sending,
+        filename: 'sending.p000.split000.flac',
+        partId: 'sending-p0',
+        deleteAfterSend: true,
+      },
+      { deliveryPartId: 'audio:sending-p0:split0', sessionId: 'sending' },
+    );
+    seedAudioOutbox(
+      'dead-owner',
+      'dead',
+      {
+        type: 'document',
+        path: dead,
+        filename: 'dead.p000.split000.flac',
+        partId: 'dead-p0',
+        deleteAfterSend: true,
+      },
+      { deliveryPartId: 'audio:dead-p0:split0', sessionId: 'dead' },
+    );
 
     const report = await recoverAfterCrash(db.handle, paths(), nullLogger, { remove: true });
-    assert.deepEqual(report.orphans.map((orphan) => orphan.path).sort(), [dead, stale].sort());
-    assert.equal(report.removed, 2);
+    assert.deepEqual(
+      report.orphans.map((orphan) => orphan.path),
+      [stale],
+    );
+    assert.equal(report.removed, 1);
     assert.equal(existsSync(stale), false);
-    assert.equal(existsSync(dead), false);
+    assert.equal(existsSync(dead), true, 'an exact dead delivery remains available for retry');
     assert.equal(existsSync(pending), true);
     assert.equal(existsSync(sending), true);
   });
@@ -229,18 +267,32 @@ describe('crash recovery', () => {
     assert.equal(existsSync(source), true);
   });
 
-  it('preserves every split but still recovers .part files when ownership is ambiguous', async () => {
+  it('preserves every split when a parseable dead owner has a mismatched path', async () => {
     const split = seedOrphan('ambiguous.p000.split005.flac', 100);
     const partial = seedOrphan('01J-AMBIGUOUS.p000.flac.part', 200);
+    seedLiveSession('broken', 1);
+    db.handle.prepare("UPDATE audio_sessions SET state = 'DONE' WHERE session_id = 'broken'").run();
     const now = nowIso();
+    const wrongPath = join(dir, 'outside-temp', 'broken.p000.split000.flac');
     db.handle
       .prepare(
         `INSERT INTO telegram_outbox
-           (outbox_id, delivery_part_id, kind, ordinal, payload,
-            run_after, created_at, updated_at)
-         VALUES ('broken-owner', 'audio:broken:split5', 'audio', 0, '{', ?, ?, ?)`,
+           (outbox_id, delivery_part_id, session_id, kind, ordinal, payload,
+            state, run_after, created_at, updated_at)
+         VALUES ('broken-owner', 'audio:broken-p0:split0', 'broken', 'audio', 0, ?, 'dead', ?, ?, ?)`,
       )
-      .run(now, now, now);
+      .run(
+        JSON.stringify({
+          type: 'document',
+          path: wrongPath,
+          filename: 'broken.p000.split000.flac',
+          partId: 'broken-p0',
+          deleteAfterSend: true,
+        }),
+        now,
+        now,
+        now,
+      );
     const records: Record<string, unknown>[] = [];
     const logger = createLogger({
       level: 'debug',
@@ -264,21 +316,31 @@ describe('crash recovery', () => {
   });
 
   it('rechecks ownership immediately before deleting a stale split', async () => {
-    const split = seedOrphan('raced.p000.split006.flac', 100);
+    const split = seedOrphan('raced.p000.split000.flac', 100);
     let ownershipReads = 0;
     const guardedDb = new Proxy(db.handle, {
       get(target, property) {
         if (property === 'prepare') {
           return (sql: string) => {
-            if (sql.includes('SELECT outbox_id, payload FROM telegram_outbox')) {
+            if (sql.includes("WHERE state IN ('pending','sending','dead')")) {
               ownershipReads += 1;
               if (ownershipReads === 2) {
-                seedAudioOutbox('late-owner', 'pending', {
-                  type: 'document',
-                  path: split,
-                  filename: 'raced.p000.split006.flac',
-                  deleteAfterSend: true,
-                });
+                seedLiveSession('raced', 1);
+                db.handle
+                  .prepare("UPDATE audio_sessions SET state = 'DONE' WHERE session_id = 'raced'")
+                  .run();
+                seedAudioOutbox(
+                  'late-owner',
+                  'pending',
+                  {
+                    type: 'document',
+                    path: split,
+                    filename: 'raced.p000.split000.flac',
+                    partId: 'raced-p0',
+                    deleteAfterSend: true,
+                  },
+                  { deliveryPartId: 'audio:raced-p0:split0', sessionId: 'raced' },
+                );
               }
             }
             return target.prepare(sql);
