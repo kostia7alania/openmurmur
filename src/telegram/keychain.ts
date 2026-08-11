@@ -180,6 +180,74 @@ export interface TelegramSecrets {
   readonly chatId: number;
 }
 
+export type TelegramSetupReadiness =
+  | { readonly status: 'configured'; readonly format: 'combined' | 'legacy' }
+  | { readonly status: 'not_configured' }
+  | { readonly status: 'incomplete_legacy' }
+  | { readonly status: 'inaccessible'; readonly detail: string };
+
+export interface TelegramSetupReadinessProvider {
+  inspect(): Promise<TelegramSetupReadiness>;
+}
+
+export interface KeychainMetadataResult {
+  readonly code: number;
+  readonly stderr: string;
+}
+
+export type KeychainMetadataCommand = (args: readonly string[]) => Promise<KeychainMetadataResult>;
+
+type MetadataLookup =
+  | { readonly status: 'found' }
+  | { readonly status: 'missing' }
+  | { readonly status: 'inaccessible'; readonly detail: string };
+
+/**
+ * Checks only generic-password metadata. Omitting `-g`/`-w` is deliberate:
+ * password-data access can show macOS authorization UI, which a read-only
+ * diagnostics command must never surprise the operator with.
+ */
+export function createTelegramSetupReadinessProbe(
+  command: KeychainMetadataCommand,
+): TelegramSetupReadinessProvider {
+  const lookup = async (account: string): Promise<MetadataLookup> => {
+    try {
+      const result = await command(['find-generic-password', '-a', account, '-s', SERVICE]);
+      if (result.code === 0) return { status: 'found' };
+      if (result.code === ITEM_NOT_FOUND) return { status: 'missing' };
+      return {
+        status: 'inaccessible',
+        detail: result.stderr.trim().split('\n')[0] || `security exited ${result.code}`,
+      };
+    } catch (error) {
+      return {
+        status: 'inaccessible',
+        detail: (error as Error).message.split('\n')[0] ?? 'Keychain metadata lookup failed',
+      };
+    }
+  };
+
+  return {
+    async inspect(): Promise<TelegramSetupReadiness> {
+      const combined = await lookup(ACCOUNT_SECRETS);
+      if (combined.status === 'inaccessible') return combined;
+      if (combined.status === 'found') return { status: 'configured', format: 'combined' };
+
+      const token = await lookup(ACCOUNT_TOKEN);
+      if (token.status === 'inaccessible') return token;
+      const chatId = await lookup(ACCOUNT_CHAT_ID);
+      if (chatId.status === 'inaccessible') return chatId;
+      if (token.status === 'found' && chatId.status === 'found') {
+        return { status: 'configured', format: 'legacy' };
+      }
+      if (token.status === 'found' || chatId.status === 'found') {
+        return { status: 'incomplete_legacy' };
+      }
+      return { status: 'not_configured' };
+    },
+  };
+}
+
 /** Stable, non-secret credential identity used to scope Telegram update state. */
 export function telegramBotScope(token: string): string {
   return createHash('sha256').update(token, 'utf8').digest('hex').slice(0, 32);
@@ -289,6 +357,11 @@ const securityBackend: SecretStorageBackend = {
 };
 
 export const keychain = createTelegramKeychain(securityBackend);
+
+export const keychainSetupReadiness = createTelegramSetupReadinessProbe(async (args) => {
+  const result = await run(SECURITY_BIN, args);
+  return { code: result.code, stderr: result.stderr };
+});
 
 /**
  * Secrets provider indirection so tests, `--dry-run` and CI never touch the

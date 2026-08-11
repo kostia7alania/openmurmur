@@ -5,6 +5,7 @@ import { extname, join, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { TelegramAudioLike, TelegramClient, TelegramMessage } from './client.ts';
+import { formatBytes, formatDuration } from './format.ts';
 
 /**
  * Ingest of audio a user sends to the bot.
@@ -277,24 +278,34 @@ export function validateProbe(probe: ProbeResult | null, limits: DownloadLimits)
   return probe;
 }
 
-export function rejectionMessage(reason: IncomingRejection, detail: string): string {
+/**
+ * Stable chat copy for an incoming-file rejection.
+ *
+ * The exception detail is deliberately not accepted here: it may contain an
+ * ffmpeg error, a Telegram response or a local path. Callers keep that detail
+ * in the redacted local log while the chat receives only bounded product copy.
+ */
+export function rejectionMessage(reason: IncomingRejection, limits: DownloadLimits): string {
   switch (reason) {
     case 'too_large_declared':
     case 'too_large_actual':
       return (
         '⚠️ Файл слишком большой.\n\n' +
-        `${detail}\n\n` +
-        'Если используется официальный Cloud Bot API, предел входящего файла — 20 MB. ' +
-        'Для больших файлов запустите локальный Telegram Bot API server и увеличьте ' +
+        `Лимит этого бота: ${formatBytes(limits.maxIncomingBytes)}.\n\n` +
+        'Если бот использует официальный Cloud Bot API, его предел входящего файла — 20 MB. ' +
+        'Для больших файлов нужен локальный Telegram Bot API server и больший ' +
         '`telegram.maxIncomingBytes`.'
       );
     case 'too_long':
-      return `⚠️ Запись слишком длинная.\n\n${detail}`;
+      return (
+        '⚠️ Запись слишком длинная.\n\n' +
+        `Максимальная длительность: ${formatDuration(limits.maxDurationSeconds * 1000)}.`
+      );
     case 'unsupported_media':
     case 'unsupported_codec':
-      return `⚠️ Формат не поддерживается.\n\n${detail}\n\nПоддерживаются: ${SUPPORTED_EXTENSIONS.join(', ')}`;
+      return `⚠️ Формат не поддерживается.\n\nПоддерживаются: ${SUPPORTED_EXTENSIONS.join(', ')}`;
     case 'corrupt_media':
-      return `⚠️ Файл не читается.\n\n${detail}`;
+      return '⚠️ Файл не читается.\n\nПроверьте аудио и отправьте файл ещё раз.';
     case 'no_audio_stream':
       return '⚠️ В файле нет аудиодорожки.';
     case 'not_allowlisted':

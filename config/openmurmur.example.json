@@ -8,7 +8,6 @@
     "minSpeechSeconds": 3,
     "minTranscriptWords": 5,
     "vadThreshold": 0.5,
-    "vadFrameMs": 32,
     "vadBackend": "silero"
   },
   "audio": {
@@ -51,8 +50,7 @@
     "longPollSeconds": 25,
     "receiveUpdates": true,
     "maxIncomingDurationSeconds": 7200,
-    "maxConcurrentIncomingJobs": 2,
-    "summarizeIncoming": true
+    "maxConcurrentIncomingJobs": 2
   },
   "retention": {
     "sessionAudioHours": 48,

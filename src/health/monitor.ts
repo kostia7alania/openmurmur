@@ -13,6 +13,7 @@ export interface HealthCheck {
 export interface HealthInputs {
   readonly recorderRunning: boolean;
   readonly msSinceLastFrame: number | null;
+  readonly processingLagMs: number | null;
   readonly minutesSinceLastClosedPart: number | null;
   readonly workerReady: boolean;
   readonly workerDetail: string;
@@ -58,6 +59,17 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
     });
   } else {
     checks.push({ component: 'recorder', status: 'healthy', detail: 'receiving audio' });
+  }
+
+  if (inputs.processingLagMs !== null) {
+    const lagging = inputs.processingLagMs > config.recorderStaleSeconds * 1000;
+    checks.push({
+      component: 'capture_pipeline',
+      status: lagging ? 'degraded' : 'healthy',
+      detail: lagging
+        ? `processing is ${Math.round(inputs.processingLagMs / 1000)}s behind capture`
+        : 'keeping up with capture',
+    });
   }
 
   checks.push({
@@ -138,13 +150,85 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
 /** The short `/health` reply: one line per non-healthy component. */
 export function renderHealthLines(report: HealthReport): string {
   const problems = report.checks.filter((c) => c.status !== 'healthy');
-  if (problems.length === 0) return 'OK';
+  if (problems.length === 0) return '✅ Всё в порядке';
   return problems
     .map((c) => {
-      const level = c.status === 'failed' ? 'ERROR' : 'WARN';
-      return `${level}: ${c.component} — ${c.detail}`;
+      const level = c.status === 'failed' ? 'ОШИБКА' : 'ВНИМАНИЕ';
+      return `${level}: ${healthComponentLabel(c.component)} — ${healthDetail(c)}`;
     })
     .join('\n');
+}
+
+const HEALTH_COMPONENT_LABELS: Readonly<Record<string, string>> = {
+  recorder: 'запись',
+  capture_pipeline: 'обработка аудио',
+  asr_worker: 'распознавание',
+  dead_jobs: 'очередь задач',
+  llm: 'отчёты',
+  dead_outbox: 'доставка Telegram',
+  asr_backlog: 'очередь распознавания',
+  telegram_outbox: 'очередь Telegram',
+  disk: 'диск',
+  sqlite: 'база данных',
+  digest: 'дайджест',
+};
+
+function healthComponentLabel(component: string): string {
+  return HEALTH_COMPONENT_LABELS[component] ?? 'компонент';
+}
+
+/**
+ * Keeps raw adapter/process errors in health events and logs, never in chat.
+ * Only bounded numeric facts from our own health evaluator cross the boundary.
+ */
+function healthDetail(check: HealthCheck): string {
+  const count = firstNumber(check.detail);
+  switch (check.component) {
+    case 'recorder':
+      if (check.status === 'recovering') return 'ожидаю первый аудиокадр';
+      return count === null ? 'процесс записи не работает' : `нет аудиокадров ${count} сек`;
+    case 'capture_pipeline':
+      return count === null
+        ? 'обработка не успевает за записью'
+        : `обработка отстаёт на ${count} сек`;
+    case 'asr_worker':
+      return 'локальный ASR недоступен';
+    case 'dead_jobs':
+      return count === null
+        ? 'есть задачи, исчерпавшие попытки'
+        : `${count} ${russianCount(count, 'задача', 'задачи', 'задач')} исчерпали попытки`;
+    case 'llm':
+      return 'локальные отчёты недоступны; транскрипты продолжат работать';
+    case 'dead_outbox':
+      return count === null
+        ? 'есть сообщения, исчерпавшие попытки'
+        : `${count} ${russianCount(count, 'сообщение', 'сообщения', 'сообщений')} не доставлены`;
+    case 'asr_backlog':
+      return count === null ? 'очередь растёт' : `старейшей задаче ${count} мин`;
+    case 'telegram_outbox':
+      return count === null ? 'очередь растёт' : `старейшему сообщению ${count} мин`;
+    case 'disk':
+      return count === null ? 'мало свободного места' : `свободно ${count} ГБ`;
+    case 'sqlite':
+      return 'база данных недоступна для записи';
+    case 'digest':
+      return count === null ? 'дайджест не сформирован' : `последний дайджест ${count} ч назад`;
+    default:
+      return 'требует внимания';
+  }
+}
+
+function firstNumber(detail: string): number | null {
+  const match = /\d+/.exec(detail);
+  return match === null ? null : Number(match[0]);
+}
+
+function russianCount(count: number, one: string, few: string, many: string): string {
+  const lastTwo = count % 100;
+  if (lastTwo >= 11 && lastTwo <= 14) return many;
+  const last = count % 10;
+  if (last === 1) return one;
+  return last >= 2 && last <= 4 ? few : many;
 }
 
 export async function diskFreeGb(path: string): Promise<number> {

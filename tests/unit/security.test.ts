@@ -14,6 +14,7 @@ import {
   extractAttachment,
   IncomingRejected,
   quarantinePathFor,
+  rejectionMessage,
   safeExtension,
   validateProbe,
 } from '../../src/telegram/incoming.ts';
@@ -85,6 +86,37 @@ describe('path traversal in incoming filenames', () => {
 
 describe('incoming media validation', () => {
   const limits = { maxIncomingBytes: 20 * 1024 * 1024, maxDurationSeconds: 7200 };
+
+  it('renders stable Russian rejection copy without exposing technical errors', () => {
+    const detail = 'ffprobe failed at /Users/alice/private/audio.bin: ECONNRESET';
+    const messages = {
+      tooLarge: rejectionMessage('too_large_actual', limits),
+      tooLong: rejectionMessage('too_long', limits),
+      unsupported: rejectionMessage('unsupported_codec', limits),
+      corrupt: rejectionMessage('corrupt_media', limits),
+    };
+
+    assert.equal(
+      messages.tooLarge,
+      '⚠️ Файл слишком большой.\n\n' +
+        'Лимит этого бота: 20.0 MB.\n\n' +
+        'Если бот использует официальный Cloud Bot API, его предел входящего файла — 20 MB. ' +
+        'Для больших файлов нужен локальный Telegram Bot API server и больший `telegram.maxIncomingBytes`.',
+    );
+    assert.equal(
+      messages.tooLong,
+      '⚠️ Запись слишком длинная.\n\nМаксимальная длительность: 2 ч 0 мин.',
+    );
+    assert.equal(
+      messages.unsupported,
+      '⚠️ Формат не поддерживается.\n\nПоддерживаются: .ogg, .opus, .mp3, .m4a, .aac, .wav, .flac',
+    );
+    assert.equal(
+      messages.corrupt,
+      '⚠️ Файл не читается.\n\nПроверьте аудио и отправьте файл ещё раз.',
+    );
+    assert.ok(!Object.values(messages).some((message) => message.includes(detail)));
+  });
 
   it('rejects media ffprobe could not read', () => {
     assert.throws(() => validateProbe(null, limits), /could not read/);

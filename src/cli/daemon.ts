@@ -15,6 +15,7 @@ import { recoverAfterCrash } from '../capture/recovery.ts';
 import type { LoadedConfig } from '../config/load.ts';
 import { type Database, openDatabase, transaction } from '../database/db.ts';
 import {
+  appendIncomingTranscript,
   IncomingFileRepository,
   type IncomingFileRow,
   PartRepository,
@@ -77,7 +78,7 @@ import {
   renderProvenanceHtml,
   renderProvenancePlain,
 } from '../telegram/provenance.ts';
-import { HELP_TEXT, renderStatus } from '../telegram/report.ts';
+import { HELP_TEXT, renderCaptureFailure, renderStatus } from '../telegram/report.ts';
 import {
   markUpdateHandled,
   nextOffsetFor,
@@ -94,6 +95,7 @@ import {
 } from '../telegram/settings.ts';
 import { writeTextAtomically } from '../util/atomic-file.ts';
 import { createAsrBackend, createLlmBackend, createVadBackend } from './backends.ts';
+import { writeDaemonHeartbeat } from './status.ts';
 import { VERSION } from './version.ts';
 
 const DIGEST_TICK_INTERVAL_MS = 5 * 60 * 1000;
@@ -147,6 +149,7 @@ export class Daemon {
   #workersClosePromise: Promise<void> | null = null;
   #storageClosePromise: Promise<void> | null = null;
   #pidClaimed = false;
+  #daemonStartedAt: string | null = null;
   #stopPromise: Promise<void> | null = null;
   #nextSecretsRetryAt = 0;
   #telegramUnavailable = false;
@@ -228,8 +231,9 @@ export class Daemon {
       finishStartupPhase = resolve;
     });
     try {
-      await claimDaemonPid(paths.pidFile, paths.root);
+      const identity = await claimDaemonPid(paths.pidFile, paths.root);
       this.#pidClaimed = true;
+      this.#daemonStartedAt = identity.startedAt;
       if (this.#stopping) return;
       const staleNoticeCutoff = new Date().toISOString();
 
@@ -257,6 +261,7 @@ export class Daemon {
         'superseded by the next daemon startup',
       );
       this.#reconcileDeadAsrSessions();
+      this.#reconcileDeadIncomingFiles();
       if (reclaimedJobs > 0 || reclaimedSends > 0 || retiredStaleNotices > 0) {
         logger.info('recovered work from a previous run', {
           reclaimedJobs,
@@ -325,10 +330,7 @@ export class Daemon {
     } catch (error) {
       this.#recorderFailure = (error as Error).message;
       logger.error('capture failed', { error: this.#recorderFailure });
-      const heading = this.#announcedRecording
-        ? '🔴 Запись остановлена'
-        : '🔴 Запись не запустилась';
-      await this.#sendNow(`${heading}\n\n${this.#recorderFailure.slice(0, 900)}`);
+      await this.#sendNow(renderCaptureFailure(this.#announcedRecording));
       throw new Error(`capture failed: ${this.#recorderFailure}`, { cause: error });
     }
   }
@@ -424,6 +426,7 @@ export class Daemon {
       if (this.#pidClaimed) {
         await releaseDaemonPid(this.#options.loaded.paths.pidFile, process.pid);
         this.#pidClaimed = false;
+        this.#daemonStartedAt = null;
       }
     } finally {
       this.#db.close();
@@ -565,6 +568,9 @@ export class Daemon {
       const outcome = this.#jobs.fail(job.jobId, (error as Error).message);
       if (job.kind === 'asr' && outcome === 'dead') {
         markExhaustedAsrSession(this.#db.handle, job.payload);
+      }
+      if (job.kind === 'incoming_audio' && outcome === 'dead') {
+        markExhaustedIncomingFile(this.#db.handle, job.payload);
       }
       this.#options.logger.warn('job failed', {
         kind: job.kind,
@@ -722,6 +728,10 @@ export class Daemon {
           this.#capture.msSinceLastFrame() === null
             ? null
             : (this.#capture.msSinceLastFrame() ?? 0) / 1000,
+        processingLagSeconds:
+          this.#capture.processingLagMs() === null
+            ? null
+            : (this.#capture.processingLagMs() ?? 0) / 1000,
         sessionState: snapshot.state,
         sessionElapsedMs:
           snapshot.sessionStartedMonotonicMs === null
@@ -863,11 +873,25 @@ export class Daemon {
         maxDurationSeconds: config.telegram.maxIncomingDurationSeconds,
       });
 
+      incomingFiles.reserveNormalizedPath(
+        incoming.fileUid,
+        join(paths.quarantineDir, `${incoming.fileUid}.16k.wav`),
+      );
+      incoming = incomingFiles.get(incoming.fileUid);
+      if (incoming === undefined)
+        throw new Error('incoming audio disappeared before normalization');
+
       const wavPath = await ensureIncomingWav(
         config.audio.ffmpegPath,
+        config.audio.ffprobePath,
         quarantinePath,
-        paths.quarantineDir,
         incoming,
+      );
+      incomingFiles.markNormalized(
+        incoming.fileUid,
+        wavPath,
+        probe.formatName,
+        Math.round(probe.durationSeconds * 1000),
       );
 
       const forcedLanguage = forcedLanguageFromPayload(payload, this.#asrLanguage);
@@ -878,54 +902,50 @@ export class Daemon {
         ...(config.asr.context.length > 0 ? { context: config.asr.context } : {}),
       });
       const reconciledLanguages = reconcileLanguages(result.languages, result.text).languages;
+      const transcriptIncoming = incoming;
 
-      new TranscriptRepository(this.#db.handle).append({
-        incomingFileId: incoming.fileUid,
-        engine: result.engine,
-        model: result.model,
-        languages: reconciledLanguages,
-        forcedLanguage,
-        text: result.text,
-        segments: result.segments.map((s) => ({
-          startMs: s.startMs,
-          endMs: s.endMs,
-          timestampSource: s.timestampSource,
-          language: s.language,
-          text: s.text,
-        })),
-      });
-
-      this.#db.handle
-        .prepare(
-          `UPDATE incoming_telegram_files
-              SET state = 'transcribed', normalized_path = ?, probed_format = ?,
-                  duration_ms = ?, updated_at = ?
-            WHERE file_uid = ?`,
-        )
-        .run(
-          wavPath,
-          probe.formatName,
-          Math.round(probe.durationSeconds * 1000),
-          new Date().toISOString(),
-          incoming.fileUid,
-        );
-
-      this.#enqueueIncomingTranscript(
-        incoming,
-        result.text,
-        result.segments,
-        reconciledLanguages,
-        forcedLanguage,
+      appendIncomingTranscript(
+        this.#db.handle,
+        {
+          incomingFileId: incoming.fileUid,
+          engine: result.engine,
+          model: result.model,
+          languages: reconciledLanguages,
+          forcedLanguage,
+          text: result.text,
+          segments: result.segments.map((s) => ({
+            startMs: s.startMs,
+            endMs: s.endMs,
+            timestampSource: s.timestampSource,
+            language: s.language,
+            text: s.text,
+          })),
+        },
+        () => {
+          this.#enqueueIncomingTranscript(
+            transcriptIncoming,
+            result.text,
+            result.segments,
+            reconciledLanguages,
+            forcedLanguage,
+          );
+        },
       );
     } catch (error) {
       // The only undefined assignment above is a failed reload after download;
       // there is then no durable row whose state can truthfully be changed.
       if (incoming === undefined) throw error;
       if (error instanceof IncomingRejected) {
+        this.#options.logger.info('incoming Telegram media rejected', {
+          fileUid: incoming.fileUid,
+          reason: error.reason,
+          detail: error.message,
+        });
         this.#enqueueText(
-          `${rejectionMessage(error.reason, error.message)}\n\n${renderProvenancePlain(
-            incomingTelegramProvenance(incoming),
-          )}`.trim(),
+          `${rejectionMessage(error.reason, {
+            maxIncomingBytes: config.telegram.maxIncomingBytes,
+            maxDurationSeconds: config.telegram.maxIncomingDurationSeconds,
+          })}\n\n${renderProvenancePlain(incomingTelegramProvenance(incoming))}`.trim(),
           `reject:${attachment.fileUniqueId}`,
         );
         this.#db.handle
@@ -936,11 +956,7 @@ export class Daemon {
           .run(error.reason, new Date().toISOString(), incoming.fileUid);
         return;
       }
-      this.#db.handle
-        .prepare(
-          "UPDATE incoming_telegram_files SET state = 'failed', updated_at = ? WHERE file_uid = ?",
-        )
-        .run(new Date().toISOString(), incoming.fileUid);
+      incomingFiles.markFailedIfUntranscribed(incoming.fileUid);
       throw error;
     }
   }
@@ -991,6 +1007,7 @@ export class Daemon {
     return {
       recorderRunning: this.#recorder.running && this.#recorderFailure === null,
       msSinceLastFrame: this.#capture.msSinceLastFrame(),
+      processingLagMs: this.#capture.processingLagMs(),
       minutesSinceLastClosedPart:
         lastPart?.ended_at == null ? null : (Date.now() - Date.parse(lastPart.ended_at)) / 60_000,
       workerReady: asrHealth.ok,
@@ -1035,6 +1052,7 @@ export class Daemon {
   }
 
   async #tickHealth(): Promise<void> {
+    this.#writeHeartbeat();
     const inputs = await this.#collectHealth();
     const config = this.#options.loaded.config;
     const report = evaluateHealth(inputs, config.health);
@@ -1114,6 +1132,21 @@ export class Daemon {
     for (const condition of conditions) {
       this.#processHealthAlert(condition);
     }
+  }
+
+  #writeHeartbeat(): void {
+    const daemonStartedAt = this.#daemonStartedAt;
+    if (daemonStartedAt === null) return;
+    const snapshot = this.#recorder.snapshot();
+    writeDaemonHeartbeat(this.#db.handle, {
+      daemonPid: process.pid,
+      daemonStartedAt,
+      recorderRunning: this.#recorder.running && this.#recorderFailure === null,
+      sessionState: snapshot.state,
+      lastSourceFrameAgeMs: this.#capture.msSinceLastFrame(),
+      processingLagMs: this.#capture.processingLagMs(),
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   #processHealthAlert(condition: {
@@ -1261,7 +1294,9 @@ export class Daemon {
       if (this.#stopping) return false;
       if (secrets === null) {
         if (!this.#telegramUnavailable) {
-          this.#options.logger.warn('Telegram is not configured; run `openmurmur setup telegram`');
+          this.#options.logger.warn(
+            'Telegram is not configured; run `pnpm openmurmur setup telegram` from the repository checkout',
+          );
         }
         this.#telegramUnavailable = true;
         return false;
@@ -1338,6 +1373,24 @@ export class Daemon {
         );
       } catch (error) {
         this.#options.logger.warn('could not reconcile an exhausted ASR job', {
+          error: (error as Error).message,
+        });
+      }
+    }
+  }
+
+  #reconcileDeadIncomingFiles(): void {
+    const rows = this.#db.handle
+      .prepare("SELECT payload FROM jobs WHERE kind = 'incoming_audio' AND state = 'dead'")
+      .all() as { payload: string }[];
+    for (const row of rows) {
+      try {
+        markExhaustedIncomingFile(
+          this.#db.handle,
+          JSON.parse(row.payload) as Record<string, unknown>,
+        );
+      } catch (error) {
+        this.#options.logger.warn('could not reconcile an exhausted incoming audio job', {
           error: (error as Error).message,
         });
       }
@@ -1432,6 +1485,51 @@ export function markExhaustedAsrSession(
   });
 }
 
+/**
+ * Turns a permanently failed incoming-audio job into one bounded chat notice.
+ * The retry error remains in jobs.last_error and the local log; it never
+ * becomes user-visible Telegram copy.
+ */
+export function markExhaustedIncomingFile(
+  db: Database['handle'],
+  payload: Record<string, unknown>,
+): boolean {
+  const fileUid = payload['fileUid'];
+  if (typeof fileUid !== 'string' || fileUid.length === 0) return false;
+
+  return transaction(db, () => {
+    const incoming = new IncomingFileRepository(db).get(fileUid);
+    if (
+      incoming === undefined ||
+      incoming.state === 'delivered' ||
+      incoming.state === 'transcribed' ||
+      incoming.state === 'rejected'
+    ) {
+      return false;
+    }
+
+    db.prepare(
+      `UPDATE incoming_telegram_files
+          SET state = 'failed', rejection_reason = COALESCE(rejection_reason, 'processing_failed'),
+              updated_at = ?
+        WHERE file_uid = ?`,
+    ).run(new Date().toISOString(), fileUid);
+    new Outbox(db).enqueue({
+      deliveryPartId: `incoming-failed:${fileUid}`,
+      kind: 'status',
+      ordinal: 20,
+      payload: {
+        type: 'text',
+        text:
+          '🔴 Не удалось обработать аудио после нескольких попыток.\n\n' +
+          'Технические подробности сохранены в локальном журнале.\n\n' +
+          renderProvenancePlain(incomingTelegramProvenance(incoming)),
+      },
+    });
+    return true;
+  });
+}
+
 export function expectedDigestIsMissing(
   db: Database['handle'],
   epochMs: number,
@@ -1465,13 +1563,14 @@ export interface DaemonPidRecord {
   readonly pid: number;
   readonly root: string | null;
   readonly startedAt: string | null;
+  readonly processBirth: string | null;
 }
 
 export function parseDaemonPid(value: string): DaemonPidRecord | null {
   const trimmed = value.trim();
   if (/^\d+$/.test(trimmed)) {
     const pid = Number.parseInt(trimmed, 10);
-    return pid > 0 ? { pid, root: null, startedAt: null } : null;
+    return pid > 0 ? { pid, root: null, startedAt: null, processBirth: null } : null;
   }
 
   try {
@@ -1479,9 +1578,16 @@ export function parseDaemonPid(value: string): DaemonPidRecord | null {
     const pid = parsed['pid'];
     const root = parsed['root'];
     const startedAt = parsed['startedAt'];
+    const processBirth = parsed['processBirth'];
     if (!Number.isInteger(pid) || (pid as number) <= 0) return null;
     if (typeof root !== 'string' || typeof startedAt !== 'string') return null;
-    return { pid: pid as number, root, startedAt };
+    if (processBirth !== undefined && typeof processBirth !== 'string') return null;
+    return {
+      pid: pid as number,
+      root,
+      startedAt,
+      processBirth: processBirth ?? null,
+    };
   } catch {
     return null;
   }
@@ -1499,36 +1605,74 @@ export function commandLooksLikeOpenMurmurDaemon(command: string): boolean {
   return command.toLowerCase().includes('openmurmur') && /(?:^|\s)start(?:\s|$)/.test(command);
 }
 
+export function processIdentityMatches(
+  command: string | null,
+  actualBirth: string | null,
+  expectedBirth: string | null,
+): boolean {
+  return (
+    command !== null &&
+    actualBirth !== null &&
+    expectedBirth !== null &&
+    actualBirth === expectedBirth &&
+    commandLooksLikeOpenMurmurDaemon(command)
+  );
+}
+
 export async function inspectDaemonProcess(
   pid: number,
-): Promise<{ alive: boolean; identityMatches: boolean; command: string | null }> {
+  expectedBirth: string | null,
+): Promise<{
+  alive: boolean;
+  identityMatches: boolean;
+  command: string | null;
+  processBirth: string | null;
+}> {
   try {
     process.kill(pid, 0);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EPERM') {
-      return { alive: false, identityMatches: false, command: null };
+      return { alive: false, identityMatches: false, command: null, processBirth: null };
     }
   }
 
-  const command = await processCommand(pid);
+  const [command, processBirth] = await Promise.all([processCommand(pid), processBirthMarker(pid)]);
   return {
     alive: true,
-    identityMatches: command !== null && commandLooksLikeOpenMurmurDaemon(command),
+    identityMatches: processIdentityMatches(command, processBirth, expectedBirth),
     command,
+    processBirth,
   };
 }
 
-export async function claimDaemonPid(pidFile: string, root: string): Promise<void> {
-  const record = JSON.stringify({
+interface DaemonPidClaimDependencies {
+  readonly birthMarker?: (pid: number) => Promise<string | null>;
+  readonly inspect?: typeof inspectDaemonProcess;
+}
+
+export async function claimDaemonPid(
+  pidFile: string,
+  root: string,
+  dependencies: DaemonPidClaimDependencies = {},
+): Promise<DaemonPidRecord> {
+  const birthMarker = dependencies.birthMarker ?? processBirthMarker;
+  const inspect = dependencies.inspect ?? inspectDaemonProcess;
+  const processBirth = await birthMarker(process.pid);
+  if (processBirth === null) {
+    throw new Error('could not establish daemon process birth identity');
+  }
+  const identity = {
     pid: process.pid,
     root,
     startedAt: new Date().toISOString(),
-  });
+    processBirth,
+  } satisfies DaemonPidRecord;
+  const record = JSON.stringify(identity);
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await writeFile(pidFile, `${record}\n`, { mode: 0o600, flag: 'wx' });
-      return;
+      return identity;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
@@ -1538,7 +1682,7 @@ export async function claimDaemonPid(pidFile: string, root: string): Promise<voi
       throw new Error(`daemon pid file is invalid; inspect and remove it manually: ${pidFile}`);
     }
 
-    const processState = await inspectDaemonProcess(existing.pid);
+    const processState = await inspect(existing.pid, existing.processBirth);
     if (processState.alive) {
       const detail = processState.identityMatches
         ? 'OpenMurmur is already running'
@@ -1722,11 +1866,7 @@ function forcedLanguageFromPayload(
 }
 
 function markIncomingTranscribed(db: Database['handle'], fileUid: string): void {
-  db.prepare(
-    `UPDATE incoming_telegram_files
-        SET state = 'transcribed', updated_at = ?
-      WHERE file_uid = ? AND state <> 'delivered'`,
-  ).run(new Date().toISOString(), fileUid);
+  new IncomingFileRepository(db).markTranscribed(fileUid);
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -1740,16 +1880,26 @@ async function pathExists(path: string): Promise<boolean> {
 
 async function ensureIncomingWav(
   ffmpegPath: string,
+  ffprobePath: string,
   quarantinePath: string,
-  quarantineDir: string,
   incoming: IncomingFileRow,
 ): Promise<string> {
-  const wavPath = incoming.normalizedPath ?? join(quarantineDir, `${incoming.fileUid}.16k.wav`);
-  if (incoming.normalizedPath === null) {
-    // A pre-atomic-version crash may have left this deterministic path partial.
-    await rm(wavPath, { force: true });
+  const wavPath = incoming.normalizedPath;
+  if (wavPath === null) throw new Error('incoming normalized path was not reserved');
+  if (await pathExists(wavPath)) {
+    const existing = await probeAudio(ffprobePath, wavPath);
+    if (
+      existing !== null &&
+      existing.codec === 'pcm_s16le' &&
+      existing.formatName.split(',').includes('wav') &&
+      existing.channels === 1 &&
+      existing.sampleRate === 16_000 &&
+      Number.isFinite(existing.durationSeconds) &&
+      existing.durationSeconds >= 0
+    ) {
+      return wavPath;
+    }
   }
-  if (await pathExists(wavPath)) return wavPath;
   if (!(await normalizeToWav(ffmpegPath, quarantinePath, wavPath))) {
     throw new IncomingRejected('corrupt_media', 'could not decode the audio');
   }
@@ -1759,13 +1909,26 @@ async function ensureIncomingWav(
 function processCommand(pid: number): Promise<string | null> {
   return new Promise((resolve) => {
     try {
-      execFile('ps', ['-p', String(pid), '-o', 'command='], (error, stdout) => {
+      execFile('/bin/ps', ['-p', String(pid), '-o', 'command='], (error, stdout) => {
         if (error !== null) {
           resolve(null);
           return;
         }
         const command = stdout.trim();
         resolve(command.length > 0 ? command : null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function processBirthMarker(pid: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    try {
+      execFile('/bin/ps', ['-p', String(pid), '-o', 'lstart='], (error, stdout) => {
+        const marker = stdout.trim();
+        resolve(error || marker.length === 0 ? null : marker);
       });
     } catch {
       resolve(null);

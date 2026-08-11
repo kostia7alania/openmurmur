@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { commitTelegramSetup, drainUpdateBacklog, waitForStart } from '../../src/cli/setup.ts';
+import {
+  commitTelegramSetup,
+  drainUpdateBacklog,
+  renderSetupCompletion,
+  renderTelegramSetupCompletion,
+  waitForStart,
+} from '../../src/cli/setup.ts';
 import { openDatabase } from '../../src/database/db.ts';
 import type { TelegramUpdate } from '../../src/telegram/client.ts';
 import {
@@ -27,6 +33,37 @@ function update(
     },
   };
 }
+
+describe('setup completion output', () => {
+  it('leads a fresh setup through Telegram to one verifiable ambient session', () => {
+    const output = renderSetupCompletion();
+    const expectedInOrder = [
+      'pnpm openmurmur setup telegram',
+      'pnpm openmurmur capture test',
+      'pnpm openmurmur start',
+      'speak for more than 3 seconds',
+      'wait for 60 seconds of silence',
+      'source FLAC, then transcript, then report',
+    ];
+
+    let previous = -1;
+    for (const text of expectedInOrder) {
+      const index = output.indexOf(text);
+      assert.ok(index > previous, `expected "${text}" after the previous onboarding step`);
+      previous = index;
+    }
+  });
+
+  it('continues a completed Telegram setup without promising a global binary', () => {
+    const output = renderTelegramSetupCompletion({ botUsername: 'murmur_bot', chatId: 42 });
+
+    assert.match(output, /^✅ Connected @murmur_bot, chat 42$/m);
+    assert.doesNotMatch(output, /setup telegram/);
+    assert.match(output, /pnpm openmurmur capture test/);
+    assert.match(output, /pnpm openmurmur start/);
+    assert.doesNotMatch(output, /(^|\n)\s*(?:\d+\.\s+)?openmurmur\s/m);
+  });
+});
 
 describe('Telegram setup ownership handshake', () => {
   it('drains every pre-existing update batch before asking for /start', async () => {
@@ -132,6 +169,34 @@ function memorySecrets(initial: TelegramSecrets | null): {
 }
 
 describe('Telegram setup persistence', () => {
+  it('publishes the matching scoped offset before the Keychain pair', async () => {
+    const db = openDatabase({ file: ':memory:' });
+    const next = { token: 'new-token', chatId: 20 } as const;
+    let stored: TelegramSecrets | null = null;
+    const store: SecretsStore = {
+      async load() {
+        return null;
+      },
+      async storeSecrets(secrets) {
+        assert.equal(
+          readOffset(db.handle, telegramBotScope(secrets.token)),
+          101,
+          'a hard death after this Keychain publish must leave a matching cursor',
+        );
+        stored = secrets;
+      },
+      async clear() {
+        stored = null;
+      },
+    };
+    try {
+      await commitTelegramSetup(db.handle, store, next, 101, async () => {});
+      assert.deepEqual(stored, next);
+    } finally {
+      db.close();
+    }
+  });
+
   it('stores one credential pair and its matching update offset on success', async () => {
     const db = openDatabase({ file: ':memory:' });
     const secrets = memorySecrets(null);
@@ -206,6 +271,58 @@ describe('Telegram setup persistence', () => {
         /Keychain write failed/,
       );
       assert.equal(readOffset(db.handle, oldBotScope), 7);
+      assert.throws(
+        () => readOffset(db.handle, telegramBotScope('new-token')),
+        /Telegram update offset is missing.*setup telegram/,
+        'failed credentials must not leave an apparently configured cursor',
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it('restores the prior cursor when the same bot credential write fails', async () => {
+    const db = openDatabase({ file: ':memory:' });
+    const old = { token: 'same-token', chatId: 10 } as const;
+    const scope = telegramBotScope(old.token);
+    writeOffset(db.handle, 7, scope);
+    const store: SecretsStore = {
+      async load() {
+        return old;
+      },
+      async storeSecrets() {
+        assert.equal(readOffset(db.handle, scope), 101);
+        throw new Error('Keychain write failed');
+      },
+      async clear() {
+        assert.fail('an atomic failed write needs no destructive rollback');
+      },
+    };
+    try {
+      await assert.rejects(
+        commitTelegramSetup(
+          db.handle,
+          store,
+          { token: old.token, chatId: 20 },
+          101,
+          async () => {},
+        ),
+        /Keychain write failed/,
+      );
+      assert.equal(readOffset(db.handle, scope), 7);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('fails closed when a configured credential scope has no durable cursor', () => {
+    const db = openDatabase({ file: ':memory:' });
+    try {
+      assert.throws(
+        () => readOffset(db.handle, telegramBotScope('interrupted-token')),
+        /Telegram update offset is missing.*pnpm openmurmur setup telegram/,
+      );
+      assert.equal(readOffset(db.handle), 0, 'only the pre-scoping legacy cursor defaults to zero');
     } finally {
       db.close();
     }

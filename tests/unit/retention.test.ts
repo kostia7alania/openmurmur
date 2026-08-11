@@ -554,6 +554,7 @@ describe('health evaluation', () => {
   const base = {
     recorderRunning: true,
     msSinceLastFrame: 100,
+    processingLagMs: 0,
     minutesSinceLastClosedPart: 2,
     workerReady: true,
     workerDetail: 'ready',
@@ -572,7 +573,7 @@ describe('health evaluation', () => {
   it('reports OK when everything is fine', () => {
     const report = evaluateHealth(base, DEFAULT_CONFIG.health);
     assert.equal(report.overall, 'healthy');
-    assert.equal(renderHealthLines(report), 'OK');
+    assert.equal(renderHealthLines(report), '✅ Всё в порядке');
   });
 
   it('fails when audio has stopped arriving', () => {
@@ -581,7 +582,7 @@ describe('health evaluation', () => {
       DEFAULT_CONFIG.health,
     );
     assert.equal(report.overall, 'failed');
-    assert.match(renderHealthLines(report), /ERROR: recorder/);
+    assert.equal(renderHealthLines(report), 'ОШИБКА: запись — нет аудиокадров 960 сек');
   });
 
   it('is "recovering", not "failed", before the first frame arrives', () => {
@@ -590,15 +591,46 @@ describe('health evaluation', () => {
     assert.equal(report.overall, 'recovering');
   });
 
+  it('distinguishes downstream processing lag from a silent microphone', () => {
+    const report = evaluateHealth({ ...base, processingLagMs: 16_000 }, DEFAULT_CONFIG.health);
+    assert.equal(report.overall, 'degraded');
+    assert.equal(
+      renderHealthLines(report),
+      'ВНИМАНИЕ: обработка аудио — обработка отстаёт на 16 сек',
+    );
+    assert.equal(report.checks.find((check) => check.component === 'recorder')?.status, 'healthy');
+  });
+
   it('warns on low disk without failing', () => {
     const report = evaluateHealth({ ...base, diskFreeGb: 5 }, DEFAULT_CONFIG.health);
     assert.equal(report.overall, 'degraded');
-    assert.match(renderHealthLines(report), /WARN: disk/);
+    assert.equal(renderHealthLines(report), 'ВНИМАНИЕ: диск — свободно 5 ГБ');
   });
 
   it('warns on ASR backlog', () => {
     const report = evaluateHealth({ ...base, asrBacklogMinutes: 63 }, DEFAULT_CONFIG.health);
-    assert.match(renderHealthLines(report), /WARN: asr_backlog — oldest job 63 min old/);
+    assert.equal(
+      renderHealthLines(report),
+      'ВНИМАНИЕ: очередь распознавания — старейшей задаче 63 мин',
+    );
+  });
+
+  it('keeps raw adapter failures out of the Russian chat boundary', () => {
+    const report = evaluateHealth(
+      {
+        ...base,
+        workerReady: false,
+        workerDetail: 'spawn failed: /Users/alice/private/model.bin',
+        ollamaReady: false,
+        ollamaDetail: 'ECONNREFUSED 127.0.0.1:11434',
+      },
+      DEFAULT_CONFIG.health,
+    );
+    assert.equal(
+      renderHealthLines(report),
+      'ОШИБКА: распознавание — локальный ASR недоступен\n' +
+        'ВНИМАНИЕ: отчёты — локальные отчёты недоступны; транскрипты продолжат работать',
+    );
   });
 
   it('makes exhausted jobs and messages visible', () => {

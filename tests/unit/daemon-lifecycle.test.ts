@@ -5,13 +5,16 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import {
   claimDaemonPid,
+  claimIncomingRequest,
   commandLooksLikeOpenMurmurDaemon,
   enqueueIncomingRequest,
   expectedDigestIsMissing,
   findIncomingFile,
   incomingFileUidFromDeliveryPart,
   markExhaustedAsrSession,
+  markExhaustedIncomingFile,
   parseDaemonPid,
+  processIdentityMatches,
   readDaemonPid,
   reconcileIncomingDelivery,
   recordIncomingDownload,
@@ -22,8 +25,13 @@ import {
   shouldEnqueueHealthAlert,
 } from '../../src/cli/daemon.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
+import { appendIncomingTranscript, IncomingFileRepository } from '../../src/database/repository.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
 import { Outbox } from '../../src/telegram/outbox.ts';
+import {
+  incomingTelegramProvenance,
+  renderProvenancePlain,
+} from '../../src/telegram/provenance.ts';
 import { recordUpdate } from '../../src/telegram/router.ts';
 
 let dir: string;
@@ -41,12 +49,31 @@ afterEach(() => {
 
 describe('daemon PID ownership', () => {
   it('reads legacy and identity-bearing PID records', () => {
-    assert.deepEqual(parseDaemonPid('123\n'), { pid: 123, root: null, startedAt: null });
+    assert.deepEqual(parseDaemonPid('123\n'), {
+      pid: 123,
+      root: null,
+      startedAt: null,
+      processBirth: null,
+    });
     assert.deepEqual(parseDaemonPid('{"pid":456,"root":"/state","startedAt":"now"}'), {
       pid: 456,
       root: '/state',
       startedAt: 'now',
+      processBirth: null,
     });
+    assert.deepEqual(
+      parseDaemonPid('{"pid":456,"root":"/state","startedAt":"now","processBirth":"birth-1"}'),
+      {
+        pid: 456,
+        root: '/state',
+        startedAt: 'now',
+        processBirth: 'birth-1',
+      },
+    );
+    assert.equal(
+      parseDaemonPid('{"pid":456,"root":"/state","startedAt":"now","processBirth":123}'),
+      null,
+    );
     assert.equal(parseDaemonPid('not-a-pid'), null);
   });
 
@@ -57,15 +84,33 @@ describe('daemon PID ownership', () => {
     );
     assert.equal(commandLooksLikeOpenMurmurDaemon('/opt/node unrelated.ts start'), false);
     assert.equal(commandLooksLikeOpenMurmurDaemon('/opt/openmurmur status'), false);
+    assert.equal(processIdentityMatches('/opt/openmurmur start', 'birth-1', 'birth-1'), true);
+    assert.equal(
+      processIdentityMatches('/opt/openmurmur start', 'birth-2', 'birth-1'),
+      false,
+      'a reused PID must not inherit the previous daemon identity',
+    );
+    assert.equal(processIdentityMatches('/opt/openmurmur start', 'birth-1', null), false);
   });
 
   it('claims the PID file exclusively and only its owner releases it', async () => {
     const pidFile = join(dir, 'daemon.pid');
-    await claimDaemonPid(pidFile, dir);
-    assert.equal((await readDaemonPid(pidFile))?.pid, process.pid);
+    const dependencies = {
+      birthMarker: async () => 'birth-1',
+      inspect: async () => ({
+        alive: true,
+        identityMatches: false,
+        command: 'test process',
+        processBirth: 'birth-1',
+      }),
+    };
+    await claimDaemonPid(pidFile, dir, dependencies);
+    const claimed = await readDaemonPid(pidFile);
+    assert.equal(claimed?.pid, process.pid);
+    assert.ok(claimed?.processBirth);
 
     await assert.rejects(
-      claimDaemonPid(pidFile, dir),
+      claimDaemonPid(pidFile, dir, dependencies),
       /refusing to replace/,
       'a second daemon must not overwrite a live owner',
     );
@@ -263,6 +308,127 @@ describe('incoming Telegram retry identity', () => {
       count: number;
     };
     assert.equal(count.count, 1);
+  });
+
+  it('reserves normalized ownership before publication and keeps it across restart', () => {
+    const message = {
+      message_id: 11,
+      date: 0,
+      chat: { id: 42, type: 'private' },
+      voice: { file_id: 'atomic-file', file_unique_id: 'atomic-unique' },
+    };
+    const incoming = claimIncomingRequest(db.handle, 11, message, 'test-host');
+    assert.ok(incoming);
+    const files = new IncomingFileRepository(db.handle);
+    const quarantinePath = join(dir, `${incoming.fileUid}.ogg`);
+    const normalizedPath = join(dir, `${incoming.fileUid}.16k.wav`);
+    files.markDownloaded(incoming.fileUid, quarantinePath, 12);
+    files.reserveNormalizedPath(incoming.fileUid, normalizedPath);
+
+    db.close();
+    db = openDatabase({ file: join(dir, 'test.db') });
+    assert.equal(
+      new IncomingFileRepository(db.handle).get(incoming.fileUid)?.normalizedPath,
+      normalizedPath,
+    );
+  });
+
+  it('rolls back transcript state and outbox together, then retries once', () => {
+    const message = {
+      message_id: 12,
+      date: 0,
+      chat: { id: 42, type: 'private' },
+      voice: { file_id: 'atomic-file', file_unique_id: 'atomic-unique' },
+    };
+    const incoming = claimIncomingRequest(db.handle, 12, message, 'test-host');
+    assert.ok(incoming);
+    const files = new IncomingFileRepository(db.handle);
+    const quarantinePath = join(dir, `${incoming.fileUid}.ogg`);
+    const normalizedPath = join(dir, `${incoming.fileUid}.16k.wav`);
+    files.markDownloaded(incoming.fileUid, quarantinePath, 12);
+    files.reserveNormalizedPath(incoming.fileUid, normalizedPath);
+    files.markNormalized(incoming.fileUid, normalizedPath, 'ogg', 1_000);
+    db.handle.exec(`CREATE TRIGGER fail_incoming_outbox
+      BEFORE INSERT ON telegram_outbox
+      WHEN NEW.delivery_part_id = 'incoming:${incoming.fileUid}:1'
+      BEGIN SELECT RAISE(ABORT, 'simulated incoming outbox failure'); END`);
+
+    const append = () =>
+      appendIncomingTranscript(
+        db.handle,
+        {
+          incomingFileId: incoming.fileUid,
+          engine: 'fake',
+          model: 'fake',
+          languages: ['en'],
+          text: 'hello',
+          segments: [],
+        },
+        () => {
+          new Outbox(db.handle).enqueue({
+            deliveryPartId: `incoming:${incoming.fileUid}:1`,
+            kind: 'incoming_transcript',
+            ordinal: 10,
+            payload: { type: 'text', text: 'hello' },
+          });
+        },
+      );
+
+    assert.throws(append, /simulated incoming outbox failure/);
+    files.markFailedIfUntranscribed(incoming.fileUid);
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT count(*) AS count FROM transcript_revisions WHERE incoming_file_id = ?')
+          .get(incoming.fileUid) as { count: number }
+      ).count,
+      0,
+    );
+    assert.deepEqual(
+      { ...files.get(incoming.fileUid) },
+      {
+        ...incoming,
+        state: 'failed',
+        quarantinePath,
+        normalizedPath,
+      },
+      'the retry retains exact DB ownership of both audio files',
+    );
+    assert.equal(
+      (
+        db.handle
+          .prepare(
+            "SELECT count(*) AS count FROM telegram_outbox WHERE kind = 'incoming_transcript'",
+          )
+          .get() as { count: number }
+      ).count,
+      0,
+    );
+
+    db.handle.exec('DROP TRIGGER fail_incoming_outbox');
+    assert.doesNotThrow(append);
+    files.markFailedIfUntranscribed(incoming.fileUid);
+    assert.equal(files.get(incoming.fileUid)?.state, 'transcribed');
+    assert.equal(markExhaustedIncomingFile(db.handle, { fileUid: incoming.fileUid }), false);
+    assert.equal(files.get(incoming.fileUid)?.normalizedPath, normalizedPath);
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT count(*) AS count FROM transcript_revisions WHERE incoming_file_id = ?')
+          .get(incoming.fileUid) as { count: number }
+      ).count,
+      1,
+    );
+    assert.equal(
+      (
+        db.handle
+          .prepare(
+            "SELECT count(*) AS count FROM telegram_outbox WHERE kind = 'incoming_transcript'",
+          )
+          .get() as { count: number }
+      ).count,
+      1,
+    );
   });
 
   it('marks incoming audio delivered only after every transcript chunk is sent', () => {
@@ -474,6 +640,42 @@ describe('daemon terminal state reconciliation', () => {
       .get() as { count: number; state: string };
     assert.equal(status.count, 1);
     assert.equal(status.state, 'pending');
+  });
+
+  it('reports an exhausted incoming-audio job without exposing its retry error', () => {
+    const message = {
+      message_id: 77,
+      date: Date.parse('2026-08-11T12:00:00.000Z') / 1000,
+      chat: { id: 42, type: 'private' },
+      voice: {
+        file_id: 'incoming-failure-file',
+        file_unique_id: 'incoming-failure-unique',
+      },
+    };
+    const incoming = enqueueIncomingRequest(db.handle, 707, message, 'capture-mac');
+    const technicalError = 'ffmpeg failed at /Users/alice/private/audio.bin';
+    db.handle
+      .prepare("UPDATE jobs SET state = 'dead', last_error = ? WHERE kind = 'incoming_audio'")
+      .run(technicalError);
+
+    assert.equal(markExhaustedIncomingFile(db.handle, { fileUid: incoming.fileUid }), true);
+    assert.equal(markExhaustedIncomingFile(db.handle, { fileUid: incoming.fileUid }), true);
+
+    const stored = db.handle
+      .prepare('SELECT state, rejection_reason FROM incoming_telegram_files WHERE file_uid = ?')
+      .get(incoming.fileUid) as { state: string; rejection_reason: string };
+    assert.deepEqual({ ...stored }, { state: 'failed', rejection_reason: 'processing_failed' });
+    const status = db.handle
+      .prepare('SELECT payload FROM telegram_outbox WHERE delivery_part_id = ?')
+      .get(`incoming-failed:${incoming.fileUid}`) as { payload: string };
+    const text = (JSON.parse(status.payload) as { text: string }).text;
+    assert.equal(
+      text,
+      '🔴 Не удалось обработать аудио после нескольких попыток.\n\n' +
+        'Технические подробности сохранены в локальном журнале.\n\n' +
+        renderProvenancePlain(incomingTelegramProvenance(incoming)),
+    );
+    assert.ok(!text.includes(technicalError));
   });
 });
 

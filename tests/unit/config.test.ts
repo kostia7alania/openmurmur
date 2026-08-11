@@ -59,6 +59,20 @@ describe('config parsing', () => {
     );
   });
 
+  it('rejects the removed incoming-summary option with a migration instruction', () => {
+    assert.throws(
+      () => parseConfig({ telegram: { summarizeIncoming: true } }),
+      /summarizeIncoming.*removed.*remove it from the config/,
+    );
+  });
+
+  it('rejects the removed VAD frame option with the fixed protocol contract', () => {
+    assert.throws(
+      () => parseConfig({ sessionizer: { vadFrameMs: 16 } }),
+      /vadFrameMs.*removed.*fixed 32 ms frames.*remove it from the config/,
+    );
+  });
+
   it('rejects a wrong type', () => {
     assert.throws(
       () => parseConfig({ sessionizer: { silenceTimeoutSeconds: 'sixty' } }),

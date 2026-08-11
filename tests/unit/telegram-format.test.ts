@@ -20,6 +20,7 @@ import {
 } from '../../src/telegram/provenance.ts';
 import {
   HELP_TEXT,
+  renderCaptureFailure,
   renderSessionReport,
   renderSessionReportMarkdown,
   renderSessionSummaryPreview,
@@ -31,6 +32,19 @@ describe('help text', () => {
     assert.match(HELP_TEXT, /^<b>OpenMurmur<\/b>/);
     assert.match(HELP_TEXT, /^\/status — подробное состояние демона$/m);
     assert.match(HELP_TEXT, /^\/help — этот текст$/m);
+  });
+});
+
+describe('capture failure copy', () => {
+  it('keeps internal capture exceptions in the local log', () => {
+    assert.equal(
+      renderCaptureFailure(false),
+      '🔴 Запись не запустилась\n\n' +
+        'Не удалось получать аудио с микрофона.\n' +
+        'Проверьте доступ к микрофону и запустите `pnpm openmurmur doctor` в корне репозитория.\n' +
+        'Технические подробности сохранены в локальном журнале.',
+    );
+    assert.match(renderCaptureFailure(true), /^🔴 Запись остановлена$/m);
   });
 });
 
@@ -391,6 +405,7 @@ describe('status report', () => {
       hostName: 'Kostia <Mac> & Studio',
       recording: true,
       lastFrameSecondsAgo: 1,
+      processingLagSeconds: 0.5,
       sessionState: 'IDLE',
       sessionElapsedMs: null,
       lastClosedPartMinutesAgo: 2,

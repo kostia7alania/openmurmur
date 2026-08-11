@@ -15,7 +15,7 @@ import {
   type TelegramSecrets,
   telegramBotScope,
 } from '../telegram/keychain.ts';
-import { nextOffsetFor, readOffset, writeOffset } from '../telegram/router.ts';
+import { clearOffset, nextOffsetFor, readOffsetOrZero, writeOffset } from '../telegram/router.ts';
 
 /**
  * Reads a secret without echoing it and without leaving it in shell history.
@@ -88,13 +88,32 @@ export function planSetup(paths: Paths, configExists: boolean): SetupPlan {
 }
 
 export function renderSetupPlan(plan: SetupPlan): string {
-  const lines = ['openmurmur setup will make these changes:', ''];
+  const lines = ['pnpm openmurmur setup will make these changes:', ''];
   for (const dir of plan.directories) lines.push(`  create directory  ${dir}`);
   if (plan.willCreateConfig) lines.push(`  write config      ${plan.configFile}`);
   else lines.push(`  keep config       ${plan.configFile} (already exists, untouched)`);
   lines.push(`  create database   ${plan.databaseFile}`);
   lines.push('');
   lines.push('It will NOT download models, contact any network service, or touch the Keychain.');
+  return lines.join('\n');
+}
+
+/** The clone-based install has no global binary, so every next step is runnable as printed. */
+export function renderSetupNextSteps(telegramConfigured: boolean): string {
+  const lines = ['Next, verify the complete foreground path:'];
+  let step = 1;
+  if (!telegramConfigured) {
+    lines.push(`  ${step}. Connect Telegram: pnpm openmurmur setup telegram`);
+    step += 1;
+  }
+  lines.push(`  ${step}. Verify the microphone: pnpm openmurmur capture test`);
+  step += 1;
+  lines.push(`  ${step}. Start in the foreground: pnpm openmurmur start`);
+  step += 1;
+  lines.push(`  ${step}. After "first audio frame received", speak for more than 3 seconds.`);
+  step += 1;
+  lines.push(`  ${step}. Stop speaking and wait for 60 seconds of silence.`);
+  lines.push('Expected in Telegram: source FLAC, then transcript, then report.');
   return lines.join('\n');
 }
 
@@ -112,6 +131,14 @@ export async function applySetup(paths: Paths, plan: SetupPlan): Promise<void> {
 export interface TelegramSetupResult {
   readonly botUsername: string;
   readonly chatId: number;
+}
+
+export function renderSetupCompletion(): string {
+  return `✅ Setup complete.\n\n${renderSetupNextSteps(false)}`;
+}
+
+export function renderTelegramSetupCompletion(result: TelegramSetupResult): string {
+  return `✅ Connected @${result.botUsername}, chat ${result.chatId}\n\n${renderSetupNextSteps(true)}`;
 }
 
 /**
@@ -180,8 +207,10 @@ export async function setupTelegram(
 
 /**
  * Commits the allowlisted recipient and that bot's update cursor as one setup
- * operation. Keychain and SQLite cannot share a crash-atomic transaction, but
- * ordinary failures restore the previous pair or fail closed with no secrets.
+ * operation. SQLite publishes the credential-scoped cursor first. A hard death
+ * before the Keychain update leaves inactive cursor metadata; a hard death
+ * after it leaves a complete credential pair with its matching cursor. Ordinary
+ * failures restore the previous pair and cursor or fail closed with no secrets.
  */
 export async function commitTelegramSetup(
   db: DatabaseSync,
@@ -194,35 +223,41 @@ export async function commitTelegramSetup(
   const newBotScope = telegramBotScope(secrets.token);
   const previousBotScope =
     previousSecrets === null ? 'legacy' : telegramBotScope(previousSecrets.token);
-  const previousOffset = readOffset(db, previousBotScope);
+  const previousOffset = readOffsetOrZero(db, previousBotScope);
   let stored = false;
   let offsetWritten = false;
 
   try {
-    await store.storeSecrets(secrets);
-    stored = true;
     writeOffset(db, nextOffset, newBotScope);
     offsetWritten = true;
+    await store.storeSecrets(secrets);
+    stored = true;
     await confirmDelivery();
   } catch (error) {
-    if (!stored) throw error;
-
     const rollbackErrors: unknown[] = [];
-    try {
-      await store.clear();
-    } catch (rollbackError) {
-      rollbackErrors.push(rollbackError);
+    if (stored) {
+      try {
+        await store.clear();
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
     }
 
     let offsetRestored = !offsetWritten;
-    try {
-      writeOffset(db, previousOffset, previousBotScope);
-      offsetRestored = true;
-    } catch (rollbackError) {
-      rollbackErrors.push(rollbackError);
+    if (offsetWritten) {
+      try {
+        if (newBotScope === previousBotScope) {
+          writeOffset(db, previousOffset, previousBotScope);
+        } else {
+          clearOffset(db, newBotScope);
+        }
+        offsetRestored = true;
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
     }
 
-    if (offsetRestored && previousSecrets !== null) {
+    if (stored && offsetRestored && previousSecrets !== null) {
       try {
         await store.storeSecrets(previousSecrets);
       } catch (rollbackError) {
@@ -292,7 +327,7 @@ export async function waitForStart(
   }
   throw new Error(
     'No message arrived. Make sure you messaged the right bot, then run ' +
-      '`openmurmur setup telegram` again.',
+      '`pnpm openmurmur setup telegram` again.',
   );
 }
 

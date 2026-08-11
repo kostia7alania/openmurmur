@@ -5,9 +5,14 @@ import { arch, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { LoadedConfig } from '../config/load.ts';
+import { MINIMUM_NODE_VERSION } from '../config/runtime-requirements.ts';
 import { compareVersions, MINIMUM_SQLITE_VERSION, sqliteVersionOf } from '../database/db.ts';
 import { diskFreeGb } from '../health/monitor.ts';
 import { nullLogger } from '../logging/logger.ts';
+import {
+  keychainSetupReadiness,
+  type TelegramSetupReadinessProvider,
+} from '../telegram/keychain.ts';
 import { REPO_ROOT, WORKER_ARGS } from './backends.ts';
 
 export type CheckLevel = 'ok' | 'warn' | 'fail' | 'info';
@@ -19,7 +24,7 @@ export interface Check {
   readonly fix?: string;
 }
 
-export const MINIMUM_NODE_VERSION = '26.7.0';
+export { MINIMUM_NODE_VERSION } from '../config/runtime-requirements.ts';
 
 async function commandVersion(command: string, args: string[]): Promise<string | null> {
   return new Promise((resolve) => {
@@ -280,7 +285,7 @@ async function checkStateDirectory(loaded: LoadedConfig): Promise<Check> {
     name: 'state_directory',
     level: writable ? 'ok' : 'warn',
     detail: `${loaded.paths.root}${writable ? '' : ' (missing or not writable)'}`,
-    ...(writable ? {} : { fix: 'Run `openmurmur setup` to create it.' }),
+    ...(writable ? {} : { fix: 'Run `pnpm openmurmur setup` to create it.' }),
   };
 }
 
@@ -335,13 +340,40 @@ function checkBackends(loaded: LoadedConfig): Check {
   };
 }
 
-function checkTelegram(): Check {
-  // Presence only. Reading the Keychain here would pop an authentication
-  // prompt on what is documented as a read-only command.
+export async function checkTelegramSetup(
+  readiness: TelegramSetupReadinessProvider,
+): Promise<Check> {
+  const result = await readiness.inspect();
+  if (result.status === 'configured') {
+    return {
+      name: 'telegram_setup',
+      level: 'ok',
+      detail:
+        `${result.format === 'combined' ? 'credential item' : 'legacy credential items'} present ` +
+        'in the macOS Keychain; secret readability and Telegram connectivity were not tested',
+    };
+  }
+  if (result.status === 'not_configured') {
+    return {
+      name: 'telegram_setup',
+      level: 'warn',
+      detail: 'no Telegram credential items found in the macOS Keychain',
+      fix: 'Run `pnpm openmurmur setup telegram` from the repository checkout.',
+    };
+  }
+  if (result.status === 'incomplete_legacy') {
+    return {
+      name: 'telegram_setup',
+      level: 'warn',
+      detail: 'an incomplete legacy Telegram credential pair is present in the macOS Keychain',
+      fix: 'Run `pnpm openmurmur setup telegram` to replace it atomically.',
+    };
+  }
   return {
-    name: 'telegram',
-    level: 'info',
-    detail: 'run `openmurmur setup telegram` to configure; secrets live in the macOS Keychain',
+    name: 'telegram_setup',
+    level: 'warn',
+    detail: `Keychain metadata is inaccessible: ${result.detail}`,
+    fix: 'Run doctor from the logged-in GUI user session and verify the login Keychain is available.',
   };
 }
 
@@ -361,15 +393,16 @@ const CHECKS: readonly CheckFn[] = [
   checkDisk,
   checkConfigSource,
   checkBackends,
-  checkTelegram,
+  () => checkTelegramSetup(keychainSetupReadiness),
 ];
 
 /**
- * `openmurmur doctor` — strictly read-only.
+ * `pnpm openmurmur doctor` — strictly read-only from the repository checkout.
  *
- * It never installs, never downloads, never writes a config, never touches the
- * Keychain. A user must be able to run it on a machine they do not fully trust
- * and know that all it did was look.
+ * It never installs, never downloads, never writes a config and never reads
+ * Keychain password data. Telegram setup readiness searches item metadata
+ * without `security -g`/`-w`; it cannot trigger a password-data authorization
+ * prompt or mutate legacy credentials.
  */
 export async function runDoctor(loaded: LoadedConfig): Promise<Check[]> {
   const checks: Check[] = [];

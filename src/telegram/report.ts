@@ -187,6 +187,7 @@ export interface StatusReportInput {
   readonly hostName: string;
   readonly recording: boolean;
   readonly lastFrameSecondsAgo: number | null;
+  readonly processingLagSeconds: number | null;
   readonly sessionState: string;
   readonly sessionElapsedMs: number | null;
   readonly lastClosedPartMinutesAgo: number | null;
@@ -216,6 +217,11 @@ export function renderStatus(input: StatusReportInput): string {
     '',
     `Запись: ${input.recording ? 'включена' : 'остановлена'}`,
     `Последний аудиокадр: ${ago(input.lastFrameSecondsAgo, 'сек')}`,
+    `Отставание обработки: ${
+      input.processingLagSeconds === null
+        ? 'нет данных'
+        : `${Math.round(input.processingLagSeconds)} сек`
+    }`,
     `Текущая сессия: ${escapeHtml(session)}`,
     `Последний закрытый файл: ${ago(input.lastClosedPartMinutesAgo, 'мин')}`,
     `Очередь ASR: ${input.asrBacklog}`,
@@ -230,12 +236,24 @@ export function renderStatus(input: StatusReportInput): string {
   ].join('\n');
 }
 
+/** Stable chat copy; the capture exception itself remains in the local log. */
+export function renderCaptureFailure(recordingWasAnnounced: boolean): string {
+  const heading = recordingWasAnnounced ? '🔴 Запись остановлена' : '🔴 Запись не запустилась';
+  return [
+    heading,
+    '',
+    'Не удалось получать аудио с микрофона.',
+    'Проверьте доступ к микрофону и запустите `pnpm openmurmur doctor` в корне репозитория.',
+    'Технические подробности сохранены в локальном журнале.',
+  ].join('\n');
+}
+
 export const HELP_TEXT = [
   '<b>OpenMurmur</b>',
   '',
   'Команды:',
   '/status — подробное состояние демона',
-  '/health — короткая сводка OK / WARN / ERROR',
+  '/health — короткая сводка на русском',
   '/settings — режим языка для следующих расшифровок',
   '/help — этот текст',
   '',

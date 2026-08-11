@@ -98,11 +98,36 @@ export function markUpdateHandled(db: DatabaseSync, updateId: number, botScope =
   );
 }
 
+export class MissingTelegramOffsetError extends Error {
+  constructor(botScope: string) {
+    super(
+      `Telegram update offset is missing for credential scope ${botScope}; ` +
+        'run `pnpm openmurmur setup telegram` again',
+    );
+    this.name = 'MissingTelegramOffsetError';
+  }
+}
+
 /**
  * The getUpdates offset is persisted, not held in memory: a restart must not
  * replay an hour of updates, nor skip the ones that arrived while down.
+ *
+ * Only the pre-scoping `legacy` cursor may default to zero. An absent cursor
+ * for a concrete credential fingerprint means setup could have died between
+ * Keychain and SQLite publication. Polling from zero would cross the fresh
+ * `/start` boundary, so startup fails closed until setup re-establishes it.
  */
 export function readOffset(db: DatabaseSync, botScope = 'legacy'): number {
+  const row = db
+    .prepare('SELECT next_offset FROM telegram_offset WHERE bot_scope = ?')
+    .get(botScope) as { next_offset: number } | undefined;
+  if (row !== undefined) return row.next_offset;
+  if (botScope === 'legacy') return 0;
+  throw new MissingTelegramOffsetError(botScope);
+}
+
+/** Setup-only read before a credential has ever owned a scoped cursor. */
+export function readOffsetOrZero(db: DatabaseSync, botScope: string): number {
   const row = db
     .prepare('SELECT next_offset FROM telegram_offset WHERE bot_scope = ?')
     .get(botScope) as { next_offset: number } | undefined;
@@ -117,6 +142,11 @@ export function writeOffset(db: DatabaseSync, nextOffset: number, botScope = 'le
        next_offset = excluded.next_offset,
        updated_at = excluded.updated_at`,
   ).run(botScope, nextOffset, new Date().toISOString());
+}
+
+/** Removes setup state that never became the active Keychain credential. */
+export function clearOffset(db: DatabaseSync, botScope: string): void {
+  db.prepare('DELETE FROM telegram_offset WHERE bot_scope = ?').run(botScope);
 }
 
 /** Highest update_id + 1, which is what Telegram expects as the next offset. */

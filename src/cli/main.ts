@@ -35,12 +35,26 @@ import { systemClock } from '../util/clock.ts';
 import { createAsrBackend } from './backends.ts';
 import { Daemon, inspectDaemonProcess, readDaemonPid } from './daemon.ts';
 import { doctorExitCode, formatChecks, runDoctor } from './doctor.ts';
-import { applySetup, planSetup, renderSetupPlan, setupTelegram } from './setup.ts';
+import {
+  applySetup,
+  planSetup,
+  renderSetupCompletion,
+  renderSetupPlan,
+  renderTelegramSetupCompletion,
+  setupTelegram,
+} from './setup.ts';
+import {
+  heartbeatFreshForMs,
+  readLocalLiveStatus,
+  readLocalStatusCounts,
+  renderLiveStatus,
+  renderQueueStatus,
+} from './status.ts';
 import { VERSION } from './version.ts';
 
 const USAGE = `openmurmur ${VERSION} — private ambient journal for Apple Silicon
 
-Usage: openmurmur <command> [options]
+Usage: pnpm openmurmur <command> [options]
 
 Setup and diagnostics
   doctor                 Check every dependency. Read-only: changes nothing.
@@ -179,7 +193,7 @@ async function main(argv: readonly string[]): Promise<number> {
     case 'search': {
       const query = positionals.slice(1).join(' ');
       if (query.length === 0) {
-        process.stderr.write('Usage: openmurmur search TEXT\n');
+        process.stderr.write('Usage: pnpm openmurmur search TEXT\n');
         return 1;
       }
       return searchCommand(loaded, query, values, asJson);
@@ -188,7 +202,7 @@ async function main(argv: readonly string[]): Promise<number> {
     case 'transcribe': {
       const file = positionals[1];
       if (file === undefined) {
-        process.stderr.write('Usage: openmurmur transcribe FILE\n');
+        process.stderr.write('Usage: pnpm openmurmur transcribe FILE\n');
         return 1;
       }
       return transcribeFile(loaded, file, logger, asJson);
@@ -277,7 +291,7 @@ async function searchCommand(
     process.stdout.write(
       asJson ? `${JSON.stringify(hits, null, 2)}\n` : `${renderSearchResults(hits, query)}\n`,
     );
-    // Exit 1 on no match, so `openmurmur search x || echo none` works in a script.
+    // Exit 1 on no match, so `pnpm openmurmur search x || echo none` works in a script.
     return hits.length > 0 ? 0 : 1;
   } finally {
     db.close();
@@ -294,7 +308,7 @@ async function setupCommand(
     const result = await setupTelegram(loaded.paths, loaded.config.telegram.apiBaseUrl, (message) =>
       process.stdout.write(`${message}\n`),
     );
-    process.stdout.write(`\n✅ Connected @${result.botUsername}, chat ${result.chatId}\n`);
+    process.stdout.write(`\n${renderTelegramSetupCompletion(result)}\n`);
     return 0;
   }
 
@@ -307,7 +321,7 @@ async function setupCommand(
   }
 
   await applySetup(loaded.paths, plan);
-  process.stdout.write('\n✅ Setup complete. Next: openmurmur setup telegram\n');
+  process.stdout.write(`\n${renderSetupCompletion()}\n`);
   return 0;
 }
 
@@ -371,7 +385,7 @@ async function stopDaemon(loaded: Awaited<ReturnType<typeof loadConfig>>): Promi
     process.stderr.write(`PID file belongs to a different OpenMurmur root: ${record.root}\n`);
     return 1;
   }
-  const state = await inspectDaemonProcess(record.pid);
+  const state = await inspectDaemonProcess(record.pid, record.processBirth);
   if (!state.alive) {
     process.stderr.write(
       `Daemon pid ${record.pid} is no longer running; removed stale PID file.\n`,
@@ -511,25 +525,27 @@ async function localStatus(
   const db = openDatabase({ file: loaded.paths.databaseFile });
   try {
     const pidRecord = await readDaemonPid(loaded.paths.pidFile);
-    const pidState = pidRecord === null ? null : await inspectDaemonProcess(pidRecord.pid);
+    const pidState =
+      pidRecord === null ? null : await inspectDaemonProcess(pidRecord.pid, pidRecord.processBirth);
     const alive = pidState?.alive === true && pidState.identityMatches;
     const pid = pidRecord?.pid ?? null;
 
-    const counts = db.handle
-      .prepare(
-        `SELECT
-           (SELECT count(*) FROM audio_sessions)                                    AS sessions,
-           (SELECT count(*) FROM audio_sessions WHERE state = 'DONE')               AS done,
-           (SELECT count(*) FROM audio_sessions WHERE state = 'REJECTED')           AS rejected,
-           (SELECT count(*) FROM jobs WHERE state IN ('pending','leased'))          AS jobs,
-           (SELECT count(*) FROM jobs WHERE state = 'dead')                         AS failed_jobs,
-           (SELECT count(*) FROM telegram_outbox WHERE state IN ('pending','sending')) AS outbox,
-           (SELECT count(*) FROM telegram_outbox WHERE state = 'dead')              AS failed_outbox,
-           (SELECT count(*) FROM audio_parts WHERE deleted_at IS NULL)              AS parts`,
-      )
-      .get() as Record<string, number>;
+    const counts = readLocalStatusCounts(db.handle);
+    const live = readLocalLiveStatus(db.handle, {
+      daemonRunning: alive,
+      daemonPid: pid,
+      daemonStartedAt: pidRecord?.startedAt ?? null,
+      nowMs: Date.now(),
+      freshForMs: heartbeatFreshForMs(loaded.config.health.pollIntervalMs),
+    });
 
-    const payload = { version: VERSION, daemon: alive ? 'running' : 'stopped', pid, ...counts };
+    const payload = {
+      version: VERSION,
+      daemon: alive ? 'running' : 'stopped',
+      pid,
+      ...counts,
+      ...live,
+    };
     if (asJson) {
       process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
       return 0;
@@ -538,15 +554,11 @@ async function localStatus(
       [
         `OpenMurmur ${VERSION}`,
         `Daemon:            ${alive ? `running (pid ${pid})` : 'stopped'}`,
-        `Sessions:          ${counts['sessions']} (${counts['done']} delivered, ${counts['rejected']} rejected)`,
-        `Audio parts on disk: ${counts['parts']}`,
-        `Jobs pending:      ${counts['jobs']}`,
-        `Jobs failed:       ${counts['failed_jobs']}`,
-        `Telegram outbox:   ${counts['outbox']}`,
-        `Telegram failed:   ${counts['failed_outbox']}`,
-        ...((counts['failed_jobs'] ?? 0) > 0
-          ? ['Failed job details: pnpm openmurmur jobs failed']
-          : []),
+        ...renderLiveStatus(live),
+        `Sessions:          ${counts.sessions} (${counts.done} delivered, ${counts.rejected} rejected)`,
+        `Audio parts on disk: ${counts.parts}`,
+        ...renderQueueStatus(counts, join(loaded.paths.logsDir, 'openmurmur.ndjson')),
+        ...(counts.jobsDead > 0 ? ['Failed job details: pnpm openmurmur jobs failed'] : []),
         `SQLite:            ${db.sqliteVersion}`,
         '',
       ].join('\n'),
@@ -637,7 +649,7 @@ async function telegramCommand(
 ): Promise<number> {
   const secrets = await keychain.load();
   if (secrets === null) {
-    process.stderr.write('Telegram is not configured. Run: openmurmur setup telegram\n');
+    process.stderr.write('Telegram is not configured. Run: pnpm openmurmur setup telegram\n');
     return 1;
   }
   const client = new TelegramClient({
@@ -673,7 +685,7 @@ async function telegramCommand(
     }
   }
 
-  process.stderr.write('Usage: openmurmur telegram <test|poll>\n');
+  process.stderr.write('Usage: pnpm openmurmur telegram <test|poll>\n');
   return 1;
 }
 
@@ -719,7 +731,7 @@ async function retentionCommand(
   asJson: boolean,
 ): Promise<number> {
   if (subcommand !== 'dry-run' && subcommand !== 'apply') {
-    process.stderr.write('Usage: openmurmur retention <dry-run|apply>\n');
+    process.stderr.write('Usage: pnpm openmurmur retention <dry-run|apply>\n');
     return 1;
   }
 

@@ -21,8 +21,6 @@ export interface SessionizerConfig {
   readonly minTranscriptWords: number;
   /** VAD speech probability above which a frame counts as speech. */
   readonly vadThreshold: number;
-  /** VAD frame size. Silero operates on 512 samples at 16 kHz = 32 ms. */
-  readonly vadFrameMs: number;
   /**
    * Live speech detector.
    *
@@ -135,7 +133,6 @@ export interface TelegramConfig {
   readonly receiveUpdates: boolean;
   readonly maxIncomingDurationSeconds: number;
   readonly maxConcurrentIncomingJobs: number;
-  readonly summarizeIncoming: boolean;
 }
 
 export interface RetentionConfig {
@@ -185,7 +182,6 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
     minSpeechSeconds: 3,
     minTranscriptWords: 5,
     vadThreshold: 0.5,
-    vadFrameMs: 32,
     vadBackend: 'silero',
   },
   audio: {
@@ -230,7 +226,6 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
     receiveUpdates: true,
     maxIncomingDurationSeconds: 2 * 60 * 60,
     maxConcurrentIncomingJobs: 2,
-    summarizeIncoming: true,
   },
   retention: {
     sessionAudioHours: 48,
@@ -265,6 +260,13 @@ export class ConfigError extends Error {
 
 type Json = Record<string, unknown>;
 
+const REMOVED_OPTIONS: Readonly<Record<string, string>> = {
+  'sessionizer.vadFrameMs':
+    '"sessionizer.vadFrameMs" was removed because capture and Silero require fixed 32 ms frames; remove it from the config',
+  'telegram.summarizeIncoming':
+    '"telegram.summarizeIncoming" was removed because incoming summaries are not implemented; remove it from the config',
+};
+
 function isObject(value: unknown): value is Json {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -292,7 +294,7 @@ function mergeInto(defaults: Json, overrides: Json, prefix: string, issues: stri
   for (const [key, value] of Object.entries(overrides)) {
     const path = prefix ? `${prefix}.${key}` : key;
     if (!(key in defaults)) {
-      issues.push(`unknown option "${path}"`);
+      issues.push(REMOVED_OPTIONS[path] ?? `unknown option "${path}"`);
       continue;
     }
     const fallback = defaults[key];
@@ -332,7 +334,6 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
   positive('sessionizer.speechCandidateMs', s.speechCandidateMs);
   positive('sessionizer.silenceTimeoutSeconds', s.silenceTimeoutSeconds);
   positive('sessionizer.maxPartSeconds', s.maxPartSeconds);
-  positive('sessionizer.vadFrameMs', s.vadFrameMs);
   if (!Number.isFinite(s.vadThreshold) || s.vadThreshold <= 0 || s.vadThreshold >= 1) {
     issues.push('sessionizer.vadThreshold must be strictly between 0 and 1');
   }
