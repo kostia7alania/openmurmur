@@ -71,6 +71,24 @@ export class SessionRepository {
       .run(state, nowIso(), sessionId);
   }
 
+  advanceToDelivering(sessionId: string): void {
+    const updated = this.#db
+      .prepare(
+        `UPDATE audio_sessions
+            SET state = 'DELIVERING', updated_at = ?
+          WHERE session_id = ? AND state = 'PROCESSING'`,
+      )
+      .run(nowIso(), sessionId);
+    if (updated.changes === 1) return;
+
+    const row = this.#db
+      .prepare('SELECT state FROM audio_sessions WHERE session_id = ?')
+      .get(sessionId) as { state: string } | undefined;
+    if (row?.state === 'DELIVERING' || row?.state === 'DONE') return;
+    if (row === undefined) throw new Error(`unknown session ${sessionId}`);
+    throw new Error(`cannot advance session ${sessionId} from ${row.state} to DELIVERING`);
+  }
+
   finalize(
     sessionId: string,
     endedAtIso: string,

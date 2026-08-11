@@ -436,7 +436,7 @@ export async function enqueueSessionTranscript(
     if (enqueued) transcriptRows += 1;
   }
 
-  mutateCurrent(db, input, () => sessions.setState(input.sessionId, 'DELIVERING'));
+  mutateCurrent(db, input, () => sessions.advanceToDelivering(input.sessionId));
   return transcriptRows;
 }
 
@@ -582,7 +582,7 @@ export async function enqueueSessionReport(
       : reportRows;
   }
 
-  mutateCurrent(db, input, () => sessions.setState(input.sessionId, 'DELIVERING'));
+  mutateCurrent(db, input, () => sessions.advanceToDelivering(input.sessionId));
   return reportRows;
 }
 

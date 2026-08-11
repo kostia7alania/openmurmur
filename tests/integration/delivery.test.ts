@@ -686,6 +686,53 @@ describe('delivery enqueue', () => {
     );
   });
 
+  it('keeps a fully delivered session DONE when a delivery job replays', async () => {
+    const sessionId = 'completed-replay';
+    seedFinalizedSession(sessionId);
+    await transcribeAndSummarize(sessionId);
+    await enqueueSessionDelivery(db.handle, {
+      sessionId,
+      summary: EMPTY_SUMMARY,
+      config: CONFIG,
+      paths: paths(),
+    });
+
+    const outbox = new Outbox(db.handle);
+    let messageId = 100;
+    for (let row = outbox.claimNext(); row !== null; row = outbox.claimNext()) {
+      const payload = JSON.parse(row.payload) as { partId?: string };
+      assert.equal(
+        outbox.markSent(row, messageId, () => {
+          if (payload.partId !== undefined) markAudioDelivered(db.handle, payload.partId);
+          reconcileSessionDelivery(db.handle, sessionId, nullLogger);
+        }),
+        'sent',
+      );
+      messageId += 1;
+    }
+    assert.equal(new SessionRepository(db.handle).get(sessionId)?.state, 'DONE');
+
+    const rowsBefore = db.handle
+      .prepare('SELECT count(*) AS count FROM telegram_outbox WHERE session_id = ?')
+      .get(sessionId) as { count: number };
+    const jobs = new JobQueue(db.handle, 'completed-replay');
+    jobs.enqueue({
+      kind: 'deliver',
+      idempotencyKey: `completed-replay:${sessionId}`,
+      payload: { sessionId },
+    });
+    const replay = jobs.claim(['deliver']);
+    assert.ok(replay);
+
+    await handleJob({ ...deps(), jobs }, replay);
+    assert.equal(jobs.complete(replay), true);
+    assert.equal(new SessionRepository(db.handle).get(sessionId)?.state, 'DONE');
+    const rowsAfter = db.handle
+      .prepare('SELECT count(*) AS count FROM telegram_outbox WHERE session_id = ?')
+      .get(sessionId) as { count: number };
+    assert.equal(rowsAfter.count, rowsBefore.count);
+  });
+
   it('does not invoke ffmpeg or overwrite a split artifact owned by a pending row', async () => {
     seedFinalizedSession('s1', 1, 4096);
     const part = db.handle
