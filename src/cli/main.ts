@@ -25,6 +25,12 @@ import { compactJobError, renderDeadJobAlert } from '../jobs/diagnostics.ts';
 import { canRetryDeadJob, JobQueue } from '../jobs/queue.ts';
 import { createLogger } from '../logging/logger.ts';
 import { applyRetention, planRetention } from '../retention/policy.ts';
+import {
+  applyDeliveryReconciliation,
+  exactUtcAcknowledgement,
+  listHeldLegacyDeliveries,
+  renderHeldLegacyDeliveries,
+} from '../retention/reconcile-delivery.ts';
 import { EnergyVad, rmsDbfs } from '../sessionizer/vad.ts';
 import { TelegramClient } from '../telegram/client.ts';
 import { keychain, telegramBotScope } from '../telegram/keychain.ts';
@@ -76,6 +82,8 @@ Telegram
 Work
   jobs failed            Show exhausted background jobs and their causes.
   jobs retry JOB_ID      Re-queue one exhausted job after fixing its cause.
+  delivery reconcile     Report legacy delivered audio held without an exact ACK time.
+  delivery reconcile apply  Set a selected exact ACK with confirmation and audit evidence.
   recall QUERY           Recall grounded sessions with provenance and audio availability.
   search TEXT            Search every stored transcript.
   transcribe FILE        Transcribe one audio file locally and print the text.
@@ -89,6 +97,8 @@ Options
   --yes                  Skip the confirmation prompt.
   --limit N              Maximum search results (default 20).
   --since ISO --until ISO  Restrict search to a time range.
+  --part ID | --session ID  Select delivery reconciliation scope.
+  --ack-at UTC --operator ID --evidence TEXT  Exact manual reconciliation proof.
   --help, --version
 `;
 
@@ -104,6 +114,11 @@ async function main(argv: readonly string[]): Promise<number> {
       limit: { type: 'string' },
       since: { type: 'string' },
       until: { type: 'string' },
+      part: { type: 'string' },
+      session: { type: 'string' },
+      'ack-at': { type: 'string' },
+      operator: { type: 'string' },
+      evidence: { type: 'string' },
       help: { type: 'boolean', default: false, short: 'h' },
       version: { type: 'boolean', default: false },
     },
@@ -191,6 +206,16 @@ async function main(argv: readonly string[]): Promise<number> {
 
     case 'jobs':
       return jobsCommand(loaded, positionals[1], positionals[2], asJson);
+
+    case 'delivery':
+      return deliveryCommand(
+        loaded,
+        positionals[1],
+        positionals[2],
+        values,
+        values['yes'] === true,
+        asJson,
+      );
 
     case 'recall': {
       const query = positionals.slice(1).join(' ');
@@ -671,6 +696,100 @@ function jobsCommand(
       asJson
         ? `${JSON.stringify(result, null, 2)}\n`
         : `Re-queued ${jobId}. It will run when the OpenMurmur daemon is running.\n`,
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+async function deliveryCommand(
+  loaded: Awaited<ReturnType<typeof loadConfig>>,
+  subcommand: string | undefined,
+  action: string | undefined,
+  values: Record<string, unknown>,
+  yes: boolean,
+  asJson: boolean,
+): Promise<number> {
+  if (
+    subcommand !== 'reconcile' ||
+    (action !== undefined && action !== 'report' && action !== 'apply')
+  ) {
+    process.stderr.write(
+      'Usage: pnpm openmurmur delivery reconcile [report|apply] [--part ID|--session ID]\n',
+    );
+    return 1;
+  }
+  const mode = action ?? 'report';
+  const hasPart = typeof values['part'] === 'string';
+  const hasSession = typeof values['session'] === 'string';
+  if (mode === 'apply' && hasPart === hasSession) {
+    process.stderr.write('Apply requires exactly one --part or --session selector.\n');
+    return 1;
+  }
+  const selector = {
+    ...(typeof values['part'] === 'string' ? { partId: values['part'] } : {}),
+    ...(typeof values['session'] === 'string' ? { sessionId: values['session'] } : {}),
+  };
+  const db = openDatabase({ file: loaded.paths.databaseFile });
+  try {
+    const held = listHeldLegacyDeliveries(db.handle, selector);
+    if (mode === 'report') {
+      process.stdout.write(
+        asJson ? `${JSON.stringify({ held }, null, 2)}\n` : `${renderHeldLegacyDeliveries(held)}\n`,
+      );
+      return 0;
+    }
+
+    const acknowledgedAt = values['ack-at'];
+    const operatorId = values['operator'];
+    const evidence = values['evidence'];
+    if (
+      typeof acknowledgedAt !== 'string' ||
+      typeof operatorId !== 'string' ||
+      typeof evidence !== 'string'
+    ) {
+      process.stderr.write(
+        'Apply requires --ack-at YYYY-MM-DDTHH:mm:ss.sssZ, --operator ID and --evidence TEXT.\n',
+      );
+      return 1;
+    }
+    const exactAcknowledgedAt = exactUtcAcknowledgement(acknowledgedAt);
+    if (held.length === 0) {
+      process.stderr.write('No held legacy delivery matches the selected scope.\n');
+      return 1;
+    }
+    if (asJson && !yes) {
+      process.stderr.write('JSON apply requires explicit --yes confirmation.\n');
+      return 1;
+    }
+    if (!asJson) {
+      process.stdout.write(`${renderHeldLegacyDeliveries(held)}\n`);
+      process.stdout.write(
+        'Warning: an elapsed supplied ACK may make this audio eligible for retention deletion.\n',
+      );
+    }
+    if (
+      !yes &&
+      !(await confirm(
+        `\nSet exact ACK ${exactAcknowledgedAt} for ${held.length} held part(s)? [y/N] `,
+      ))
+    ) {
+      process.stdout.write('Cancelled. No delivery clocks were changed.\n');
+      return 1;
+    }
+
+    const result = applyDeliveryReconciliation(db.handle, {
+      selector,
+      acknowledgedAt: exactAcknowledgedAt,
+      operatorId,
+      evidence,
+      expectedPartIds: held.map((row) => row.partId),
+    });
+    process.stdout.write(
+      asJson
+        ? `${JSON.stringify(result, null, 2)}\n`
+        : `Reconciled ${result.partIds.length} part(s) at exact ACK ${result.acknowledgedAt}.\n`,
     );
     return 0;
   } finally {

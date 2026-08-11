@@ -68,6 +68,16 @@ state, because each represents a distinct way to lose a user's recording.
 direct upload or a contiguous `split0..splitN` set whose every row is `sent` and
 belongs to the same session. Legacy absence or ambiguity stays NULL.
 
+An operator may release that legacy hold only with `pnpm openmurmur delivery
+reconcile apply`: one selected part or session, an exact UTC acknowledgement,
+an operator id and a non-secret evidence reference are required. The command
+never derives the acknowledgement from session, outbox or filesystem times. It
+atomically writes `delivered_at` and one immutable
+`audio_delivery_reconciliation_audit` row containing the supplied fact, prior
+delivery state, scope and apply time. Session scope uses the supplied final
+session-audio ACK conservatively for every previewed held part. A stale preview,
+an ACK before recording ended, or an ACK in the future aborts the whole commit.
+
 Atomic rename necessarily precedes the SQLite update. If the process dies in
 that gap, startup scans non-finalized part rows whose archive path now exists,
 hashes the complete published FLAC, fills size/SHA-256/finalized, then reconciles

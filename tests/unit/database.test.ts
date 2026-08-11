@@ -57,6 +57,7 @@ describe('migrations', () => {
       'telegram_updates',
       'telegram_outbox',
       'incoming_telegram_files',
+      'audio_delivery_reconciliation_audit',
       'asr_preferences',
       'schema_migrations',
     ]) {
@@ -240,6 +241,7 @@ describe('migrations', () => {
         '007_audio_delivery_time.sql',
         '008_daemon_heartbeat.sql',
         '009_incoming_delivery_time.sql',
+        '010_audio_delivery_reconciliation.sql',
       ]);
       const rows = legacy
         .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')

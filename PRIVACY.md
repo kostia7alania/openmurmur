@@ -81,6 +81,12 @@ split manifest, never the earlier session end. Legacy or ambiguous delivery
 records have no proven clock and remain on disk. `pnpm openmurmur retention
 dry-run` shows exactly what would go and why anything is being kept.
 
+`pnpm openmurmur delivery reconcile` reports those legacy holds without changing
+them. Releasing one requires the explicit `apply` action, a selected part or
+session, an exact UTC acknowledgement, operator id, evidence reference and
+confirmation. OpenMurmur does not guess the acknowledgement from an older local
+timestamp; the supplied fact and audit metadata are stored immutably.
+
 ## Deleting everything
 
 ```bash
