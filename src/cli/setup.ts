@@ -1,5 +1,5 @@
-import { writeFile } from 'node:fs/promises';
-import { stdin, stdout } from 'node:process';
+import { type FileHandle, open, unlink, writeFile } from 'node:fs/promises';
+import process, { stdin, stdout } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import type { DatabaseSync } from 'node:sqlite';
 import { ensureDirectories } from '../config/load.ts';
@@ -144,6 +144,49 @@ export interface TelegramSetupDependencies {
   readonly confirmRecipient?: (prompt: string) => Promise<boolean>;
   readonly secrets?: SecretsStore;
   readonly fetchImpl?: typeof fetch;
+  /** Test seam; production uses one per-user lock shared by every state root. */
+  readonly setupLockPath?: string;
+}
+
+const TELEGRAM_SETUP_LOCK_PATH = `/private/tmp/openmurmur-telegram-setup-${typeof process.getuid === 'function' ? process.getuid() : 'user'}.lock`;
+
+async function withTelegramSetupLock<T>(
+  lockPath: string,
+  log: (message: string) => void,
+  action: () => Promise<T>,
+): Promise<T> {
+  let handle: FileHandle;
+  try {
+    handle = await open(lockPath, 'wx', 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error(
+        `Another Telegram setup is running, or a prior setup was interrupted. Verify no setup process is active, remove the stale lock ${lockPath}, and retry.`,
+      );
+    }
+    throw error;
+  }
+
+  try {
+    return await action();
+  } finally {
+    try {
+      await handle.close();
+    } catch {
+      log(
+        `Warning: Telegram setup lock handle cleanup failed; later setup will fail closed: ${lockPath}`,
+      );
+    }
+    try {
+      await unlink(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log(
+          `Warning: Telegram setup lock cleanup failed; later setup will fail closed: ${lockPath}`,
+        );
+      }
+    }
+  }
 }
 
 export function renderSetupCompletion(): string {
@@ -166,13 +209,39 @@ export async function setupTelegram(
   log: (message: string) => void,
   dependencies: TelegramSetupDependencies = {},
 ): Promise<TelegramSetupResult> {
+  return withTelegramSetupLock(dependencies.setupLockPath ?? TELEGRAM_SETUP_LOCK_PATH, log, () =>
+    setupTelegramLocked(paths, apiBaseUrl, role, log, dependencies),
+  );
+}
+
+async function setupTelegramLocked(
+  paths: Paths,
+  apiBaseUrl: string,
+  role: TelegramSetupRole,
+  log: (message: string) => void,
+  dependencies: TelegramSetupDependencies,
+): Promise<TelegramSetupResult> {
   const token = await (
     dependencies.promptToken ?? (() => promptSecret('Telegram bot token (input hidden): '))
   )();
   if (token.trim().length === 0) throw new Error('no token entered');
+  const normalizedToken = token.trim();
+  const secretsStore = dependencies.secrets ?? keychain;
+
+  if (role === 'owner') {
+    const previousSecrets = await secretsStore.peek();
+    if (
+      previousSecrets !== null &&
+      telegramBotScope(previousSecrets.token) === telegramBotScope(normalizedToken)
+    ) {
+      throw new Error(
+        'This bot token is already configured as an input owner. Rebinding it could discard queued updates; create a separate bot with @BotFather and retry with its token.',
+      );
+    }
+  }
 
   const client = new TelegramClient({
-    token: token.trim(),
+    token: normalizedToken,
     baseUrl: apiBaseUrl,
     ...(dependencies.fetchImpl === undefined ? {} : { fetchImpl: dependencies.fetchImpl }),
   });
@@ -228,8 +297,8 @@ export async function setupTelegram(
   try {
     await commitTelegramSetup(
       db.handle,
-      dependencies.secrets ?? keychain,
-      { token: token.trim(), chatId },
+      secretsStore,
+      { token: normalizedToken, chatId },
       commit,
       () =>
         client.sendMessage(

@@ -94,6 +94,11 @@ describe('Telegram Keychain credential pair', () => {
     });
     const keychain = createTelegramKeychain(memory.backend);
 
+    assert.deepEqual(await keychain.peek(), { token: 'legacy-token', chatId: 73 });
+    assert.equal(memory.writes.length, 0, 'read-only setup preflight must not migrate legacy data');
+    assert.equal(memory.values.has('telegram-bot-token'), true);
+    assert.equal(memory.values.has('telegram-chat-id'), true);
+
     assert.deepEqual(await keychain.load(), { token: 'legacy-token', chatId: 73 });
     assert.equal(memory.writes.length, 1);
     assert.equal(memory.values.has('telegram-bot-token'), false);

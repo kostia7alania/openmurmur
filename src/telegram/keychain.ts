@@ -261,6 +261,8 @@ export interface SecretStorageBackend {
 
 export interface SecretsStore {
   storeSecrets(secrets: TelegramSecrets): Promise<void>;
+  /** Reads current credentials without migrating or deleting legacy items. */
+  peek(): Promise<TelegramSecrets | null>;
   load(): Promise<TelegramSecrets | null>;
   clear(): Promise<void>;
 }
@@ -306,35 +308,45 @@ function decodeLegacySecrets(token: string, chatIdRaw: string): TelegramSecrets 
   return decodeTelegramSecrets(encodeTelegramSecrets({ token, chatId }));
 }
 
+async function readStoredTelegramSecrets(
+  backend: SecretStorageBackend,
+): Promise<{ readonly secrets: TelegramSecrets | null; readonly legacy: boolean }> {
+  const encoded = await backend.get(ACCOUNT_SECRETS);
+  if (encoded !== null) return { secrets: decodeTelegramSecrets(encoded), legacy: false };
+
+  const token = await backend.get(ACCOUNT_TOKEN);
+  const chatIdRaw = await backend.get(ACCOUNT_CHAT_ID);
+  if (token === null && chatIdRaw === null) return { secrets: null, legacy: false };
+  if (token === null || chatIdRaw === null) {
+    throw new KeychainError(
+      'Legacy Telegram credentials in Keychain are incomplete; run setup again',
+    );
+  }
+  return { secrets: decodeLegacySecrets(token, chatIdRaw), legacy: true };
+}
+
 export function createTelegramKeychain(backend: SecretStorageBackend): SecretsStore {
   return {
     async storeSecrets(secrets: TelegramSecrets): Promise<void> {
       await backend.set(ACCOUNT_SECRETS, encodeTelegramSecrets(secrets));
     },
+    async peek(): Promise<TelegramSecrets | null> {
+      return (await readStoredTelegramSecrets(backend)).secrets;
+    },
     async load(): Promise<TelegramSecrets | null> {
-      const encoded = await backend.get(ACCOUNT_SECRETS);
-      if (encoded !== null) return decodeTelegramSecrets(encoded);
-
-      const token = await backend.get(ACCOUNT_TOKEN);
-      const chatIdRaw = await backend.get(ACCOUNT_CHAT_ID);
-      if (token === null && chatIdRaw === null) return null;
-      if (token === null || chatIdRaw === null) {
-        throw new KeychainError(
-          'Legacy Telegram credentials in Keychain are incomplete; run setup again',
-        );
-      }
-      const legacy = decodeLegacySecrets(token, chatIdRaw);
+      const stored = await readStoredTelegramSecrets(backend);
+      if (stored.secrets === null || !stored.legacy) return stored.secrets;
 
       // Publish the combined item first. Once it exists it is authoritative, so
       // interrupted cleanup can leave duplicate legacy items but never a mixed pair.
       try {
-        await backend.set(ACCOUNT_SECRETS, encodeTelegramSecrets(legacy));
+        await backend.set(ACCOUNT_SECRETS, encodeTelegramSecrets(stored.secrets));
         await Promise.all([backend.delete(ACCOUNT_TOKEN), backend.delete(ACCOUNT_CHAT_ID)]);
       } catch {
         // A read-only/locked Keychain must not make an otherwise valid legacy
         // installation unusable. A later load retries this best-effort migration.
       }
-      return legacy;
+      return stored.secrets;
     },
     async clear(): Promise<void> {
       const failures: unknown[] = [];

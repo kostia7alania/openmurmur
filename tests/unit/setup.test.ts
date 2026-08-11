@@ -75,10 +75,55 @@ describe('setup completion output', () => {
 });
 
 describe('Telegram setup ownership handshake', () => {
+  it('serializes every setup role before token, Keychain or Telegram access', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'om-telegram-lock-'));
+    const setupLockPath = join(root, 'telegram-setup.lock');
+    let enteredPrompt!: () => void;
+    let releasePrompt!: () => void;
+    const promptEntered = new Promise<void>((resolve) => {
+      enteredPrompt = resolve;
+    });
+    const promptRelease = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+    let secondPrompted = false;
+
+    try {
+      const first = setupTelegram(resolvePaths(root), '', 'owner', () => {}, {
+        setupLockPath,
+        promptToken: async () => {
+          enteredPrompt();
+          await promptRelease;
+          throw new Error('first setup cancelled');
+        },
+      });
+      await promptEntered;
+
+      await assert.rejects(
+        setupTelegram(resolvePaths(root), '', 'send-only', () => {}, {
+          setupLockPath,
+          promptToken: async () => {
+            secondPrompted = true;
+            return 'second-token';
+          },
+        }),
+        /Another Telegram setup is running/,
+      );
+      assert.equal(secondPrompted, false);
+
+      releasePrompt();
+      await assert.rejects(first, /first setup cancelled/);
+    } finally {
+      releasePrompt();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('lets only the explicit owner poll while send-only proves delivery', async () => {
     const ownerRoot = mkdtempSync(join(tmpdir(), 'om-telegram-owner-'));
     const senderRoot = mkdtempSync(join(tmpdir(), 'om-telegram-sender-'));
     const calls: string[] = [];
+    const setupLockPath = join(ownerRoot, 'telegram-setup.lock');
     let actor: 'owner' | 'send-only' = 'owner';
     let ownerPoll = 0;
     const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -108,9 +153,35 @@ describe('Telegram setup ownership handshake', () => {
       });
     }) as typeof fetch;
 
-    const ownerSecrets = memorySecrets(null);
+    const ownerSecrets = memorySecrets({ token: 'old-owner-token', chatId: 70 });
     const senderSecrets = memorySecrets(null);
     try {
+      const priorOwnerDb = openDatabase({ file: resolvePaths(ownerRoot).databaseFile });
+      try {
+        writeOffset(priorOwnerDb.handle, 41, telegramBotScope('old-owner-token'));
+      } finally {
+        priorOwnerDb.close();
+      }
+      await assert.rejects(
+        setupTelegram(resolvePaths(ownerRoot), 'https://api.telegram.org', 'owner', () => {}, {
+          promptToken: async () => 'old-owner-token',
+          confirmRecipient: async () => true,
+          secrets: ownerSecrets.store,
+          setupLockPath,
+          fetchImpl: (async () => {
+            assert.fail('same-token owner rebind must fail before contacting Telegram');
+          }) as typeof fetch,
+        }),
+        /already configured.*discard queued updates.*separate bot/i,
+      );
+      assert.deepEqual(ownerSecrets.get(), { token: 'old-owner-token', chatId: 70 });
+      const unchangedOwnerDb = openDatabase({ file: resolvePaths(ownerRoot).databaseFile });
+      try {
+        assert.equal(readOffset(unchangedOwnerDb.handle, telegramBotScope('old-owner-token')), 41);
+      } finally {
+        unchangedOwnerDb.close();
+      }
+
       const staleSenderDb = openDatabase({ file: resolvePaths(senderRoot).databaseFile });
       try {
         const scope = telegramBotScope('shared-token');
@@ -142,6 +213,7 @@ describe('Telegram setup ownership handshake', () => {
           promptToken: async () => 'shared-token',
           confirmRecipient: async () => true,
           secrets: ownerSecrets.store,
+          setupLockPath,
           fetchImpl,
         },
       );
@@ -156,6 +228,7 @@ describe('Telegram setup ownership handshake', () => {
           promptSendOnlyChatId: async () => owner.chatId,
           confirmRecipient: async () => true,
           secrets: senderSecrets.store,
+          setupLockPath,
           fetchImpl,
         },
       );
@@ -181,6 +254,7 @@ describe('Telegram setup ownership handshake', () => {
       const senderDb = openDatabase({ file: resolvePaths(senderRoot).databaseFile });
       try {
         assert.equal(readOffset(ownerDb.handle, telegramBotScope('shared-token')), 8);
+        assert.equal(readOffset(ownerDb.handle, telegramBotScope('old-owner-token')), 41);
         assert.throws(
           () => readOffset(senderDb.handle, telegramBotScope('shared-token')),
           /Telegram update offset is missing/,
@@ -283,6 +357,9 @@ function memorySecrets(initial: TelegramSecrets | null): {
     writes,
     get: () => current,
     store: {
+      async peek() {
+        return current;
+      },
       async load() {
         return current;
       },
@@ -303,6 +380,9 @@ describe('Telegram setup persistence', () => {
     const next = { token: 'new-token', chatId: 20 } as const;
     let stored: TelegramSecrets | null = null;
     const store: SecretsStore = {
+      async peek() {
+        return null;
+      },
       async load() {
         return null;
       },
@@ -384,6 +464,9 @@ describe('Telegram setup persistence', () => {
     const oldBotScope = telegramBotScope(old.token);
     writeOffset(db.handle, 7, oldBotScope);
     const store: SecretsStore = {
+      async peek() {
+        return old;
+      },
       async load() {
         return old;
       },
@@ -422,6 +505,9 @@ describe('Telegram setup persistence', () => {
     const scope = telegramBotScope(old.token);
     writeOffset(db.handle, 7, scope);
     const store: SecretsStore = {
+      async peek() {
+        return old;
+      },
       async load() {
         return old;
       },

@@ -57,15 +57,18 @@ SQLite and Keychain cannot share one transaction, so publication order is the
 privacy boundary: a hard death before step 8 leaves only inactive, non-secret
 cursor metadata; a hard death after step 8 leaves the complete pair with its
 matching cursor. Startup refuses to poll a concrete credential fingerprint when
-that cursor is absent. This fail-closed state is repaired only by running
-`pnpm openmurmur setup telegram owner` again, which establishes a new explicit
-`/start` boundary; it never guesses by polling from zero.
+that cursor is absent; it never guesses by polling from zero.
 
-One fail-closed trade-off remains when rebinding the same bot token to a
-different chat: a hard death after step 7 but before step 8 can advance that
-bot-wide cursor while the old chat remains configured, so queued updates may be
-skipped. It cannot replay historical updates or bind an unconfirmed chat; rerun
-setup to complete the rebind.
+Owner setup also refuses an already configured identical bot token **before**
+constructing the Telegram client or making `getMe`/`getUpdates` calls. An
+in-place same-token rebind could consume the old owner's queued updates before
+the new Keychain pair is durable. Create a separate bot with @BotFather for a
+new owner binding. Reusing the token on a `send-only` host remains supported
+because that role never consumes updates. All setup roles share one exclusive
+per-user temporary lock across state roots, so another OpenMurmur setup cannot
+publish credentials between the read-only preflight and the owner handshake.
+An interrupted stale lock makes the next setup fail closed with an explicit
+cleanup instruction; it never falls through to Keychain or Telegram.
 
 ### Where the token is never allowed
 
