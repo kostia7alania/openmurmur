@@ -126,9 +126,32 @@ RSS stayed near 867 MiB with 432 KiB growth across the remaining warm calls.
 Every observed worker process was gone after `close()`.
 
 This proves bounded real-model readiness, replacement-worker recovery and a
-bounded warm RSS profile for the production backend. It does **not** prove that
-a daemon `JobQueue` lease/failure/retry transaction converges after the worker
-dies; that remains the separate D091 live gate.
+bounded warm RSS profile for the production backend.
+
+### Real worker death inside queued ASR — 2026-08-12
+
+An external disposable harness drove the production `JobQueue`, renewable
+lease wrapper, `handleJob` ASR pipeline and one reusable `MlxAsr` against two
+locally synthesized English FLAC sessions with the enforced offline worker
+environment. After readiness completed in 777 ms, the harness sent `SIGKILL`
+to the actual Python PID 75 ms after the first leased `transcribe` began. The
+handler failed with worker exit code 137; the exact job returned to `pending`
+at attempt 1 with no transcript revision, downstream job or Telegram outbox
+fact.
+
+While that row was in its ordinary backoff, the next queued ASR job spawned one
+replacement MLX generation and completed in 3.255 s. The original row then
+retried once on the same replacement generation and completed in 1.658 s. The
+final ASR rows were `done` at attempts 2 and 1; each session had exactly one
+current transcript revision, the four expected downstream jobs existed once,
+no lease remained, both source FLAC SHA-256 values were unchanged, SQLite
+integrity was `ok` with zero foreign-key violations, and both observed worker
+trees were gone after close.
+
+This closes the real worker-death `JobQueue` failure/retry boundary without a
+permanent test fixture or network, microphone, Telegram credential or user
+recording. It does **not** prove the complete long-running daemon service,
+capture-to-delivery path or release gates D120–D122.
 
 ### Current-revision Ollama corpus — 2026-08-11
 
