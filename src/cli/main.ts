@@ -35,6 +35,7 @@ import { systemClock } from '../util/clock.ts';
 import { createAsrBackend } from './backends.ts';
 import { Daemon, inspectDaemonProcess, readDaemonPid } from './daemon.ts';
 import { doctorExitCode, formatChecks, runDoctor } from './doctor.ts';
+import { normalizeRecallOptions, recallTranscripts, renderRecallResults } from './recall.ts';
 import {
   applySetup,
   planSetup,
@@ -75,6 +76,7 @@ Telegram
 Work
   jobs failed            Show exhausted background jobs and their causes.
   jobs retry JOB_ID      Re-queue one exhausted job after fixing its cause.
+  recall QUERY           Recall grounded sessions with provenance and audio availability.
   search TEXT            Search every stored transcript.
   transcribe FILE        Transcribe one audio file locally and print the text.
   digest DATE            Build and print the digest for YYYY-MM-DD.
@@ -190,6 +192,15 @@ async function main(argv: readonly string[]): Promise<number> {
     case 'jobs':
       return jobsCommand(loaded, positionals[1], positionals[2], asJson);
 
+    case 'recall': {
+      const query = positionals.slice(1).join(' ');
+      if (query.length === 0) {
+        process.stderr.write('Usage: pnpm openmurmur recall QUERY\n');
+        return 1;
+      }
+      return recallCommand(loaded, query, values, asJson);
+    }
+
     case 'search': {
       const query = positionals.slice(1).join(' ');
       if (query.length === 0) {
@@ -293,6 +304,30 @@ async function searchCommand(
     );
     // Exit 1 on no match, so `pnpm openmurmur search x || echo none` works in a script.
     return hits.length > 0 ? 0 : 1;
+  } finally {
+    db.close();
+  }
+}
+
+async function recallCommand(
+  loaded: Awaited<ReturnType<typeof loadConfig>>,
+  query: string,
+  values: Record<string, unknown>,
+  asJson: boolean,
+): Promise<number> {
+  const options = normalizeRecallOptions({
+    query,
+    ...(typeof values['limit'] === 'string' ? { limit: values['limit'] } : {}),
+    ...(typeof values['since'] === 'string' ? { since: values['since'] } : {}),
+    ...(typeof values['until'] === 'string' ? { until: values['until'] } : {}),
+  });
+  const db = openDatabase({ file: loaded.paths.databaseFile });
+  try {
+    const matches = await recallTranscripts(db.handle, options);
+    process.stdout.write(
+      asJson ? `${JSON.stringify(matches, null, 2)}\n` : `${renderRecallResults(matches, query)}\n`,
+    );
+    return matches.length > 0 ? 0 : 1;
   } finally {
     db.close();
   }
