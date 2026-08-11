@@ -21,8 +21,7 @@ Qwen3-ASR. Аудио сразу ставится в очередь Telegram; р
 ## Что потребуется
 
 - Mac на Apple Silicon, macOS 14 или новее;
-- Node.js 26.7.0+ (`.nvmrc` включён);
-- Homebrew, FFmpeg 8.x и `uv`;
+- Homebrew; `bootstrap` установит недостающие Node.js 26.7+, FFmpeg и `uv`;
 - 64 ГБ unified memory рекомендуется для ASR и локальной 27B LLM;
 - свой Telegram-бот и приватный чат;
 - Ollama — опционально, для структурированных отчётов.

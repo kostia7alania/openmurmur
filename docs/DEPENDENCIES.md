@@ -60,6 +60,29 @@ boundary. It is not a clean-Mac proof: Node, uv and FFmpeg were preinstalled,
 and the run did not provision MLX weights, Ollama, native capture permission,
 state, Keychain or Telegram. Those remain D004/D101 and the live release gates.
 
+### Homebrew-only Node bootstrap — 2026-08-12
+
+A second private, disposable checkout ran the current production bootstrap with
+a `PATH` that initially contained no Node executable. Before any install, the
+script used fixed macOS `plutil` to validate every field in the runtime contract.
+A scripted Homebrew boundary recorded exactly one `brew install node`, exposed
+the real Node 26.7.0/npm pair through `brew --prefix node`, and the ordinary
+runtime validator then confirmed embedded SQLite 3.53.4. The contract tuple was
+unchanged across the pre-Node and Node phases.
+
+The same production run installed pnpm 10.19.0 into a private npm prefix, ran
+the frozen Node dependency install and the CI-safe Python sync, with pnpm and uv
+forced offline. A second bootstrap with npm also forced offline completed
+without another Homebrew or npm install. The checkout's bootstrap and runtime
+contract matched the reviewed working-tree snapshot; the original repository
+was not mutated.
+
+This closes D004 at the repository bootstrap control-flow boundary: a Mac that
+already has Homebrew no longer needs a separately installed Node merely to run
+the installer. The scripted Homebrew boundary does not claim a physical clean
+Mac download, Command Line Tools, Homebrew itself, model provisioning or final
+`doctor` readiness; that complete machine gate remains D101.
+
 ## Python packages
 
 | Package | Pinned | Verified | Purpose |

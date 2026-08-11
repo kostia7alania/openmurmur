@@ -28,7 +28,7 @@ weights are obtained only by the explicit foreground provisioning step below.
 
 | Situation | Start here |
 | --- | --- |
-| A Mac you sit at, with Homebrew and Node 26.7.0 already installed | [Quick start](#quick-start), below |
+| A Mac you sit at, with Homebrew installed and on `PATH` | [Quick start](#quick-start), below |
 | A Mac with none of that yet | [docs/INSTALL.md](docs/INSTALL.md) — assumes nothing, starts at `xcode-select` |
 | A headless Mac reached over SSH, set up by an agent | [docs/SERVER.md](docs/SERVER.md) — and run `./scripts/server-preflight` first |
 
@@ -73,9 +73,10 @@ transcripts and summaries are kept indefinitely.
 
 ## Quick start
 
-This assumes Homebrew, Node 26.7.0 and FFmpeg are already installed. Starting from a
-Mac that has none of them? Follow [docs/INSTALL.md](docs/INSTALL.md) instead —
-same destination, nothing assumed.
+This assumes Homebrew is installed and on `PATH`. Bootstrap installs a missing
+Node runtime and FFmpeg through Homebrew, installs `uv`, and pins pnpm exactly.
+Starting from a Mac without Homebrew or Command Line Tools? Follow
+[docs/INSTALL.md](docs/INSTALL.md) instead — same destination, nothing assumed.
 
 ```bash
 git clone https://github.com/kostia7alania/openmurmur.git

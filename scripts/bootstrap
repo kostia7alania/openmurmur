@@ -22,8 +22,36 @@ if [ "$(uname -m)" != "arm64" ]; then
 fi
 
 # --- Node ---------------------------------------------------------------
-command -v node >/dev/null 2>&1 || die "Node is not installed. Install the version pinned in .nvmrc: https://nodejs.org"
-NODE_BIN="$(command -v node)"
+PLUTIL=/usr/bin/plutil
+[ -x "$PLUTIL" ] || die "macOS plutil is required to read the runtime contract."
+
+CONTRACT_SCHEMA_VERSION="$($PLUTIL -extract schemaVersion raw -o - "$RUNTIME_CONTRACT" 2>/dev/null || true)"
+CONTRACT_NODE_MINIMUM="$($PLUTIL -extract nodeMinimum raw -o - "$RUNTIME_CONTRACT" 2>/dev/null || true)"
+CONTRACT_SQLITE_MINIMUM="$($PLUTIL -extract sqliteMinimum raw -o - "$RUNTIME_CONTRACT" 2>/dev/null || true)"
+CONTRACT_PNPM_EXACT="$($PLUTIL -extract pnpmExact raw -o - "$RUNTIME_CONTRACT" 2>/dev/null || true)"
+VERSION_PATTERN='^[0-9]+\.[0-9]+\.[0-9]+$'
+if [ "$CONTRACT_SCHEMA_VERSION" != "1" ] ||
+   ! [[ "$CONTRACT_NODE_MINIMUM" =~ $VERSION_PATTERN ]] ||
+   ! [[ "$CONTRACT_SQLITE_MINIMUM" =~ $VERSION_PATTERN ]] ||
+   ! [[ "$CONTRACT_PNPM_EXACT" =~ $VERSION_PATTERN ]]; then
+  die "runtime-requirements.json is invalid; refusing to install a runtime from it."
+fi
+
+NODE_BIN="$(command -v node 2>/dev/null || true)"
+if [ -z "$NODE_BIN" ]; then
+  BREW_BIN="$(command -v brew 2>/dev/null || true)"
+  [ -n "$BREW_BIN" ] || \
+    die "Node >= $CONTRACT_NODE_MINIMUM is required. Install Homebrew (https://brew.sh) and re-run bootstrap."
+
+  warn "Node >= $CONTRACT_NODE_MINIMUM not found; installing with Homebrew"
+  "$BREW_BIN" install node
+  BREW_NODE_PREFIX="$($BREW_BIN --prefix node 2>/dev/null || true)"
+  NODE_BIN="$BREW_NODE_PREFIX/bin/node"
+  [ -x "$NODE_BIN" ] || \
+    die "Homebrew reported a successful Node install, but $NODE_BIN is not executable."
+  hash -r
+fi
+
 if ! RUNTIME_VALUES="$("$NODE_BIN" --input-type=module - "$RUNTIME_CONTRACT" 2>&1 <<'NODE'
 import { readFileSync } from 'node:fs';
 
@@ -65,6 +93,11 @@ NODE
   die "Runtime requirement check failed: $RUNTIME_VALUES. Run: nvm install && nvm use"
 fi
 IFS=$'\t' read -r MINIMUM_NODE_VERSION MINIMUM_SQLITE_VERSION PNPM_VERSION <<< "$RUNTIME_VALUES"
+if [ "$MINIMUM_NODE_VERSION" != "$CONTRACT_NODE_MINIMUM" ] ||
+   [ "$MINIMUM_SQLITE_VERSION" != "$CONTRACT_SQLITE_MINIMUM" ] ||
+   [ "$PNPM_VERSION" != "$CONTRACT_PNPM_EXACT" ]; then
+  die "runtime-requirements.json changed while bootstrap was selecting the runtime; re-run bootstrap."
+fi
 ok "Node $("$NODE_BIN" -v)"
 
 # --- pnpm ---------------------------------------------------------------

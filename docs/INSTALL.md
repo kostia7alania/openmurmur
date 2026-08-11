@@ -5,8 +5,9 @@ delivers to Telegram. Every command below was run on the machine this project
 was built on, and the failure modes described are ones actually hit rather than
 ones imagined.
 
-The [README quick start](../README.md#quick-start) assumes Node, pnpm and
-Homebrew are already installed. This one assumes nothing.
+The [README quick start](../README.md#quick-start) assumes Homebrew is already
+installed and on `PATH`; bootstrap provisions the remaining repository
+dependencies. This guide assumes nothing and makes each prerequisite explicit.
 
 **Budget:** 20 minutes of your attention, plus 30–60 minutes of downloads you
 can walk away from. About 25 GB of disk.
@@ -137,10 +138,12 @@ git clone https://github.com/kostia7alania/openmurmur.git ~/openmurmur && cd ~/o
 ./scripts/bootstrap
 ```
 
-`bootstrap` installs the pinned pnpm via npm, `uv`, the Node dependencies and the
+`bootstrap` installs Node and FFmpeg through Homebrew when they are missing,
+then installs the pinned pnpm via npm, `uv`, the Node dependencies and the
 CI-safe Python subset. It is idempotent — re-run it whenever something looks
 wrong. It deliberately installs **no models**, preserves an already-installed
-local model stack, and never touches the Keychain.
+local model stack, and never touches the Keychain. The explicit steps above are
+still useful because they make clean-machine failures easier to diagnose.
 
 This source checkout does not install a global `openmurmur` binary. Run the
 commands below from the repository as `pnpm openmurmur ...`.
