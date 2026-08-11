@@ -9,7 +9,8 @@ import {
   modelLanguageName,
 } from '../asr/preferences.ts';
 import type { AsrBackend, AsrSegment } from '../asr/types.ts';
-import { FfmpegCapture } from '../capture/ffmpeg.ts';
+import type { CaptureBackend } from '../capture/backend.ts';
+import { createCaptureBackend } from '../capture/native.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
 import { recoverAfterCrash } from '../capture/recovery.ts';
 import type { LoadedConfig } from '../config/load.ts';
@@ -136,7 +137,7 @@ export class Daemon {
   readonly #outbox: Outbox;
   readonly #alerts: AlertEvaluator;
   readonly #recorder: Recorder;
-  readonly #capture: FfmpegCapture;
+  readonly #capture: CaptureBackend;
   readonly #vad: Vad;
   readonly #asr: AsrBackend;
   readonly #llm: LlmBackend;
@@ -188,14 +189,19 @@ export class Daemon {
     this.#asr = createAsrBackend(options.loaded, options.logger);
     this.#llm = createLlmBackend(config);
 
-    this.#capture = new FfmpegCapture({
+    const captureClock = {
+      monotonicMs: () => Number(process.hrtime.bigint() / 1_000_000n),
+      wallMs: Date.now,
+    };
+    this.#capture = createCaptureBackend({
+      backend: config.audio.captureBackend,
       sampleRate: config.audio.sampleRate,
       channels: config.audio.channels,
       device: config.audio.captureDevice,
       // 512 samples at 16 kHz = 32 ms, the frame size Silero VAD requires.
       frameSamples: 512,
       ffmpegPath: config.audio.ffmpegPath,
-      clock: { monotonicMs: () => Number(process.hrtime.bigint() / 1_000_000n), wallMs: Date.now },
+      clock: captureClock,
     });
 
     this.#sleepDetector = new SleepDetector({
@@ -784,6 +790,7 @@ export class Daemon {
     const lastPart = parts.lastFinalized();
     const snapshot = this.#recorder.snapshot();
     const lastDelivery = this.#outbox.lastDeliveryAt();
+    const processingLagMs = this.#capture.processingLagMs?.() ?? null;
 
     this.#completeTextUpdate(
       'command',
@@ -796,10 +803,7 @@ export class Daemon {
           this.#capture.msSinceLastFrame() === null
             ? null
             : (this.#capture.msSinceLastFrame() ?? 0) / 1000,
-        processingLagSeconds:
-          this.#capture.processingLagMs() === null
-            ? null
-            : (this.#capture.processingLagMs() ?? 0) / 1000,
+        processingLagSeconds: processingLagMs === null ? null : processingLagMs / 1000,
         sessionState: snapshot.state,
         sessionElapsedMs:
           snapshot.sessionStartedMonotonicMs === null
@@ -1125,7 +1129,7 @@ export class Daemon {
     return {
       recorderRunning: this.#recorder.running && this.#recorderFailure === null,
       msSinceLastFrame: this.#capture.msSinceLastFrame(),
-      processingLagMs: this.#capture.processingLagMs(),
+      processingLagMs: this.#capture.processingLagMs?.() ?? null,
       minutesSinceLastClosedPart:
         lastPart?.ended_at == null ? null : (Date.now() - Date.parse(lastPart.ended_at)) / 60_000,
       workerReady: asrHealth.ok,
@@ -1263,7 +1267,7 @@ export class Daemon {
       recorderRunning: this.#recorder.running && this.#recorderFailure === null,
       sessionState: snapshot.state,
       lastSourceFrameAgeMs: this.#capture.msSinceLastFrame(),
-      processingLagMs: this.#capture.processingLagMs(),
+      processingLagMs: this.#capture.processingLagMs?.() ?? null,
       updatedAt: new Date().toISOString(),
     });
   }

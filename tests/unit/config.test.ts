@@ -124,6 +124,10 @@ describe('config parsing', () => {
   it('refuses a sample rate the models cannot use', () => {
     assert.throws(() => parseConfig({ audio: { sampleRate: 44_100 } }), /must be 16000/);
     assert.throws(() => parseConfig({ audio: { channels: 2 } }), /must be 1/);
+    assert.throws(
+      () => parseConfig({ audio: { captureBackend: 'automatic' } }),
+      /captureBackend must be "ffmpeg" or "native"/,
+    );
   });
 
   it('refuses a rotation shorter than the silence timeout', () => {

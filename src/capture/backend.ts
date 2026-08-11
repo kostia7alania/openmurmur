@@ -1,10 +1,8 @@
 /**
  * Capture backend interface.
  *
- * The MVP ships one implementation (FFmpeg + AVFoundation). A native
- * AVAudioEngine helper is P1 — see native/OpenMurmurCapture/README.md — and
- * exists behind this interface so that shipping it does not touch the
- * sessionizer, the database or Telegram.
+ * FFmpeg and the signed native helper both implement this boundary, so capture
+ * identity changes never reach the sessionizer, database or Telegram.
  */
 
 export interface CaptureFrame {
@@ -39,6 +37,8 @@ export interface CaptureBackend {
   stop(): Promise<void>;
   /** Milliseconds since the last frame, or null if none has ever arrived. */
   msSinceLastFrame(): number | null;
+  /** Source-to-consumer lag for process-backed capture implementations. */
+  processingLagMs?(): number | null;
   /** Drops PCM not yet handed to the recorder and starts a new stream epoch. */
   discardBufferedFrames?(): number;
   currentStreamEpoch?(): number;

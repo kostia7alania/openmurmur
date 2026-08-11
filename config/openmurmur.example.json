@@ -11,6 +11,7 @@
     "vadBackend": "silero"
   },
   "audio": {
+    "captureBackend": "ffmpeg",
     "sampleRate": 16000,
     "channels": 1,
     "captureDevice": "default",

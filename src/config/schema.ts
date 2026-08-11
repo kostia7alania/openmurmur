@@ -58,6 +58,7 @@ export interface DiarizationConfig {
 }
 
 export interface AudioConfig {
+  readonly captureBackend: 'ffmpeg' | 'native';
   readonly sampleRate: number;
   readonly channels: number;
   /** AVFoundation device index, or 'default'. */
@@ -185,6 +186,7 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
     vadBackend: 'silero',
   },
   audio: {
+    captureBackend: 'ffmpeg',
     sampleRate: 16_000,
     channels: 1,
     captureDevice: 'default',
@@ -346,13 +348,7 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
     issues.push('sessionizer.vadBackend must be "silero" or "energy"');
   }
 
-  if (c.audio.sampleRate !== 16_000) {
-    issues.push('audio.sampleRate must be 16000: Silero VAD and Qwen3-ASR both require it');
-  }
-  if (c.audio.channels !== 1) issues.push('audio.channels must be 1');
-  if (c.audio.flacCompressionLevel < 0 || c.audio.flacCompressionLevel > 12) {
-    issues.push('audio.flacCompressionLevel must be between 0 and 12');
-  }
+  validateAudio(c.audio, issues);
 
   const d = c.diarization;
   if (d.maxSpeakers < 1 || d.maxSpeakers > 20) {
@@ -408,6 +404,19 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
 
   if (!['debug', 'info', 'warn', 'error'].includes(c.logLevel)) {
     issues.push('logLevel must be one of: debug, info, warn, error');
+  }
+}
+
+function validateAudio(audio: AudioConfig, issues: string[]): void {
+  if (audio.sampleRate !== 16_000) {
+    issues.push('audio.sampleRate must be 16000: Silero VAD and Qwen3-ASR both require it');
+  }
+  if (audio.channels !== 1) issues.push('audio.channels must be 1');
+  if (audio.captureBackend !== 'ffmpeg' && audio.captureBackend !== 'native') {
+    issues.push('audio.captureBackend must be "ffmpeg" or "native"');
+  }
+  if (audio.flacCompressionLevel < 0 || audio.flacCompressionLevel > 12) {
+    issues.push('audio.flacCompressionLevel must be between 0 and 12');
   }
 }
 
