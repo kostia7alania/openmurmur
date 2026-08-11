@@ -98,6 +98,26 @@ The runtime environment is fixed at `python/openmurmur_audio/.venv`.
 launchd: installing the extra elsewhere must fail readiness instead of making
 an interactive shell and the background runtime inspect different packages.
 
+### Real Silero startup gate — 2026-08-12
+
+A private-root production `Daemon` used the real cached Silero/ONNX worker and
+a synthetic local PCM capture helper. The helper was constructed to refuse to
+start unless the daemon had already recorded both readiness milestones. The
+resulting exact order was `speech detection ready` → `daemon started` → capture
+helper spawn → first PCM frame. The real warm-up frame completed in 791.2 ms,
+inside the production scorer's five-second timeout; the first source frame
+arrived 881.9 ms after startup began.
+
+Only after that frame did the daemon durably enqueue the single truthful
+`🟢 Запись включена` status. Orderly stop reaped the capture process and the
+observed VAD worker tree, removed the PID mirror and SQLite ownership, and left
+no sessions, parts, journal rows, jobs or leases. SQLite integrity was `ok`
+with zero foreign-key violations.
+
+This closes the real local readiness and causal startup boundary, not
+microphone/TCC/native-helper behavior, live device cadence, timeout fallback,
+Telegram delivery or launchd.
+
 ### Current-revision Qwen smoke — 2026-08-11
 
 Revision `fd333d0` ran the existing `transcribe` CLI through the production
