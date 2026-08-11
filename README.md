@@ -515,6 +515,15 @@ provenance, path traversal, chat allowlisting, update deduplication, secret
 redaction, prompt-injection fencing, health deduplication and migrations.
 Model-facing automated tests use fake adapters and do not download weights.
 
+On 2026-08-12 a private-root production `Daemon` with real local Silero VAD
+received a synthetic 16 kHz PCM flood. Its processing-lag guard terminated the
+capture path in 900 ms before silently dropping audio, reaped the child, stored
+one bounded failure status without the raw cause or path, and released daemon
+ownership and leases. This proves the overload terminal/alert boundary without
+opening a microphone. The rehearsal used a null Telegram provider and opened
+no speech session, so live failure-message delivery, device cadence and
+open-session finalization remain separate gates.
+
 [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records same-machine smoke runs of
 the pinned MLX/Qwen, Silero and Ollama dependencies. On this revision the real
 Qwen CLI path recognized local synthetic speech, and a killed Python worker
