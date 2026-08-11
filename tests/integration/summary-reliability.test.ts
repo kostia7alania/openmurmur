@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { FakeAsr } from '../../src/asr/fake.ts';
 import { resolvePaths } from '../../src/config/paths.ts';
@@ -368,75 +369,104 @@ describe('offline summary reliability', () => {
   });
 
   it('archives ambiguous pre-012 duplicates before enforcing revision uniqueness', () => {
-    seedSession('legacy-duplicates', 'A legacy database contains duplicate summary rows.');
-    const revisionId = new TranscriptRepository(db.handle).current(
-      'legacy-duplicates',
-    )?.revision_id;
-    assert.ok(revisionId);
-    db.handle.exec('DROP INDEX idx_summaries_revision');
-    db.handle
-      .prepare('DELETE FROM schema_migrations WHERE name = ?')
-      .run('012_summary_revision_uniqueness.sql');
-    db.handle
-      .prepare(
+    const legacy = new DatabaseSync(join(dir, 'pre-012.db'));
+    try {
+      legacy.exec(`
+        CREATE TABLE schema_migrations (
+          name TEXT PRIMARY KEY,
+          applied_at TEXT NOT NULL
+        ) STRICT
+      `);
+      for (const name of [
+        '001_initial.sql',
+        '002_speaker_diarization.sql',
+        '003_output_provenance.sql',
+        '004_telegram_bot_scope.sql',
+        '005_asr_preferences.sql',
+        '006_alert_fingerprints.sql',
+        '007_audio_delivery_time.sql',
+        '008_daemon_heartbeat.sql',
+        '009_incoming_delivery_time.sql',
+        '010_audio_delivery_reconciliation.sql',
+        '011_telegram_delivery_reconciliation.sql',
+      ]) {
+        legacy.exec(
+          readFileSync(new URL(`../../src/database/migrations/${name}`, import.meta.url), 'utf8'),
+        );
+        legacy
+          .prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)')
+          .run(name, '2026-08-11T00:00:00.000Z');
+      }
+
+      new SessionRepository(legacy).create('legacy-duplicates', '2026-08-11T00:00:00.000Z');
+      const revisionId = new TranscriptRepository(legacy).append({
+        sessionId: 'legacy-duplicates',
+        engine: 'legacy',
+        model: 'legacy-1',
+        languages: ['en'],
+        text: 'A legacy database contains duplicate summary rows.',
+        segments: [],
+      });
+      const insertSummary = legacy.prepare(
         `INSERT INTO summaries
            (summary_id, session_id, revision_id, engine, model, payload, created_at)
-         VALUES (?, ?, ?, 'legacy', 'legacy-1', ?, ?)`,
-      )
-      .run(
+         VALUES (?, 'legacy-duplicates', ?, 'legacy', 'legacy-1', ?, ?)`,
+      );
+      insertSummary.run(
         'summary-first',
-        'legacy-duplicates',
         revisionId,
         JSON.stringify({ ...EMPTY_SUMMARY, summary: 'First committed result.' }),
         '2026-08-11T00:00:00.000Z',
       );
-    db.handle
-      .prepare(
-        `INSERT INTO summaries
-           (summary_id, session_id, revision_id, engine, model, payload, created_at)
-         VALUES (?, ?, ?, 'legacy', 'legacy-1', ?, ?)`,
-      )
-      .run(
+      insertSummary.run(
         'summary-second',
-        'legacy-duplicates',
         revisionId,
         JSON.stringify({ ...EMPTY_SUMMARY, summary: 'Conflicting later result.' }),
         '2026-08-11T00:00:01.000Z',
       );
 
-    assert.deepEqual(migrate(db.handle), ['012_summary_revision_uniqueness.sql']);
-    const live = db.handle
-      .prepare('SELECT summary_id FROM summaries WHERE revision_id = ?')
-      .all(revisionId) as unknown as { summary_id: string }[];
-    const archived = db.handle
-      .prepare(
-        'SELECT summary_id, archive_reason FROM summary_revision_conflicts WHERE revision_id = ?',
-      )
-      .all(revisionId) as unknown as { summary_id: string; archive_reason: string }[];
-    assert.deepEqual(
-      live.map((row) => ({ ...row })),
-      [{ summary_id: 'summary-first' }],
-    );
-    assert.deepEqual(
-      archived.map((row) => ({ ...row })),
-      [
-        {
-          summary_id: 'summary-second',
-          archive_reason: 'duplicate_revision_before_012',
-        },
-      ],
-    );
-    assert.throws(
-      () =>
-        db.handle
-          .prepare(
-            `INSERT INTO summaries
-               (summary_id, session_id, revision_id, engine, model, payload, created_at)
-             VALUES ('summary-third', ?, ?, 'legacy', 'legacy-1', '{}', ?)`,
-          )
-          .run('legacy-duplicates', revisionId, '2026-08-11T00:00:02.000Z'),
-      /UNIQUE constraint failed: summaries\.revision_id/,
-    );
+      assert.deepEqual(migrate(legacy), [
+        '012_summary_revision_uniqueness.sql',
+        '013_audio_finalization_journal.sql',
+        '014_current_transcript_uniqueness.sql',
+        '015_telegram_outbox_claim_generation.sql',
+        '016_transcript_timestamp_provenance.sql',
+      ]);
+      const live = legacy
+        .prepare('SELECT summary_id FROM summaries WHERE revision_id = ?')
+        .all(revisionId) as unknown as { summary_id: string }[];
+      const archived = legacy
+        .prepare(
+          'SELECT summary_id, archive_reason FROM summary_revision_conflicts WHERE revision_id = ?',
+        )
+        .all(revisionId) as unknown as { summary_id: string; archive_reason: string }[];
+      assert.deepEqual(
+        live.map((row) => ({ ...row })),
+        [{ summary_id: 'summary-first' }],
+      );
+      assert.deepEqual(
+        archived.map((row) => ({ ...row })),
+        [
+          {
+            summary_id: 'summary-second',
+            archive_reason: 'duplicate_revision_before_012',
+          },
+        ],
+      );
+      assert.throws(
+        () =>
+          legacy
+            .prepare(
+              `INSERT INTO summaries
+                 (summary_id, session_id, revision_id, engine, model, payload, created_at)
+               VALUES ('summary-third', ?, ?, 'legacy', 'legacy-1', '{}', ?)`,
+            )
+            .run('legacy-duplicates', revisionId, '2026-08-11T00:00:02.000Z'),
+        /UNIQUE constraint failed: summaries\.revision_id/,
+      );
+    } finally {
+      legacy.close();
+    }
   });
 
   for (const scenario of [

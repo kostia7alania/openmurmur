@@ -7,12 +7,17 @@ import {
   languageListLabel,
   recognitionModeLabel,
 } from '../asr/preferences.ts';
+import type { TimestampSource } from '../asr/types.ts';
 import type { Paths } from '../config/paths.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
 import { transaction } from '../database/db.ts';
 import { PartRepository, SessionRepository, TranscriptRepository } from '../database/repository.ts';
 import { boundClaimEvidence, type StructuredSummary } from '../llm/schema.ts';
-import { formatTimedTranscript, renderTimedTranscriptMessages } from '../telegram/format.ts';
+import {
+  formatTimedTranscript,
+  formatUnavailableTimestampSources,
+  renderTimedTranscriptMessages,
+} from '../telegram/format.ts';
 import { Outbox } from '../telegram/outbox.ts';
 import {
   liveCaptureProvenance,
@@ -333,13 +338,14 @@ export async function enqueueSessionTranscript(
   // with their timings; a recorded session is the *main* output and was the
   // only path still sending the flat blob, while audio sent to the bot got the
   // readable form. `renderTimedTranscriptMessages` falls back to the flat text
-  // when no segment carries a timestamp, which is what Thai gets when the
-  // aligner cannot run.
+  // when no segment carries a timestamp. Persisted provenance is carried into
+  // every rendered block so a coarse ASR offset is never presented as VAD.
   const messages = renderTimedTranscriptMessages(
     input.sessionId,
     transcripts.segments(transcript.revision_id).map((segment) => ({
       startMs: segment.startMs,
       endMs: segment.endMs,
+      timestampSource: segment.timestampSource,
       text: segment.text,
       speaker: segment.speaker ?? null,
     })),
@@ -385,9 +391,13 @@ export async function enqueueSessionTranscript(
     const segments = transcripts.segments(transcript.revision_id).map((segment) => ({
       startMs: segment.startMs,
       endMs: segment.endMs,
+      timestampSource: segment.timestampSource,
       text: segment.text,
       speaker: segment.speaker ?? null,
     }));
+    const hasTimestamps = segments.some(
+      (segment) => segment.startMs !== null && segment.timestampSource !== 'none',
+    );
     const hasSpeakers = segments.some((segment) => segment.speaker !== null);
     assertCurrent(input);
     await writeTextAtomically(
@@ -417,7 +427,7 @@ export async function enqueueSessionTranscript(
           path: mdPath,
           filename: `${input.sessionId}.md`,
           caption:
-            `📝 Транскрипт с таймингами${hasSpeakers ? ' и голосами' : ''}\n\n` +
+            `📝 Транскрипт ${hasTimestamps ? 'с метками времени' : 'без меток времени'}${hasSpeakers ? ' и голосами' : ''}\n\n` +
             renderProvenanceHtml(provenance),
           ...(settingsKeyboard === undefined ? {} : { replyMarkup: settingsKeyboard }),
         },
@@ -495,6 +505,7 @@ export async function enqueueSessionReport(
       : transcripts.segments(transcript.revision_id).map((segment) => ({
           startMs: segment.startMs,
           endMs: segment.endMs,
+          timestampSource: segment.timestampSource,
           text: segment.text,
           speaker: segment.speaker ?? null,
         }));
@@ -591,6 +602,7 @@ export function renderTranscriptMarkdown(
   segments: readonly {
     readonly startMs: number | null;
     readonly endMs: number | null;
+    readonly timestampSource?: TimestampSource;
     readonly text: string;
     readonly speaker?: number | null;
   }[] = [],
@@ -598,6 +610,7 @@ export function renderTranscriptMarkdown(
   languageInfo?: { readonly languages: readonly string[]; readonly forcedLanguage: string | null },
 ): string {
   const timed = formatTimedTranscript(segments);
+  const unavailableSources = timed.length === 0 ? formatUnavailableTimestampSources(segments) : '';
   return [
     '# Расшифровка OpenMurmur',
     '',
@@ -614,7 +627,11 @@ export function renderTranscriptMarkdown(
     '',
     '---',
     '',
-    timed.length > 0 ? timed : text,
+    timed.length > 0
+      ? timed
+      : unavailableSources.length > 0
+        ? `${unavailableSources}\n\n${text}`
+        : text,
     '',
   ].join('\n');
 }

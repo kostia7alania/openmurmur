@@ -7,6 +7,7 @@ import {
   formatTimestamp,
   TELEGRAM_MESSAGE_LIMIT,
   type TimedTranscriptSegment,
+  timestampSourceLabel,
 } from './format.ts';
 import {
   type OutputProvenance,
@@ -274,7 +275,15 @@ function reportTranscript(
       title: 'Сегменты-источники транскрипта',
       text: segments
         .map((segment, index) => {
-          const time = segment.startMs === null ? 'без времени' : formatTimestamp(segment.startMs);
+          const hasTimestamp = segment.startMs !== null && segment.timestampSource !== 'none';
+          const time =
+            segment.timestampSource === undefined
+              ? segment.startMs === null
+                ? 'без времени'
+                : formatTimestamp(segment.startMs)
+              : hasTimestamp
+                ? `${formatTimestamp(segment.startMs ?? 0)} · ${timestampSourceLabel(segment.timestampSource, true)}`
+                : timestampSourceLabel(segment.timestampSource, false);
           const speaker =
             (segment.speaker ?? null) === null ? '' : ` · Голос ${(segment.speaker ?? 0) + 1}`;
           const text = segment.text.replace(/\s+/gu, ' ').trim() || '(пустой сегмент)';

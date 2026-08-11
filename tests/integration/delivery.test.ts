@@ -389,7 +389,10 @@ describe('ASR job', () => {
     const reportPayload = JSON.parse(reportRow.payload) as { type: string; text: string };
     assert.equal(reportPayload.type, 'text');
     assert.match(reportPayload.text, new RegExp(revisionId));
-    assert.match(reportPayload.text, /\[сегм\. 2\] 0:01: Затем решили выпустить MVP\./);
+    assert.match(
+      reportPayload.text,
+      /\[сегм\. 2\] 0:01 · источник времени: aligner: Затем решили выпустить MVP\./,
+    );
     assert.doesNotMatch(reportPayload.text, /сегм\. 100/);
     assert.doesNotMatch(reportPayload.text, /A newer transcript must not detach/);
   });
@@ -894,9 +897,12 @@ second=$(/usr/bin/printf "$pattern" 1)
     const transcriptFile = join(dir, 'transcripts', `s1.${revisionId}.md`);
     assert.ok(existsSync(transcriptFile));
     const transcriptPayload = JSON.parse(md.payload) as { caption: string };
-    assert.match(transcriptPayload.caption, /^📝 Транскрипт с таймингами/);
+    assert.match(transcriptPayload.caption, /^📝 Транскрипт без меток времени/);
     assert.match(transcriptPayload.caption, /UID сессии: <code>s1<\/code>/);
-    assert.match(readFileSync(transcriptFile, 'utf8'), /0:00 {2}слово/);
+    assert.match(
+      readFileSync(transcriptFile, 'utf8'),
+      /источник времени: none \(время недоступно\)\n\nслово/,
+    );
   });
 
   it('still delivers the transcript when retention proved the audio was deleted', async () => {

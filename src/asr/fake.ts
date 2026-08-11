@@ -43,9 +43,9 @@ export class FakeAsr implements AsrBackend {
       languages: ['en'],
       segments: [
         {
-          startMs: 0,
+          startMs: null,
           endMs: null,
-          timestampSource: 'vad',
+          timestampSource: 'none',
           language: 'en',
           text,
         },

@@ -132,6 +132,23 @@ describe('migrations', () => {
           revision_number INTEGER NOT NULL DEFAULT 1,
           is_current INTEGER NOT NULL
         ) STRICT;
+        CREATE TABLE transcript_segments (
+          segment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          revision_id TEXT NOT NULL REFERENCES transcript_revisions(revision_id) ON DELETE CASCADE,
+          segment_index INTEGER NOT NULL,
+          start_ms INTEGER,
+          end_ms INTEGER,
+          timestamp_source TEXT NOT NULL CHECK (timestamp_source IN ('aligner', 'vad', 'none')),
+          language TEXT,
+          text TEXT NOT NULL,
+          speaker INTEGER,
+          UNIQUE (revision_id, segment_index)
+        ) STRICT;
+        CREATE VIRTUAL TABLE transcript_fts USING fts5(
+          text,
+          revision_id UNINDEXED,
+          tokenize = "trigram"
+        );
         CREATE TABLE summaries (
           summary_id TEXT PRIMARY KEY,
           session_id TEXT,
@@ -276,6 +293,7 @@ describe('migrations', () => {
         '013_audio_finalization_journal.sql',
         '014_current_transcript_uniqueness.sql',
         '015_telegram_outbox_claim_generation.sql',
+        '016_transcript_timestamp_provenance.sql',
       ]);
       const rows = legacy
         .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')
@@ -533,7 +551,8 @@ describe('migrations', () => {
       DELETE FROM schema_migrations
        WHERE name IN (
          '014_current_transcript_uniqueness.sql',
-         '015_telegram_outbox_claim_generation.sql'
+         '015_telegram_outbox_claim_generation.sql',
+         '016_transcript_timestamp_provenance.sql'
        );
     `);
     const at = '2026-08-11T01:00:00.000Z';
@@ -561,6 +580,7 @@ describe('migrations', () => {
     assert.deepEqual(migrate(db.handle), [
       '014_current_transcript_uniqueness.sql',
       '015_telegram_outbox_claim_generation.sql',
+      '016_transcript_timestamp_provenance.sql',
     ]);
     const pointers = db.handle
       .prepare(

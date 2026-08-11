@@ -81,7 +81,8 @@ when it is off.
 - **44 MB, RTF ~0.08.** About 13× faster than real time; a two-minute session is
   diarized in ten seconds. Negligible next to transcription.
 - **Thai attribution is weaker than RU/EN.** No forced aligner supports Thai, so
-  its segments carry coarse VAD timings and overlap the wrong turn more often.
+  its Qwen-supplied segments carry only coarse ASR boundaries and overlap the
+  independently measured diarization turn incorrectly more often.
   Measured: 44 of 55 segments attributed on Thai audio, and most collapsed onto
   the dominant voice.
 - **Unattributed lines are shown unlabelled.** A segment falling in a gap

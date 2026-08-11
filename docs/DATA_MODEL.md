@@ -86,8 +86,9 @@ never treated as proof that a recording was safely delivered or deletable.
 
 ### `vad_segments`
 
-Speech segments with millisecond offsets from session start. Used for Thai
-segment timings, where no word-level aligner exists.
+Speech segments with millisecond offsets from session start, measured by the
+separate finalized-file VAD pass. They remain an independent speech fact; ASR
+offsets are not relabelled as VAD merely because a forced aligner is unavailable.
 
 ### `transcript_revisions`
 
@@ -118,12 +119,18 @@ the effective model-language name, so later button presses cannot alter a retry.
 
 | Column | Notes |
 | --- | --- |
-| `timestamp_source` | `aligner` \| `vad` \| `none`. |
+| `timestamp_source` | `aligner` \| `vad` \| `coarse` \| `none`. |
 
-`aligner` means the Qwen forced aligner produced real word-level timings (RU,
-EN). `vad` means the timing came from segment/VAD boundaries. Thai never gets
-`aligner`: no official aligner supports it, and presenting a guess as a
-measurement would be worse than admitting the gap.
+`aligner` means the Qwen forced aligner produced word-level offsets. `vad` is
+reserved for boundaries actually derived from a VAD measurement. `coarse`
+preserves a Qwen-supplied segment offset without claiming aligner/VAD provenance
+or precision. `none` carries no measured offset. Thai never gets `aligner`: it
+uses `coarse` when Qwen returned offsets and `none` otherwise.
+
+Migration 016 conservatively changes historical `vad` rows to `coarse`: the old
+producer used that label for unsupported upstream ASR timing without mapping the
+separate VAD facts into transcript segments. The migration preserves segment
+identity, speaker attribution and the existing FTS content.
 
 ### `transcript_fts`
 

@@ -58,7 +58,9 @@ process.stdin.on('data', (chunk) => {
         op: 'transcribe',
         text: 'ok',
         languages: ['en'],
-        segments: [],
+        segments: mode === 'coarse-provenance'
+          ? [{ start_ms: 0, end_ms: 500, timestamp_source: 'coarse', language: 'th', text: 'สวัสดี' }]
+          : [],
         model: 'expected/model',
         duration_ms: 1,
       });
@@ -198,5 +200,20 @@ describe('MLX ASR model load health', () => {
       ok: false,
       reason: 'ASR worker exited; the queued job will restart it',
     });
+  });
+
+  it('preserves coarse timestamp provenance across the Python worker boundary', async (t) => {
+    const { asr } = backend(t, 'coarse-provenance');
+    const result = await asr.transcribe({ audioPath: '/tmp/ignored.wav', requestId: 'coarse' });
+
+    assert.deepEqual(result.segments, [
+      {
+        startMs: 0,
+        endMs: 500,
+        timestampSource: 'coarse',
+        language: 'th',
+        text: 'สวัสดี',
+      },
+    ]);
   });
 });

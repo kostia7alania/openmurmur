@@ -1,5 +1,6 @@
 import { languageListLabel, recognitionModeLabel } from '../asr/preferences.ts';
 import { speakerLabel } from '../asr/speakers.ts';
+import type { TimestampSource } from '../asr/types.ts';
 
 /**
  * Telegram message formatting.
@@ -101,6 +102,8 @@ export interface TimedTranscriptSegment {
   readonly startMs: number | null;
   readonly endMs: number | null;
   readonly text: string;
+  /** Persisted provenance for the displayed offset; omitted only by legacy callers. */
+  readonly timestampSource?: TimestampSource;
   /** Which voice, when diarization ran. Null means unknown, not "the first". */
   readonly speaker?: number | null;
 }
@@ -165,26 +168,41 @@ export function renderTimedTranscriptMessages(
   languageInfo?: TranscriptLanguageInfo,
 ): TranscriptMessage[] {
   const formatted = formatTimedTranscript(segments);
-  return renderTranscriptMessages(
-    sessionId,
-    formatted.length > 0 ? formatted : fallbackTranscript,
-    inlineLimit,
-    provenanceHtml,
-    languageInfo,
-  );
+  const unavailableSources =
+    formatted.length === 0 ? formatUnavailableTimestampSources(segments) : '';
+  const body =
+    formatted.length > 0
+      ? formatted
+      : unavailableSources.length > 0
+        ? `${unavailableSources}\n\n${fallbackTranscript}`
+        : fallbackTranscript;
+  return renderTranscriptMessages(sessionId, body, inlineLimit, provenanceHtml, languageInfo);
+}
+
+/** Labels stored source facts when no segment has a usable offset. */
+export function formatUnavailableTimestampSources(
+  segments: readonly TimedTranscriptSegment[],
+): string {
+  return [
+    ...new Set(
+      segments.flatMap((segment) =>
+        segment.timestampSource === undefined
+          ? []
+          : [timestampSourceLabel(segment.timestampSource, false)],
+      ),
+    ),
+  ].join('; ');
 }
 
 export function formatTimedTranscript(
   segments: readonly TimedTranscriptSegment[],
   blockMs = 30_000,
 ): string {
-  const timed = segments.filter(
-    (segment) => segment.startMs !== null && segment.text.trim() !== '',
-  );
-  if (timed.length === 0) return '';
+  const nonempty = segments.filter((segment) => segment.text.trim() !== '');
+  if (!nonempty.some(hasUsableTimestamp)) return '';
 
   const lines: string[] = [];
-  let blockStart = timed[0]?.startMs ?? 0;
+  let blockStart = nonempty.find(hasUsableTimestamp)?.startMs ?? 0;
   let previousEnd = blockStart;
   let current: TimedTranscriptSegment[] = [];
 
@@ -195,13 +213,22 @@ export function formatTimedTranscript(
       // unlabelled line is honest; a wrong one is not.
       const speaker = current.find((s) => (s.speaker ?? null) !== null)?.speaker ?? null;
       const label = speaker === null ? '' : `${speakerLabel(speaker)}: `;
-      lines.push(`${formatTimestamp(blockStart)}  ${label}${text}`);
+      const source = current[0]?.timestampSource;
+      const sourceLabel = source === undefined ? '' : ` · ${timestampSourceLabel(source, true)}`;
+      lines.push(`${formatTimestamp(blockStart)}${sourceLabel}  ${label}${text}`);
     }
     current = [];
   };
 
-  for (const segment of timed) {
+  for (const segment of nonempty) {
+    if (!hasUsableTimestamp(segment)) {
+      flush();
+      lines.push(formatUntimedSegment(segment));
+      continue;
+    }
+
     const start = segment.startMs ?? blockStart;
+    if (current.length === 0) blockStart = start;
     const candidate = normalizeTranscriptLine([...current, segment].map((s) => s.text).join(''));
     const gapMs = Math.max(0, start - previousEnd);
     // A change of voice ends the block whatever the clock says: running two
@@ -218,9 +245,16 @@ export function formatTimedTranscript(
     const nextSpeaker = segment.speaker ?? null;
     const voiceChanged =
       previousSpeaker !== null && nextSpeaker !== null && previousSpeaker !== nextSpeaker;
+    const sourceChanged =
+      current.length > 0 &&
+      current[current.length - 1]?.timestampSource !== segment.timestampSource;
     if (
       current.length > 0 &&
-      (voiceChanged || start - blockStart >= blockMs || gapMs >= 5_000 || candidate.length > 700)
+      (voiceChanged ||
+        sourceChanged ||
+        start - blockStart >= blockMs ||
+        gapMs >= 5_000 ||
+        candidate.length > 700)
     ) {
       flush();
       blockStart = start;
@@ -232,6 +266,39 @@ export function formatTimedTranscript(
   flush();
 
   return lines.join('\n\n');
+}
+
+/** Stable Russian copy that states provenance without turning it into a precision claim. */
+export function timestampSourceLabel(source: TimestampSource, hasTimestamp: boolean): string {
+  if (!hasTimestamp) {
+    return source === 'none'
+      ? 'источник времени: none (время недоступно)'
+      : `источник времени: ${source}, метка недоступна`;
+  }
+  switch (source) {
+    case 'aligner':
+      return 'источник времени: aligner';
+    case 'vad':
+      return 'источник времени: VAD';
+    case 'coarse':
+      return 'источник времени: coarse (примерно, ASR)';
+    case 'none':
+      return 'источник времени: none (время недоступно)';
+  }
+}
+
+function hasUsableTimestamp(segment: TimedTranscriptSegment): boolean {
+  return segment.startMs !== null && segment.timestampSource !== 'none';
+}
+
+function formatUntimedSegment(segment: TimedTranscriptSegment): string {
+  const speaker = segment.speaker ?? null;
+  const label = speaker === null ? '' : `${speakerLabel(speaker)}: `;
+  const timing =
+    segment.timestampSource === undefined
+      ? 'время недоступно'
+      : timestampSourceLabel(segment.timestampSource, false);
+  return `${timing}  ${label}${normalizeTranscriptLine(segment.text)}`;
 }
 
 export function formatTimestamp(ms: number): string {

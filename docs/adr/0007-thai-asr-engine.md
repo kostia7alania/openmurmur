@@ -8,8 +8,9 @@ Thai is one of the three languages this product claims to handle, and it is the
 one most likely to be badly served: it is lower-resource than Russian or
 English, it is tonal, and it is written without spaces between words. It is also
 the language where OpenMurmur already accepts a known limitation — no forced
-aligner supports Thai, so Thai segments get VAD-derived timings rather than word
-timings (see [ARCHITECTURE.md](../ARCHITECTURE.md)).
+aligner supports Thai. Qwen-supplied Thai offsets are therefore retained only
+as coarse ASR boundaries, never relabelled as VAD or word timings (see
+[ARCHITECTURE.md](../ARCHITECTURE.md)).
 
 Thai-specialized open models exist and are actively developed, so the question
 is whether one of them should replace or supplement Qwen3-ASR-1.7B.

@@ -185,9 +185,9 @@ blocked even if its task appears earlier.
 
 ## 18. Timestamp and diarization truth
 
-- [ ] **PX-22 · P1 · gap** — Render persisted timestamp provenance. Evidence: `timestampSource` is stored but omitted from reports. Accept: user sees aligner, coarse or none; no precision is implied beyond the source.
-- [ ] **PX-23 · P0 · gap** — Stop labelling unsupported upstream timestamps as VAD. Evidence: `python/openmurmur_audio/src/openmurmur_audio/asr/__init__.py:244-259` relabels without VAD facts. Accept: `vad` appears only with real VAD boundaries; otherwise store coarse/none.
-- [ ] **PX-24 · P1 · gap** — Correct Thai timing claims. Evidence: official aligner excludes Thai while docs imply VAD-derived timing. Accept: no Thai word-time claim; coarse segment boundaries appear only with an identified source.
+- [x] **PX-22 · P1 · fixed-current** — Telegram transcript blocks and reports render the persisted `aligner`, `VAD`, `coarse` or `none` source with conservative Russian copy. Evidence: `src/telegram/format.ts`, `src/telegram/report.ts`, `tests/unit/telegram-format.test.ts`.
+- [x] **PX-23 · P0 · fixed-current** — Unsupported upstream offsets persist as `coarse`, absent offsets as `none`, and migration 016 repairs historical unsupported `vad` labels without deleting segment/FTS facts. Evidence: Python normalizer, `016_transcript_timestamp_provenance.sql`, `tests/unit/timestamp-provenance.test.ts`.
+- [x] **PX-24 · P1 · fixed-current** — Thai never claims aligner or VAD timing: Qwen offsets are labelled approximate `coarse` and missing offsets remain `none`; user-facing docs and renderers carry that boundary. Evidence: `test_asr_normalize.py`, timestamp formatter/report tests and ASR ADRs.
 - [ ] **PX-25 · P1 · confirmed** — Keep diarization identity-free. Evidence: `docs/adr/0008-speaker-diarization.md` specifies `Голос N` and no identity. Accept: no names or semantic roles are inferred; unattributed speech stays unlabelled.
 - [ ] **PX-26 · P2 · gap** — Add a persisted technical-quality block to reports. Evidence: reports list languages but omit model/mode/timing/diarization facts. Accept: block uses stored facts only and never invents confidence percentages.
 - [ ] **PX-27 · P1 · verify-live** — Measure diarization before enabling it by default. Evidence: ADR calls current behavior plausible but unmeasured. Accept: hand-labelled real RU/TH/EN room corpus publishes DER and failure cases.

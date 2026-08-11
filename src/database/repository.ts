@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
+import type { TimestampSource } from '../asr/types.ts';
 import { transaction } from './db.ts';
 
 const nowIso = () => new Date().toISOString();
@@ -790,7 +791,7 @@ export class IncomingFileRepository {
 export interface TranscriptSegmentInput {
   readonly startMs: number | null;
   readonly endMs: number | null;
-  readonly timestampSource: 'aligner' | 'vad' | 'none';
+  readonly timestampSource: TimestampSource;
   readonly language: string | null;
   readonly text: string;
   /**
@@ -953,7 +954,7 @@ export class TranscriptRepository {
       .all(revisionId) as {
       start_ms: number | null;
       end_ms: number | null;
-      timestamp_source: 'aligner' | 'vad' | 'none';
+      timestamp_source: TimestampSource;
       language: string | null;
       text: string;
       speaker: number | null;
@@ -1011,8 +1012,8 @@ export interface VadSegmentRow {
  *
  * These are the authoritative boundaries. The streaming pass that drives the
  * sessionizer sees 32 ms at a time and cannot look ahead, so its decisions are
- * provisional; this pass sees the whole recording. They are also what gives
- * Thai its segment timings, since no word aligner supports it.
+ * provisional; this pass sees the whole recording. They remain independent of
+ * transcript timing unless an explicit mapping records VAD provenance.
  */
 export class VadSegmentRepository {
   readonly #db: DatabaseSync;

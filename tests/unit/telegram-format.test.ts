@@ -12,6 +12,7 @@ import {
   splitForTelegram,
   splitOnBoundaries,
   TELEGRAM_MESSAGE_LIMIT,
+  timestampSourceLabel,
 } from '../../src/telegram/format.ts';
 import {
   renderProvenanceHtml,
@@ -249,6 +250,51 @@ describe('transcript messages', () => {
     assert.equal(text, '0:00  Yes okay\n\n0:31  second block.');
   });
 
+  it('renders persisted timing provenance without promoting coarse ASR boundaries', () => {
+    const text = formatTimedTranscript([
+      {
+        startMs: 0,
+        endMs: 500,
+        timestampSource: 'aligner',
+        text: 'Точное происхождение. ',
+      },
+      {
+        startMs: 500,
+        endMs: 1000,
+        timestampSource: 'coarse',
+        text: 'สวัสดี',
+      },
+      { startMs: null, endMs: null, timestampSource: 'none', text: ' Untimed.' },
+      {
+        startMs: 31_000,
+        endMs: 32_000,
+        timestampSource: 'coarse',
+        text: ' After untimed.',
+      },
+    ]);
+
+    assert.equal(
+      text,
+      '0:00 · источник времени: aligner  Точное происхождение.\n\n' +
+        '0:00 · источник времени: coarse (примерно, ASR)  สวัสดี\n\n' +
+        'источник времени: none (время недоступно)  Untimed.\n\n' +
+        '0:31 · источник времени: coarse (примерно, ASR)  After untimed.',
+    );
+    assert.doesNotMatch(text, /VAD/);
+  });
+
+  it('keeps the four persisted source labels distinct and conservative', () => {
+    assert.equal(timestampSourceLabel('aligner', true), 'источник времени: aligner');
+    assert.equal(timestampSourceLabel('vad', true), 'источник времени: VAD');
+    assert.equal(timestampSourceLabel('coarse', true), 'источник времени: coarse (примерно, ASR)');
+    assert.equal(timestampSourceLabel('none', false), 'источник времени: none (время недоступно)');
+    assert.equal(
+      timestampSourceLabel('aligner', false),
+      'источник времени: aligner, метка недоступна',
+      'a source tag without a persisted offset must not become a displayed timestamp',
+    );
+  });
+
   it('falls back to the raw transcript when segments have no timing', () => {
     const messages = renderTimedTranscriptMessages(
       sessionId,
@@ -259,6 +305,18 @@ describe('transcript messages', () => {
 
     assert.ok(messages[0]?.text.includes('raw transcript'));
     assert.ok(!messages[0]?.text.includes('untimed'));
+  });
+
+  it('states none provenance while preserving the complete revision text', () => {
+    const messages = renderTimedTranscriptMessages(
+      sessionId,
+      [{ startMs: null, endMs: null, timestampSource: 'none', text: 'untimed source' }],
+      'fallback should not replace a grounded segment',
+      3500,
+    );
+
+    assert.match(messages[0]?.text ?? '', /источник времени: none \(время недоступно\)/);
+    assert.match(messages[0]?.text ?? '', /fallback should not replace a grounded segment/);
   });
 
   it('escapes markup after rendering timed transcript blocks', () => {
@@ -357,6 +415,48 @@ describe('session report', () => {
     assert.match(report, /## Сегменты-источники транскрипта/);
     assert.ok(report.includes('\\[сегм\\. 1\\] 0:00 · Голос 1: Начали обсуждение\\.'));
     assert.ok(report.includes('\\[сегм\\. 2\\] 0:01 · Голос 2: Продолжили\\.'));
+  });
+
+  it('renders the persisted timestamp source in HTML and Markdown without overclaim', () => {
+    const input = {
+      ...base,
+      summary: EMPTY_SUMMARY,
+      transcriptSegments: [
+        {
+          startMs: 0,
+          endMs: 1000,
+          timestampSource: 'aligner' as const,
+          text: 'aligned',
+        },
+        {
+          startMs: 1000,
+          endMs: 2000,
+          timestampSource: 'coarse' as const,
+          text: 'สวัสดี',
+        },
+        {
+          startMs: 2000,
+          endMs: 3000,
+          timestampSource: 'vad' as const,
+          text: 'measured boundary',
+        },
+        {
+          startMs: null,
+          endMs: null,
+          timestampSource: 'none' as const,
+          text: 'untimed',
+        },
+      ],
+    };
+
+    for (const report of [renderSessionReport(input), renderSessionReportMarkdown(input)]) {
+      assert.match(report, /0:00.*источник времени: aligner/s);
+      assert.match(report, /0:01.*источник времени: coarse/s);
+      assert.match(report, /примерно, ASR/);
+      assert.match(report, /0:02.*источник времени: VAD/s);
+      assert.match(report, /источник времени: none.*время недоступно.*untimed/s);
+      assert.doesNotMatch(report, /สวัสดี[^\n]*VAD/);
+    }
   });
 
   it('keeps a long summary preview compact and collapsible', () => {

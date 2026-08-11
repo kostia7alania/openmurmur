@@ -192,8 +192,9 @@ expandable quote carrying the `session_id`.
 
 Over it: one `.md` attachment, without duplicate numbered chat messages, so
 the chat stays compact and the transcript remains a searchable artefact. The
-file contains timestamps when ASR supplied them and `Голос N` only when
-diarization supplied a speaker label.
+file labels each persisted timestamp source: `aligner`, actual `VAD`, or
+approximate `ASR`; segments with `none` say that time is unavailable. `Голос N`
+appears only when diarization supplied a speaker label.
 
 ### Status messages
 

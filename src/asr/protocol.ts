@@ -9,6 +9,8 @@
  * stderr is reserved for human-readable logs and is never parsed.
  */
 
+import type { TimestampSource } from './types.ts';
+
 export interface WorkerRequestBase {
   readonly id: string;
 }
@@ -52,7 +54,7 @@ export type WorkerRequest =
 export interface WorkerSegment {
   readonly start_ms: number | null;
   readonly end_ms: number | null;
-  readonly timestamp_source: 'aligner' | 'vad' | 'none';
+  readonly timestamp_source: TimestampSource;
   readonly language: string | null;
   readonly text: string;
 }

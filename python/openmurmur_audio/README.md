@@ -46,14 +46,16 @@ stdout is protocol-only. Logs go to stderr.
 
 `timestamp_source` on each segment says where the timing came from:
 
-| Value     | Meaning                                                     |
-| --------- | ----------------------------------------------------------- |
-| `aligner` | Qwen forced aligner produced word-level timings (RU, EN)     |
-| `vad`     | Timing derived from VAD/segment boundaries (Thai, and others)|
-| `none`    | No timing available                                          |
+| Value     | Meaning                                                        |
+| --------- | -------------------------------------------------------------- |
+| `aligner` | Qwen forced aligner produced word-level timings (RU, EN)        |
+| `vad`     | An actual VAD measurement was used to derive the boundaries     |
+| `coarse`  | Qwen returned segment offsets without validated aligner/VAD provenance |
+| `none`    | No measured timing is available                                |
 
-Thai never gets `aligner`. No official aligner supports it, and presenting a
-guess as a measurement would be worse than admitting the gap.
+Thai never gets `aligner`. It gets `coarse` when Qwen supplied offsets and
+`none` when it did not. No official aligner supports Thai, and an upstream ASR
+offset is never relabelled as VAD merely because the allowlist did not match.
 
 ## Tests
 

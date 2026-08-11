@@ -101,10 +101,10 @@ or makes source delivery wait for re-encoding.
 
 Qwen3-ASR supports Thai recognition, but the official forced aligner supports
 11 languages and Thai is not one of them. Thai output must not present invented
-word-level timestamps. It may show coarse boundaries only when those boundaries
-come from an identified source such as VAD; otherwise timing is marked
-unavailable. A timestamp produced by an unknown upstream path must not be
-renamed `vad` merely because the forced aligner language allowlist did not match.
+word-level timestamps. Qwen-supplied offsets are persisted as `coarse`: useful
+segment boundaries, but neither an aligner nor a VAD measurement and not a
+precision claim. `vad` is reserved for boundaries actually derived from the
+separate VAD pass; absent offsets are `none` and render as unavailable.
 
 Optional diarization may attach `Голос N` within one recording when a local
 diarizer actually attributed the segment. It does not identify people, infer

@@ -1,13 +1,14 @@
+export type TimestampSource = 'aligner' | 'vad' | 'coarse' | 'none';
+
 export interface AsrSegment {
   readonly startMs: number | null;
   readonly endMs: number | null;
   /**
-   * 'aligner' when the Qwen forced aligner produced real word timings (RU/EN),
-   * 'vad' when timings come from session/VAD boundaries instead. Thai gets
-   * 'vad': no official aligner supports it, and inventing word timestamps
-   * would be a fabricated confidence signal.
+   * `aligner` is forced-aligner output; `vad` requires an actual VAD-derived
+   * boundary; `coarse` preserves an upstream ASR offset without claiming its
+   * precision; `none` means no measured offset exists.
    */
-  readonly timestampSource: 'aligner' | 'vad' | 'none';
+  readonly timestampSource: TimestampSource;
   readonly language: string | null;
   readonly text: string;
 }
@@ -83,8 +84,9 @@ export interface AsrBackend {
    * Run after the file is closed rather than reusing the streaming decisions:
    * the streaming pass sees 32 ms at a time and cannot look ahead, so its
    * segment boundaries are provisional. This pass sees the whole part and
-   * produces the boundaries stored in `vad_segments` and used for Thai
-   * timings, where no word aligner exists.
+   * produces the boundaries stored in `vad_segments` as an independent speech
+   * fact. ASR timestamps are not relabelled as VAD unless this measured output
+   * is actually used to derive them.
    *
    * It never decides what to delete. Retention reads the database, not VAD.
    */

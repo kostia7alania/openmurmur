@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { foreignScripts, reconcileLanguages } from '../asr/languages.ts';
 import { effectiveAsrLanguage } from '../asr/preferences.ts';
 import { assignSpeaker, offsetTurns, speakerCount } from '../asr/speakers.ts';
-import type { AsrBackend, SpeakerTurn } from '../asr/types.ts';
+import type { AsrBackend, SpeakerTurn, TimestampSource } from '../asr/types.ts';
 import type { Paths } from '../config/paths.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
 import { transaction } from '../database/db.ts';
@@ -234,7 +234,7 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
   const segments: {
     startMs: number | null;
     endMs: number | null;
-    timestampSource: 'aligner' | 'vad' | 'none';
+    timestampSource: TimestampSource;
     language: string | null;
     text: string;
   }[] = [];

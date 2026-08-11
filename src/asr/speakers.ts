@@ -14,9 +14,9 @@ import type { SpeakerTurn } from './types.ts';
  * Which voice spoke a segment, or null when that cannot be answered.
  *
  * Null is returned for a segment with no timestamps and for one falling
- * entirely in a gap between turns. Both are common — Thai has no forced
- * aligner, so its segments carry coarse VAD timings — and an unlabelled line
- * is honest where a nearest-neighbour guess would not be.
+ * entirely in a gap between turns. Both are common — some ASR output has no
+ * timing, and the two models choose different boundaries — and an unlabelled
+ * line is honest where a nearest-neighbour guess would not be.
  */
 export function assignSpeaker(
   startMs: number | null,

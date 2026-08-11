@@ -28,6 +28,8 @@ def test_plain_string_result_is_accepted() -> None:
     assert result.text == "привет мир"
     assert len(result.segments) == 1
     assert result.segments[0].timestamp_source == "none"
+    assert result.segments[0].start_ms is None
+    assert result.segments[0].end_ms is None
 
 
 def test_empty_string_yields_no_segments() -> None:
@@ -48,8 +50,8 @@ def test_russian_word_timings_are_labelled_aligner() -> None:
     assert result.segments[0].end_ms == 1250
 
 
-def test_thai_timings_are_never_labelled_aligner() -> None:
-    """No official aligner supports Thai; timings must not claim word accuracy."""
+def test_thai_upstream_timings_are_labelled_coarse_not_aligner_or_vad() -> None:
+    """No aligner or VAD fact supports a stronger Thai provenance claim."""
     raw = {
         "text": "สวัสดี",
         "segments": [{"text": "สวัสดี", "language": "th", "start": 0.0, "end": 1.0}],
@@ -57,7 +59,32 @@ def test_thai_timings_are_never_labelled_aligner() -> None:
     result = normalize_result(raw, "m", ALIGNER, 1000)
 
     assert result.segments[0].language == "th"
-    assert result.segments[0].timestamp_source == "vad"
+    assert result.segments[0].timestamp_source == "coarse"
+    assert result.segments[0].start_ms == 0
+    assert result.segments[0].end_ms == 1000
+
+
+def test_thai_cannot_be_promoted_by_a_stale_or_invalid_aligner_allowlist() -> None:
+    raw = {
+        "text": "สวัสดี",
+        "segments": [{"text": "สวัสดี", "language": "th", "start": 0.0, "end": 1.0}],
+    }
+
+    result = normalize_result(raw, "m", [*ALIGNER, "th"], 1000)
+
+    assert result.segments[0].timestamp_source == "coarse"
+
+
+@pytest.mark.parametrize("language", ["de", "klingon"])
+def test_unverified_language_cannot_be_promoted_by_the_caller_allowlist(language: str) -> None:
+    raw = {
+        "text": "hallo",
+        "segments": [{"text": "hallo", "language": language, "start": 0.0, "end": 1.0}],
+    }
+
+    result = normalize_result(raw, "m", [*ALIGNER, language], 1000)
+
+    assert result.segments[0].timestamp_source == "coarse"
 
 
 def test_segment_without_timings_is_labelled_none() -> None:
@@ -82,7 +109,7 @@ def test_mixed_language_recording_reports_every_language() -> None:
     sources = {s.language: s.timestamp_source for s in result.segments}
     assert sources["ru"] == "aligner"
     assert sources["en"] == "aligner"
-    assert sources["th"] == "vad"
+    assert sources["th"] == "coarse"
 
 
 def test_top_level_language_is_included() -> None:
@@ -126,6 +153,9 @@ def test_dataclass_without_segments_still_yields_one_segment() -> None:
     assert result.text == "hello"
     assert len(result.segments) == 1
     assert result.languages == ["en"]
+    assert result.segments[0].timestamp_source == "none"
+    assert result.segments[0].start_ms is None
+    assert result.segments[0].end_ms is None
 
 
 def test_thai_from_the_dataclass_is_still_never_aligner() -> None:
@@ -135,7 +165,7 @@ def test_thai_from_the_dataclass_is_still_never_aligner() -> None:
         segments=[{"text": "สวัสดี", "language": "th", "start": 0.0, "end": 1.0}],
     )
     result = normalize_result(raw, "m", ALIGNER, 1000)
-    assert result.segments[0].timestamp_source == "vad"
+    assert result.segments[0].timestamp_source == "coarse"
 
 
 @requires_local_models
@@ -206,7 +236,7 @@ def test_thai_display_name_still_never_gets_aligner() -> None:
     result = normalize_result(raw, "m", ALIGNER, 1360)
 
     assert result.languages == ["th"]
-    assert result.segments[0].timestamp_source == "vad"
+    assert result.segments[0].timestamp_source == "coarse"
 
 
 def test_a_segment_may_override_the_detected_language() -> None:
@@ -223,5 +253,5 @@ def test_a_segment_may_override_the_detected_language() -> None:
 
     sources = {s.language: s.timestamp_source for s in result.segments}
     assert sources["ru"] == "aligner"
-    assert sources["th"] == "vad"
+    assert sources["th"] == "coarse"
     assert set(result.languages) == {"ru", "th"}

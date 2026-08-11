@@ -7,9 +7,10 @@ process and the model stays in unified memory between requests.
 Language handling:
   * Detection is automatic and multiple languages may appear in one recording.
   * Word-level timestamps come from the Qwen forced aligner for RU and EN.
-  * Thai gets segment timings derived from VAD boundaries instead. No official
-    aligner supports Thai, and emitting invented word timings would present a
-    guess as measurement.
+  * Other languages may carry coarse segment boundaries returned by Qwen. They
+    are not relabelled as VAD: this code did not measure them with VAD.
+  * Missing boundaries stay missing. An audio duration is not a measured
+    transcript timestamp.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from typing import Any, Literal
 
 from openmurmur_audio.audio import FloatArray, duration_ms
 
-TimestampSource = Literal["aligner", "vad", "none"]
+TimestampSource = Literal["aligner", "vad", "coarse", "none"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +162,11 @@ _LANGUAGE_CODES: dict[str, str] = {
     "ukrainian": "uk",
 }
 
+# A caller allowlist is configuration, not capability evidence. This is the
+# subset verified for the bundled Qwen/MLX path; an upstream offset outside it
+# remains coarse even if stale or invalid config names that language.
+_SUPPORTED_FORCED_ALIGNER_LANGUAGES = frozenset({"ru", "en"})
+
 
 def normalize_language(value: object) -> str | None:
     """Maps a model language label onto an ISO 639-1 code.
@@ -213,8 +219,8 @@ def normalize_result(
             segments=[
                 Segment(
                     text=raw.strip(),
-                    start_ms=0,
-                    end_ms=audio_duration_ms,
+                    start_ms=None,
+                    end_ms=None,
                     timestamp_source="none",
                     language=None,
                 )
@@ -242,17 +248,21 @@ def normalize_result(
             languages.append(language)
 
         has_word_times = item.get("start") is not None and item.get("end") is not None
-        aligner_supported = language is not None and language in aligner_languages
+        aligner_supported = (
+            language is not None
+            and language in aligner_languages
+            and language in _SUPPORTED_FORCED_ALIGNER_LANGUAGES
+        )
 
         if has_word_times and aligner_supported:
             source: TimestampSource = "aligner"
             start_ms: int | None = int(float(item["start"]) * 1000)
             end_ms: int | None = int(float(item["end"]) * 1000)
         elif has_word_times:
-            # Timings exist but no validated aligner for this language: keep
-            # them, and label them as VAD-grade so downstream code does not
-            # present them as word-accurate.
-            source = "vad"
+            # The upstream ASR returned boundaries, but there is no validated
+            # forced aligner for this language. Preserve the useful coarse
+            # offsets without inventing a VAD measurement that never ran.
+            source = "coarse"
             start_ms = int(float(item["start"]) * 1000)
             end_ms = int(float(item["end"]) * 1000)
         else:
@@ -274,8 +284,8 @@ def normalize_result(
         segments.append(
             Segment(
                 text=text,
-                start_ms=0,
-                end_ms=audio_duration_ms,
+                start_ms=None,
+                end_ms=None,
                 timestamp_source="none",
                 language=languages[0] if languages else None,
             )
