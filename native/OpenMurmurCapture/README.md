@@ -1,80 +1,99 @@
-# OpenMurmurCapture (planned — P1-01)
+# OpenMurmurCapture
 
-A native Swift capture helper using `AVAudioEngine`, to replace FFmpeg +
-AVFoundation as the default capture backend.
+A native Swift capture helper using `AVAudioEngine`. It owns microphone access
+under the stable `io.openmurmur.capture` bundle identity and writes raw mono
+16 kHz signed 16-bit little-endian PCM to stdout.
 
-**Nothing here is implemented.** This document records the design so the
-interface in `src/capture/backend.ts` stays honest about what it is for.
+## Permission modes
 
-## Why FFmpeg is the MVP backend
+- `--authorize` is the only mode that can display the macOS microphone prompt.
+  Launch it explicitly as a GUI app before starting a background daemon.
+- `--stream` never requests permission. It exits with code 77 unless permission
+  was already granted.
+- `--authorization-status` returns fixed JSON and exits 0 when authorized or 77
+  otherwise. It never requests permission or opens an audio device.
+- `--source-digest` prints the signed bundle's lowercase source SHA-256 and does
+  not inspect TCC or audio hardware.
+- `--self-check` converts synthetic PCM without opening or enumerating an audio
+  device. Build automation uses this mode.
 
-A native helper that behaves well under macOS TCC should be code-signed, which
-requires an Apple Developer Program membership ($99/year). Requiring that to run
-an open-source project from source would exclude most users and contributors on
-day one.
+stdout is reserved for PCM in stream mode. Diagnostics are fixed, bounded
+messages on stderr; status and source-digest modes return their documented
+machine-readable stdout only.
 
-See [ADR-0003](../../docs/adr/0003-capture-backend.md).
+## Realtime boundary
 
-## What FFmpeg costs us
+The AVAudioEngine tap only copies into one of 64 preallocated buffers after a
+nonblocking semaphore acquisition. A serial worker performs resampling,
+downmixing, Int16 conversion and stdout writes. If the ring is full, capture
+terminates explicitly instead of blocking the realtime callback or silently
+dropping samples.
 
-| Limitation | Consequence |
-| --- | --- |
-| Imprecise TCC errors | macOS reports a permission denial as a device-open failure, so `classifyFfmpegFailure` matches on message text. A wrong guess costs a less helpful error string, never correctness. |
-| No route-change notifications | Unplugging a USB microphone looks like a stream ending, not a device change. The health check catches it within 15 seconds. |
-| An extra process | One more thing to supervise, and a pipe between it and the daemon. |
-| Timestamps assigned on receipt | Frames carry pipe scheduling jitter. Irrelevant at 32 ms granularity for session boundaries; word-level alignment comes from the ASR model instead. |
+Configuration changes, system sleep, conversion errors and broken stdout all
+terminate with stable nonzero codes. SIGINT and SIGTERM are normal shutdowns.
 
-## What the native helper would provide
+## Build and self-check
 
-- `AVAudioSession` / `AVAudioEngine` with an explicit, distinguishable
-  permission state (`AVCaptureDevice.authorizationStatus`).
-- Route-change and configuration-change notifications, so switching microphones
-  is handled rather than looking like a failure.
-- Hardware-referenced timestamps.
-- A stable, signed identity, so a TCC grant survives a rebuild.
-- No extra process if built as a framework, or a small signed helper if not.
-
-## Interface it must satisfy
-
-```ts
-interface CaptureBackend {
-  readonly name: string;
-  start(): AsyncIterableIterator<CaptureFrame>;
-  stop(): Promise<void>;
-  msSinceLastFrame(): number | null;
-}
+```bash
+native/OpenMurmurCapture/build.sh
 ```
 
-`start()` yielding its first frame is the daemon's proof that the microphone is
-genuinely open — it gates the `🟢 Запись включена` message. A native
-implementation must preserve that: **do not signal readiness before real audio
-arrives.**
+The default build is ad-hoc signed with hardened runtime and the audio-input
+entitlement. That is sufficient for compilation and the device-free self-check,
+but it is not a distributable or TCC-stable release identity.
 
-## Sketch
+The default compiler target is `arm64-apple-macos14.0`. Override
+`OPENMURMUR_CAPTURE_TARGET` only when deliberately producing another supported
+release slice.
 
+The build directory and all of its existing parents must be real directories,
+not symlinks. Compile, signing, verification, digest comparison and self-check
+run in a private adjacent staging directory. Only a fully verified app reaches
+the final path. An existing app is moved to a private adjacent backup during
+that final publish step and restored if publication fails; if rollback itself
+fails, both recovery paths are printed and preserved instead of being deleted.
+
+Before signing, the build writes `Contents/Resources/source.sha256`. Its input
+manifest is deterministic:
+
+1. Take `Info.plist`, `OpenMurmurCapture.entitlements`, `build.sh`, and every
+   regular `Sources/*.swift` file recursively.
+2. Sort their paths relative to this directory using bytewise `LC_ALL=C` order.
+3. For each path, append `<lowercase SHA-256><two spaces><relative path><LF>`.
+4. SHA-256 those exact manifest bytes; write the resulting 64 lowercase hex
+   characters plus LF to `source.sha256`.
+
+The build verifies that `--source-digest` returns that value after codesigning,
+so an installer can compare release metadata with a resource sealed by the app
+signature.
+
+`build.sh --source-digest` computes the same value directly from a source tree
+without compiling or signing. It uses a private temporary directory and prints
+only the digest, allowing an installer check to compare source and signed bundle
+without reimplementing the manifest algorithm.
+
+Release builds set `OPENMURMUR_CAPTURE_CODESIGN_IDENTITY` to a Developer ID
+Application identity. They must be notarized and installed at one stable path;
+updates must retain the Team ID, bundle ID and designated requirement.
+
+The application is intentionally not launched by the build. Run its explicit
+GUI authorization flow only when a user is present:
+
+```bash
+open -W "/stable/path/OpenMurmur Capture.app" --args --authorize
 ```
-native/OpenMurmurCapture/
-├── Package.swift
-├── Sources/OpenMurmurCapture/
-│   ├── main.swift               # NDJSON control on stdin, PCM on stdout
-│   ├── AudioCapture.swift       # AVAudioEngine tap → 16 kHz mono s16le
-│   ├── Permissions.swift        # explicit TCC state
-│   └── RouteMonitor.swift       # device change handling
-└── Tests/
-```
 
-The wire format would mirror the FFmpeg backend — raw 16-bit mono PCM on stdout
-— so `FfmpegCapture` and the native helper differ only in how the process is
-started and how errors are reported.
+Opening the bundle executable with `--stream` emits no readiness marker. The
+first PCM bytes remain the only proof that capture actually started.
 
-## Acceptance criteria (P1-01)
+## Stable exit codes
 
-- A permission denial is distinguishable from a missing device, in code.
-- Switching the input device does not drop or corrupt an active session.
-- Frame timing is at least as stable as the FFmpeg backend.
-- The daemon runs unchanged apart from backend selection.
-- Building from source still works without an Apple Developer account, even if
-  the resulting binary is unsigned.
-
-That last point is a hard requirement. Signing may improve behaviour; it must
-never be the price of running the project.
+| Code | Meaning |
+| ---: | --- |
+| 64 | Invalid invocation |
+| 69 | Input device unavailable or engine start failed |
+| 70 | PCM setup or conversion failed |
+| 74 | PCM stdout write failed |
+| 75 | Bounded handoff overflow or system sleep |
+| 76 | Input-device configuration changed |
+| 77 | Microphone permission is not granted |
