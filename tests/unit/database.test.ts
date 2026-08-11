@@ -13,6 +13,7 @@ import {
   transaction,
 } from '../../src/database/db.ts';
 import {
+  AudioFinalizationJournalRepository,
   countWords,
   IncomingFileRepository,
   SessionRepository,
@@ -59,6 +60,7 @@ describe('migrations', () => {
       'incoming_telegram_files',
       'audio_delivery_reconciliation_audit',
       'telegram_delivery_reconciliation_audit',
+      'audio_finalization_journal',
       'asr_preferences',
       'schema_migrations',
     ]) {
@@ -93,8 +95,20 @@ describe('migrations', () => {
         CREATE TABLE audio_parts (
           part_id TEXT PRIMARY KEY,
           session_id TEXT NOT NULL,
+          ended_at TEXT,
+          duration_ms INTEGER,
+          bytes INTEGER,
+          sha256 TEXT,
+          finalized INTEGER NOT NULL DEFAULT 0,
           delivered INTEGER NOT NULL,
           deleted_at TEXT
+        ) STRICT;
+        CREATE TABLE audio_sessions (
+          session_id TEXT PRIMARY KEY,
+          state TEXT NOT NULL DEFAULT 'DONE',
+          ended_at TEXT,
+          duration_ms INTEGER,
+          rejection_reason TEXT
         ) STRICT;
         CREATE TABLE telegram_outbox (
           outbox_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -256,6 +270,7 @@ describe('migrations', () => {
         '010_audio_delivery_reconciliation.sql',
         '011_telegram_delivery_reconciliation.sql',
         '012_summary_revision_uniqueness.sql',
+        '013_audio_finalization_journal.sql',
       ]);
       const rows = legacy
         .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')
@@ -407,6 +422,57 @@ describe('migrations', () => {
          VALUES ('old-alert', 'alert:asr_backlog:raise:1', 'alert', 5, '{}', 'pending', ?, ?, ?)`,
       )
       .run('2026-08-10T10:00:00.000Z', '2026-08-10T10:00:00.000Z', '2026-08-10T10:00:00.000Z');
+    const addLegacySession = legacy.prepare(
+      `INSERT INTO audio_sessions
+         (session_id, state, started_at, ended_at, duration_ms, created_at, updated_at)
+       VALUES (?, 'DONE', ?, ?, ?, ?, ?)`,
+    );
+    addLegacySession.run(
+      'legacy-exact',
+      '2026-08-10T09:00:00.000Z',
+      '2026-08-10T09:00:12.345Z',
+      12_345,
+      '2026-08-10T09:00:00.000Z',
+      '2026-08-10T09:00:00.000Z',
+    );
+    addLegacySession.run(
+      'legacy-unknown',
+      '2026-08-10T09:00:00.000Z',
+      null,
+      null,
+      '2026-08-10T09:00:00.000Z',
+      '2026-08-10T09:00:00.000Z',
+    );
+    addLegacySession.run(
+      'legacy-asr-empty',
+      '2026-08-10T09:00:00.000Z',
+      '2026-08-10T10:30:00.000Z',
+      300_000,
+      '2026-08-10T09:00:00.000Z',
+      '2026-08-10T09:00:00.000Z',
+    );
+    addLegacySession.run(
+      'legacy-asr-thin',
+      '2026-08-10T09:00:00.000Z',
+      '2026-08-10T10:31:00.000Z',
+      301_000,
+      '2026-08-10T09:00:00.000Z',
+      '2026-08-10T09:00:00.000Z',
+    );
+    legacy
+      .prepare(
+        `UPDATE audio_sessions
+            SET state = 'REJECTED', rejection_reason = ?
+          WHERE session_id = ?`,
+      )
+      .run('asr_empty', 'legacy-asr-empty');
+    legacy
+      .prepare(
+        `UPDATE audio_sessions
+            SET state = 'REJECTED', rejection_reason = ?
+          WHERE session_id = ?`,
+      )
+      .run('insufficient_words', 'legacy-asr-thin');
     legacy.close();
 
     const upgraded = openDatabase({ file: legacyPath });
@@ -421,9 +487,67 @@ describe('migrations', () => {
       assert.equal(alert?.fingerprint, null);
       assert.equal(outbox.state, 'failed');
       assert.match(outbox.last_error ?? '', /dedicated dead-job diagnostics/);
+      const timing = upgraded.handle
+        .prepare(
+          `SELECT session_id, timing_exact
+             FROM audio_sessions
+            WHERE session_id LIKE 'legacy-%'
+            ORDER BY session_id`,
+        )
+        .all() as { session_id: string; timing_exact: number }[];
+      assert.deepEqual(
+        timing.map((row) => ({ ...row })),
+        [
+          { session_id: 'legacy-asr-empty', timing_exact: 0 },
+          { session_id: 'legacy-asr-thin', timing_exact: 0 },
+          { session_id: 'legacy-exact', timing_exact: 1 },
+          { session_id: 'legacy-unknown', timing_exact: 0 },
+        ],
+      );
     } finally {
       upgraded.close();
     }
+  });
+});
+
+describe('audio finalization journal', () => {
+  it('accepts only an identical replay and remains immutable', () => {
+    const at = '2026-08-11T04:00:00.000Z';
+    new SessionRepository(db.handle).create('journal-session', at);
+    db.handle
+      .prepare(
+        `INSERT INTO audio_parts
+           (part_id, session_id, part_index, path, started_at, created_at)
+         VALUES ('journal-part', 'journal-session', 0, '/audio/journal.flac', ?, ?)`,
+      )
+      .run(at, at);
+    const journal = new AudioFinalizationJournalRepository(db.handle);
+    const facts = {
+      partId: 'journal-part',
+      sessionId: 'journal-session',
+      partEndedAtIso: '2026-08-11T04:00:01.000Z',
+      partDurationMs: 1_000,
+      finalSession: {
+        endedAtIso: '2026-08-11T04:00:02.000Z',
+        durationMs: 2_000,
+        speechMs: 1_500,
+      },
+    } as const;
+
+    journal.record(facts);
+    assert.doesNotThrow(() => journal.record(facts));
+    assert.throws(
+      () => journal.record({ ...facts, partDurationMs: 999 }),
+      /conflicting finalization journal/,
+    );
+    assert.throws(
+      () =>
+        db.handle
+          .prepare('UPDATE audio_finalization_journal SET part_duration_ms = 999 WHERE part_id = ?')
+          .run('journal-part'),
+      /immutable/,
+    );
+    assert.equal(journal.forPart('journal-part')?.partDurationMs, 1_000);
   });
 });
 

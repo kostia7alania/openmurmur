@@ -20,6 +20,8 @@ export interface SessionReportInput {
   readonly endedWallMs: number;
   readonly durationMs: number;
   readonly speechMs: number;
+  /** False means crash recovery could not prove exact monotonic timing. */
+  readonly timingExact?: boolean | undefined;
   readonly languages: readonly string[];
   readonly partCount: number;
   readonly summary: StructuredSummary;
@@ -115,10 +117,11 @@ function escapeMarkdown(text: string): string {
  * writes itself are live markup.
  */
 export function renderSessionReport(input: SessionReportInput): string {
+  const timingExact = input.timingExact ?? true;
   const details: string[] = [
-    `Время: ${formatClock(input.startedWallMs, input.timezone)}–${formatClock(input.endedWallMs, input.timezone)}`,
-    `Продолжительность: ${formatDuration(input.durationMs)}`,
-    `Речь: ${formatDuration(input.speechMs)}`,
+    `Время: ${formatClock(input.startedWallMs, input.timezone)}–${timingExact ? formatClock(input.endedWallMs, input.timezone) : 'неизвестно'}`,
+    `Продолжительность: ${timingExact ? formatDuration(input.durationMs) : 'неизвестно'}`,
+    `Речь: ${timingExact ? formatDuration(input.speechMs) : 'неизвестно'}`,
     `Языки: ${escapeHtml(languageListLabel(input.languages))}`,
     `Частей аудио: ${input.partCount}`,
   ];
@@ -201,15 +204,16 @@ export function renderSessionSummaryPreview(input: SessionReportInput): string {
 
 /** Full report artifact used when the Telegram-sized HTML rendering is too long. */
 export function renderSessionReportMarkdown(input: SessionReportInput): string {
+  const timingExact = input.timingExact ?? true;
   const lines: string[] = [
     '# Отчёт OpenMurmur',
     '',
     ...(input.provenance === undefined
       ? [`- UID сессии: \`${input.sessionId}\``]
       : [renderProvenanceMarkdown(input.provenance)]),
-    `- Время: ${formatClock(input.startedWallMs, input.timezone)}–${formatClock(input.endedWallMs, input.timezone)}`,
-    `- Продолжительность: ${formatDuration(input.durationMs)}`,
-    `- Речь: ${formatDuration(input.speechMs)}`,
+    `- Время: ${formatClock(input.startedWallMs, input.timezone)}–${timingExact ? formatClock(input.endedWallMs, input.timezone) : 'неизвестно'}`,
+    `- Продолжительность: ${timingExact ? formatDuration(input.durationMs) : 'неизвестно'}`,
+    `- Речь: ${timingExact ? formatDuration(input.speechMs) : 'неизвестно'}`,
     `- Языки: ${languageListLabel(input.languages)}`,
     `- Частей аудио: ${input.partCount}`,
     ...(input.transcriptRevisionId === undefined

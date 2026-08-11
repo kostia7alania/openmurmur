@@ -6,7 +6,11 @@ import { PartWriter, partPaths } from '../capture/writer.ts';
 import type { Paths } from '../config/paths.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
 import { transaction } from '../database/db.ts';
-import { PartRepository, SessionRepository } from '../database/repository.ts';
+import {
+  AudioFinalizationJournalRepository,
+  PartRepository,
+  SessionRepository,
+} from '../database/repository.ts';
 import { JobQueue } from '../jobs/queue.ts';
 import type { Logger } from '../logging/logger.ts';
 import { Outbox } from '../telegram/outbox.ts';
@@ -46,6 +50,7 @@ export interface RecorderOptions {
 
 interface OpenPart {
   readonly partId: string;
+  readonly sessionId: string;
   readonly writer: PartWriter;
   readonly startedMonotonicMs: number;
 }
@@ -55,6 +60,7 @@ export class Recorder {
   readonly #machine: Sessionizer;
   readonly #sessions: SessionRepository;
   readonly #parts: PartRepository;
+  readonly #finalizations: AudioFinalizationJournalRepository;
   readonly #jobs: JobQueue;
   readonly #outbox: Outbox;
   readonly #captureHost: string;
@@ -73,6 +79,7 @@ export class Recorder {
     this.#machine = new Sessionizer({ config: options.config.sessionizer });
     this.#sessions = new SessionRepository(options.db);
     this.#parts = new PartRepository(options.db);
+    this.#finalizations = new AudioFinalizationJournalRepository(options.db);
     this.#jobs = new JobQueue(options.db);
     this.#outbox = new Outbox(options.db);
     this.#captureHost = options.captureHost ?? hostname();
@@ -251,39 +258,50 @@ export class Recorder {
         break;
 
       case 'close_part':
-        await this.#closeOpenPart(intent.endedWallMs, intent.endedMonotonicMs);
+        await this.#closeOpenPart(intent.endedWallMs, intent.endedMonotonicMs, intent.finalSession);
         break;
 
       case 'session_finalized': {
         const finalizedParts = this.#parts
           .listForSession(intent.sessionId)
           .filter((part) => part.finalized === 1);
-        if (finalizedParts.length === 0) {
+        const publishedPartPendingDatabase = this.#finalizations.hasUnfinalizedPart(
+          intent.sessionId,
+        );
+        if (finalizedParts.length === 0 || publishedPartPendingDatabase) {
           transaction(this.#options.db, () => {
             this.#options.db
               .prepare(
                 `UPDATE audio_sessions
                     SET state = 'FAILED', rejection_reason = 'audio_finalize_failed',
-                        ended_at = ?, duration_ms = ?, speech_ms = ?, part_count = 0,
-                        updated_at = ?
+                        ended_at = ?, duration_ms = ?, speech_ms = ?, part_count = ?,
+                        timing_exact = 1, updated_at = ?
                   WHERE session_id = ?`,
               )
               .run(
                 new Date(intent.endedWallMs).toISOString(),
                 intent.durationMs,
                 intent.speechMs,
+                finalizedParts.length,
                 new Date().toISOString(),
                 intent.sessionId,
               );
+            this.#finalizations.consumeSessionIfPartFinalized(intent.sessionId, {
+              endedAtIso: new Date(intent.endedWallMs).toISOString(),
+              durationMs: intent.durationMs,
+              speechMs: intent.speechMs,
+            });
             this.#enqueueLifecycleStatus(
               intent.sessionId,
               'failed',
               '🔴 Сессию не удалось сохранить: финализация аудио завершилась ошибкой. Аудио не загружаю.',
             );
           });
-          this.#options.logger.error('session failed because no audio part was finalized', {
+          this.#options.logger.error('session held because audio finalization is incomplete', {
             sessionId: intent.sessionId,
             attemptedParts: intent.partCount,
+            finalizedParts: finalizedParts.length,
+            publishedPartPendingDatabase,
           });
           break;
         }
@@ -297,6 +315,11 @@ export class Recorder {
             intent.speechMs,
             finalizedParts.length,
           );
+          this.#finalizations.consumeSessionIfPartFinalized(intent.sessionId, {
+            endedAtIso: new Date(intent.endedWallMs).toISOString(),
+            durationMs: intent.durationMs,
+            speechMs: intent.speechMs,
+          });
           // Audio delivery is a separate job so Telegram can upload while ASR
           // works, without putting filesystem or network I/O on this hot path.
           this.#jobs.enqueue({
@@ -332,7 +355,29 @@ export class Recorder {
 
       case 'session_rejected':
         transaction(this.#options.db, () => {
-          this.#sessions.reject(intent.sessionId, intent.reason, intent.speechMs, intent.partCount);
+          if (intent.endedWallMs !== undefined && intent.durationMs !== undefined) {
+            const exact = {
+              endedAtIso: new Date(intent.endedWallMs).toISOString(),
+              durationMs: intent.durationMs,
+              speechMs: intent.speechMs,
+            };
+            this.#sessions.rejectExact(
+              intent.sessionId,
+              intent.reason,
+              exact.endedAtIso,
+              exact.durationMs,
+              exact.speechMs,
+              intent.partCount,
+            );
+            this.#finalizations.consumeSessionIfPartFinalized(intent.sessionId, exact);
+          } else {
+            this.#sessions.reject(
+              intent.sessionId,
+              intent.reason,
+              intent.speechMs,
+              intent.partCount,
+            );
+          }
           this.#enqueueLifecycleStatus(
             intent.sessionId,
             'rejected',
@@ -418,6 +463,7 @@ export class Recorder {
 
     this.#openPart = {
       partId,
+      sessionId: intent.sessionId,
       writer,
       startedMonotonicMs: intent.startedMonotonicMs,
     };
@@ -432,7 +478,15 @@ export class Recorder {
     this.#preRoll.length = 0;
   }
 
-  async #closeOpenPart(endedWallMs: number, endedMonotonicMs: number): Promise<void> {
+  async #closeOpenPart(
+    endedWallMs: number,
+    endedMonotonicMs: number,
+    finalSession?: {
+      readonly endedWallMs: number;
+      readonly durationMs: number;
+      readonly speechMs: number;
+    },
+  ): Promise<void> {
     const open = this.#openPart;
     if (open === null) return;
     this.#openPart = null;
@@ -440,23 +494,59 @@ export class Recorder {
     // Duration comes from the monotonic span of the part, so an NTP step
     // mid-recording cannot report a negative or wildly long part.
     const durationMs = Math.max(0, Math.round(endedMonotonicMs - open.startedMonotonicMs));
+    const partEndedAtIso = new Date(endedWallMs).toISOString();
 
     try {
-      const finalized = await open.writer.close();
-      this.#parts.finalizePart(
-        open.partId,
-        new Date(endedWallMs).toISOString(),
-        durationMs,
-        finalized.bytes,
-        finalized.sha256,
-      );
+      this.#finalizations.record({
+        partId: open.partId,
+        sessionId: open.sessionId,
+        partEndedAtIso,
+        partDurationMs: durationMs,
+        ...(finalSession === undefined
+          ? {}
+          : {
+              finalSession: {
+                endedAtIso: new Date(finalSession.endedWallMs).toISOString(),
+                durationMs: finalSession.durationMs,
+                speechMs: finalSession.speechMs,
+              },
+            }),
+      });
+    } catch (error) {
+      this.#options.logger.error('failed to journal exact audio timing', {
+        partId: open.partId,
+        error: (error as Error).message,
+      });
+      await open.writer.abort();
+      return;
+    }
+
+    let finalized: Awaited<ReturnType<PartWriter['close']>>;
+    try {
+      finalized = await open.writer.close();
+    } catch (error) {
+      // PartWriter computes its checksum before rename, so a thrown close did
+      // not publish an archive and this journal no longer owns future work.
+      this.#finalizations.deletePart(open.partId);
+      this.#options.logger.error('failed to publish audio part', {
+        partId: open.partId,
+        error: (error as Error).message,
+      });
+      await open.writer.abort();
+      return;
+    }
+
+    try {
+      this.#parts.finalizePartFromJournal(open.partId, finalized.bytes, finalized.sha256);
       this.#options.logger.info('audio part closed', {
         partId: open.partId,
         bytes: finalized.bytes,
         sha256: finalized.sha256,
       });
     } catch (error) {
-      this.#options.logger.error('failed to finalize audio part', {
+      // The archive and exact journal are both durable. Startup recovery owns
+      // the missing database finalization; abort only removes a temp if present.
+      this.#options.logger.error('failed to commit published audio part', {
         partId: open.partId,
         error: (error as Error).message,
       });

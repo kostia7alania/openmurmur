@@ -10,7 +10,10 @@ import {
 } from '../../src/capture/recovery.ts';
 import { managedDirectories, resolvePaths } from '../../src/config/paths.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
-import { TranscriptRepository } from '../../src/database/repository.ts';
+import {
+  AudioFinalizationJournalRepository,
+  TranscriptRepository,
+} from '../../src/database/repository.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
 import { createLogger, nullLogger } from '../../src/logging/logger.ts';
 
@@ -73,6 +76,27 @@ function seedOrphan(name: string, bytes = 4096): string {
   const path = join(paths().tempDir, name);
   writeFileSync(path, Buffer.alloc(bytes));
   return path;
+}
+
+function seedPendingPublication(id: string, publish: boolean): { partId: string; path: string } {
+  const at = nowIso();
+  const path = join(paths().audioDir, `${id}.p000.flac`);
+  db.handle
+    .prepare(
+      `INSERT INTO audio_sessions (session_id, state, started_at, created_at, updated_at)
+       VALUES (?, 'ACTIVE', ?, ?, ?)`,
+    )
+    .run(id, at, at, at);
+  const partId = `${id}-p0`;
+  db.handle
+    .prepare(
+      `INSERT INTO audio_parts
+         (part_id, session_id, part_index, path, started_at, finalized, created_at)
+       VALUES (?, ?, 0, ?, ?, 0, ?)`,
+    )
+    .run(partId, id, path, at, at);
+  if (publish) writeFileSync(path, Buffer.from(`published:${id}`));
+  return { partId, path };
 }
 
 function seedAudioOutbox(
@@ -336,13 +360,221 @@ describe('crash recovery', () => {
     const report = await recoverAfterCrash(db.handle, paths(), nullLogger);
     assert.deepEqual(report.recoveredPublishedParts, ['published-p0']);
     const part = db.handle
-      .prepare('SELECT finalized, bytes, sha256 FROM audio_parts WHERE part_id = ?')
-      .get('published-p0') as { finalized: number; bytes: number; sha256: string };
+      .prepare(
+        'SELECT finalized, ended_at, duration_ms, bytes, sha256 FROM audio_parts WHERE part_id = ?',
+      )
+      .get('published-p0') as {
+      finalized: number;
+      ended_at: string | null;
+      duration_ms: number | null;
+      bytes: number;
+      sha256: string;
+    };
     assert.equal(part.finalized, 1);
+    assert.equal(part.ended_at, null, 'filesystem mtime is not an exact capture clock');
+    assert.equal(part.duration_ms, null, 'a legacy archive cannot invent monotonic duration');
     assert.equal(part.bytes, Buffer.byteLength('complete archive bytes'));
     assert.match(part.sha256, /^[0-9a-f]{64}$/);
+    const session = db.handle
+      .prepare(
+        'SELECT ended_at, duration_ms, timing_exact FROM audio_sessions WHERE session_id = ?',
+      )
+      .get('published') as {
+      ended_at: string | null;
+      duration_ms: number | null;
+      timing_exact: number;
+    };
+    assert.deepEqual({ ...session }, { ended_at: null, duration_ms: null, timing_exact: 0 });
     assert.equal(new JobQueue(db.handle).pendingCount('deliver_audio'), 1);
     assert.equal(new JobQueue(db.handle).pendingCount('asr'), 1);
+  });
+
+  it('converges journal, archive, part finalization, and session outcome after every write fault', async () => {
+    const { partId } = seedPendingPublication('exact-window', true);
+    const journal = new AudioFinalizationJournalRepository(db.handle);
+    const exact = {
+      endedAtIso: '2026-08-11T01:02:03.400Z',
+      durationMs: 12_345,
+      speechMs: 8_765,
+    };
+    journal.record({
+      partId,
+      sessionId: 'exact-window',
+      partEndedAtIso: '2026-08-11T01:02:03.000Z',
+      partDurationMs: 10_000,
+      finalSession: exact,
+    });
+
+    db.handle.exec(`
+      CREATE TRIGGER inject_part_finalize_failure
+      BEFORE UPDATE ON audio_parts
+      WHEN OLD.part_id = 'exact-window-p0'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected part finalize failure');
+      END;
+    `);
+    await assert.rejects(recoverAfterCrash(db.handle, paths(), nullLogger), (error) => {
+      assert.match(String(error), /could not reconcile published audio part/);
+      assert.match(String((error as Error).cause), /injected part finalize failure/);
+      return true;
+    });
+    assert.equal(
+      (
+        db.handle.prepare('SELECT finalized FROM audio_parts WHERE part_id = ?').get(partId) as {
+          finalized: number;
+        }
+      ).finalized,
+      0,
+    );
+    assert.ok(journal.forPart(partId), 'part update failure cannot consume its proof');
+
+    db.handle.exec('DROP TRIGGER inject_part_finalize_failure');
+    db.handle.exec(`
+      CREATE TRIGGER inject_exact_session_failure
+      BEFORE INSERT ON jobs
+      WHEN NEW.kind = 'asr'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected exact session failure');
+      END;
+    `);
+    await assert.rejects(
+      recoverAfterCrash(db.handle, paths(), nullLogger),
+      /injected exact session failure/,
+    );
+    const afterSessionFault = db.handle
+      .prepare(
+        'SELECT state, ended_at, duration_ms, timing_exact FROM audio_sessions WHERE session_id = ?',
+      )
+      .get('exact-window') as {
+      state: string;
+      ended_at: string | null;
+      duration_ms: number | null;
+      timing_exact: number;
+    };
+    assert.deepEqual(
+      { ...afterSessionFault },
+      { state: 'ACTIVE', ended_at: null, duration_ms: null, timing_exact: 0 },
+      'session facts and work roll back together',
+    );
+    assert.ok(journal.forPart(partId), 'session transaction failure preserves the exact proof');
+    assert.equal(new JobQueue(db.handle).pendingCount(), 0);
+
+    db.handle.exec('DROP TRIGGER inject_exact_session_failure');
+    await recoverAfterCrash(db.handle, paths(), nullLogger);
+    const recoveredPart = db.handle
+      .prepare('SELECT ended_at, duration_ms, finalized FROM audio_parts WHERE part_id = ?')
+      .get(partId) as { ended_at: string; duration_ms: number; finalized: number };
+    assert.deepEqual(
+      { ...recoveredPart },
+      { ended_at: '2026-08-11T01:02:03.000Z', duration_ms: 10_000, finalized: 1 },
+    );
+    const recoveredSession = db.handle
+      .prepare(
+        `SELECT state, ended_at, duration_ms, speech_ms, timing_exact, part_count
+           FROM audio_sessions WHERE session_id = ?`,
+      )
+      .get('exact-window') as {
+      state: string;
+      ended_at: string;
+      duration_ms: number;
+      speech_ms: number;
+      timing_exact: number;
+      part_count: number;
+    };
+    assert.deepEqual(
+      { ...recoveredSession },
+      {
+        state: 'PROCESSING',
+        ended_at: exact.endedAtIso,
+        duration_ms: exact.durationMs,
+        speech_ms: exact.speechMs,
+        timing_exact: 1,
+        part_count: 1,
+      },
+    );
+    assert.equal(journal.forPart(partId), undefined);
+
+    await recoverAfterCrash(db.handle, paths(), nullLogger);
+    assert.equal(new JobQueue(db.handle).pendingCount(), 2, 'replay creates no duplicate work');
+  });
+
+  it('uses an exact final journal even when no archive survived publication', async () => {
+    const { partId } = seedPendingPublication('journal-only', false);
+    const journal = new AudioFinalizationJournalRepository(db.handle);
+    journal.record({
+      partId,
+      sessionId: 'journal-only',
+      partEndedAtIso: '2026-08-11T02:00:01.000Z',
+      partDurationMs: 1_000,
+      finalSession: {
+        endedAtIso: '2026-08-11T02:00:02.000Z',
+        durationMs: 2_000,
+        speechMs: 900,
+      },
+    });
+
+    await recoverAfterCrash(db.handle, paths(), nullLogger);
+
+    const session = db.handle
+      .prepare(
+        `SELECT state, rejection_reason, ended_at, duration_ms, speech_ms, timing_exact
+           FROM audio_sessions WHERE session_id = ?`,
+      )
+      .get('journal-only') as Record<string, unknown>;
+    assert.deepEqual(
+      { ...session },
+      {
+        state: 'FAILED',
+        rejection_reason: 'interrupted',
+        ended_at: '2026-08-11T02:00:02.000Z',
+        duration_ms: 2_000,
+        speech_ms: 900,
+        timing_exact: 1,
+      },
+    );
+    assert.equal(journal.forPart(partId), undefined);
+    assert.equal(new JobQueue(db.handle).pendingCount(), 0);
+  });
+
+  it('rejects conflicting durable session timing without consuming the journal', async () => {
+    const { partId } = seedPendingPublication('timing-conflict', true);
+    const journal = new AudioFinalizationJournalRepository(db.handle);
+    journal.record({
+      partId,
+      sessionId: 'timing-conflict',
+      partEndedAtIso: '2026-08-11T03:00:01.000Z',
+      partDurationMs: 1_000,
+      finalSession: {
+        endedAtIso: '2026-08-11T03:00:02.000Z',
+        durationMs: 2_000,
+        speechMs: 1_000,
+      },
+    });
+    db.handle
+      .prepare(
+        `UPDATE audio_sessions
+            SET state = 'FAILED', rejection_reason = 'audio_finalize_failed', ended_at = ?,
+                duration_ms = 9999, speech_ms = 1, timing_exact = 1
+          WHERE session_id = ?`,
+      )
+      .run('2026-08-11T03:00:09.999Z', 'timing-conflict');
+
+    await assert.rejects(recoverAfterCrash(db.handle, paths(), nullLogger), (error) => {
+      assert.match(String(error), /could not reconcile published audio part/);
+      assert.match(String((error as Error).cause), /conflicting durable timing facts/);
+      return true;
+    });
+    assert.equal(
+      (
+        db.handle.prepare('SELECT finalized FROM audio_parts WHERE part_id = ?').get(partId) as {
+          finalized: number;
+        }
+      ).finalized,
+      0,
+      'the part update rolls back with the conflicting proof check',
+    );
+    assert.ok(journal.forPart(partId), 'an operator-visible conflict is never consumed');
+    assert.equal(new JobQueue(db.handle).pendingCount(), 0);
   });
 
   it('recovers published audio after DB finalization failed and retries atomically', async () => {

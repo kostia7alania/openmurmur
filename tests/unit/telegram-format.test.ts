@@ -315,6 +315,20 @@ describe('session report', () => {
     assert.ok(report.includes('Частей аудио: 2'));
   });
 
+  it('renders crash-recovered unknown timing without invented clocks or zero durations', () => {
+    const input = { ...base, timingExact: false, summary: EMPTY_SUMMARY };
+    const report = renderSessionReport(input);
+    assert.ok(report.includes('Время: 11:02–неизвестно'));
+    assert.ok(report.includes('Продолжительность: неизвестно'));
+    assert.ok(report.includes('Речь: неизвестно'));
+    assert.ok(!report.includes('11:18'));
+
+    const markdown = renderSessionReportMarkdown(input);
+    assert.ok(markdown.includes('- Время: 11:02–неизвестно'));
+    assert.ok(markdown.includes('- Продолжительность: неизвестно'));
+    assert.ok(markdown.includes('- Речь: неизвестно'));
+  });
+
   it('escapes HTML inside every summary field', () => {
     const report = renderSessionReport({
       ...base,

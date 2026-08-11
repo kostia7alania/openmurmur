@@ -11,6 +11,7 @@ export interface SessionRow {
   ended_at: string | null;
   duration_ms: number | null;
   speech_ms: number;
+  timing_exact: number;
   part_count: number;
   rejection_reason: string | null;
   languages: string | null;
@@ -80,7 +81,7 @@ export class SessionRepository {
       .prepare(
         `UPDATE audio_sessions
             SET state = 'PROCESSING', ended_at = ?, duration_ms = ?, speech_ms = ?,
-                part_count = ?, updated_at = ?
+                timing_exact = 1, part_count = ?, updated_at = ?
           WHERE session_id = ?`,
       )
       .run(endedAtIso, durationMs, speechMs, partCount, nowIso(), sessionId);
@@ -90,11 +91,30 @@ export class SessionRepository {
     this.#db
       .prepare(
         `UPDATE audio_sessions
-            SET state = 'REJECTED', rejection_reason = ?, ended_at = ?, speech_ms = ?,
+            SET state = 'REJECTED', rejection_reason = ?, ended_at = COALESCE(ended_at, ?),
+                speech_ms = CASE WHEN timing_exact = 1 THEN speech_ms ELSE ? END,
                 part_count = ?, updated_at = ?
           WHERE session_id = ?`,
       )
       .run(reason, nowIso(), speechMs, partCount, nowIso(), sessionId);
+  }
+
+  rejectExact(
+    sessionId: string,
+    reason: string,
+    endedAtIso: string,
+    durationMs: number,
+    speechMs: number,
+    partCount: number,
+  ): void {
+    this.#db
+      .prepare(
+        `UPDATE audio_sessions
+            SET state = 'REJECTED', rejection_reason = ?, ended_at = ?, duration_ms = ?,
+                speech_ms = ?, timing_exact = 1, part_count = ?, updated_at = ?
+          WHERE session_id = ?`,
+      )
+      .run(reason, endedAtIso, durationMs, speechMs, partCount, nowIso(), sessionId);
   }
 
   setLanguages(sessionId: string, languages: readonly string[]): void {
@@ -160,6 +180,35 @@ export class PartRepository {
       .run(endedAtIso, durationMs, bytes, sha256, partId);
   }
 
+  finalizePartFromJournal(partId: string, bytes: number, sha256: string): void {
+    transaction(this.#db, () => {
+      const journal = new AudioFinalizationJournalRepository(this.#db);
+      const exact = journal.forPart(partId);
+      if (exact === undefined) {
+        throw new Error(`audio part ${partId} has no durable finalization journal`);
+      }
+      finalizePartWithFacts(this.#db, partId, bytes, sha256, exact);
+      if (exact.sessionDurationMs === null) {
+        journal.deletePart(partId);
+        return;
+      }
+
+      const session = this.#db
+        .prepare(
+          'SELECT state, ended_at, duration_ms, speech_ms, timing_exact FROM audio_sessions WHERE session_id = ?',
+        )
+        .get(exact.sessionId) as StoredSessionTiming | undefined;
+      if (
+        session?.timing_exact === 1 &&
+        session.state !== 'ACTIVE' &&
+        session.state !== 'FINALIZING'
+      ) {
+        assertStoredSessionTiming(exact, session);
+        journal.deletePart(partId);
+      }
+    });
+  }
+
   markDelivered(partId: string, deliveredAtIso: string): void {
     // A replay may prove a later final acknowledgement, but must never move the
     // retention clock backwards and make a file eligible sooner.
@@ -193,6 +242,343 @@ export class PartRepository {
       .prepare('SELECT * FROM audio_parts WHERE finalized = 1 ORDER BY ended_at DESC LIMIT 1')
       .get() as unknown as PartRow | undefined;
   }
+}
+
+export interface FinalSessionTiming {
+  readonly endedAtIso: string;
+  readonly durationMs: number;
+  readonly speechMs: number;
+}
+
+export interface AudioFinalizationJournalInput {
+  readonly partId: string;
+  readonly sessionId: string;
+  readonly partEndedAtIso: string;
+  readonly partDurationMs: number;
+  readonly finalSession?: FinalSessionTiming;
+}
+
+export interface AudioFinalizationJournalRow {
+  readonly partId: string;
+  readonly sessionId: string;
+  readonly partEndedAtIso: string;
+  readonly partDurationMs: number;
+  readonly sessionEndedAtIso: string | null;
+  readonly sessionDurationMs: number | null;
+  readonly sessionSpeechMs: number | null;
+}
+
+interface StoredSessionTiming {
+  readonly state: string;
+  readonly ended_at: string | null;
+  readonly duration_ms: number | null;
+  readonly speech_ms: number;
+  readonly timing_exact: number;
+}
+
+function assertNonNegativeInteger(value: number, field: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative safe integer`);
+  }
+}
+
+function sameJournal(
+  left: AudioFinalizationJournalRow,
+  right: AudioFinalizationJournalInput,
+): boolean {
+  return (
+    left.partId === right.partId &&
+    left.sessionId === right.sessionId &&
+    left.partEndedAtIso === right.partEndedAtIso &&
+    left.partDurationMs === right.partDurationMs &&
+    left.sessionEndedAtIso === (right.finalSession?.endedAtIso ?? null) &&
+    left.sessionDurationMs === (right.finalSession?.durationMs ?? null) &&
+    left.sessionSpeechMs === (right.finalSession?.speechMs ?? null)
+  );
+}
+
+function assertJournalMatches(
+  exact: AudioFinalizationJournalRow,
+  expected: FinalSessionTiming,
+): void {
+  if (
+    exact.sessionEndedAtIso !== expected.endedAtIso ||
+    exact.sessionDurationMs !== expected.durationMs ||
+    exact.sessionSpeechMs !== expected.speechMs
+  ) {
+    throw new Error(`session ${exact.sessionId} finalization journal conflicts with exact timing`);
+  }
+}
+
+export function assertStoredSessionTiming(
+  exact: AudioFinalizationJournalRow,
+  stored: StoredSessionTiming,
+): void {
+  if (
+    stored.timing_exact !== 1 ||
+    stored.ended_at !== exact.sessionEndedAtIso ||
+    stored.duration_ms !== exact.sessionDurationMs ||
+    stored.speech_ms !== exact.sessionSpeechMs
+  ) {
+    throw new Error(`session ${exact.sessionId} has conflicting durable timing facts`);
+  }
+}
+
+export class AudioFinalizationJournalRepository {
+  readonly #db: DatabaseSync;
+
+  constructor(db: DatabaseSync) {
+    this.#db = db;
+  }
+
+  record(input: AudioFinalizationJournalInput): void {
+    assertNonNegativeInteger(input.partDurationMs, 'part duration');
+    if (input.finalSession !== undefined) {
+      assertNonNegativeInteger(input.finalSession.durationMs, 'session duration');
+      assertNonNegativeInteger(input.finalSession.speechMs, 'session speech');
+      if (input.finalSession.speechMs > input.finalSession.durationMs) {
+        throw new Error('session speech cannot exceed its duration');
+      }
+    }
+    const part = this.#db
+      .prepare(
+        `SELECT session_id, ended_at, duration_ms, bytes, sha256, finalized
+           FROM audio_parts WHERE part_id = ?`,
+      )
+      .get(input.partId) as
+      | {
+          session_id: string;
+          ended_at: string | null;
+          duration_ms: number | null;
+          bytes: number | null;
+          sha256: string | null;
+          finalized: number;
+        }
+      | undefined;
+    if (
+      part?.session_id !== input.sessionId ||
+      part.finalized !== 0 ||
+      part.ended_at !== null ||
+      part.duration_ms !== null ||
+      part.bytes !== null ||
+      part.sha256 !== null
+    ) {
+      throw new Error(
+        `audio part ${input.partId} is not an unfinalized part owned by session ${input.sessionId}`,
+      );
+    }
+
+    this.#db
+      .prepare(
+        `INSERT INTO audio_finalization_journal
+           (part_id, session_id, part_ended_at, part_duration_ms,
+            session_ended_at, session_duration_ms, session_speech_ms, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (part_id) DO NOTHING`,
+      )
+      .run(
+        input.partId,
+        input.sessionId,
+        input.partEndedAtIso,
+        input.partDurationMs,
+        input.finalSession?.endedAtIso ?? null,
+        input.finalSession?.durationMs ?? null,
+        input.finalSession?.speechMs ?? null,
+        nowIso(),
+      );
+    const stored = this.forPart(input.partId);
+    if (stored === undefined || !sameJournal(stored, input)) {
+      throw new Error(`audio part ${input.partId} has a conflicting finalization journal`);
+    }
+  }
+
+  forPart(partId: string): AudioFinalizationJournalRow | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT j.part_id, j.session_id, j.part_ended_at, j.part_duration_ms,
+                j.session_ended_at, j.session_duration_ms, j.session_speech_ms,
+                p.session_id AS owned_session_id
+           FROM audio_finalization_journal j
+           JOIN audio_parts p ON p.part_id = j.part_id
+          WHERE j.part_id = ?`,
+      )
+      .get(partId) as
+      | {
+          part_id: string;
+          session_id: string;
+          part_ended_at: string;
+          part_duration_ms: number;
+          session_ended_at: string | null;
+          session_duration_ms: number | null;
+          session_speech_ms: number | null;
+          owned_session_id: string;
+        }
+      | undefined;
+    if (row === undefined) return undefined;
+    if (row.session_id !== row.owned_session_id) {
+      throw new Error(`audio part ${partId} has a finalization journal for another session`);
+    }
+    return {
+      partId: row.part_id,
+      sessionId: row.session_id,
+      partEndedAtIso: row.part_ended_at,
+      partDurationMs: row.part_duration_ms,
+      sessionEndedAtIso: row.session_ended_at,
+      sessionDurationMs: row.session_duration_ms,
+      sessionSpeechMs: row.session_speech_ms,
+    };
+  }
+
+  forSession(sessionId: string): AudioFinalizationJournalRow | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT part_id
+           FROM audio_finalization_journal
+          WHERE session_id = ? AND session_duration_ms IS NOT NULL`,
+      )
+      .get(sessionId) as { part_id: string } | undefined;
+    return row === undefined ? undefined : this.forPart(row.part_id);
+  }
+
+  hasUnfinalizedPart(sessionId: string): boolean {
+    const row = this.#db
+      .prepare(
+        `SELECT 1
+           FROM audio_finalization_journal j
+           JOIN audio_parts p ON p.part_id = j.part_id
+          WHERE j.session_id = ? AND p.finalized = 0
+          LIMIT 1`,
+      )
+      .get(sessionId);
+    return row !== undefined;
+  }
+
+  consumeSessionIfPartFinalized(sessionId: string, expected: FinalSessionTiming): boolean {
+    const exact = this.forSession(sessionId);
+    if (exact === undefined) return false;
+    assertJournalMatches(exact, expected);
+    const part = this.#db
+      .prepare('SELECT ended_at, duration_ms, finalized FROM audio_parts WHERE part_id = ?')
+      .get(exact.partId) as
+      | { ended_at: string | null; duration_ms: number | null; finalized: number }
+      | undefined;
+    if (part?.finalized !== 1) return false;
+    if (part.ended_at !== exact.partEndedAtIso || part.duration_ms !== exact.partDurationMs) {
+      throw new Error(`audio part ${exact.partId} conflicts with its finalization journal`);
+    }
+    this.deletePart(exact.partId);
+    return true;
+  }
+
+  consumeSession(sessionId: string, expected: FinalSessionTiming): void {
+    const exact = this.forSession(sessionId);
+    if (exact === undefined) {
+      throw new Error(`session ${sessionId} has no exact finalization journal`);
+    }
+    assertJournalMatches(exact, expected);
+    const part = this.#db
+      .prepare('SELECT ended_at, duration_ms, finalized FROM audio_parts WHERE part_id = ?')
+      .get(exact.partId) as
+      | { ended_at: string | null; duration_ms: number | null; finalized: number }
+      | undefined;
+    if (
+      part === undefined ||
+      (part.finalized === 1 &&
+        (part.ended_at !== exact.partEndedAtIso || part.duration_ms !== exact.partDurationMs)) ||
+      (part.finalized === 0 && (part.ended_at !== null || part.duration_ms !== null))
+    ) {
+      throw new Error(`audio part ${exact.partId} conflicts with its finalization journal`);
+    }
+    this.deletePart(exact.partId);
+  }
+
+  deletePart(partId: string): void {
+    this.#db.prepare('DELETE FROM audio_finalization_journal WHERE part_id = ?').run(partId);
+  }
+
+  deleteSession(sessionId: string): void {
+    this.#db.prepare('DELETE FROM audio_finalization_journal WHERE session_id = ?').run(sessionId);
+  }
+}
+
+function finalizePartWithFacts(
+  db: DatabaseSync,
+  partId: string,
+  bytes: number,
+  sha256: string,
+  exact: AudioFinalizationJournalRow | undefined,
+): boolean {
+  const part = db
+    .prepare(
+      'SELECT ended_at, duration_ms, bytes, sha256, finalized FROM audio_parts WHERE part_id = ?',
+    )
+    .get(partId) as
+    | {
+        ended_at: string | null;
+        duration_ms: number | null;
+        bytes: number | null;
+        sha256: string | null;
+        finalized: number;
+      }
+    | undefined;
+  if (part === undefined) throw new Error(`unknown audio part ${partId}`);
+  const endedAtIso = exact?.partEndedAtIso ?? null;
+  const durationMs = exact?.partDurationMs ?? null;
+  if (part.finalized === 1) {
+    if (
+      part.ended_at !== endedAtIso ||
+      part.duration_ms !== durationMs ||
+      part.bytes !== bytes ||
+      part.sha256 !== sha256
+    ) {
+      throw new Error(`audio part ${partId} has conflicting finalized facts`);
+    }
+    return false;
+  }
+  if (
+    part.ended_at !== null ||
+    part.duration_ms !== null ||
+    part.bytes !== null ||
+    part.sha256 !== null
+  ) {
+    throw new Error(`audio part ${partId} has conflicting provisional facts`);
+  }
+  db.prepare(
+    `UPDATE audio_parts
+        SET ended_at = ?, duration_ms = ?, bytes = ?, sha256 = ?, finalized = 1
+      WHERE part_id = ? AND finalized = 0`,
+  ).run(endedAtIso, durationMs, bytes, sha256, partId);
+  return true;
+}
+
+export function recoverPublishedPart(
+  db: DatabaseSync,
+  partId: string,
+  bytes: number,
+  sha256: string,
+): { readonly changed: boolean; readonly timingExact: boolean } {
+  return transaction(db, () => {
+    const journal = new AudioFinalizationJournalRepository(db);
+    const exact = journal.forPart(partId);
+    const changed = finalizePartWithFacts(db, partId, bytes, sha256, exact);
+    if (exact?.sessionDurationMs === null) journal.deletePart(partId);
+    if (exact?.sessionDurationMs !== null && exact !== undefined) {
+      const session = db
+        .prepare(
+          'SELECT state, ended_at, duration_ms, speech_ms, timing_exact FROM audio_sessions WHERE session_id = ?',
+        )
+        .get(exact.sessionId) as StoredSessionTiming | undefined;
+      if (
+        session?.timing_exact === 1 &&
+        session.state !== 'ACTIVE' &&
+        session.state !== 'FINALIZING'
+      ) {
+        assertStoredSessionTiming(exact, session);
+        journal.deletePart(partId);
+      }
+    }
+    return { changed, timingExact: exact !== undefined };
+  });
 }
 
 export type IncomingAttachmentType = 'voice' | 'audio' | 'document' | 'video_note';

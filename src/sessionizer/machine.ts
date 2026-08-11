@@ -292,6 +292,7 @@ export class Sessionizer {
 
     const partCount = this.#partIndex + 1;
     const speechMs = this.#speechMs;
+    const durationMs = frame.monotonicMs - startedMonotonicMs;
     const intents: SessionIntent[] = [
       {
         kind: 'close_part',
@@ -300,12 +301,25 @@ export class Sessionizer {
         endedWallMs: frame.wallMs,
         endedMonotonicMs: frame.monotonicMs,
         reason: 'session_end',
+        finalSession: {
+          endedWallMs: frame.wallMs,
+          durationMs,
+          speechMs,
+        },
       },
     ];
 
     if (speechMs < this.#config.minSpeechSeconds * 1000) {
       const reason: RejectionReason = 'insufficient_speech';
-      intents.push({ kind: 'session_rejected', sessionId, reason, speechMs, partCount });
+      intents.push({
+        kind: 'session_rejected',
+        sessionId,
+        reason,
+        speechMs,
+        partCount,
+        endedWallMs: frame.wallMs,
+        durationMs,
+      });
     } else {
       intents.push({
         kind: 'session_finalized',
@@ -314,7 +328,7 @@ export class Sessionizer {
         endedWallMs: frame.wallMs,
         partCount,
         speechMs,
-        durationMs: frame.monotonicMs - startedMonotonicMs,
+        durationMs,
       });
     }
 

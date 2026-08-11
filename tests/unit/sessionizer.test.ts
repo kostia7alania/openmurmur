@@ -217,6 +217,14 @@ describe('sessionizer: monotonic time', () => {
     h.clock.jumpWallClock(-7_200_000);
     const intents = h.feed(61_000, SILENCE);
     assert.deepEqual(kinds(intents), ['close_part', 'session_finalized']);
+    const close = intents.find((intent) => intent.kind === 'close_part');
+    const finalized = intents.find((intent) => intent.kind === 'session_finalized');
+    assert.ok(close?.kind === 'close_part' && close.finalSession !== undefined);
+    assert.ok(finalized?.kind === 'session_finalized');
+    assert.equal(close.finalSession.durationMs, finalized.durationMs);
+    assert.equal(close.finalSession.speechMs, finalized.speechMs);
+    assert.equal(close.finalSession.endedWallMs, finalized.endedWallMs);
+    assert.ok(close.finalSession.durationMs > 0, 'wall-clock reversal cannot corrupt duration');
   });
 });
 

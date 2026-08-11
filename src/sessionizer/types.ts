@@ -57,6 +57,12 @@ export type SessionIntent =
       readonly endedWallMs: number;
       readonly endedMonotonicMs: number;
       readonly reason: 'rotation' | 'session_end';
+      /** Present only for the last part, before its archive publication. */
+      readonly finalSession?: {
+        readonly endedWallMs: number;
+        readonly durationMs: number;
+        readonly speechMs: number;
+      };
     }
   | {
       readonly kind: 'session_started';
@@ -78,6 +84,8 @@ export type SessionIntent =
       readonly reason: RejectionReason;
       readonly speechMs: number;
       readonly partCount: number;
+      readonly endedWallMs?: number;
+      readonly durationMs?: number;
     };
 
 export interface SessionizerSnapshot {

@@ -124,12 +124,15 @@ export class PartWriter {
     }
 
     await fsyncFile(this.#options.tempPath);
+    // Measure and hash while the file is still private. Once rename returns,
+    // every remaining operation is non-throwing, so callers can distinguish a
+    // failed unpublished temp from a durably published archive.
+    const info = await stat(this.#options.tempPath);
+    const sha256 = await sha256File(this.#options.tempPath);
     await rename(this.#options.tempPath, this.#options.finalPath);
     // Fsync the directory too, or the rename itself can be lost on power loss.
     await fsyncDirectory(dirname(this.#options.finalPath));
 
-    const info = await stat(this.#options.finalPath);
-    const sha256 = await sha256File(this.#options.finalPath);
     return { path: this.#options.finalPath, bytes: info.size, sha256 };
   }
 
@@ -156,14 +159,16 @@ export async function fsyncFile(path: string): Promise<void> {
 }
 
 export async function fsyncDirectory(path: string): Promise<void> {
-  const handle = await open(path, 'r');
   try {
-    await handle.sync();
+    const handle = await open(path, 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   } catch {
     // Directory fsync is not permitted on every filesystem; the rename is
     // still atomic, only its durability window is wider.
-  } finally {
-    await handle.close();
   }
 }
 

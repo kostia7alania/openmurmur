@@ -462,6 +462,7 @@ export async function enqueueSessionReport(
     endedWallMs: session.ended_at === null ? Date.now() : Date.parse(session.ended_at),
     durationMs: session.duration_ms ?? 0,
     speechMs: session.speech_ms,
+    timingExact: session.timing_exact === 1,
     languages,
     partCount: session.part_count,
     summary,

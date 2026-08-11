@@ -3,6 +3,11 @@ import { join, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { Paths } from '../config/paths.ts';
 import { transaction } from '../database/db.ts';
+import {
+  AudioFinalizationJournalRepository,
+  assertStoredSessionTiming,
+  recoverPublishedPart,
+} from '../database/repository.ts';
 import { JobQueue } from '../jobs/queue.ts';
 import type { Logger } from '../logging/logger.ts';
 import { formatBytes } from '../telegram/format.ts';
@@ -75,15 +80,12 @@ export async function reconcilePublishedParts(
         continue;
       }
       const sha256 = await sha256File(row.path);
-      db.prepare(
-        `UPDATE audio_parts
-            SET ended_at = COALESCE(ended_at, ?), bytes = ?, sha256 = ?, finalized = 1
-          WHERE part_id = ? AND finalized = 0`,
-      ).run(new Date(info.mtimeMs).toISOString(), info.size, sha256, row.part_id);
+      const result = recoverPublishedPart(db, row.part_id, info.size, sha256);
       recovered.push(row.part_id);
       logger.warn('recovered an atomically published audio part', {
         partId: row.part_id,
         bytes: info.size,
+        timingExact: result.timingExact,
       });
     } catch (error) {
       // A genuinely missing path is an interrupted temp write and is handled by
@@ -520,7 +522,7 @@ export function reconcileStalledSessions(
 ): string[] {
   const stalled = db
     .prepare(
-      `SELECT s.session_id,
+      `SELECT s.session_id, s.state, s.ended_at, s.duration_ms, s.speech_ms, s.timing_exact,
               (SELECT count(*) FROM audio_parts p
                 WHERE p.session_id = s.session_id AND p.finalized = 1) AS finalized_parts
          FROM audio_sessions s
@@ -535,24 +537,52 @@ export function reconcileStalledSessions(
                     )
               )`,
     )
-    .all() as { session_id: string; finalized_parts: number }[];
+    .all() as {
+    session_id: string;
+    state: string;
+    ended_at: string | null;
+    duration_ms: number | null;
+    speech_ms: number;
+    timing_exact: number;
+    finalized_parts: number;
+  }[];
 
   const reconciled: string[] = [];
   const nowIso = new Date().toISOString();
+  const finalizations = new AudioFinalizationJournalRepository(db);
 
   for (const row of stalled) {
+    const exact = finalizations.forSession(row.session_id);
+    if (exact !== undefined && row.timing_exact === 1) {
+      assertStoredSessionTiming(exact, row);
+    }
     reconciled.push(row.session_id);
     if (!repair) continue;
     if (row.finalized_parts > 0) {
       // Some audio survived. Send it down the normal path rather than
       // discarding a recording the user may well want.
       transaction(db, () => {
-        db.prepare(
-          `UPDATE audio_sessions
-              SET state = 'PROCESSING', ended_at = COALESCE(ended_at, ?),
-                  part_count = ?, rejection_reason = NULL, updated_at = ?
-            WHERE session_id = ?`,
-        ).run(nowIso, row.finalized_parts, nowIso, row.session_id);
+        if (exact === undefined) {
+          db.prepare(
+            `UPDATE audio_sessions
+                SET state = 'PROCESSING', part_count = ?, rejection_reason = NULL, updated_at = ?
+              WHERE session_id = ?`,
+          ).run(row.finalized_parts, nowIso, row.session_id);
+        } else {
+          db.prepare(
+            `UPDATE audio_sessions
+                SET state = 'PROCESSING', ended_at = ?, duration_ms = ?, speech_ms = ?,
+                    timing_exact = 1, part_count = ?, rejection_reason = NULL, updated_at = ?
+              WHERE session_id = ?`,
+          ).run(
+            exact.sessionEndedAtIso,
+            exact.sessionDurationMs,
+            exact.sessionSpeechMs,
+            row.finalized_parts,
+            nowIso,
+            row.session_id,
+          );
+        }
         const jobs = new JobQueue(db);
         jobs.enqueue({
           kind: 'deliver_audio',
@@ -574,6 +604,14 @@ export function reconcileStalledSessions(
             text: '⚠️ Запись прервалась, но сохранившиеся части готовы — загружаю аудио и расшифровываю локально…',
           },
         });
+        if (exact !== undefined) {
+          finalizations.consumeSession(row.session_id, {
+            endedAtIso: exact.sessionEndedAtIso as string,
+            durationMs: exact.sessionDurationMs as number,
+            speechMs: exact.sessionSpeechMs as number,
+          });
+        }
+        finalizations.deleteSession(row.session_id);
       });
       logger.warn('recovered a session interrupted by a crash', {
         sessionId: row.session_id,
@@ -582,12 +620,36 @@ export function reconcileStalledSessions(
       continue;
     }
 
-    db.prepare(
-      `UPDATE audio_sessions
-          SET state = 'FAILED', rejection_reason = 'interrupted',
-              ended_at = COALESCE(ended_at, ?), updated_at = ?
-        WHERE session_id = ?`,
-    ).run(nowIso, nowIso, row.session_id);
+    transaction(db, () => {
+      if (exact === undefined) {
+        db.prepare(
+          `UPDATE audio_sessions
+              SET state = 'FAILED', rejection_reason = 'interrupted', updated_at = ?
+            WHERE session_id = ?`,
+        ).run(nowIso, row.session_id);
+      } else {
+        db.prepare(
+          `UPDATE audio_sessions
+              SET state = 'FAILED', rejection_reason = 'interrupted', ended_at = ?,
+                  duration_ms = ?, speech_ms = ?, timing_exact = 1, updated_at = ?
+            WHERE session_id = ?`,
+        ).run(
+          exact.sessionEndedAtIso,
+          exact.sessionDurationMs,
+          exact.sessionSpeechMs,
+          nowIso,
+          row.session_id,
+        );
+      }
+      if (exact !== undefined) {
+        finalizations.consumeSession(row.session_id, {
+          endedAtIso: exact.sessionEndedAtIso as string,
+          durationMs: exact.sessionDurationMs as number,
+          speechMs: exact.sessionSpeechMs as number,
+        });
+      }
+      finalizations.deleteSession(row.session_id);
+    });
     logger.warn('session was interrupted before any audio was finalized', {
       sessionId: row.session_id,
     });

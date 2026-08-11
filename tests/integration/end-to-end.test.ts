@@ -7,6 +7,7 @@ import { afterEach, before, beforeEach, describe, it } from 'node:test';
 import { FakeAsr } from '../../src/asr/fake.ts';
 import type { CaptureBackend, CaptureFrame } from '../../src/capture/backend.ts';
 import { probeAudio } from '../../src/capture/probe.ts';
+import { recoverAfterCrash } from '../../src/capture/recovery.ts';
 import { resolvePaths } from '../../src/config/paths.ts';
 import { DEFAULT_CONFIG } from '../../src/config/schema.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
@@ -339,6 +340,16 @@ describe('end to end: capture through delivery, without a microphone', () => {
     const provenance = sessions.get(sessionId);
     assert.equal(provenance?.capture_host, 'test-capture-mac');
     assert.equal(provenance?.capture_timezone, 'Asia/Bangkok');
+    assert.equal(provenance?.timing_exact, 1);
+    assert.equal(
+      (
+        db.handle.prepare('SELECT count(*) AS count FROM audio_finalization_journal').get() as {
+          count: number;
+        }
+      ).count,
+      0,
+      'normal part and session finalization consume the durable journal',
+    );
     assert.deepEqual(startedSessions, [sessionId], 'one durable start event per session');
     assert.deepEqual(finalizedSessions, [sessionId], 'one durable finish event per session');
     const lifecycle = db.handle
@@ -476,12 +487,16 @@ describe('end to end: capture through delivery, without a microphone', () => {
     ]);
     await recorder.run();
 
-    const row = db.handle.prepare('SELECT state, rejection_reason FROM audio_sessions').get() as
-      | { state: string; rejection_reason: string }
+    const row = db.handle
+      .prepare('SELECT state, rejection_reason, duration_ms, timing_exact FROM audio_sessions')
+      .get() as
+      | { state: string; rejection_reason: string; duration_ms: number; timing_exact: number }
       | undefined;
 
     assert.equal(row?.state, 'REJECTED');
     assert.equal(row?.rejection_reason, 'insufficient_speech');
+    assert.equal(row?.timing_exact, 1);
+    assert.ok((row?.duration_ms ?? 0) > 0);
     assert.equal(
       new JobQueue(db.handle).pendingCount('asr'),
       0,
@@ -524,6 +539,107 @@ describe('end to end: capture through delivery, without a microphone', () => {
       .prepare('SELECT payload FROM telegram_outbox WHERE delivery_part_id = ?')
       .get(`session-status:failed:${session.session_id}`) as { payload: string };
     assert.match(JSON.parse(failure.payload).text as string, /не удалось сохранить/);
+  });
+
+  it('queues no partial plan until every published journal-owned part is recovered', async (t) => {
+    if (!hasFfmpeg) return t.skip('ffmpeg not available');
+
+    const scenarios = [
+      {
+        name: 'final-part',
+        script: [
+          { kind: 'speech' as const, seconds: 6 },
+          { kind: 'silence' as const, seconds: 61 },
+        ],
+        overrides: {},
+      },
+      {
+        name: 'rotated-part',
+        script: [
+          { kind: 'speech' as const, seconds: 14 },
+          { kind: 'silence' as const, seconds: 6 },
+        ],
+        overrides: { maxPartSeconds: 5, silenceTimeoutSeconds: 5 },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      db.handle.exec(`
+        CREATE TRIGGER fail_${scenario.name.replace('-', '_')}_finalize
+        BEFORE UPDATE OF finalized ON audio_parts
+        WHEN NEW.part_index = 0 AND NEW.finalized = 1
+        BEGIN
+          SELECT RAISE(ABORT, 'injected part finalization failure');
+        END
+      `);
+      const { recorder } = recorderFor(scenario.script, scenario.overrides);
+      await recorder.run();
+      const session = db.handle
+        .prepare(
+          `SELECT session_id, state, rejection_reason, timing_exact, part_count
+             FROM audio_sessions ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get() as {
+        session_id: string;
+        state: string;
+        rejection_reason: string;
+        timing_exact: number;
+        part_count: number;
+      };
+      assert.deepEqual(
+        {
+          state: session.state,
+          rejectionReason: session.rejection_reason,
+          timingExact: session.timing_exact,
+        },
+        { state: 'FAILED', rejectionReason: 'audio_finalize_failed', timingExact: 1 },
+      );
+      const jobsBeforeRecovery = db.handle
+        .prepare(
+          `SELECT count(*) AS count FROM jobs
+            WHERE idempotency_key IN (?, ?)`,
+        )
+        .get(`deliver-audio:${session.session_id}`, `asr:${session.session_id}`) as {
+        count: number;
+      };
+      assert.equal(jobsBeforeRecovery.count, 0, `${scenario.name} cannot enqueue a partial plan`);
+      const pendingParts = db.handle
+        .prepare(
+          `SELECT count(*) AS count
+             FROM audio_finalization_journal j
+             JOIN audio_parts p ON p.part_id = j.part_id
+            WHERE j.session_id = ? AND p.finalized = 0`,
+        )
+        .get(session.session_id) as { count: number };
+      assert.ok(pendingParts.count > 0, `${scenario.name} keeps its exact recovery proof`);
+
+      db.handle.exec(`DROP TRIGGER fail_${scenario.name.replace('-', '_')}_finalize`);
+      await recoverAfterCrash(db.handle, resolvePaths(dir), nullLogger);
+
+      const recovered = new SessionRepository(db.handle).get(session.session_id);
+      const parts = new PartRepository(db.handle).listForSession(session.session_id);
+      assert.equal(recovered?.state, 'PROCESSING');
+      assert.equal(recovered?.part_count, parts.length);
+      assert.ok(parts.length > 0);
+      assert.ok(parts.every((part) => part.finalized === 1));
+      const recoveredJobs = db.handle
+        .prepare(
+          `SELECT kind FROM jobs
+            WHERE idempotency_key IN (?, ?)
+            ORDER BY kind`,
+        )
+        .all(`deliver-audio:${session.session_id}`, `asr:${session.session_id}`) as {
+        kind: string;
+      }[];
+      assert.deepEqual(
+        recoveredJobs.map((job) => job.kind),
+        ['asr', 'deliver_audio'],
+      );
+      const journal = db.handle
+        .prepare('SELECT count(*) AS count FROM audio_finalization_journal WHERE session_id = ?')
+        .get(session.session_id) as { count: number };
+      assert.equal(journal.count, 0);
+    }
   });
 
   it('keeps one session across a pause shorter than the timeout', async (t) => {
