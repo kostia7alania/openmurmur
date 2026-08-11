@@ -211,6 +211,119 @@ describe('ASR job', () => {
     assert.equal(d.jobs.pendingCount('deliver_report'), 1);
   });
 
+  it('persists claim evidence bound to the immutable transcript revision', async () => {
+    seedFinalizedSession('s1');
+    const revisionId = new TranscriptRepository(db.handle).append({
+      sessionId: 's1',
+      engine: 'fixture',
+      model: 'fixture-1',
+      languages: ['ru'],
+      text: 'Сначала обсудили сроки. Затем решили выпустить MVP.',
+      segments: [
+        {
+          startMs: 0,
+          endMs: 1_000,
+          timestampSource: 'aligner',
+          language: 'ru',
+          text: 'Сначала обсудили сроки.',
+        },
+        {
+          startMs: 1_000,
+          endMs: 2_000,
+          timestampSource: 'aligner',
+          language: 'ru',
+          text: 'Затем решили выпустить MVP.',
+        },
+      ],
+    });
+    const groundedLlm = {
+      name: 'grounded-fake',
+      async ready() {
+        return { ok: true as const, model: 'grounded-fake-1' };
+      },
+      async summarize() {
+        return {
+          ...EMPTY_SUMMARY,
+          summary: 'Решили выпустить MVP.',
+          decisions: ['Выпустить MVP.'],
+          claimEvidence: [
+            { field: 'summary' as const, item: 0, segments: [1, 99] },
+            { field: 'decisions' as const, item: 0, segments: [1] },
+          ],
+        };
+      },
+    };
+
+    await handleJob(
+      { ...deps(), llm: groundedLlm },
+      {
+        jobId: 'summary-provenance',
+        kind: 'summarize',
+        payload: { sessionId: 's1' },
+        attempts: 1,
+        maxAttempts: 5,
+      },
+    );
+
+    const stored = db.handle
+      .prepare('SELECT revision_id, payload FROM summaries WHERE session_id = ?')
+      .get('s1') as { revision_id: string; payload: string };
+    const payload = JSON.parse(stored.payload) as {
+      claimEvidence: { field: string; item: number; segments: number[] }[];
+    };
+    assert.equal(stored.revision_id, revisionId);
+    assert.deepEqual(payload.claimEvidence, [
+      { field: 'summary', item: 0, segments: [1] },
+      { field: 'decisions', item: 0, segments: [1] },
+    ]);
+
+    // A pre-release or manually corrupted stored payload must be bounded again
+    // at delivery against the exact immutable revision it names.
+    payload.claimEvidence[0]?.segments.push(99);
+    db.handle
+      .prepare('UPDATE summaries SET payload = ? WHERE session_id = ?')
+      .run(JSON.stringify(payload), 's1');
+
+    const newerRevisionId = new TranscriptRepository(db.handle).append({
+      sessionId: 's1',
+      engine: 'fixture',
+      model: 'fixture-2',
+      languages: ['en'],
+      text: 'A newer transcript must not detach the stored summary from its source.',
+      segments: [
+        {
+          startMs: 0,
+          endMs: 1_000,
+          timestampSource: 'aligner',
+          language: 'en',
+          text: 'A newer transcript must not detach the stored summary from its source.',
+        },
+      ],
+    });
+    assert.notEqual(newerRevisionId, revisionId);
+
+    await handleJob(
+      { ...deps(), llm: groundedLlm },
+      {
+        jobId: 'report-provenance',
+        kind: 'deliver_report',
+        payload: { sessionId: 's1' },
+        attempts: 1,
+        maxAttempts: 5,
+      },
+    );
+
+    const reportRow = db.handle
+      .prepare("SELECT payload FROM telegram_outbox WHERE delivery_part_id = 'report:s1'")
+      .get() as { payload: string };
+    const reportPayload = JSON.parse(reportRow.payload) as { type: string; text: string };
+    assert.equal(reportPayload.type, 'text');
+    assert.match(reportPayload.text, new RegExp(revisionId));
+    assert.match(reportPayload.text, /\[сегм\. 2\] 0:01: Затем решили выпустить MVP\./);
+    assert.doesNotMatch(reportPayload.text, /сегм\. 100/);
+    assert.doesNotMatch(reportPayload.text, /A newer transcript must not detach/);
+  });
+
   it('rejects a session whose transcript is empty', async () => {
     seedFinalizedSession('s1');
     await handleJob(deps(new SilentFakeAsr()), {
@@ -653,7 +766,7 @@ describe('delivery enqueue', () => {
     const report = readFileSync(payload.path, 'utf8');
     assert.match(report, /Источник: фоновая запись OpenMurmur/);
     assert.match(report, /UID сессии: `s1`/);
-    assert.match(report, /## Таймлайн\n/);
+    assert.match(report, /## Сегменты-источники транскрипта\n/);
     assert.doesNotMatch(report, /Голос 1:/, 'отчёт не должен выдумывать голоса');
   });
 });

@@ -100,6 +100,19 @@ only a validated loopback URL (normally `127.0.0.1:11434`) and is used for one
 thing: turning a transcript into a JSON object matching a fixed schema.
 Constrained decoding (`format`) makes a non-conforming response nearly
 impossible, and `parseSummary` validates and clamps whatever comes back anyway.
+Each summary claim may carry model-reported references to numbered transcript
+segments. The pipeline rejects indexes outside the immutable transcript
+revision, stores the remaining claim references inside that revision's summary
+payload, and renders them as model links rather than as independently verified
+facts. Missing references stay visibly unknown. Neither a claim nor its link is
+read by routing, retention, filesystem or job control flow.
+
+Long transcripts are covered by deterministic byte-bounded chunks whose source
+ranges do not overlap or leave gaps. The whole summary request has one deadline
+and a 64-call work limit; schema-invalid chunks and every reached bound produce
+an explicit incomplete notice while the complete transcript remains available.
+Prompt accounting includes the system message, user message, constrained JSON
+schema and a conservative reserve for Ollama's model-specific chat template.
 
 If Ollama is missing, the session still gets its audio and transcript. The
 report simply has no summary. This is a *degraded* health state, never a failed

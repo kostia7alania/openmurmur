@@ -246,7 +246,12 @@ of duplicate messages.
 ### `health_events`, `summaries`, `digests`, `schema_migrations`
 
 Append-only records, a JSON summary payload per session, one digest per local
-date (`UNIQUE`, upserted), and the applied-migration ledger.
+date (`UNIQUE`, upserted), and the applied-migration ledger. Each summary row is
+bound to one immutable `transcript_revisions.revision_id`. Its optional
+`claimEvidence` entries name a normalized summary field/item and revision-local
+segment indexes. The indexes are bounded both before storage and again before
+delivery; reports name the revision and enumerate those exact source segments.
+They remain model-reported provenance, never a retention or routing fact.
 
 Digest day bounds use the configured `digest.timezone`, including IANA-zone DST
 transitions. Digest storage and enqueue of `digest:<date>` share one transaction,

@@ -1,10 +1,10 @@
 import { languageListLabel } from '../asr/preferences.ts';
-import type { StructuredSummary } from '../llm/schema.ts';
+import type { StructuredSummary, SummaryClaimField } from '../llm/schema.ts';
 import {
   escapeHtml,
   formatClock,
   formatDuration,
-  formatTimedTranscript,
+  formatTimestamp,
   TELEGRAM_MESSAGE_LIMIT,
   type TimedTranscriptSegment,
 } from './format.ts';
@@ -23,20 +23,82 @@ export interface SessionReportInput {
   readonly languages: readonly string[];
   readonly partCount: number;
   readonly summary: StructuredSummary;
+  readonly transcriptRevisionId?: string | undefined;
   readonly timezone?: string | undefined;
   readonly transcript?: string | undefined;
   readonly transcriptSegments?: readonly TimedTranscriptSegment[] | undefined;
   readonly provenance?: OutputProvenance | undefined;
 }
 
-function bulletList(title: string, items: readonly string[]): string[] {
+function bulletList(
+  title: string,
+  field: SummaryClaimField,
+  items: readonly string[],
+  summary: StructuredSummary,
+): string[] {
   if (items.length === 0) return [];
-  return ['', `<b>${title}</b>`, ...items.map((item) => `• ${escapeHtml(item)}`)];
+  return [
+    '',
+    `<b>${title}</b>`,
+    ...items.map(
+      (item, index) => `• ${escapeHtml(item)}${claimEvidenceHtml(summary, field, index)}`,
+    ),
+  ];
 }
 
-function markdownList(title: string, items: readonly string[]): string[] {
+function markdownList(
+  title: string,
+  field: SummaryClaimField,
+  items: readonly string[],
+  summary: StructuredSummary,
+): string[] {
   if (items.length === 0) return [];
-  return ['', `## ${title}`, '', ...items.map((item) => `- ${escapeMarkdown(item)}`)];
+  return [
+    '',
+    `## ${title}`,
+    '',
+    ...items.map(
+      (item, index) => `- ${escapeMarkdown(item)}${claimEvidenceMarkdown(summary, field, index)}`,
+    ),
+  ];
+}
+
+function claimEvidenceSegments(
+  summary: StructuredSummary,
+  field: SummaryClaimField,
+  item: number,
+): readonly number[] {
+  return (
+    summary.claimEvidence.find((claim) => claim.field === field && claim.item === item)?.segments ??
+    []
+  );
+}
+
+function claimEvidenceLabel(
+  summary: StructuredSummary,
+  field: SummaryClaimField,
+  item: number,
+): string {
+  const segments = claimEvidenceSegments(summary, field, item);
+  return segments.length === 0
+    ? 'ссылка модели: не указана'
+    : `ссылка модели: сегм. ${segments.map((segment) => segment + 1).join(', ')}`;
+}
+
+function claimEvidenceHtml(
+  summary: StructuredSummary,
+  field: SummaryClaimField,
+  item: number,
+): string {
+  return ` <i>[${escapeHtml(claimEvidenceLabel(summary, field, item))}]</i>`;
+}
+
+function claimEvidenceMarkdown(
+  summary: StructuredSummary,
+  field: SummaryClaimField,
+  item: number,
+): string {
+  return ` _[${escapeMarkdown(claimEvidenceLabel(summary, field, item))}]_`;
 }
 
 function escapeMarkdown(text: string): string {
@@ -60,21 +122,33 @@ export function renderSessionReport(input: SessionReportInput): string {
     `Языки: ${escapeHtml(languageListLabel(input.languages))}`,
     `Частей аудио: ${input.partCount}`,
   ];
+  if (input.transcriptRevisionId !== undefined) {
+    details.push(`Ревизия транскрипта: <code>${escapeHtml(input.transcriptRevisionId)}</code>`);
+  }
 
   const s = input.summary;
-  details.push(...bulletList('Решения:', s.decisions));
-  details.push(...bulletList('Задачи:', s.tasks));
-  details.push(...bulletList('Обязательства:', s.commitments));
-  details.push(...bulletList('Расходы:', s.expenses));
-  details.push(...bulletList('Идеи:', s.ideas));
-  details.push(...bulletList('Вопросы:', s.questions));
-  details.push(...bulletList('Неуверенность:', s.uncertainties));
+  details.push(...bulletList('Решения:', 'decisions', s.decisions, s));
+  details.push(...bulletList('Задачи:', 'tasks', s.tasks, s));
+  details.push(...bulletList('Обязательства:', 'commitments', s.commitments, s));
+  details.push(...bulletList('Расходы:', 'expenses', s.expenses, s));
+  details.push(...bulletList('Идеи:', 'ideas', s.ideas, s));
+  details.push(...bulletList('Вопросы:', 'questions', s.questions, s));
+  details.push(...bulletList('Неуверенность:', 'uncertainties', s.uncertainties, s));
 
   if (s.people.length > 0) {
-    details.push('', `Люди: ${escapeHtml(s.people.join(', '))}`);
+    details.push(
+      '',
+      `Люди: ${s.people
+        .map((person, index) => `${escapeHtml(person)}${claimEvidenceHtml(s, 'people', index)}`)
+        .join(', ')}`,
+    );
   }
   if (s.places.length > 0) {
-    details.push(`Места: ${escapeHtml(s.places.join(', '))}`);
+    details.push(
+      `Места: ${s.places
+        .map((place, index) => `${escapeHtml(place)}${claimEvidenceHtml(s, 'places', index)}`)
+        .join(', ')}`,
+    );
   }
 
   const transcript = reportTranscript(input);
@@ -93,7 +167,7 @@ export function renderSessionReport(input: SessionReportInput): string {
     lines.push(
       '',
       '🧠 <b>Кратко</b>',
-      `<blockquote expandable>${escapeHtml(s.summary)}</blockquote>`,
+      `<blockquote expandable>${escapeHtml(s.summary)}${claimEvidenceHtml(s, 'summary', 0)}</blockquote>`,
     );
   }
   lines.push('', '📋 <b>Отчёт</b>', `<blockquote expandable>${details.join('\n')}</blockquote>`);
@@ -105,14 +179,24 @@ export function renderSessionSummaryPreview(input: SessionReportInput): string {
   if (input.summary.summary.length === 0) return '';
   const prefix = '🧠 <b>Кратко</b>\n<blockquote expandable>';
   const suffix = '</blockquote>';
+  const evidence = claimEvidenceHtml(input.summary, 'summary', 0);
+  const revision =
+    input.transcriptRevisionId === undefined
+      ? ''
+      : `\n\nРевизия транскрипта: <code>${escapeHtml(input.transcriptRevisionId)}</code>`;
   const provenance =
     input.provenance === undefined ? '' : `\n\n${renderProvenanceHtml(input.provenance)}`;
   const summary = compactPreview(
     input.summary.summary,
     500,
-    TELEGRAM_MESSAGE_LIMIT - prefix.length - suffix.length - provenance.length,
+    TELEGRAM_MESSAGE_LIMIT -
+      prefix.length -
+      suffix.length -
+      evidence.length -
+      revision.length -
+      provenance.length,
   );
-  return `${prefix}${escapeHtml(summary)}${suffix}${provenance}`;
+  return `${prefix}${escapeHtml(summary)}${evidence}${suffix}${revision}${provenance}`;
 }
 
 /** Full report artifact used when the Telegram-sized HTML rendering is too long. */
@@ -128,22 +212,47 @@ export function renderSessionReportMarkdown(input: SessionReportInput): string {
     `- Речь: ${formatDuration(input.speechMs)}`,
     `- Языки: ${languageListLabel(input.languages)}`,
     `- Частей аудио: ${input.partCount}`,
+    ...(input.transcriptRevisionId === undefined
+      ? []
+      : [`- Ревизия транскрипта: \`${escapeMarkdown(input.transcriptRevisionId)}\``]),
   ];
 
   const s = input.summary;
-  if (s.summary.length > 0) lines.push('', '## Кратко', '', escapeMarkdown(s.summary));
-  lines.push(...markdownList('Решения', s.decisions));
-  lines.push(...markdownList('Задачи', s.tasks));
-  lines.push(...markdownList('Обязательства', s.commitments));
-  lines.push(...markdownList('Расходы', s.expenses));
-  lines.push(...markdownList('Идеи', s.ideas));
-  lines.push(...markdownList('Вопросы', s.questions));
-  lines.push(...markdownList('Неуверенность', s.uncertainties));
+  if (s.summary.length > 0) {
+    lines.push(
+      '',
+      '## Кратко',
+      '',
+      `${escapeMarkdown(s.summary)}${claimEvidenceMarkdown(s, 'summary', 0)}`,
+    );
+  }
+  lines.push(...markdownList('Решения', 'decisions', s.decisions, s));
+  lines.push(...markdownList('Задачи', 'tasks', s.tasks, s));
+  lines.push(...markdownList('Обязательства', 'commitments', s.commitments, s));
+  lines.push(...markdownList('Расходы', 'expenses', s.expenses, s));
+  lines.push(...markdownList('Идеи', 'ideas', s.ideas, s));
+  lines.push(...markdownList('Вопросы', 'questions', s.questions, s));
+  lines.push(...markdownList('Неуверенность', 'uncertainties', s.uncertainties, s));
   if (s.people.length > 0) {
-    lines.push('', `**Люди:** ${s.people.map(escapeMarkdown).join(', ')}`);
+    lines.push(
+      '',
+      `**Люди:** ${s.people
+        .map(
+          (person, index) =>
+            `${escapeMarkdown(person)}${claimEvidenceMarkdown(s, 'people', index)}`,
+        )
+        .join(', ')}`,
+    );
   }
   if (s.places.length > 0) {
-    lines.push('', `**Места:** ${s.places.map(escapeMarkdown).join(', ')}`);
+    lines.push(
+      '',
+      `**Места:** ${s.places
+        .map(
+          (place, index) => `${escapeMarkdown(place)}${claimEvidenceMarkdown(s, 'places', index)}`,
+        )
+        .join(', ')}`,
+    );
   }
   const transcript = reportTranscript(input);
   if (transcript !== null) {
@@ -156,10 +265,19 @@ function reportTranscript(
   input: SessionReportInput,
 ): { readonly title: string; readonly text: string } | null {
   const segments = input.transcriptSegments ?? [];
-  const timed = formatTimedTranscript(segments);
-  if (timed.length > 0) {
-    const hasSpeakers = segments.some((segment) => (segment.speaker ?? null) !== null);
-    return { title: hasSpeakers ? 'Таймлайн и голоса' : 'Таймлайн', text: timed };
+  if (segments.length > 0) {
+    return {
+      title: 'Сегменты-источники транскрипта',
+      text: segments
+        .map((segment, index) => {
+          const time = segment.startMs === null ? 'без времени' : formatTimestamp(segment.startMs);
+          const speaker =
+            (segment.speaker ?? null) === null ? '' : ` · Голос ${(segment.speaker ?? 0) + 1}`;
+          const text = segment.text.replace(/\s+/gu, ' ').trim() || '(пустой сегмент)';
+          return `[сегм. ${index + 1}] ${time}${speaker}: ${text}`;
+        })
+        .join('\n\n'),
+    };
   }
   const fallback = input.transcript?.trim() ?? '';
   return fallback.length > 0 ? { title: 'Транскрипт', text: fallback } : null;

@@ -11,7 +11,7 @@ import type { Paths } from '../config/paths.ts';
 import type { OpenMurmurConfig } from '../config/schema.ts';
 import { transaction } from '../database/db.ts';
 import { PartRepository, SessionRepository, TranscriptRepository } from '../database/repository.ts';
-import type { StructuredSummary } from '../llm/schema.ts';
+import { boundClaimEvidence, type StructuredSummary } from '../llm/schema.ts';
 import { formatTimedTranscript, renderTimedTranscriptMessages } from '../telegram/format.ts';
 import { Outbox } from '../telegram/outbox.ts';
 import {
@@ -47,6 +47,8 @@ export interface EnqueueDeliveryInput {
 
 export interface EnqueueReportInput extends EnqueueDeliveryInput {
   readonly summary: StructuredSummary;
+  /** Exact immutable transcript revision from the summaries row. */
+  readonly summaryRevisionId?: string | undefined;
 }
 
 export interface DeliveryPlan {
@@ -384,6 +386,36 @@ export async function enqueueSessionTranscript(
   return transcriptRows;
 }
 
+interface ReportTranscriptRevision {
+  readonly revision_id: string;
+  readonly text: string;
+  readonly word_count: number;
+  readonly languages: string;
+  readonly forced_language: string | null;
+}
+
+function reportTranscriptRevision(
+  db: DatabaseSync,
+  transcripts: TranscriptRepository,
+  sessionId: string,
+  revisionId: string | undefined,
+): ReportTranscriptRevision | undefined {
+  if (revisionId === undefined) return transcripts.current(sessionId);
+  const transcript = db
+    .prepare(
+      `SELECT revision_id, text, word_count, languages, forced_language
+         FROM transcript_revisions
+        WHERE revision_id = ? AND session_id = ?`,
+    )
+    .get(revisionId, sessionId) as ReportTranscriptRevision | undefined;
+  if (transcript === undefined) {
+    throw new Error(
+      `summary transcript revision ${revisionId} does not belong to session ${sessionId}`,
+    );
+  }
+  return transcript;
+}
+
 export async function enqueueSessionReport(
   db: DatabaseSync,
   input: EnqueueReportInput,
@@ -394,8 +426,21 @@ export async function enqueueSessionReport(
   const session = sessions.get(input.sessionId);
   if (session === undefined) throw new Error(`unknown session ${input.sessionId}`);
 
-  const languages = session.languages === null ? [] : (JSON.parse(session.languages) as string[]);
-  const transcript = transcripts.current(input.sessionId);
+  if (input.summary.claimEvidence.length > 0 && input.summaryRevisionId === undefined) {
+    throw new Error('claim-level summary evidence requires an exact transcript revision');
+  }
+  const transcript = reportTranscriptRevision(
+    db,
+    transcripts,
+    input.sessionId,
+    input.summaryRevisionId,
+  );
+  const languages =
+    transcript === undefined
+      ? session.languages === null
+        ? []
+        : (JSON.parse(session.languages) as string[])
+      : (JSON.parse(transcript.languages) as string[]);
   const transcriptSegments =
     transcript === undefined
       ? []
@@ -405,6 +450,7 @@ export async function enqueueSessionReport(
           text: segment.text,
           speaker: segment.speaker ?? null,
         }));
+  const summary = boundClaimEvidence(input.summary, transcriptSegments.length);
   const reportInput = {
     sessionId: input.sessionId,
     startedWallMs: Date.parse(session.started_at),
@@ -413,7 +459,8 @@ export async function enqueueSessionReport(
     speechMs: session.speech_ms,
     languages,
     partCount: session.part_count,
-    summary: input.summary,
+    summary,
+    transcriptRevisionId: transcript?.revision_id,
     transcript: transcript?.text ?? '',
     transcriptSegments,
     timezone: session.capture_timezone ?? 'UTC',

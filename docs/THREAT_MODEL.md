@@ -72,9 +72,14 @@ complies, and something acts on it.
 3. The system prompt states that the content is data.
 4. `parseSummary` validates and clamps the result. Non-conforming shapes degrade
    to an empty summary rather than propagating.
+5. Claim-level segment references are also untrusted model output. They are
+   bounded to the immutable transcript revision and displayed as model links;
+   they never become evidence for retention, delivery, routing or any other
+   control decision.
 
-**Status:** four attack strings are covered by tests, plus a test that a
-malicious model response still cannot produce a non-conforming object.
+**Status:** four attack strings are covered by tests, plus tests that a
+malicious model response cannot produce a non-conforming object or persist a
+segment reference outside its bound transcript revision.
 
 ### T3 — Malicious incoming file
 

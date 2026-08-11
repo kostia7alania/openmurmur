@@ -17,7 +17,12 @@ import {
   VadSegmentRepository,
 } from '../database/repository.ts';
 import type { LlmBackend } from '../llm/ollama.ts';
-import { EMPTY_SUMMARY } from '../llm/schema.ts';
+import {
+  boundClaimEvidence,
+  EMPTY_SUMMARY,
+  parseSummary,
+  type StructuredSummary,
+} from '../llm/schema.ts';
 import type { Logger } from '../logging/logger.ts';
 import { Outbox } from '../telegram/outbox.ts';
 import {
@@ -424,12 +429,17 @@ async function handleSummarize(deps: PipelineDeps, job: Job): Promise<void> {
   const segments = transcripts.segments(current.revision_id).map((s) => s.text);
   let summary = EMPTY_SUMMARY;
   try {
-    summary = await deps.llm.summarize({
-      transcript: current.text,
-      segments,
-      languages: session.languages === null ? [] : (JSON.parse(session.languages) as string[]),
-      durationMs: session.duration_ms ?? 0,
-    });
+    summary = boundClaimEvidence(
+      parseSummary(
+        await deps.llm.summarize({
+          transcript: current.text,
+          segments,
+          languages: session.languages === null ? [] : (JSON.parse(session.languages) as string[]),
+          durationMs: session.duration_ms ?? 0,
+        }),
+      ),
+      segments.length,
+    );
   } catch (error) {
     // A missing or broken LLM degrades the report, never the delivery. The
     // audio and transcript still reach the user.
@@ -468,13 +478,17 @@ async function handleDeliverReport(deps: PipelineDeps, job: Job): Promise<void> 
   const sessionId = sessionIdOf(job);
   const row = deps.db
     .prepare(
-      'SELECT payload FROM summaries WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1',
+      `SELECT payload, revision_id
+         FROM summaries
+        WHERE session_id = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1`,
     )
-    .get(sessionId) as { payload: string } | undefined;
-  const summary = row === undefined ? EMPTY_SUMMARY : JSON.parse(row.payload);
+    .get(sessionId) as { payload: string; revision_id: string } | undefined;
+  const summary = row === undefined ? EMPTY_SUMMARY : parseStoredSummary(row.payload);
   const rows = await enqueueSessionReport(deps.db, {
     sessionId,
     summary,
+    ...(row === undefined ? {} : { summaryRevisionId: row.revision_id }),
     config: deps.config,
     paths: deps.paths,
   });
@@ -485,14 +499,18 @@ async function handleDeliver(deps: PipelineDeps, job: Job): Promise<void> {
   const sessionId = sessionIdOf(job);
   const row = deps.db
     .prepare(
-      'SELECT payload FROM summaries WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1',
+      `SELECT payload, revision_id
+         FROM summaries
+        WHERE session_id = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1`,
     )
-    .get(sessionId) as { payload: string } | undefined;
+    .get(sessionId) as { payload: string; revision_id: string } | undefined;
 
-  const summary = row === undefined ? EMPTY_SUMMARY : JSON.parse(row.payload);
+  const summary = row === undefined ? EMPTY_SUMMARY : parseStoredSummary(row.payload);
   const plan = await enqueueSessionDelivery(deps.db, {
     sessionId,
     summary,
+    ...(row === undefined ? {} : { summaryRevisionId: row.revision_id }),
     config: deps.config,
     paths: deps.paths,
   });
@@ -504,6 +522,14 @@ async function handleDeliver(deps: PipelineDeps, job: Job): Promise<void> {
     report: plan.reportRows,
     oversizeParts: plan.oversizeParts.length,
   });
+}
+
+function parseStoredSummary(payload: string): StructuredSummary {
+  try {
+    return parseSummary(JSON.parse(payload));
+  } catch {
+    return EMPTY_SUMMARY;
+  }
 }
 
 /**

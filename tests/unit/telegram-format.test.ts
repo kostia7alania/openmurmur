@@ -328,6 +328,7 @@ describe('session report', () => {
   it('renders a complete Markdown artifact for file delivery', () => {
     const report = renderSessionReportMarkdown({
       ...base,
+      transcriptRevisionId: 'revision-123',
       summary: { ...EMPTY_SUMMARY, summary: 'Краткий итог', tasks: ['Позвонить завтра'] },
       transcript: 'fallback',
       transcriptSegments: [
@@ -338,9 +339,10 @@ describe('session report', () => {
     assert.match(report, /^# Отчёт OpenMurmur/);
     assert.match(report, /## Кратко\n\nКраткий итог/);
     assert.match(report, /## Задачи\n\n- Позвонить завтра/);
-    assert.match(report, /## Таймлайн и голоса/);
-    assert.match(report, /0:00 {2}Голос 1: Начали обсуждение\\\./);
-    assert.match(report, /0:01 {2}Голос 2: Продолжили\\\./);
+    assert.ok(report.includes('Ревизия транскрипта: `revision\\-123`'));
+    assert.match(report, /## Сегменты-источники транскрипта/);
+    assert.ok(report.includes('\\[сегм\\. 1\\] 0:00 · Голос 1: Начали обсуждение\\.'));
+    assert.ok(report.includes('\\[сегм\\. 2\\] 0:01 · Голос 2: Продолжили\\.'));
   });
 
   it('keeps a long summary preview compact and collapsible', () => {
@@ -351,7 +353,7 @@ describe('session report', () => {
     assert.ok(preview.includes('<blockquote expandable>'));
     assert.ok(preview.includes('&lt;важно&gt;'));
     assert.ok(preview.length < TELEGRAM_MESSAGE_LIMIT);
-    assert.ok(preview.endsWith('…</blockquote>'));
+    assert.match(preview, /… <i>\[ссылка модели: не указана\]<\/i><\/blockquote>$/);
   });
 
   it('bounds a preview containing multi-code-unit graphemes', () => {
@@ -360,7 +362,7 @@ describe('session report', () => {
       summary: { ...EMPTY_SUMMARY, summary: '👨‍👩‍👧‍👦'.repeat(1000) },
     });
     assert.ok(preview.length <= TELEGRAM_MESSAGE_LIMIT);
-    assert.ok(preview.endsWith('…</blockquote>'));
+    assert.match(preview, /… <i>\[ссылка модели: не указана\]<\/i><\/blockquote>$/);
   });
 
   it('keeps transcript-derived Markdown as literal text', () => {
