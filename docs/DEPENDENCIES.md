@@ -34,6 +34,32 @@ Node's `fetch`, argument parsing is `node:util.parseArgs`, SQLite is
 
 Exact versions, no ranges. `pnpm-lock.yaml` is committed.
 
+### Isolated no-Corepack bootstrap — 2026-08-12
+
+A fresh disposable checkout ran the production `scripts/bootstrap` with a
+private HOME, npm prefix/cache, pnpm store, uv cache and XDG directories. Its
+PATH exposed the validated Node 26.7.0 runtime with SQLite 3.53.4 and the real
+adjacent npm 11.19.0, plus existing uv and FFmpeg prerequisites; neither pnpm
+nor Corepack was available before the run.
+
+Bootstrap invoked the real npm exactly once as
+`install --global pnpm@10.19.0`. The installed pnpm metadata and executable
+reported 10.19.0 from inside the private prefix, then completed the frozen
+Node lockfile and the 20-package CI-safe Python environment. TypeScript 7.0.2,
+numpy 2.5.1, onnxruntime 1.28.0 and soundfile 0.14.0 were usable, and the
+product CLI reported version 0.1.0. All inspected dependency and environment
+symlinks resolved inside the disposable root.
+
+A second invocation forced npm, pnpm and uv offline. It completed with the
+Node tree already current and uv checking the same 20 packages; the npm call
+log still contained only the original exact pnpm installation. Both the fresh
+checkout and the working repository remained clean.
+
+This closes the real exact-pnpm/no-Corepack and idempotent dependency-bootstrap
+boundary. It is not a clean-Mac proof: Node, uv and FFmpeg were preinstalled,
+and the run did not provision MLX weights, Ollama, native capture permission,
+state, Keychain or Telegram. Those remain D004/D101 and the live release gates.
+
 ## Python packages
 
 | Package | Pinned | Verified | Purpose |
