@@ -21,7 +21,7 @@ describe('local status', () => {
       jobs.enqueue({ kind: 'asr', idempotencyKey: 'dead', payload: {}, maxAttempts: 1 });
       const deadJob = jobs.claim(['asr']);
       assert.ok(deadJob);
-      assert.equal(jobs.fail(deadJob.jobId, 'terminal model failure'), 'dead');
+      assert.equal(jobs.fail(deadJob, 'terminal model failure'), 'dead');
       jobs.enqueue({ kind: 'asr', idempotencyKey: 'pending', payload: {} });
 
       const outbox = new Outbox(db.handle);

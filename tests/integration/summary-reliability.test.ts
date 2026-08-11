@@ -187,11 +187,11 @@ describe('offline summary reliability', () => {
     const summarizeA = pipeline.jobs.claim(['summarize']);
     assert.ok(summarizeA);
     await handleJob(pipeline, summarizeA);
-    pipeline.jobs.complete(summarizeA.jobId);
+    pipeline.jobs.complete(summarizeA);
     const reportA = pipeline.jobs.claim(['deliver_report']);
     assert.ok(reportA);
     await handleJob(pipeline, reportA);
-    pipeline.jobs.complete(reportA.jobId);
+    pipeline.jobs.complete(reportA);
     assert.equal(
       db.handle.prepare("SELECT count(*) AS c FROM telegram_outbox WHERE kind = 'report'").get()?.[
         'c'
@@ -205,14 +205,14 @@ describe('offline summary reliability', () => {
     assert.ok(summarizeB);
     assert.equal(summarizeB.payload['revisionId'], revisionB);
     await handleJob(pipeline, summarizeB);
-    pipeline.jobs.complete(summarizeB.jobId);
-    await handleJob(pipeline, summarizeB);
+    pipeline.jobs.complete(summarizeB);
+    await handleJob(pipeline, job('summarize', 'revision-replay', revisionB));
 
     const reportB = pipeline.jobs.claim(['deliver_report']);
     assert.ok(reportB);
     assert.equal(reportB.payload['revisionId'], revisionB);
     await handleJob(pipeline, reportB);
-    pipeline.jobs.complete(reportB.jobId);
+    pipeline.jobs.complete(reportB);
 
     assert.deepEqual(seenTranscripts, [
       'Revision A records the original release decision.',
@@ -284,6 +284,47 @@ describe('offline summary reliability', () => {
       .get('legacy-bind') as { revision_id: string };
     assert.equal(stored.revision_id, revisionA);
     assert.equal(calls, 1, 'replay reuses the summary for the durably bound revision');
+  });
+
+  it('does not let a reclaimed generation bind or summarize a legacy payload', async () => {
+    seedSession('legacy-fenced', 'Only the current lease may bind this legacy summary job.');
+    let calls = 0;
+    const pipeline = deps({
+      name: 'lease-fence-fixture',
+      async ready() {
+        return { ok: true, model: 'lease-fence-fixture-1' };
+      },
+      async summarize() {
+        calls += 1;
+        return { ...EMPTY_SUMMARY, summary: 'Current generation summary.' };
+      },
+    });
+    pipeline.jobs.enqueue({
+      kind: 'summarize',
+      idempotencyKey: 'summarize:legacy-fenced',
+      payload: { sessionId: 'legacy-fenced' },
+    });
+    const stale = pipeline.jobs.claim(['summarize']);
+    assert.ok(stale);
+    db.handle
+      .prepare("UPDATE jobs SET lease_expires_at = '2000-01-01T00:00:00.000Z' WHERE job_id = ?")
+      .run(stale.jobId);
+    assert.equal(pipeline.jobs.recoverStaleLeases(), 1);
+    const current = pipeline.jobs.claim(['summarize']);
+    assert.ok(current);
+
+    await assert.rejects(handleJob(pipeline, stale), /lost its lease before the handler completed/);
+    const stalePayload = db.handle
+      .prepare('SELECT payload FROM jobs WHERE job_id = ?')
+      .get(stale.jobId) as { payload: string };
+    assert.equal(JSON.parse(stalePayload.payload).revisionId, undefined);
+    assert.equal(calls, 0);
+    assert.equal(pipeline.jobs.pendingCount('deliver_report'), 0);
+
+    await handleJob(pipeline, current);
+    assert.equal(pipeline.jobs.complete(current), true);
+    assert.equal(calls, 1);
+    assert.equal(pipeline.jobs.pendingCount('deliver_report'), 1);
   });
 
   it('commits one summary when reclaimed workers finish the same revision concurrently', async () => {

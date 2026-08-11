@@ -212,9 +212,14 @@ older ready transcript or report.
 
 ### Job leases, not locks
 
-A worker claims a job by taking a time-boxed lease. A crashed worker's job
-returns to the pool when the lease expires. There is no lock to leak and no
-cleanup that must run for the system to recover.
+A worker claims a job with a unique generation token and renews its time-boxed
+lease while work is active. After a long event-loop suspension, active local
+tokens are renewed before globally expired leases are reclaimed. Completion,
+failure and durable handler mutations recheck the same live token inside their
+write transaction, so a reclaimed generation cannot publish domain or outbox
+facts. Derived files and incoming download temps are generation-scoped until
+that proof commits. A crashed worker's job returns to the pool when the lease
+expires; there is no process lock to leak.
 
 ### One writer
 

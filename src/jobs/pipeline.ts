@@ -31,7 +31,7 @@ import {
   enqueueSessionReport,
   enqueueSessionTranscript,
 } from './delivery.ts';
-import type { Job, JobQueue } from './queue.ts';
+import type { ClaimedJob, Job, JobQueue } from './queue.ts';
 
 /**
  * Job handlers for the post-silence pipeline:
@@ -85,6 +85,8 @@ async function handleDeliverAudio(deps: PipelineDeps, job: Job): Promise<void> {
     sessionId,
     config: deps.config,
     paths: deps.paths,
+    assertCurrent: () => assertCurrentJobLease(deps, job),
+    ...(hasLeaseToken(job) ? { artifactGeneration: job.leaseToken } : {}),
   });
   deps.logger.info('audio delivery enqueued', {
     sessionId,
@@ -113,6 +115,7 @@ function sessionIdOf(job: Job): string {
  */
 async function runFinalVadPass(
   deps: PipelineDeps,
+  job: Job,
   sessionId: string,
   parts: readonly PartRow[],
 ): Promise<void> {
@@ -145,6 +148,7 @@ async function runFinalVadPass(
 
   if (collected.length === 0) return;
 
+  assertCurrentJobLease(deps, job);
   repository.replaceForSession(sessionId, collected);
   deps.logger.info('final VAD pass stored', {
     sessionId,
@@ -163,6 +167,7 @@ async function runFinalVadPass(
  */
 async function runDiarization(
   deps: PipelineDeps,
+  job: Job,
   sessionId: string,
   parts: readonly PartRow[],
 ): Promise<readonly SpeakerTurn[]> {
@@ -193,6 +198,7 @@ async function runDiarization(
 
   if (collected.length === 0) return [];
 
+  assertCurrentJobLease(deps, job);
   new SpeakerTurnRepository(deps.db).replaceForSession(sessionId, collected);
   deps.logger.info('diarization stored', {
     sessionId,
@@ -213,13 +219,13 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
     throw new Error(`session ${sessionId} has no finalized audio parts`);
   }
 
-  if (replayStoredTranscript(deps, sessions, sessionId)) {
+  if (replayStoredTranscript(deps, sessions, sessionId, job)) {
     deps.logger.info('existing transcript replayed into downstream jobs', { sessionId });
     return;
   }
 
-  await runFinalVadPass(deps, sessionId, finalized);
-  const turns = await runDiarization(deps, sessionId, finalized);
+  await runFinalVadPass(deps, job, sessionId, finalized);
+  const turns = await runDiarization(deps, job, sessionId, finalized);
 
   // Parts are transcribed in order and concatenated. Timestamps are offset by
   // the cumulative duration so segment times refer to the whole session.
@@ -266,7 +272,7 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
 
   // Second rejection gate: enough speech by duration, but nothing meaningful
   // was said. Rejecting here rather than sending keeps the chat usable.
-  if (rejectInsufficientTranscript(deps, sessions, sessionId, words, finalized.length)) return;
+  if (rejectInsufficientTranscript(deps, sessions, sessionId, words, finalized.length, job)) return;
 
   // The model reports the language it settled on, which is incomplete on
   // genuinely mixed speech: a real Thai-English conversation came back as
@@ -306,6 +312,7 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
       })),
     },
     (revisionId) => {
+      assertCurrentJobLease(deps, job);
       sessions.setLanguages(sessionId, reconciled);
       enqueuePostAsrJobs(deps, sessionId, revisionId);
     },
@@ -334,11 +341,13 @@ function rejectInsufficientTranscript(
   sessionId: string,
   words: number,
   finalizedParts: number,
+  job: Job,
 ): boolean {
   if (words >= deps.config.sessionizer.minTranscriptWords) return false;
 
   const reason = words === 0 ? 'asr_empty' : 'insufficient_words';
   transaction(deps.db, () => {
+    assertCurrentJobLease(deps, job);
     sessions.reject(sessionId, reason, 0, finalizedParts);
     new Outbox(deps.db).enqueue({
       deliveryPartId: `session-status:asr-rejected:${sessionId}`,
@@ -359,6 +368,7 @@ function replayStoredTranscript(
   deps: PipelineDeps,
   sessions: SessionRepository,
   sessionId: string,
+  job: Job,
 ): boolean {
   const existing = deps.db
     .prepare(
@@ -370,6 +380,7 @@ function replayStoredTranscript(
 
   const languages = JSON.parse(existing.languages) as string[];
   transaction(deps.db, () => {
+    assertCurrentJobLease(deps, job);
     sessions.setLanguages(sessionId, languages);
     enqueuePostAsrJobs(deps, sessionId, existing.revision_id);
   });
@@ -396,6 +407,7 @@ async function handleDeliverTranscript(deps: PipelineDeps, job: Job): Promise<vo
     sessionId,
     config: deps.config,
     paths: deps.paths,
+    assertCurrent: () => assertCurrentJobLease(deps, job),
   });
   deps.logger.info('transcript delivery enqueued', { sessionId, transcript: rows });
 }
@@ -421,6 +433,7 @@ async function handleSummarize(deps: PipelineDeps, job: Job): Promise<void> {
     )
     .get(sessionId, revisionId) as { payload: string } | undefined;
   if (existing !== undefined) {
+    assertCurrentJobLease(deps, job);
     enqueueReportJob(deps, sessionId, revisionId);
     return;
   }
@@ -449,6 +462,7 @@ async function handleSummarize(deps: PipelineDeps, job: Job): Promise<void> {
   }
 
   transaction(deps.db, () => {
+    assertCurrentJobLease(deps, job);
     deps.db
       .prepare(
         `INSERT INTO summaries
@@ -501,6 +515,7 @@ async function handleDeliverReport(deps: PipelineDeps, job: Job): Promise<void> 
     requireCurrentRevision: true,
     config: deps.config,
     paths: deps.paths,
+    assertCurrent: () => assertCurrentJobLease(deps, job),
   });
   deps.logger.info('report delivery enqueued', { sessionId, report: rows });
 }
@@ -525,6 +540,8 @@ async function handleDeliver(deps: PipelineDeps, job: Job): Promise<void> {
     ...(row === undefined ? {} : { summaryRevisionId: row.revision_id }),
     config: deps.config,
     paths: deps.paths,
+    assertCurrent: () => assertCurrentJobLease(deps, job),
+    ...(hasLeaseToken(job) ? { artifactGeneration: job.leaseToken } : {}),
   });
 
   deps.logger.info('delivery enqueued', {
@@ -559,6 +576,7 @@ function revisionIdOf(deps: PipelineDeps, job: Job, sessionId: string): string {
   }
 
   return transaction(deps.db, () => {
+    assertCurrentJobLease(deps, job);
     const stored = deps.db.prepare('SELECT payload FROM jobs WHERE job_id = ?').get(job.jobId) as
       | { payload: string }
       | undefined;
@@ -593,6 +611,14 @@ function revisionIdOf(deps: PipelineDeps, job: Job, sessionId: string): string {
     if (current === undefined) throw new Error(`session ${sessionId} has no transcript`);
     return current.revision_id;
   });
+}
+
+function assertCurrentJobLease(deps: PipelineDeps, job: Job): void {
+  if (hasLeaseToken(job)) deps.jobs.assertLease(job);
+}
+
+function hasLeaseToken(job: Job): job is ClaimedJob {
+  return 'leaseToken' in job && typeof job.leaseToken === 'string' && job.leaseToken.length > 0;
 }
 
 function parseJobPayload(payload: string, jobId: string): Record<string, unknown> {

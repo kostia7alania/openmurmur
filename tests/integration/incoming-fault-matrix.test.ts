@@ -110,6 +110,91 @@ function fakeMediaTools(): { ffmpeg: string; ffprobe: string; calls: string } {
 }
 
 describe('incoming Telegram fault and restart matrix', () => {
+  it('isolates concurrent lease generations while publishing one complete download', async () => {
+    const paths = resolvePaths(root);
+    const body = silentWav();
+    const fileUid = '123e4567-e89b-42d3-a456-426614174000';
+    const attachment = {
+      fileId: 'concurrent-file',
+      fileUniqueId: 'concurrent-unique',
+      declaredBytes: body.byteLength,
+      declaredMime: 'audio/wav',
+      declaredDurationSeconds: 1,
+      claimedFilename: 'concurrent.wav',
+      source: 'audio' as const,
+    };
+    const getFile = async (fileId: string) => ({
+      file_id: fileId,
+      file_unique_id: attachment.fileUniqueId,
+      file_size: body.byteLength,
+      file_path: 'audio/concurrent.wav',
+    });
+    let releaseFirst: (() => void) | undefined;
+    const firstReleased = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const firstClient = {
+      getFile,
+      async downloadFile() {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(body.subarray(0, 128));
+              void firstReleased.then(() => {
+                controller.enqueue(body.subarray(128));
+                controller.close();
+              });
+            },
+          }),
+        );
+      },
+    } as unknown as TelegramClient;
+    let firstCurrent = true;
+    const first = downloadToQuarantine(
+      firstClient,
+      attachment,
+      paths.quarantineDir,
+      { maxIncomingBytes: 1_000_000, maxDurationSeconds: 60 },
+      fileUid,
+      {
+        attemptId: 'lease-A',
+        assertCurrent: () => {
+          if (!firstCurrent) throw new Error('lease A lost');
+        },
+      },
+    );
+    const firstTemp = quarantineTemporaryPathFor(paths.quarantineDir, fileUid, 'lease-A');
+    for (let attempt = 0; attempt < 100 && !existsSync(firstTemp); attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(existsSync(firstTemp), true, 'generation A reached its private temp');
+
+    firstCurrent = false;
+    const secondClient = {
+      getFile,
+      async downloadFile() {
+        return new Response(body);
+      },
+    } as unknown as TelegramClient;
+    const second = await downloadToQuarantine(
+      secondClient,
+      attachment,
+      paths.quarantineDir,
+      { maxIncomingBytes: 1_000_000, maxDurationSeconds: 60 },
+      fileUid,
+      { attemptId: 'lease-B', assertCurrent: () => {} },
+    );
+    releaseFirst?.();
+    await assert.rejects(first);
+
+    assert.equal(readFileSync(second.path).equals(body), true);
+    assert.deepEqual(
+      readdirSync(paths.quarantineDir).filter((name) => name.endsWith('.download.part')),
+      [],
+      'the winner removes the stale generation and both attempts consume their own temps',
+    );
+  });
+
   it('converges every durable boundary on one UID, one transcript and owned artifacts', async () => {
     const paths = resolvePaths(root);
     const body = silentWav();

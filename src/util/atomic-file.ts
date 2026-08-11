@@ -2,8 +2,17 @@ import { randomUUID } from 'node:crypto';
 import { type FileHandle, open, rename, rm } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
+export interface AtomicTextOptions {
+  /** Re-check external ownership after fsync but before the atomic publication. */
+  readonly beforePublish?: (() => void) | undefined;
+}
+
 /** Publishes a private text artefact without ever exposing a partial file. */
-export async function writeTextAtomically(path: string, contents: string): Promise<void> {
+export async function writeTextAtomically(
+  path: string,
+  contents: string,
+  options: AtomicTextOptions = {},
+): Promise<void> {
   const directory = dirname(path);
   const temporary = join(directory, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
   let handle: FileHandle | null = await open(temporary, 'wx', 0o600);
@@ -12,6 +21,7 @@ export async function writeTextAtomically(path: string, contents: string): Promi
     await handle.sync();
     await handle.close();
     handle = null;
+    options.beforePublish?.();
     await rename(temporary, path);
     await syncDirectory(directory);
   } catch (error) {

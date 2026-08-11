@@ -413,27 +413,27 @@ describe('end to end: capture through delivery, without a microphone', () => {
     const audioJob = jobs.claim(['deliver_audio']);
     assert.ok(audioJob, 'audio delivery must not wait for ASR');
     await handleJob(pipelineDeps, audioJob);
-    jobs.complete(audioJob.jobId);
+    jobs.complete(audioJob);
 
     const asrJob = jobs.claim(['asr']);
     assert.ok(asrJob);
     await handleJob(pipelineDeps, asrJob);
-    jobs.complete(asrJob.jobId);
+    jobs.complete(asrJob);
 
     const transcriptJob = jobs.claim(['deliver_transcript']);
     assert.ok(transcriptJob, 'ASR must make the transcript independently deliverable');
     await handleJob(pipelineDeps, transcriptJob);
-    jobs.complete(transcriptJob.jobId);
+    jobs.complete(transcriptJob);
 
     const summarizeJob = jobs.claim(['summarize']);
     assert.ok(summarizeJob, 'ASR must queue the summarize step');
     await handleJob(pipelineDeps, summarizeJob);
-    jobs.complete(summarizeJob.jobId);
+    jobs.complete(summarizeJob);
 
     const reportJob = jobs.claim(['deliver_report']);
     assert.ok(reportJob);
     await handleJob(pipelineDeps, reportJob);
-    jobs.complete(reportJob.jobId);
+    jobs.complete(reportJob);
 
     // --- what the user would receive --------------------------------------
     const outbox = new Outbox(db.handle);

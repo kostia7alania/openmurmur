@@ -38,6 +38,20 @@ export interface Job {
   readonly maxAttempts: number;
 }
 
+export interface ClaimedJob extends Job {
+  /** Unique claim generation used to fence a worker after its lease is reclaimed. */
+  readonly leaseToken: string;
+}
+
+export type JobFailureOutcome = 'retry' | 'dead' | 'lost';
+
+export class JobLeaseLostError extends Error {
+  constructor(jobId: string) {
+    super(`job ${jobId} lost its lease before the handler completed`);
+    this.name = 'JobLeaseLostError';
+  }
+}
+
 export interface DeadJob {
   readonly jobId: string;
   readonly kind: JobKind;
@@ -63,6 +77,8 @@ export interface EnqueueOptions {
 
 const nowIso = () => new Date().toISOString();
 const isoIn = (ms: number) => new Date(Date.now() + ms).toISOString();
+export const DEFAULT_JOB_LEASE_MS = 10 * 60 * 1000;
+export const DEFAULT_JOB_HEARTBEAT_MS = 60 * 1000;
 
 /** Exponential backoff with a ceiling, so a broken model does not hot-loop. */
 export function backoffMs(attempts: number): number {
@@ -106,7 +122,7 @@ export class JobQueue {
    * A worker that dies without releasing its lease loses the job back to the
    * pool once `leaseMs` elapses — see `recoverStaleLeases`.
    */
-  claim(kinds: readonly JobKind[], leaseMs = 10 * 60 * 1000): Job | null {
+  claim(kinds: readonly JobKind[], leaseMs = DEFAULT_JOB_LEASE_MS): ClaimedJob | null {
     if (kinds.length === 0) return null;
     const placeholders = kinds.map(() => '?').join(',');
 
@@ -140,6 +156,7 @@ export class JobQueue {
         | undefined;
       if (row === undefined) return null;
 
+      const leaseToken = `${this.#owner}:${randomUUID()}`;
       this.#db
         .prepare(
           `UPDATE jobs
@@ -147,10 +164,11 @@ export class JobQueue {
                   attempts = attempts + 1, updated_at = ?
             WHERE job_id = ?`,
         )
-        .run(this.#owner, isoIn(leaseMs), nowIso(), row.job_id);
+        .run(leaseToken, isoIn(leaseMs), nowIso(), row.job_id);
 
       return {
         jobId: row.job_id,
+        leaseToken,
         kind: row.kind,
         payload: JSON.parse(row.payload) as Record<string, unknown>,
         attempts: row.attempts + 1,
@@ -159,13 +177,75 @@ export class JobQueue {
     });
   }
 
-  complete(jobId: string): void {
-    this.#db
+  /**
+   * Extends the generation that still owns the row. An expired-but-unreclaimed
+   * token may renew after a machine pause; once recovery replaces the token it
+   * can never resurrect itself.
+   */
+  renew(job: Pick<ClaimedJob, 'jobId' | 'leaseToken'>, leaseMs = DEFAULT_JOB_LEASE_MS): boolean {
+    const now = nowIso();
+    const result = this.#db
+      .prepare(
+        `UPDATE jobs
+            SET lease_expires_at = ?, updated_at = ?
+          WHERE job_id = ? AND state = 'leased' AND lease_owner = ?`,
+      )
+      .run(isoIn(leaseMs), now, job.jobId, job.leaseToken);
+    return result.changes === 1;
+  }
+
+  /** Throws unless this exact generation currently holds an unexpired lease. */
+  assertLease(job: Pick<ClaimedJob, 'jobId' | 'leaseToken'>): void {
+    const now = nowIso();
+    const row = this.#db
+      .prepare(
+        `SELECT 1
+           FROM jobs
+          WHERE job_id = ? AND state = 'leased' AND lease_owner = ?
+            AND lease_expires_at > ?`,
+      )
+      .get(job.jobId, job.leaseToken, now);
+    if (row === undefined) throw new JobLeaseLostError(job.jobId);
+  }
+
+  /** Keeps an awaited handler leased without putting its work on another loop. */
+  async withLeaseHeartbeat<T>(
+    job: Pick<ClaimedJob, 'jobId' | 'leaseToken'>,
+    task: () => Promise<T>,
+    options: { readonly leaseMs?: number; readonly heartbeatMs?: number } = {},
+  ): Promise<T> {
+    const leaseMs = options.leaseMs ?? DEFAULT_JOB_LEASE_MS;
+    const heartbeatMs = options.heartbeatMs ?? DEFAULT_JOB_HEARTBEAT_MS;
+    const timer = setInterval(() => {
+      try {
+        this.renew(job, leaseMs);
+      } catch {
+        // The final synchronous renewal below is authoritative. A transient
+        // heartbeat failure must not invent a lost lease while this token is
+        // still the row owner.
+      }
+    }, heartbeatMs);
+    timer.unref();
+    try {
+      const result = await task();
+      if (!this.renew(job, leaseMs)) throw new JobLeaseLostError(job.jobId);
+      return result;
+    } finally {
+      clearInterval(timer);
+    }
+  }
+
+  complete(job: Pick<ClaimedJob, 'jobId' | 'leaseToken'>): boolean {
+    const now = nowIso();
+    const result = this.#db
       .prepare(
         `UPDATE jobs SET state = 'done', lease_owner = NULL, lease_expires_at = NULL,
-                         updated_at = ? WHERE job_id = ?`,
+                         updated_at = ?
+          WHERE job_id = ? AND state = 'leased' AND lease_owner = ?
+            AND lease_expires_at > ?`,
       )
-      .run(nowIso(), jobId);
+      .run(now, job.jobId, job.leaseToken, now);
+    return result.changes === 1;
   }
 
   /**
@@ -173,12 +253,20 @@ export class JobQueue {
    * burned its attempts, then becomes `dead` so an operator can see it rather
    * than it silently vanishing.
    */
-  fail(jobId: string, error: string): 'retry' | 'dead' {
+  fail(job: Pick<ClaimedJob, 'jobId' | 'leaseToken'>, error: string): JobFailureOutcome {
     return transaction(this.#db, () => {
+      const now = nowIso();
       const row = this.#db
-        .prepare('SELECT attempts, max_attempts FROM jobs WHERE job_id = ?')
-        .get(jobId) as { attempts: number; max_attempts: number } | undefined;
-      if (row === undefined) return 'dead';
+        .prepare(
+          `SELECT attempts, max_attempts
+             FROM jobs
+            WHERE job_id = ? AND state = 'leased' AND lease_owner = ?
+              AND lease_expires_at > ?`,
+        )
+        .get(job.jobId, job.leaseToken, now) as
+        | { attempts: number; max_attempts: number }
+        | undefined;
+      if (row === undefined) return 'lost';
 
       const exhausted = row.attempts >= row.max_attempts;
       this.#db
@@ -186,14 +274,15 @@ export class JobQueue {
           `UPDATE jobs
               SET state = ?, last_error = ?, run_after = ?, lease_owner = NULL,
                   lease_expires_at = NULL, updated_at = ?
-            WHERE job_id = ?`,
+            WHERE job_id = ? AND state = 'leased' AND lease_owner = ?`,
         )
         .run(
           exhausted ? 'dead' : 'pending',
           error.slice(0, 2000),
           isoIn(exhausted ? 0 : backoffMs(row.attempts)),
-          nowIso(),
-          jobId,
+          now,
+          job.jobId,
+          job.leaseToken,
         );
       return exhausted ? 'dead' : 'retry';
     });

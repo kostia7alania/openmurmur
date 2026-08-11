@@ -32,7 +32,7 @@ function exhaust(kind: 'summarize' | 'retention'): string {
   jobs.enqueue({ kind, idempotencyKey: `${kind}:cli`, payload: {}, maxAttempts: 1 });
   const claimed = jobs.claim([kind]);
   assert.ok(claimed);
-  jobs.fail(claimed.jobId, kind === 'summarize' ? 'Ollama is not reachable' : 'legacy failure');
+  jobs.fail(claimed, kind === 'summarize' ? 'Ollama is not reachable' : 'legacy failure');
   return claimed.jobId;
 }
 

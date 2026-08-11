@@ -48,7 +48,7 @@ import {
   renderLlmUnavailableDetail,
 } from '../jobs/diagnostics.ts';
 import { handleJob, markAudioDelivered, reconcileSessionDelivery } from '../jobs/pipeline.ts';
-import { type JobKind, JobQueue } from '../jobs/queue.ts';
+import { type ClaimedJob, type JobKind, JobLeaseLostError, JobQueue } from '../jobs/queue.ts';
 import type { LlmBackend } from '../llm/ollama.ts';
 import type { Logger } from '../logging/logger.ts';
 import { applyRetention, planRetention } from '../retention/policy.ts';
@@ -154,6 +154,7 @@ export class Daemon {
   readonly #timers: NodeJS.Timeout[] = [];
   readonly #activeTicks = new Set<Promise<void>>();
   readonly #activeOutboxDrains = new Set<Promise<void>>();
+  readonly #activeJobLeases = new Map<string, ClaimedJob>();
   #outboxDrainTail: Promise<void> = Promise.resolve();
   #startupPhaseDone: Promise<void> = Promise.resolve();
   #workersClosePromise: Promise<void> | null = null;
@@ -558,33 +559,44 @@ export class Daemon {
   }
 
   async #tickJobs(kinds: readonly JobKind[]): Promise<void> {
+    // Timers may all resume after a long macOS sleep. Renew in-memory work
+    // before any loop recovers expired rows, otherwise this daemon could
+    // reclaim its own still-running handler before its heartbeat timer fires.
+    for (const active of this.#activeJobLeases.values()) {
+      this.#jobs.renew(active);
+    }
     this.#jobs.recoverStaleLeases();
     const job = this.#jobs.claim(kinds);
     if (job === null) return;
+    this.#activeJobLeases.set(job.leaseToken, job);
 
     try {
-      if (job.kind === 'incoming_audio') await this.#handleIncomingJob(job.payload);
-      else {
-        await handleJob(
-          {
-            db: this.#db.handle,
-            config: this.#options.loaded.config,
-            paths: this.#options.loaded.paths,
-            asr: this.#asr,
-            llm: this.#llm,
-            jobs: this.#jobs,
-            logger: this.#options.logger,
-          },
-          job,
-        );
+      await this.#jobs.withLeaseHeartbeat(job, async () => {
+        if (job.kind === 'incoming_audio') await this.#handleIncomingJob(job);
+        else {
+          await handleJob(
+            {
+              db: this.#db.handle,
+              config: this.#options.loaded.config,
+              paths: this.#options.loaded.paths,
+              asr: this.#asr,
+              llm: this.#llm,
+              jobs: this.#jobs,
+              logger: this.#options.logger,
+            },
+            job,
+          );
+        }
+      });
+      if (!this.#jobs.complete(job)) {
+        throw new JobLeaseLostError(job.jobId);
       }
-      this.#jobs.complete(job.jobId);
     } catch (error) {
       if (this.#stopping) {
-        this.#releaseInterruptedJob(job.jobId, error);
+        this.#releaseInterruptedJob(job, error);
         return;
       }
-      const outcome = this.#jobs.fail(job.jobId, (error as Error).message);
+      const outcome = this.#jobs.fail(job, (error as Error).message);
       if (job.kind === 'asr' && outcome === 'dead') {
         markExhaustedAsrSession(this.#db.handle, job.payload);
       }
@@ -597,12 +609,17 @@ export class Daemon {
         attempts: job.attempts,
         error: (error as Error).message,
       });
+    } finally {
+      this.#activeJobLeases.delete(job.leaseToken);
     }
   }
 
-  #releaseInterruptedJob(jobId: string, error: unknown): void {
-    releaseInterruptedJob(this.#db.handle, jobId, error);
-    this.#options.logger.info('released a job interrupted by daemon shutdown', { jobId });
+  #releaseInterruptedJob(job: Pick<ClaimedJob, 'jobId' | 'leaseToken'>, error: unknown): void {
+    const released = releaseInterruptedJob(this.#db.handle, job, error);
+    this.#options.logger.info('handled a job interrupted by daemon shutdown', {
+      jobId: job.jobId,
+      outcome: released ? 'released' : 'lease_lost',
+    });
   }
 
   async #tickOutbox(): Promise<void> {
@@ -871,10 +888,11 @@ export class Daemon {
     }
   }
 
-  async #handleIncomingJob(payload: Record<string, unknown>): Promise<void> {
+  async #handleIncomingJob(job: ClaimedJob): Promise<void> {
     const client = this.#client;
     if (client === null) throw new Error('Telegram is not configured');
     const { config, paths } = this.#options.loaded;
+    const payload = job.payload;
 
     const message = payload['message'] as Parameters<typeof extractAttachment>[0];
     const attachment = extractAttachment(message);
@@ -891,13 +909,10 @@ export class Daemon {
     if (incoming === undefined) {
       const updateId = payload['updateId'];
       if (typeof updateId !== 'number') throw new Error('incoming audio has no update identity');
-      const claimed = claimIncomingRequest(
-        this.#db.handle,
-        updateId,
-        message,
-        hostname(),
-        botScope,
-      );
+      const claimed = transaction(this.#db.handle, () => {
+        this.#jobs.assertLease(job);
+        return claimIncomingRequest(this.#db.handle, updateId, message, hostname(), botScope);
+      });
       if (claimed === null) throw new Error('incoming audio payload has no supported attachment');
       incoming = claimed;
     }
@@ -907,18 +922,23 @@ export class Daemon {
 
       const storedTranscript = currentIncomingTranscript(this.#db.handle, incoming.fileUid);
       if (storedTranscript !== undefined) {
-        markIncomingTranscribed(this.#db.handle, incoming.fileUid);
-        this.#enqueueIncomingTranscript(
-          incoming,
-          storedTranscript.text,
-          storedTranscript.segments,
-          storedTranscript.languages,
-          storedTranscript.forcedLanguage,
-        );
+        const storedIncoming = incoming;
+        transaction(this.#db.handle, () => {
+          this.#jobs.assertLease(job);
+          markIncomingTranscribed(this.#db.handle, storedIncoming.fileUid);
+          this.#enqueueIncomingTranscript(
+            storedIncoming,
+            storedTranscript.text,
+            storedTranscript.segments,
+            storedTranscript.languages,
+            storedTranscript.forcedLanguage,
+          );
+        });
         return;
       }
 
       if (incoming.quarantinePath === null || !(await pathExists(incoming.quarantinePath))) {
+        const downloadIncoming = incoming;
         const downloaded = await downloadToQuarantine(
           client,
           attachment,
@@ -927,10 +947,21 @@ export class Daemon {
             maxIncomingBytes: config.telegram.maxIncomingBytes,
             maxDurationSeconds: config.telegram.maxIncomingDurationSeconds,
           },
-          incoming.fileUid,
+          downloadIncoming.fileUid,
+          {
+            attemptId: job.leaseToken,
+            assertCurrent: () => this.#jobs.assertLease(job),
+          },
         );
-        incomingFiles.markDownloaded(incoming.fileUid, downloaded.path, downloaded.actualBytes);
-        incoming = incomingFiles.get(incoming.fileUid);
+        transaction(this.#db.handle, () => {
+          this.#jobs.assertLease(job);
+          incomingFiles.markDownloaded(
+            downloadIncoming.fileUid,
+            downloaded.path,
+            downloaded.actualBytes,
+          );
+        });
+        incoming = incomingFiles.get(downloadIncoming.fileUid);
         if (incoming === undefined) throw new Error('incoming audio disappeared after download');
       }
 
@@ -942,11 +973,15 @@ export class Daemon {
         maxDurationSeconds: config.telegram.maxIncomingDurationSeconds,
       });
 
-      incomingFiles.reserveNormalizedPath(
-        incoming.fileUid,
-        join(paths.quarantineDir, `${incoming.fileUid}.16k.wav`),
-      );
-      incoming = incomingFiles.get(incoming.fileUid);
+      const probedIncoming = incoming;
+      transaction(this.#db.handle, () => {
+        this.#jobs.assertLease(job);
+        incomingFiles.reserveNormalizedPath(
+          probedIncoming.fileUid,
+          join(paths.quarantineDir, `${probedIncoming.fileUid}.16k.wav`),
+        );
+      });
+      incoming = incomingFiles.get(probedIncoming.fileUid);
       if (incoming === undefined)
         throw new Error('incoming audio disappeared before normalization');
 
@@ -956,12 +991,16 @@ export class Daemon {
         quarantinePath,
         incoming,
       );
-      incomingFiles.markNormalized(
-        incoming.fileUid,
-        wavPath,
-        probe.formatName,
-        Math.round(probe.durationSeconds * 1000),
-      );
+      const normalizedIncoming = incoming;
+      transaction(this.#db.handle, () => {
+        this.#jobs.assertLease(job);
+        incomingFiles.markNormalized(
+          normalizedIncoming.fileUid,
+          wavPath,
+          probe.formatName,
+          Math.round(probe.durationSeconds * 1000),
+        );
+      });
 
       const forcedLanguage = forcedLanguageFromPayload(payload, this.#asrLanguage);
       const result = await this.#asr.transcribe({
@@ -973,6 +1012,7 @@ export class Daemon {
       const reconciledLanguages = reconcileLanguages(result.languages, result.text).languages;
       const transcriptIncoming = incoming;
 
+      this.#jobs.assertLease(job);
       appendIncomingTranscript(
         this.#db.handle,
         {
@@ -991,6 +1031,7 @@ export class Daemon {
           })),
         },
         () => {
+          this.#jobs.assertLease(job);
           this.#enqueueIncomingTranscript(
             transcriptIncoming,
             result.text,
@@ -1004,28 +1045,35 @@ export class Daemon {
       // The only undefined assignment above is a failed reload after download;
       // there is then no durable row whose state can truthfully be changed.
       if (incoming === undefined) throw error;
+      const failedIncoming = incoming;
       if (error instanceof IncomingRejected) {
         this.#options.logger.info('incoming Telegram media rejected', {
-          fileUid: incoming.fileUid,
+          fileUid: failedIncoming.fileUid,
           reason: error.reason,
           detail: error.message,
         });
-        this.#enqueueText(
-          `${rejectionMessage(error.reason, {
-            maxIncomingBytes: config.telegram.maxIncomingBytes,
-            maxDurationSeconds: config.telegram.maxIncomingDurationSeconds,
-          })}\n\n${renderProvenancePlain(incomingTelegramProvenance(incoming))}`.trim(),
-          `reject:${attachment.fileUniqueId}`,
-        );
-        this.#db.handle
-          .prepare(
-            `UPDATE incoming_telegram_files SET state = 'rejected', rejection_reason = ?,
-                    updated_at = ? WHERE file_uid = ?`,
-          )
-          .run(error.reason, new Date().toISOString(), incoming.fileUid);
+        transaction(this.#db.handle, () => {
+          this.#jobs.assertLease(job);
+          this.#enqueueText(
+            `${rejectionMessage(error.reason, {
+              maxIncomingBytes: config.telegram.maxIncomingBytes,
+              maxDurationSeconds: config.telegram.maxIncomingDurationSeconds,
+            })}\n\n${renderProvenancePlain(incomingTelegramProvenance(failedIncoming))}`.trim(),
+            `reject:${attachment.fileUniqueId}`,
+          );
+          this.#db.handle
+            .prepare(
+              `UPDATE incoming_telegram_files SET state = 'rejected', rejection_reason = ?,
+                      updated_at = ? WHERE file_uid = ?`,
+            )
+            .run(error.reason, new Date().toISOString(), failedIncoming.fileUid);
+        });
         return;
       }
-      incomingFiles.markFailedIfUntranscribed(incoming.fileUid);
+      transaction(this.#db.handle, () => {
+        this.#jobs.assertLease(job);
+        incomingFiles.markFailedIfUntranscribed(failedIncoming.fileUid);
+      });
       throw error;
     }
   }
@@ -1481,14 +1529,29 @@ export class Daemon {
   }
 }
 
-export function releaseInterruptedJob(db: Database['handle'], jobId: string, error: unknown): void {
+export function releaseInterruptedJob(
+  db: Database['handle'],
+  job: Pick<ClaimedJob, 'jobId' | 'leaseToken'>,
+  error: unknown,
+): boolean {
   const now = new Date().toISOString();
-  db.prepare(
-    `UPDATE jobs
-        SET state = 'pending', attempts = MAX(0, attempts - 1), run_after = ?,
-            last_error = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-      WHERE job_id = ? AND state = 'leased'`,
-  ).run(now, `daemon shutdown: ${(error as Error).message}`.slice(0, 2000), now, jobId);
+  const result = db
+    .prepare(
+      `UPDATE jobs
+          SET state = 'pending', attempts = MAX(0, attempts - 1), run_after = ?,
+              last_error = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+        WHERE job_id = ? AND state = 'leased' AND lease_owner = ?
+          AND lease_expires_at > ?`,
+    )
+    .run(
+      now,
+      `daemon shutdown: ${(error as Error).message}`.slice(0, 2000),
+      now,
+      job.jobId,
+      job.leaseToken,
+      now,
+    );
+  return result.changes === 1;
 }
 
 export function retireStaleNotices(

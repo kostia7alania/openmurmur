@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { type FileHandle, open, rename, rm, stat } from 'node:fs/promises';
-import { dirname, extname, join, resolve, sep } from 'node:path';
+import { type FileHandle, open, readdir, rename, rm, stat } from 'node:fs/promises';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fsyncDirectory, fsyncFile } from '../capture/writer.ts';
@@ -135,10 +135,33 @@ export function quarantinePathFor(
 }
 
 /** One bounded crash artefact per durable UID; a retry truncates and reuses it. */
-export function quarantineTemporaryPathFor(quarantineDir: string, fileUid: string): string {
-  const temporary = join(quarantineDir, `.${fileUid}.download.part`);
+export function quarantineTemporaryPathFor(
+  quarantineDir: string,
+  fileUid: string,
+  attemptId?: string,
+): string {
+  const attemptSuffix =
+    attemptId === undefined ? '' : `.${attemptId.replace(/[^A-Za-z0-9-]/g, '_')}`;
+  const temporary = join(quarantineDir, `.${fileUid}${attemptSuffix}.download.part`);
   assertContained(quarantineDir, temporary);
   return temporary;
+}
+
+async function removeSupersededDownloadTemps(
+  quarantineDir: string,
+  fileUid: string,
+  current: string,
+): Promise<void> {
+  const prefix = `.${fileUid}.`;
+  for (const entry of await readdir(quarantineDir)) {
+    if (
+      entry !== basename(current) &&
+      entry.startsWith(prefix) &&
+      entry.endsWith('.download.part')
+    ) {
+      await rm(join(quarantineDir, entry), { force: true });
+    }
+  }
 }
 
 /** Defence in depth: proves a resolved path really is inside its directory. */
@@ -164,6 +187,13 @@ export interface DownloadResult {
   readonly actualBytes: number;
 }
 
+export interface DownloadAttemptOptions {
+  /** Unique job claim generation; omitted by compatibility and direct recovery callers. */
+  readonly attemptId?: string | undefined;
+  /** Re-proves the claim before removing an old attempt and before publication. */
+  readonly assertCurrent?: (() => void) | undefined;
+}
+
 /**
  * Downloads an attachment into quarantine.
  *
@@ -178,6 +208,7 @@ export async function downloadToQuarantine(
   quarantineDir: string,
   limits: DownloadLimits,
   fileUid?: string,
+  attempt: DownloadAttemptOptions = {},
 ): Promise<DownloadResult> {
   if (
     attachment.declaredBytes !== undefined &&
@@ -212,7 +243,12 @@ export async function downloadToQuarantine(
 
   const target = quarantinePathFor(quarantineDir, attachment.claimedFilename, fileUid);
   const { path } = target;
-  const temporary = quarantineTemporaryPathFor(quarantineDir, target.fileUid);
+  const temporary = quarantineTemporaryPathFor(quarantineDir, target.fileUid, attempt.attemptId);
+  if (attempt.attemptId !== undefined) {
+    attempt.assertCurrent?.();
+    await removeSupersededDownloadTemps(quarantineDir, target.fileUid, temporary);
+    attempt.assertCurrent?.();
+  }
   const response = await client.downloadFile(file.file_path);
   if (response.body === null) {
     throw new IncomingRejected('corrupt_media', 'Telegram returned an empty body');
@@ -253,6 +289,7 @@ export async function downloadToQuarantine(
       throw new IncomingRejected('corrupt_media', 'downloaded file is empty');
     }
     await fsyncFile(temporary);
+    attempt.assertCurrent?.();
     await rename(temporary, path);
     await fsyncDirectory(dirname(path));
     return { fileUid: target.fileUid, path, actualBytes: info.size };

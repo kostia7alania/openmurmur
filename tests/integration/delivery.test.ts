@@ -1,5 +1,13 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
@@ -18,6 +26,7 @@ import {
   enqueueSessionAudio,
   enqueueSessionDelivery,
   enqueueSessionReport,
+  enqueueSessionTranscript,
 } from '../../src/jobs/delivery.ts';
 import {
   handleJob,
@@ -114,6 +123,56 @@ describe('ASR job', () => {
     assert.ok(transcript.text.length > 0);
     assert.equal(jobs.pendingCount('deliver_transcript'), 1);
     assert.equal(jobs.pendingCount('summarize'), 1);
+  });
+
+  it('fences transcript and downstream commits from a reclaimed ASR generation', async () => {
+    seedFinalizedSession('lease-fence');
+    const asr = new FakeAsr();
+    const originalTranscribe = asr.transcribe.bind(asr);
+    let signalStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    let signalRelease: (() => void) | undefined;
+    const release = new Promise<void>((resolve) => {
+      signalRelease = resolve;
+    });
+    asr.transcribe = async (request) => {
+      signalStarted?.();
+      await release;
+      return originalTranscribe(request);
+    };
+
+    const pipeline = deps(asr);
+    pipeline.jobs.enqueue({
+      kind: 'asr',
+      idempotencyKey: 'asr:lease-fence',
+      payload: { sessionId: 'lease-fence' },
+    });
+    const stale = pipeline.jobs.claim(['asr']);
+    assert.ok(stale);
+    const staleWork = handleJob(pipeline, stale);
+    await started;
+
+    db.handle
+      .prepare("UPDATE jobs SET lease_expires_at = '2000-01-01T00:00:00.000Z' WHERE job_id = ?")
+      .run(stale.jobId);
+    assert.equal(pipeline.jobs.recoverStaleLeases(), 1);
+    const current = pipeline.jobs.claim(['asr']);
+    assert.ok(current);
+    asr.transcribe = originalTranscribe;
+    signalRelease?.();
+
+    await assert.rejects(staleWork, /lost its lease before the handler completed/);
+    assert.equal(pipeline.jobs.fail(stale, 'late stale ASR completion'), 'lost');
+    assert.equal(new TranscriptRepository(db.handle).current('lease-fence'), undefined);
+    assert.equal(pipeline.jobs.pendingCount('deliver_transcript'), 0);
+    assert.equal(pipeline.jobs.pendingCount('summarize'), 0);
+    assert.equal(new SessionRepository(db.handle).get('lease-fence')?.state, 'PROCESSING');
+
+    await handleJob(pipeline, current);
+    assert.equal(pipeline.jobs.complete(current), true);
+    assert.ok(new TranscriptRepository(db.handle).current('lease-fence'));
   });
 
   it('uses the language snapshotted in the job and records that auto-detection was skipped', async () => {
@@ -390,6 +449,101 @@ describe('delivery enqueue', () => {
     });
   }
 
+  it('fences every delivery family after another generation reclaims the job', async () => {
+    const kinds = ['deliver_audio', 'deliver_report', 'deliver_transcript', 'deliver'] as const;
+
+    for (const kind of kinds) {
+      const sessionId = `lease-${kind}`;
+      seedFinalizedSession(sessionId);
+      if (kind !== 'deliver_audio') await transcribeAndSummarize(sessionId);
+
+      const queue = new JobQueue(db.handle, `owner-${kind}`);
+      if (kind === 'deliver_audio' || kind === 'deliver') {
+        queue.enqueue({
+          kind,
+          idempotencyKey: `lease-test:${kind}:${sessionId}`,
+          payload: { sessionId },
+        });
+      }
+      const stale = queue.claim([kind]);
+      assert.ok(stale);
+      db.handle
+        .prepare("UPDATE jobs SET lease_expires_at = '2000-01-01T00:00:00.000Z' WHERE job_id = ?")
+        .run(stale.jobId);
+      assert.equal(queue.recoverStaleLeases(), 1);
+      const current = queue.claim([kind]);
+      assert.ok(current);
+      new SessionRepository(db.handle).setState(sessionId, 'DONE');
+
+      await assert.rejects(handleJob({ ...deps(), jobs: queue }, stale), /lost its lease/);
+      assert.equal(new SessionRepository(db.handle).get(sessionId)?.state, 'DONE');
+      const staleRows = db.handle
+        .prepare('SELECT count(*) AS count FROM telegram_outbox WHERE session_id = ?')
+        .get(sessionId) as { count: number };
+      assert.equal(staleRows.count, 0, `${kind} stale generation published no outbox rows`);
+
+      await handleJob({ ...deps(), jobs: queue }, current);
+      assert.equal(queue.complete(current), true);
+      const currentRows = db.handle
+        .prepare('SELECT count(*) AS count FROM telegram_outbox WHERE session_id = ?')
+        .get(sessionId) as { count: number };
+      assert.ok(currentRows.count > 0, `${kind} replacement generation completed delivery`);
+      db.handle.prepare("DELETE FROM jobs WHERE state = 'pending'").run();
+    }
+  });
+
+  it('does not publish long text artifacts when the lease is lost during their write', async () => {
+    for (const kind of ['transcript', 'report'] as const) {
+      const sessionId = `lease-file-${kind}`;
+      seedFinalizedSession(sessionId);
+      writeFileSync(join(dir, 'audio', `${sessionId}.p000.expected.txt`), 'слово '.repeat(2_000));
+      await transcribeAndSummarize(sessionId);
+      const revisionId = new TranscriptRepository(db.handle).current(sessionId)?.revision_id;
+      assert.ok(revisionId);
+      new SessionRepository(db.handle).setState(sessionId, 'DONE');
+      let checks = 0;
+      const assertCurrent = () => {
+        checks += 1;
+        if (checks === 3) throw new Error('lease lost during atomic write');
+      };
+
+      if (kind === 'transcript') {
+        await assert.rejects(
+          enqueueSessionTranscript(db.handle, {
+            sessionId,
+            config: CONFIG,
+            paths: paths(),
+            assertCurrent,
+          }),
+          /lease lost during atomic write/,
+        );
+        assert.equal(existsSync(join(dir, 'transcripts', `${sessionId}.${revisionId}.md`)), false);
+      } else {
+        await assert.rejects(
+          enqueueSessionReport(db.handle, {
+            sessionId,
+            summary: { ...EMPTY_SUMMARY, summary: 'длинный отчёт '.repeat(500) },
+            summaryRevisionId: revisionId,
+            config: CONFIG,
+            paths: paths(),
+            assertCurrent,
+          }),
+          /lease lost during atomic write/,
+        );
+        assert.equal(
+          existsSync(join(dir, 'transcripts', `${sessionId}.${revisionId}.report.md`)),
+          false,
+        );
+      }
+
+      const rows = db.handle
+        .prepare('SELECT count(*) AS count FROM telegram_outbox WHERE session_id = ?')
+        .get(sessionId) as { count: number };
+      assert.equal(rows.count, 0);
+      assert.equal(new SessionRepository(db.handle).get(sessionId)?.state, 'DONE');
+    }
+  });
+
   it('queues audio first, then transcript, then report', async () => {
     seedFinalizedSession('s1', 2);
     await transcribeAndSummarize('s1');
@@ -567,6 +721,48 @@ describe('delivery enqueue', () => {
     assert.deepEqual(readFileSync(ownedPath), ownedBytes, 'the live outbox row owns this path');
   });
 
+  it('removes only the losing generation chunks when its lease expires after splitting', async () => {
+    seedFinalizedSession('split-loser', 1, 4096);
+    const fakeFfmpeg = join(dir, 'fake-split-ffmpeg');
+    writeFileSync(
+      fakeFfmpeg,
+      `#!/bin/sh
+for argument do pattern="$argument"; done
+first=$(/usr/bin/printf "$pattern" 0)
+second=$(/usr/bin/printf "$pattern" 1)
+/usr/bin/head -c 256 /dev/zero > "$first"
+/usr/bin/head -c 256 /dev/zero > "$second"
+`,
+      { mode: 0o700 },
+    );
+    let checks = 0;
+    await assert.rejects(
+      enqueueSessionAudio(db.handle, {
+        sessionId: 'split-loser',
+        config: {
+          ...CONFIG,
+          audio: { ...CONFIG.audio, ffmpegPath: fakeFfmpeg },
+          telegram: { ...CONFIG.telegram, maxOutgoingBytes: 1024 },
+        },
+        paths: paths(),
+        artifactGeneration: 'lease-A',
+        assertCurrent: () => {
+          checks += 1;
+          if (checks === 5) throw new Error('split lease lost');
+        },
+      }),
+      /split lease lost/,
+    );
+    assert.deepEqual(
+      readdirSync(join(dir, 'tmp')).filter((name) => name.includes('.lease-A.split')),
+      [],
+    );
+    const rows = db.handle
+      .prepare("SELECT count(*) AS count FROM telegram_outbox WHERE kind = 'audio'")
+      .get() as { count: number };
+    assert.equal(rows.count, 0);
+  });
+
   it('fails safely when a pending split row has lost its owned artifact', async () => {
     seedFinalizedSession('s1', 1, 4096);
     const part = db.handle
@@ -693,7 +889,9 @@ describe('delivery enqueue', () => {
     assert.equal(rows.length, 1, 'a long transcript must not flood the chat with quote chunks');
     const md = rows.find((r) => r.delivery_part_id.startsWith('transcript-md:'));
     assert.ok(md, 'a long transcript travels as one .md file');
-    const transcriptFile = join(dir, 'transcripts', 's1.md');
+    const revisionId = new TranscriptRepository(db.handle).current('s1')?.revision_id;
+    assert.ok(revisionId);
+    const transcriptFile = join(dir, 'transcripts', `s1.${revisionId}.md`);
     assert.ok(existsSync(transcriptFile));
     const transcriptPayload = JSON.parse(md.payload) as { caption: string };
     assert.match(transcriptPayload.caption, /^📝 Транскрипт с таймингами/);

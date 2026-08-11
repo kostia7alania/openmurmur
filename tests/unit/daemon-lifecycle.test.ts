@@ -590,9 +590,13 @@ describe('daemon terminal state reconciliation', () => {
     });
     assert.ok(jobId);
     const claimed = jobs.claim(['asr']);
-    assert.equal(claimed?.attempts, 1);
+    assert.ok(claimed);
+    assert.equal(claimed.attempts, 1);
 
-    releaseInterruptedJob(db.handle, jobId, new Error('ASR worker is closed'));
+    assert.equal(
+      releaseInterruptedJob(db.handle, claimed, new Error('ASR worker is closed')),
+      true,
+    );
 
     const row = db.handle
       .prepare('SELECT state, attempts, lease_owner, lease_expires_at FROM jobs WHERE job_id = ?')
@@ -611,6 +615,39 @@ describe('daemon terminal state reconciliation', () => {
         lease_expires_at: null,
       },
     );
+  });
+
+  it('does not release a replacement lease when a stale worker shuts down', () => {
+    const staleWorker = new JobQueue(db.handle, 'stale-worker');
+    const jobId = staleWorker.enqueue({
+      kind: 'incoming_audio',
+      idempotencyKey: 'incoming:reclaimed',
+      payload: { fileUid: 'reclaimed' },
+    });
+    assert.ok(jobId);
+    const stale = staleWorker.claim(['incoming_audio']);
+    assert.ok(stale);
+    db.handle
+      .prepare("UPDATE jobs SET lease_expires_at = '2000-01-01T00:00:00.000Z' WHERE job_id = ?")
+      .run(jobId);
+    assert.equal(staleWorker.recoverStaleLeases(), 1);
+
+    const currentWorker = new JobQueue(db.handle, 'current-worker');
+    const current = currentWorker.claim(['incoming_audio']);
+    assert.ok(current);
+    assert.equal(
+      releaseInterruptedJob(db.handle, stale, new Error('old daemon is stopping late')),
+      false,
+    );
+    assert.deepEqual(
+      {
+        ...(db.handle
+          .prepare('SELECT state, attempts, lease_owner FROM jobs WHERE job_id = ?')
+          .get(jobId) as Record<string, unknown>),
+      },
+      { state: 'leased', attempts: 2, lease_owner: current.leaseToken },
+    );
+    assert.equal(currentWorker.complete(current), true);
   });
 
   it('marks an exhausted ASR session failed and enqueues one durable status', () => {

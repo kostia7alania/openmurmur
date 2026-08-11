@@ -963,12 +963,12 @@ describe('job queue', () => {
 
     const first = jobs.claim(['asr']);
     assert.ok(first);
-    assert.equal(jobs.fail(first.jobId, 'model unavailable'), 'retry');
+    assert.equal(jobs.fail(first, 'model unavailable'), 'retry');
 
     db.handle.prepare("UPDATE jobs SET run_after = '2000-01-01T00:00:00.000Z'").run();
     const second = jobs.claim(['asr']);
     assert.ok(second);
-    assert.equal(jobs.fail(second.jobId, 'model unavailable again'), 'dead');
+    assert.equal(jobs.fail(second, 'model unavailable again'), 'dead');
 
     const row = db.handle.prepare('SELECT state, last_error FROM jobs').get() as {
       state: string;
@@ -988,7 +988,7 @@ describe('job queue', () => {
     });
     const claimed = jobs.claim(['summarize']);
     assert.ok(claimed);
-    assert.equal(jobs.fail(claimed.jobId, 'Ollama is not reachable'), 'dead');
+    assert.equal(jobs.fail(claimed, 'Ollama is not reachable'), 'dead');
 
     assert.deepEqual(jobs.deadJobs(), [
       {
@@ -1036,7 +1036,7 @@ describe('job queue', () => {
     });
     const claimed = jobs.claim(['asr']);
     assert.ok(claimed);
-    jobs.fail(claimed.jobId, 'model missing');
+    jobs.fail(claimed, 'model missing');
 
     assert.equal(jobs.retryDead(claimed.jobId), 'requeued');
     const session = sessions.get('s1');
