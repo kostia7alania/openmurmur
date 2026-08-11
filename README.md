@@ -430,10 +430,11 @@ Neither needs a microphone, a model, or a network.
 
 Honesty matters more than a green badge, so:
 
-**Verified on this revision by 486 offline TypeScript tests (94 suites) and 36
+**Verified on this revision by 551 offline TypeScript tests (106 suites) and 36
 Python tests:**
 sessionizer state machine with a fake clock, pre-roll,
 60-second close, 15-minute rotation, bounded capture ingress and sleep epochs,
+unexpected clean capture-EOF handling,
 atomic FLAC and Markdown publication, lossless splitting, ffprobe validation of
 real media, staged audio-first delivery, delivery-clock retention proofs,
 lifecycle-status ordering, transcript revisions, job leases, worker timeout
@@ -442,11 +443,14 @@ outbox idempotency, 429 handling, Telegram endpoint confinement, metadata-only
 Keychain readiness, fail-closed local status heartbeats, daemon PID birth
 identity, launchd drift/readiness/rollback checks, crash recovery after a
 published-part database fault, proof-based stale split cleanup, incoming
-transcript-ACK retention clocks, stable Russian failure boundaries, HTML
-entity-aware Telegram limits, Unicode splitting, grounded recall with
-session/time/source-audio provenance, path traversal, chat allowlisting,
-update deduplication, secret redaction, prompt-injection fencing, health
-deduplication and migrations.
+artifact ownership cleanup, crash-convergent atomic incoming downloads and the
+incoming fault matrix, transcript-ACK retention clocks, explicit operator-audited
+remote ACK reconciliation, revision-scoped summary retry and delivery,
+bounded revision-grounded long-session summaries, the deterministic RU/EN/TH
+summary acceptance corpus, stable Russian failure boundaries, HTML entity-aware
+Telegram limits, Unicode splitting, grounded recall with session/time/source-audio
+provenance, path traversal, chat allowlisting, update deduplication, secret
+redaction, prompt-injection fencing, health deduplication and migrations.
 Model-facing automated tests use fake adapters and do not download weights.
 
 [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records earlier same-machine
