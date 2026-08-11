@@ -436,7 +436,7 @@ Honesty matters more than a green badge, so:
 | Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama component runs. | A component smoke run is not the complete daemon pipeline and is not current-revision live release evidence. |
 | Live release | No current-revision end-to-end live run is recorded yet; D120–D122 in [`docs/MVP_123.md`](docs/MVP_123.md) are the required gates. | Until those rows are evidenced, the project does not claim real microphone → models → Telegram, launchd login/reboot or sleep/wake verification. |
 
-**Verified on this revision by 551 offline TypeScript tests (106 suites) and 36
+**Verified on this revision by 572 offline TypeScript tests (108 suites) and 36
 Python tests:**
 sessionizer state machine with a fake clock, pre-roll,
 60-second close, 15-minute rotation, bounded capture ingress and sleep epochs,
