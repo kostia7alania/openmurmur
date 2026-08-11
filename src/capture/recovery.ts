@@ -221,6 +221,288 @@ export async function findOrphanedParts(
   return orphans;
 }
 
+type InitialSessionJobKind = 'deliver_audio' | 'asr';
+
+interface StoredInitialJob {
+  readonly kind: string;
+  readonly idempotency_key: string;
+  readonly payload: string;
+  readonly state: string;
+}
+
+interface ProcessingRepairPlan {
+  readonly status: 'repair';
+  readonly sessionId: string;
+  readonly finalizedParts: number;
+  readonly missingJobs: readonly InitialSessionJobKind[];
+  readonly statusExists: boolean;
+}
+
+type ProcessingRepairAssessment =
+  | ProcessingRepairPlan
+  | { readonly status: 'complete' }
+  | { readonly status: 'blocked'; readonly reason: string };
+
+function initialJobKey(kind: InitialSessionJobKind, sessionId: string): string {
+  return kind === 'deliver_audio' ? `deliver-audio:${sessionId}` : `asr:${sessionId}`;
+}
+
+function payloadSessionId(payload: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    const sessionId = (parsed as Record<string, unknown>)['sessionId'];
+    return typeof sessionId === 'string' ? sessionId : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasDownstreamProof(
+  db: DatabaseSync,
+  sessionId: string,
+  missingJobs: readonly InitialSessionJobKind[],
+): boolean {
+  const transcript = db
+    .prepare('SELECT 1 AS present FROM transcript_revisions WHERE session_id = ? LIMIT 1')
+    .get(sessionId);
+  if (transcript !== undefined) return true;
+  const downstreamJob = db
+    .prepare(
+      `SELECT 1 AS present
+         FROM jobs
+        WHERE kind IN ('deliver_transcript','summarize','deliver_report','deliver')
+          AND json_valid(payload) = 1
+          AND json_extract(payload, '$.sessionId') = ?
+        LIMIT 1`,
+    )
+    .get(sessionId);
+  if (downstreamJob !== undefined) return true;
+
+  if (missingJobs.includes('deliver_audio')) {
+    const audioProgress = db
+      .prepare(
+        `SELECT 1 AS present
+           FROM audio_parts p
+          WHERE p.session_id = ? AND p.delivered = 1
+          UNION ALL
+         SELECT 1 AS present
+           FROM telegram_outbox o
+          WHERE o.session_id = ? AND o.kind = 'audio'
+          LIMIT 1`,
+      )
+      .get(sessionId, sessionId);
+    if (audioProgress !== undefined) return true;
+  }
+  return false;
+}
+
+/**
+ * This repair fills absent initial facts; it never rewrites contradictory ones.
+ * With no owned finalized part, a dead/conflicting initial job or later-stage
+ * progress, another enqueue could duplicate work or invent recoverable audio,
+ * so those sessions remain operator-owned and are logged as blocked.
+ */
+function assessProcessingRepair(db: DatabaseSync, sessionId: string): ProcessingRepairAssessment {
+  const session = db
+    .prepare(
+      `SELECT state,
+              (SELECT count(*)
+                 FROM audio_parts p
+                WHERE p.session_id = s.session_id
+                  AND p.finalized = 1
+                  AND p.deleted_at IS NULL) AS finalized_parts
+         FROM audio_sessions s
+        WHERE s.session_id = ?`,
+    )
+    .get(sessionId) as { state: string; finalized_parts: number } | undefined;
+  if (session === undefined || session.state !== 'PROCESSING') return { status: 'complete' };
+  if (session.finalized_parts === 0) {
+    return {
+      status: 'blocked',
+      reason: 'the PROCESSING session has no finalized, undeleted owned audio part',
+    };
+  }
+
+  const requiredKinds = ['deliver_audio', 'asr'] as const;
+  const expectedKeys = new Map(
+    requiredKinds.map((kind) => [initialJobKey(kind, sessionId), kind] as const),
+  );
+  const rows = db
+    .prepare(
+      `SELECT kind, idempotency_key, payload, state
+         FROM jobs
+        WHERE idempotency_key IN (?, ?)
+           OR (
+                kind IN ('deliver_audio','asr')
+                AND json_valid(payload) = 1
+                AND json_extract(payload, '$.sessionId') = ?
+              )`,
+    )
+    .all(
+      initialJobKey('deliver_audio', sessionId),
+      initialJobKey('asr', sessionId),
+      sessionId,
+    ) as unknown as StoredInitialJob[];
+  const present = new Set<InitialSessionJobKind>();
+  for (const row of rows) {
+    const expectedKind = expectedKeys.get(row.idempotency_key);
+    if (expectedKind !== undefined) {
+      if (
+        row.kind !== expectedKind ||
+        payloadSessionId(row.payload) !== sessionId ||
+        row.state === 'failed' ||
+        row.state === 'dead'
+      ) {
+        return {
+          status: 'blocked',
+          reason: `required job ${row.idempotency_key} is conflicting, failed or dead`,
+        };
+      }
+      present.add(expectedKind);
+    }
+  }
+  const missingJobs = requiredKinds.filter((kind) => !present.has(kind));
+  if (missingJobs.length === 0) return { status: 'complete' };
+
+  for (const row of rows) {
+    if (
+      (row.kind === 'deliver_audio' || row.kind === 'asr') &&
+      payloadSessionId(row.payload) === sessionId &&
+      row.idempotency_key !== initialJobKey(row.kind, sessionId)
+    ) {
+      return {
+        status: 'blocked',
+        reason: `initial ${row.kind} work exists under conflicting key ${row.idempotency_key}`,
+      };
+    }
+  }
+  if (hasDownstreamProof(db, sessionId, missingJobs)) {
+    return {
+      status: 'blocked',
+      reason: 'durable downstream facts already exist for a missing initial job',
+    };
+  }
+
+  const statusId = `session-status:finalized:${sessionId}`;
+  const lifecycleStatus = db
+    .prepare(
+      `SELECT kind, session_id, payload
+         FROM telegram_outbox
+        WHERE delivery_part_id = ?`,
+    )
+    .get(statusId) as { kind: string; session_id: string | null; payload: string } | undefined;
+  if (lifecycleStatus !== undefined) {
+    let canonicalText = false;
+    try {
+      const payload = JSON.parse(lifecycleStatus.payload) as Record<string, unknown>;
+      canonicalText = payload['type'] === 'text' && typeof payload['text'] === 'string';
+    } catch {
+      // A conflicting durable status must be repaired by an operator, not overwritten here.
+    }
+    if (
+      lifecycleStatus.kind !== 'status' ||
+      lifecycleStatus.session_id !== sessionId ||
+      !canonicalText
+    ) {
+      return { status: 'blocked', reason: `lifecycle status ${statusId} is conflicting` };
+    }
+  }
+
+  return {
+    status: 'repair',
+    sessionId,
+    finalizedParts: session.finalized_parts,
+    missingJobs,
+    statusExists: lifecycleStatus !== undefined,
+  };
+}
+
+function insertMissingProcessingFacts(db: DatabaseSync, plan: ProcessingRepairPlan): void {
+  const nowIso = new Date().toISOString();
+  const updated = db
+    .prepare(
+      `UPDATE audio_sessions
+          SET part_count = ?, updated_at = ?
+        WHERE session_id = ? AND state = 'PROCESSING'`,
+    )
+    .run(plan.finalizedParts, nowIso, plan.sessionId);
+  if (updated.changes !== 1) throw new Error(`PROCESSING session ${plan.sessionId} changed`);
+
+  const jobs = new JobQueue(db);
+  for (const kind of plan.missingJobs) {
+    const inserted = jobs.enqueue({
+      kind,
+      idempotencyKey: initialJobKey(kind, plan.sessionId),
+      payload: { sessionId: plan.sessionId },
+    });
+    if (inserted === null) throw new Error(`initial ${kind} job appeared during recovery`);
+  }
+  if (!plan.statusExists) {
+    const inserted = new Outbox(db).enqueue({
+      deliveryPartId: `session-status:finalized:${plan.sessionId}`,
+      kind: 'status',
+      sessionId: plan.sessionId,
+      ordinal: -10,
+      payload: {
+        type: 'text',
+        text: '⚠️ Восстановлена локальная очередь завершённой записи — загружаю аудио и расшифровываю локально…',
+      },
+    });
+    if (!inserted) throw new Error('lifecycle status appeared during recovery');
+  }
+}
+
+function reconcileMissingProcessingJobs(
+  db: DatabaseSync,
+  logger: Logger,
+  repair: boolean,
+): string[] {
+  const sessions = db
+    .prepare("SELECT session_id FROM audio_sessions WHERE state = 'PROCESSING' ORDER BY session_id")
+    .all() as { session_id: string }[];
+  const candidates: string[] = [];
+  for (const session of sessions) {
+    const assessment = assessProcessingRepair(db, session.session_id);
+    if (assessment.status === 'complete') continue;
+    if (assessment.status === 'blocked') {
+      logger.error('PROCESSING session initial job recovery is blocked', {
+        sessionId: session.session_id,
+        reason: assessment.reason,
+        action: 'Inspect the durable jobs and session audio before retrying recovery.',
+      });
+      continue;
+    }
+    if (!repair) {
+      candidates.push(session.session_id);
+      continue;
+    }
+
+    const repaired = transaction(db, () => {
+      const current = assessProcessingRepair(db, session.session_id);
+      if (current.status !== 'repair') return current;
+      insertMissingProcessingFacts(db, current);
+      return current;
+    });
+    if (repaired.status === 'blocked') {
+      logger.error('PROCESSING session changed before initial job recovery', {
+        sessionId: session.session_id,
+        reason: repaired.reason,
+      });
+      continue;
+    }
+    if (repaired.status === 'repair') {
+      candidates.push(session.session_id);
+      logger.warn('restored missing initial processing jobs', {
+        sessionId: session.session_id,
+        jobs: repaired.missingJobs,
+        finalizedParts: repaired.finalizedParts,
+      });
+    }
+  }
+  return candidates;
+}
+
 /**
  * Marks sessions a crash left mid-flight.
  *
@@ -310,7 +592,7 @@ export function reconcileStalledSessions(
       sessionId: row.session_id,
     });
   }
-  return reconciled;
+  return [...reconciled, ...reconcileMissingProcessingJobs(db, logger, repair)];
 }
 
 export interface RecoveryOptions {

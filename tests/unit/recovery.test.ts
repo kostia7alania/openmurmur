@@ -10,6 +10,7 @@ import {
 } from '../../src/capture/recovery.ts';
 import { managedDirectories, resolvePaths } from '../../src/config/paths.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
+import { TranscriptRepository } from '../../src/database/repository.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
 import { createLogger, nullLogger } from '../../src/logging/logger.ts';
 
@@ -51,6 +52,21 @@ function seedLiveSession(id: string, finalizedParts: number): void {
       )
       .run(`${id}-p${i}`, id, i, join(dir, 'audio', `${id}.p00${i}.flac`), at, at, at);
   }
+}
+
+function seedProcessingSession(id: string, finalizedParts = 1): void {
+  seedLiveSession(id, finalizedParts);
+  db.handle.prepare("UPDATE audio_sessions SET state = 'PROCESSING' WHERE session_id = ?").run(id);
+}
+
+function seedInitialJob(sessionId: string, kind: 'deliver_audio' | 'asr'): string {
+  const jobId = new JobQueue(db.handle).enqueue({
+    kind,
+    idempotencyKey: kind === 'deliver_audio' ? `deliver-audio:${sessionId}` : `asr:${sessionId}`,
+    payload: { sessionId },
+  });
+  assert.ok(jobId);
+  return jobId;
 }
 
 function seedOrphan(name: string, bytes = 4096): string {
@@ -463,6 +479,295 @@ describe('crash recovery', () => {
       )
       .get() as { c: number };
     assert.equal(statuses.c, 1);
+  });
+
+  it('reports and atomically restores both missing initial PROCESSING jobs', async () => {
+    seedProcessingSession('missing-both');
+
+    const reportOnly = await recoverAfterCrash(db.handle, paths(), nullLogger, {
+      remove: false,
+      repair: false,
+    });
+    assert.deepEqual(reportOnly.stalledSessions, ['missing-both']);
+    assert.equal(new JobQueue(db.handle).pendingCount(), 0);
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT part_count FROM audio_sessions WHERE session_id = ?')
+          .get('missing-both') as { part_count: number }
+      ).part_count,
+      0,
+      'report-only recovery must not repair even session metadata',
+    );
+
+    const repaired = await recoverAfterCrash(db.handle, paths(), nullLogger);
+    assert.deepEqual(repaired.stalledSessions, ['missing-both']);
+    assert.equal(new JobQueue(db.handle).pendingCount('deliver_audio'), 1);
+    assert.equal(new JobQueue(db.handle).pendingCount('asr'), 1);
+    const facts = db.handle
+      .prepare(
+        `SELECT s.state, s.part_count,
+                (SELECT count(*) FROM telegram_outbox
+                  WHERE delivery_part_id = 'session-status:finalized:missing-both') AS statuses
+           FROM audio_sessions s
+          WHERE s.session_id = 'missing-both'`,
+      )
+      .get() as { state: string; part_count: number; statuses: number };
+    assert.deepEqual({ ...facts }, { state: 'PROCESSING', part_count: 1, statuses: 1 });
+
+    const repeated = await recoverAfterCrash(db.handle, paths(), nullLogger);
+    assert.deepEqual(repeated.stalledSessions, []);
+    assert.equal(new JobQueue(db.handle).pendingCount(), 2);
+    assert.equal(
+      (
+        db.handle
+          .prepare(
+            "SELECT count(*) AS count FROM telegram_outbox WHERE delivery_part_id = 'session-status:finalized:missing-both'",
+          )
+          .get() as { count: number }
+      ).count,
+      1,
+    );
+  });
+
+  it('inserts only the missing companion when one initial job already exists', async () => {
+    seedProcessingSession('has-asr');
+    const asrId = seedInitialJob('has-asr', 'asr');
+    seedProcessingSession('has-audio');
+    const audioId = seedInitialJob('has-audio', 'deliver_audio');
+
+    const report = await recoverAfterCrash(db.handle, paths(), nullLogger);
+
+    assert.deepEqual(report.stalledSessions, ['has-asr', 'has-audio']);
+    for (const sessionId of ['has-asr', 'has-audio']) {
+      const jobs = db.handle
+        .prepare(
+          `SELECT kind, count(*) AS count
+             FROM jobs
+            WHERE json_extract(payload, '$.sessionId') = ?
+            GROUP BY kind
+            ORDER BY kind`,
+        )
+        .all(sessionId) as { kind: string; count: number }[];
+      assert.deepEqual(
+        jobs.map((job) => ({ ...job })),
+        [
+          { kind: 'asr', count: 1 },
+          { kind: 'deliver_audio', count: 1 },
+        ],
+      );
+    }
+    assert.ok(db.handle.prepare('SELECT 1 FROM jobs WHERE job_id = ?').get(asrId));
+    assert.ok(db.handle.prepare('SELECT 1 FROM jobs WHERE job_id = ?').get(audioId));
+  });
+
+  it('fails closed for zero-part, dead, conflicting, downstream, and terminal sessions', async () => {
+    seedProcessingSession('zero-part', 0);
+    seedProcessingSession('dead-job');
+    seedInitialJob('dead-job', 'asr');
+    db.handle
+      .prepare("UPDATE jobs SET state = 'dead' WHERE idempotency_key = 'asr:dead-job'")
+      .run();
+    seedProcessingSession('failed-job');
+    seedInitialJob('failed-job', 'asr');
+    db.handle
+      .prepare("UPDATE jobs SET state = 'failed' WHERE idempotency_key = 'asr:failed-job'")
+      .run();
+    seedProcessingSession('conflicting-job');
+    const at = nowIso();
+    db.handle
+      .prepare(
+        `INSERT INTO jobs
+           (job_id, kind, idempotency_key, payload, state, run_after, created_at, updated_at)
+         VALUES ('conflicting-job-row', 'deliver_audio', 'asr:conflicting-job',
+                 '{"sessionId":"conflicting-job"}', 'pending', ?, ?, ?)`,
+      )
+      .run(at, at, at);
+    seedProcessingSession('alternate-key');
+    db.handle
+      .prepare(
+        `INSERT INTO jobs
+           (job_id, kind, idempotency_key, payload, state, run_after, created_at, updated_at)
+         VALUES ('alternate-key-row', 'asr', 'legacy-asr:alternate-key',
+                 '{"sessionId":"alternate-key"}', 'pending', ?, ?, ?)`,
+      )
+      .run(at, at, at);
+    seedProcessingSession('downstream');
+    seedInitialJob('downstream', 'deliver_audio');
+    db.handle
+      .prepare(
+        `INSERT INTO transcript_revisions
+           (revision_id, session_id, revision_number, engine, model, languages,
+            text, word_count, is_current, created_at)
+         VALUES ('downstream-revision', 'downstream', 1, 'fake', 'fake', '[]',
+                 'done', 1, 1, ?)`,
+      )
+      .run(at);
+    seedProcessingSession('terminal');
+    db.handle
+      .prepare("UPDATE audio_sessions SET state = 'DONE' WHERE session_id = 'terminal'")
+      .run();
+    const records: Record<string, unknown>[] = [];
+    const logger = createLogger({
+      level: 'debug',
+      sink: (record) => records.push(record),
+    });
+
+    const report = await recoverAfterCrash(db.handle, paths(), logger);
+
+    assert.deepEqual(report.stalledSessions, []);
+    for (const sessionId of [
+      'zero-part',
+      'dead-job',
+      'failed-job',
+      'conflicting-job',
+      'alternate-key',
+      'downstream',
+    ]) {
+      assert.equal(
+        (
+          db.handle
+            .prepare(
+              `SELECT count(*) AS count FROM jobs
+                WHERE json_valid(payload) = 1
+                  AND json_extract(payload, '$.sessionId') = ?`,
+            )
+            .get(sessionId) as { count: number }
+        ).count,
+        sessionId === 'zero-part' ? 0 : 1,
+      );
+      assert.equal(
+        (
+          db.handle
+            .prepare('SELECT count(*) AS count FROM telegram_outbox WHERE session_id = ?')
+            .get(sessionId) as { count: number }
+        ).count,
+        0,
+      );
+    }
+    assert.equal(
+      (
+        db.handle
+          .prepare("SELECT state FROM audio_sessions WHERE session_id = 'terminal'")
+          .get() as { state: string }
+      ).state,
+      'DONE',
+    );
+    assert.ok(
+      records.filter((record) => record['level'] === 'error').length >= 6,
+      'every ambiguous PROCESSING session is loud and remains operator-owned',
+    );
+  });
+
+  it('does not recreate missing audio work after any durable downstream progress', async () => {
+    const transcriptSession = 'progress-transcript';
+    seedProcessingSession(transcriptSession);
+    seedInitialJob(transcriptSession, 'asr');
+    new TranscriptRepository(db.handle).append({
+      sessionId: transcriptSession,
+      engine: 'fake',
+      model: 'fake',
+      languages: ['en'],
+      text: 'already transcribed',
+      segments: [],
+    });
+
+    const downstreamKinds = [
+      'deliver_transcript',
+      'summarize',
+      'deliver_report',
+      'deliver',
+    ] as const;
+    const downstreamSessions: string[] = [];
+    for (const kind of downstreamKinds) {
+      const sessionId = `progress-${kind.replaceAll('_', '-')}`;
+      downstreamSessions.push(sessionId);
+      seedProcessingSession(sessionId);
+      seedInitialJob(sessionId, 'asr');
+      assert.ok(
+        new JobQueue(db.handle).enqueue({
+          kind,
+          idempotencyKey: `downstream:${kind}:${sessionId}`,
+          payload: { sessionId },
+        }),
+      );
+    }
+    const records: Record<string, unknown>[] = [];
+    const logger = createLogger({
+      level: 'debug',
+      sink: (record) => records.push(record),
+    });
+
+    const report = await recoverAfterCrash(db.handle, paths(), logger);
+
+    assert.deepEqual(report.stalledSessions, []);
+    for (const sessionId of [transcriptSession, ...downstreamSessions]) {
+      const facts = db.handle
+        .prepare(
+          `SELECT s.state,
+                  (SELECT count(*) FROM jobs
+                    WHERE idempotency_key = 'deliver-audio:' || s.session_id) AS audio_jobs,
+                  (SELECT count(*) FROM telegram_outbox
+                    WHERE session_id = s.session_id) AS statuses
+             FROM audio_sessions s
+            WHERE s.session_id = ?`,
+        )
+        .get(sessionId) as Record<string, unknown>;
+      assert.deepEqual({ ...facts }, { state: 'PROCESSING', audio_jobs: 0, statuses: 0 });
+    }
+    assert.equal(
+      records.filter((record) => record['level'] === 'error').length,
+      downstreamSessions.length + 1,
+    );
+  });
+
+  it('rolls back session, jobs, and lifecycle status on every repair write fault', async () => {
+    const faults = [
+      {
+        name: 'deliver',
+        trigger:
+          "BEFORE INSERT ON jobs WHEN NEW.kind = 'deliver_audio' AND json_extract(NEW.payload, '$.sessionId') = 'fault-deliver'",
+      },
+      {
+        name: 'asr',
+        trigger:
+          "BEFORE INSERT ON jobs WHEN NEW.kind = 'asr' AND json_extract(NEW.payload, '$.sessionId') = 'fault-asr'",
+      },
+      {
+        name: 'status',
+        trigger:
+          "BEFORE INSERT ON telegram_outbox WHEN NEW.delivery_part_id = 'session-status:finalized:fault-status'",
+      },
+    ] as const;
+
+    for (const fault of faults) {
+      const sessionId = `fault-${fault.name}`;
+      seedProcessingSession(sessionId);
+      db.handle.exec(`
+        CREATE TRIGGER inject_processing_repair_fault
+        ${fault.trigger}
+        BEGIN SELECT RAISE(ABORT, 'injected ${fault.name} repair failure'); END
+      `);
+
+      await assert.rejects(
+        recoverAfterCrash(db.handle, paths(), nullLogger),
+        new RegExp(`injected ${fault.name} repair failure`),
+      );
+      const facts = db.handle
+        .prepare(
+          `SELECT s.state, s.part_count,
+                  (SELECT count(*) FROM jobs
+                    WHERE json_valid(payload) = 1
+                      AND json_extract(payload, '$.sessionId') = s.session_id) AS jobs,
+                  (SELECT count(*) FROM telegram_outbox
+                    WHERE session_id = s.session_id) AS statuses
+             FROM audio_sessions s
+            WHERE s.session_id = ?`,
+        )
+        .get(sessionId) as Record<string, unknown>;
+      assert.deepEqual({ ...facts }, { state: 'PROCESSING', part_count: 0, jobs: 0, statuses: 0 });
+      db.handle.exec('DROP TRIGGER inject_processing_repair_fault');
+    }
   });
 
   it('does not disguise a non-file archive path as a missing temp write', async () => {
