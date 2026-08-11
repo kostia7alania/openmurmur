@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { access, constants } from 'node:fs/promises';
-import { arch, platform } from 'node:os';
-import { basename, join } from 'node:path';
+import { access, constants, readdir, readFile, stat } from 'node:fs/promises';
+import { arch, homedir, platform } from 'node:os';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { LoadedConfig } from '../config/load.ts';
 import { MINIMUM_NODE_VERSION } from '../config/runtime-requirements.ts';
@@ -13,7 +13,7 @@ import {
   keychainSetupReadiness,
   type TelegramSetupReadinessProvider,
 } from '../telegram/keychain.ts';
-import { REPO_ROOT, WORKER_ARGS } from './backends.ts';
+import { PYTHON_PROJECT, REPO_ROOT, WORKER_ARGS } from './backends.ts';
 
 export type CheckLevel = 'ok' | 'warn' | 'fail' | 'info';
 
@@ -135,6 +135,218 @@ async function checkUv(loaded: LoadedConfig): Promise<Check> {
     level: output === null ? (required ? 'fail' : 'warn') : 'ok',
     detail: output === null ? 'not found' : output.trim(),
     ...(output === null ? { fix: 'curl -LsSf https://astral.sh/uv/install.sh | sh' } : {}),
+  };
+}
+
+const REQUIRED_MLX_PACKAGES = [{ name: 'mlx' }, { name: 'mlx-qwen3-asr' }] as const;
+const MINIMUM_MLX_CACHE_FREE_GB = 6;
+
+export interface MlxReadinessOptions {
+  readonly pythonEnvironment?: string;
+  readonly cacheRoot?: string;
+  readonly diskProbe?: (path: string) => Promise<number | null>;
+}
+
+function resolveConfiguredPath(value: string, relativeTo: string): string {
+  const home = homedir();
+  const expanded = value
+    .replace(/^~(?=\/|$)/, home)
+    .replace(/\$\{HOME\}/g, home)
+    .replaceAll('$HOME', home);
+  return isAbsolute(expanded) ? expanded : resolve(relativeTo, expanded);
+}
+
+function pythonEnvironmentPath(): string {
+  const configured = process.env['UV_PROJECT_ENVIRONMENT']?.trim();
+  return configured
+    ? resolveConfiguredPath(configured, PYTHON_PROJECT)
+    : join(PYTHON_PROJECT, '.venv');
+}
+
+function huggingFaceCacheRoot(): string {
+  const explicit =
+    process.env['HF_HUB_CACHE']?.trim() || process.env['HUGGINGFACE_HUB_CACHE']?.trim();
+  if (explicit) return resolveConfiguredPath(explicit, REPO_ROOT);
+  const hfHome = process.env['HF_HOME']?.trim();
+  if (hfHome) return join(resolveConfiguredPath(hfHome, REPO_ROOT), 'hub');
+  const xdgCache = process.env['XDG_CACHE_HOME']?.trim();
+  if (xdgCache) {
+    return join(resolveConfiguredPath(xdgCache, REPO_ROOT), 'huggingface', 'hub');
+  }
+  return join(homedir(), '.cache', 'huggingface', 'hub');
+}
+
+async function inspectMlxPackages(
+  environment: string,
+): Promise<{ environmentPresent: boolean; missing: string[] }> {
+  try {
+    const python = join(environment, 'bin', 'python');
+    await access(python, constants.X_OK);
+    const pythonInfo = await stat(python);
+    if (!pythonInfo.isFile() || pythonInfo.size === 0) throw new Error('invalid Python executable');
+  } catch {
+    return {
+      environmentPresent: false,
+      missing: REQUIRED_MLX_PACKAGES.map((dependency) => dependency.name),
+    };
+  }
+
+  const metadataNames = new Set<string>();
+  try {
+    const libraryEntries = await readdir(join(environment, 'lib'), { withFileTypes: true });
+    for (const libraryEntry of libraryEntries) {
+      if (!libraryEntry.isDirectory() || !libraryEntry.name.startsWith('python')) continue;
+      const sitePackages = join(environment, 'lib', libraryEntry.name, 'site-packages');
+      for (const entry of await readdir(sitePackages, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.toLowerCase().endsWith('.dist-info')) continue;
+        const metadata = await readFile(join(sitePackages, entry.name, 'METADATA'), 'utf8');
+        const name = metadata.match(/^Name:\s*([^\r\n]+)\s*$/m)?.[1]?.trim();
+        if (name !== undefined) metadataNames.add(name);
+      }
+    }
+  } catch {
+    // A malformed or partial environment is present, but no package metadata
+    // is trusted from it.
+  }
+
+  return {
+    environmentPresent: true,
+    missing: REQUIRED_MLX_PACKAGES.filter((dependency) => !metadataNames.has(dependency.name)).map(
+      (dependency) => dependency.name,
+    ),
+  };
+}
+
+function isSafeSnapshotFile(snapshot: string, relativeFile: string): boolean {
+  const resolved = resolve(snapshot, relativeFile);
+  return resolved.startsWith(`${snapshot}${sep}`);
+}
+
+async function modelSnapshotEvidencePresent(snapshot: string): Promise<boolean> {
+  const requiredMetadata = [
+    'config.json',
+    'preprocessor_config.json',
+    'tokenizer_config.json',
+    'vocab.json',
+    'merges.txt',
+  ];
+  try {
+    for (const file of requiredMetadata) {
+      const path = join(snapshot, file);
+      await access(path, constants.R_OK);
+      const info = await stat(path);
+      if (!info.isFile() || info.size === 0) return false;
+    }
+
+    const indexText = await readFile(join(snapshot, 'model.safetensors.index.json'), 'utf8');
+    const index: unknown = JSON.parse(indexText);
+    if (typeof index !== 'object' || index === null || Array.isArray(index)) return false;
+    const weightMap = (index as Record<string, unknown>)['weight_map'];
+    if (typeof weightMap !== 'object' || weightMap === null || Array.isArray(weightMap))
+      return false;
+    const shards = [...new Set(Object.values(weightMap))];
+    if (shards.length === 0 || shards.some((shard) => typeof shard !== 'string')) return false;
+    for (const shard of shards as string[]) {
+      if (!isSafeSnapshotFile(snapshot, shard)) return false;
+      const shardPath = resolve(snapshot, shard);
+      await access(shardPath, constants.R_OK);
+      const shardInfo = await stat(shardPath);
+      if (!shardInfo.isFile() || shardInfo.size === 0) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function configuredModelIsCached(cacheRoot: string, model: string): Promise<boolean> {
+  const repository = model.match(/^([A-Za-z0-9][A-Za-z0-9._-]*)\/([A-Za-z0-9][A-Za-z0-9._-]*)$/);
+  if (repository?.[1] !== undefined && repository[2] !== undefined) {
+    const repositoryCache = join(cacheRoot, `models--${repository[1]}--${repository[2]}`);
+    try {
+      const revision = (await readFile(join(repositoryCache, 'refs', 'main'), 'utf8')).trim();
+      if (!/^[0-9a-f]{7,64}$/.test(revision)) return false;
+      return modelSnapshotEvidencePresent(join(repositoryCache, 'snapshots', revision));
+    } catch {
+      return false;
+    }
+  }
+  if (!isAbsolute(model)) return false;
+  return modelSnapshotEvidencePresent(model);
+}
+
+async function nearestExistingDirectory(path: string): Promise<string | null> {
+  let current = path;
+  while (true) {
+    try {
+      await access(current, constants.R_OK);
+      return current;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return null;
+      current = parent;
+    }
+  }
+}
+
+/** Metadata-only MLX readiness: no Python import, model load, cache write or network. */
+export async function checkMlxReadiness(
+  asr: Pick<LoadedConfig['config']['asr'], 'backend' | 'model'>,
+  options: MlxReadinessOptions = {},
+): Promise<Check> {
+  if (asr.backend === 'fake') {
+    return {
+      name: 'mlx_readiness',
+      level: 'info',
+      detail: 'not required because asr.backend is fake',
+    };
+  }
+
+  const environment = options.pythonEnvironment ?? pythonEnvironmentPath();
+  const cacheRoot = options.cacheRoot ?? huggingFaceCacheRoot();
+  const packages = await inspectMlxPackages(environment);
+  const modelCached = await configuredModelIsCached(cacheRoot, asr.model);
+  const diskTarget = await nearestExistingDirectory(cacheRoot);
+  const freeGb = diskTarget === null ? null : await (options.diskProbe ?? diskFreeGb)(diskTarget);
+  const packageFailure = !packages.environmentPresent || packages.missing.length > 0;
+  const diskLow = freeGb !== null && freeGb < MINIMUM_MLX_CACHE_FREE_GB;
+  const level: CheckLevel =
+    packageFailure || !modelCached ? 'fail' : diskLow || freeGb === null ? 'warn' : 'ok';
+
+  const details = [
+    packages.environmentPresent ? 'Python environment present' : 'Python environment missing',
+    packages.missing.length === 0
+      ? 'MLX package metadata present'
+      : `missing package metadata: ${packages.missing.join(', ')}`,
+    modelCached
+      ? 'configured model snapshot evidence present'
+      : 'configured model snapshot evidence missing',
+    freeGb === null
+      ? 'cache-volume free space unknown'
+      : `${freeGb.toFixed(0)} GB free on cache volume`,
+  ];
+  const fixes: string[] = [];
+  if (packageFailure) {
+    fixes.push(
+      'Install the local package stack: uv sync --project python/openmurmur_audio --extra mlx',
+    );
+  }
+  if (!modelCached) {
+    fixes.push(
+      'Populate the configured ASR model with one explicit foreground transcription while online, then rerun doctor.',
+    );
+  }
+  if (diskLow) {
+    fixes.push(`Free at least ${MINIMUM_MLX_CACHE_FREE_GB} GB on the ASR cache volume.`);
+  } else if (freeGb === null) {
+    fixes.push('Check free space on the ASR cache volume, then rerun doctor.');
+  }
+
+  return {
+    name: 'mlx_readiness',
+    level,
+    detail: details.join('; '),
+    ...(fixes.length === 0 ? {} : { fix: fixes.join('\n') }),
   };
 }
 
@@ -394,6 +606,7 @@ const CHECKS: readonly CheckFn[] = [
     binaryCheck('ffprobe', loaded.config.audio.ffprobePath, 'brew install ffmpeg')(loaded),
   checkAudioDevices,
   checkUv,
+  (loaded) => checkMlxReadiness(loaded.config.asr),
   checkSpeechDetection,
   checkDiarization,
   checkOllama,

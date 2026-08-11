@@ -66,6 +66,25 @@ detection and no transcription — `pnpm openmurmur doctor` reports
 `speech_detection` as a failure, because it starts the worker and scores a frame
 rather than reading the config back.
 
+Doctor now reports ASR readiness separately as `mlx_readiness`. That check is
+metadata-only: it never imports Python packages, loads weights, contacts the
+network or writes to the Hugging Face cache. It distinguishes:
+
+- whether the project Python executable is non-empty and the installed
+  distribution metadata names exactly `mlx` and `mlx-qwen3-asr`;
+- whether the configured model has local snapshot evidence: readable metadata
+  and every weight shard named by its index are present, together with the
+  `vocab.json` and `merges.txt` files required by the MLX tokenizer;
+- whether the cache volume has at least 6 GB free, or its free space could not
+  be determined.
+
+The human-readable result never prints the environment or cache path. A missing
+snapshot is blocking because otherwise the first unattended transcription would
+try to obtain multi-gigabyte weights. Populate it deliberately with one
+foreground transcription while online, then rerun doctor. `speech_detection`
+remains the separate live, local Silero frame probe; it does not load the ASR
+model.
+
 Silero's **segment-assembly logic** is separately covered by pure Python tests,
 which take a list of probabilities and need no model.
 
