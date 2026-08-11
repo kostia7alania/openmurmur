@@ -478,6 +478,67 @@ describe('retention: dry-run and apply agree', () => {
     assert.equal(existsSync(kept), true, 'a blocked file must survive apply');
   });
 
+  it('cancels every incoming unlink when another connection adds a job after planning', async () => {
+    const quarantinePath = seedIncomingAudio('incoming-race');
+    const normalizedPath = join(dir, 'incoming-race.wav');
+    writeFileSync(normalizedPath, Buffer.alloc(100));
+    seedSentIncomingManifest('incoming-race', OLD);
+    db.handle
+      .prepare(
+        `UPDATE incoming_telegram_files
+            SET state = 'delivered', normalized_path = ?
+          WHERE file_uid = ?`,
+      )
+      .run(normalizedPath, 'incoming-race');
+
+    const plan = planRetention(db.handle, RETENTION);
+    assert.deepEqual(
+      plan.candidates.map((candidate) => candidate.path),
+      [quarantinePath, normalizedPath],
+    );
+
+    const concurrent = openDatabase({ file: join(dir, 'test.db') });
+    try {
+      concurrent.handle
+        .prepare(
+          `INSERT INTO jobs
+             (job_id, kind, idempotency_key, payload, state, run_after, created_at, updated_at)
+           VALUES ('incoming-race-job', 'incoming_audio', 'incoming:bot-scope:77', ?,
+                   'pending', ?, ?, ?)`,
+        )
+        .run(
+          JSON.stringify({
+            updateId: 77,
+            botScope: 'bot-scope',
+            fileUid: 'incoming-race',
+            message: {},
+            forcedLanguage: null,
+          }),
+          OLD,
+          OLD,
+          OLD,
+        );
+    } finally {
+      concurrent.close();
+    }
+
+    const result = await applyRetention(db.handle, plan);
+
+    assert.equal(result.deleted, 0);
+    assert.equal(result.errors.length, 2);
+    assert.ok(result.errors.every((error) => /plan became stale/.test(error.error)));
+    assert.equal(existsSync(quarantinePath), true);
+    assert.equal(existsSync(normalizedPath), true);
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT deleted_at FROM incoming_telegram_files WHERE file_uid = ?')
+          .get('incoming-race') as { deleted_at: string | null }
+      ).deleted_at,
+      null,
+    );
+  });
+
   it('dry-run changes nothing on disk or in the database', () => {
     const path = seedDeliveredSession('s1');
     planRetention(db.handle, RETENTION);
