@@ -559,11 +559,21 @@ export function retryDeadOutbox(
   paths: Paths,
   deliveryPartId: string,
   expectedSnapshotSha256: string,
+  options: { readonly requireDaemonStopped?: boolean } = {},
 ): RetryDeadOutboxResult {
   const selector = deliveryPartId.trim();
   if (selector.length === 0)
     throw new DeadOutboxRecoveryError('one exact dead delivery id is required');
   return transaction(db, () => {
+    if (
+      options.requireDaemonStopped === true &&
+      db.prepare('SELECT 1 AS present FROM daemon_ownership WHERE ownership_id = 1').get() !==
+        undefined
+    ) {
+      throw new DeadOutboxRecoveryError(
+        'daemon ownership changed before retry; stop the daemon and inspect again',
+      );
+    }
     const row = selectDeadRows(db, selector, 1)[0];
     if (row === undefined) {
       throw new DeadOutboxRecoveryError('no dead outbox delivery exists for that exact id');

@@ -347,10 +347,18 @@ The LLM has no involvement. Eligibility is pure SQL over recorded facts.
 
 ## Concurrency
 
-One daemon owns a data root. It claims the PID file with exclusive creation and
-records the root and process start metadata; `status` and `stop` verify live
-process identity before trusting it. This prevents a second daemon from becoming
-another database writer and prevents a stale reused PID from being signalled.
+One daemon owns a data root. `daemon_ownership` is the atomic authority: a
+claim replaces a proven-dead owner with a compare-and-swap transaction, so two
+concurrent restarts cannot both win. The PID file is an atomically published
+operator-facing mirror: stale removal is coupled to the SQLite write lock and
+publication is no-replace. Both facts include the root and process birth metadata;
+`status`, `stop`, and offline mutation gates derive identity from the SQLite
+owner and never act on a stale mirror generation. This prevents a second daemon
+from becoming another database writer and prevents a stale reused PID from
+being signalled. `jobs.lease_owner` starts with the exact daemon-generation
+identity, so crash recovery can return only that dead owner's leases without
+touching a concurrent generation. Ownership replacement and that scoped lease
+return commit in one `BEGIN IMMEDIATE` transaction.
 
 Inside that daemon, one writer at a time. Write transactions use
 `BEGIN IMMEDIATE`, which takes the write lock up front so two writers fail fast

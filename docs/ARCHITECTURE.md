@@ -229,11 +229,20 @@ no I/O inside one.
 
 ### One daemon per data root
 
-Startup claims the PID file atomically and refuses to replace it while the PID
-is alive. The record includes the OpenMurmur root and process start metadata;
-`status` and `stop` verify that the PID still belongs to a recognizable
-OpenMurmur daemon before trusting or signalling it. Stale dead PID records are
-reclaimed, while an ambiguous live PID is left untouched.
+Startup claims the singleton `daemon_ownership` row with a SQLite
+compare-and-swap transaction and refuses to replace it while the recorded PID
+is alive. The observed stale mirror is removed while that SQLite write lock is
+held; the replacement mirror is then published with an atomic no-replace link,
+so a concurrently created mirror aborts the claim instead of being overwritten.
+Both records include the OpenMurmur root and process
+birth metadata. `status`, `stop`, and offline mutation gates read the SQLite
+owner first; they never signal or remove a PID mirror from an earlier ownership
+generation. Stale dead owners are reclaimed, while an ambiguous live PID or
+unexpired legacy lease is left untouched. A proven-dead owner can immediately
+return only job leases carrying that exact daemon-generation prefix; leases
+from another generation remain fenced even if external mirror evidence races.
+That exact lease return is part of the same SQLite transaction as ownership
+replacement, so another process death cannot strand the predecessor's work.
 
 ## Failure behaviour
 

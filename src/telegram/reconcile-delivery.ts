@@ -83,6 +83,8 @@ export interface TelegramDeliveryReconciliationRequest {
   /** Exact report snapshot; the first apply aborts if any local fact changed. */
   readonly expected?: UnacknowledgedTelegramDelivery | undefined;
   readonly now?: number | undefined;
+  /** Re-check the singleton daemon authority inside the apply transaction. */
+  readonly requireDaemonStopped?: boolean | undefined;
 }
 
 export interface TelegramDeliveryReconciliationResult {
@@ -703,6 +705,15 @@ export function applyTelegramDeliveryReconciliation(
   const evidence = requiredMetadata(request.evidence, '--evidence', 2_000);
 
   return transaction(db, () => {
+    if (
+      request.requireDaemonStopped === true &&
+      db.prepare('SELECT 1 AS present FROM daemon_ownership WHERE ownership_id = 1').get() !==
+        undefined
+    ) {
+      throw new TelegramDeliveryReconciliationError(
+        'daemon ownership changed before reconciliation; stop the daemon and inspect again',
+      );
+    }
     const existingAudit = auditRow(db, deliveryPartId);
     if (existingAudit !== undefined) {
       return verifyIdempotentReplay(db, existingAudit, {

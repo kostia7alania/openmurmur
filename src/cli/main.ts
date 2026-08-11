@@ -58,7 +58,8 @@ import { readOffset, routeUpdate } from '../telegram/router.ts';
 import { writeTextAtomically } from '../util/atomic-file.ts';
 import { systemClock } from '../util/clock.ts';
 import { createAsrBackend } from './backends.ts';
-import { Daemon, inspectDaemonProcess, readDaemonPid } from './daemon.ts';
+import { Daemon } from './daemon.ts';
+import { inspectDaemonControl, releaseDaemonPid, stopOwnedDaemon } from './daemon-ownership.ts';
 import { doctorExitCode, formatChecks, runDoctor } from './doctor.ts';
 import { normalizeRecallOptions, recallTranscripts, renderRecallResults } from './recall.ts';
 import {
@@ -540,36 +541,32 @@ async function startDaemon(
 }
 
 async function stopDaemon(loaded: Awaited<ReturnType<typeof loadConfig>>): Promise<number> {
-  const record = await readDaemonPid(loaded.paths.pidFile);
-  if (record === null) {
-    process.stdout.write('No running daemon found.\n');
-    return 1;
-  }
-  if (record.root !== null && record.root !== loaded.paths.root) {
-    process.stderr.write(`PID file belongs to a different OpenMurmur root: ${record.root}\n`);
-    return 1;
-  }
-  const state = await inspectDaemonProcess(record.pid, record.processBirth);
-  if (!state.alive) {
-    process.stderr.write(
-      `Daemon pid ${record.pid} is no longer running; removed stale PID file.\n`,
-    );
-    await rm(loaded.paths.pidFile, { force: true });
-    return 1;
-  }
-  if (!state.identityMatches) {
-    process.stderr.write(
-      `Refusing to signal pid ${record.pid}: it is not recognisable as an OpenMurmur daemon.\n`,
-    );
-    return 1;
-  }
+  const db = openDatabase({ file: loaded.paths.databaseFile });
   try {
-    process.kill(record.pid, 'SIGTERM');
-    process.stdout.write(`Sent SIGTERM to pid ${record.pid}.\n`);
+    const result = await stopOwnedDaemon(db.handle, loaded.paths.pidFile, loaded.paths.root);
+    if (result.outcome === 'not_running') {
+      process.stdout.write('No running daemon found.\n');
+      return 1;
+    }
+    if (result.outcome === 'stale') {
+      process.stderr.write(
+        `Daemon pid ${result.pid} is no longer running; cleared its exact SQLite ownership.\n`,
+      );
+      return 1;
+    }
+    if (result.outcome === 'identity_mismatch') {
+      process.stderr.write(
+        `Refusing to signal pid ${result.pid}: it is not recognisable as an OpenMurmur daemon.\n`,
+      );
+      return 1;
+    }
+    process.stdout.write(`Sent SIGTERM to pid ${result.pid}.\n`);
     return 0;
   } catch (error) {
-    process.stderr.write(`Could not stop pid ${record.pid}: ${(error as Error).message}\n`);
+    process.stderr.write(`Could not stop daemon: ${(error as Error).message}\n`);
     return 1;
+  } finally {
+    db.close();
   }
 }
 
@@ -647,17 +644,15 @@ async function localStatus(
 ): Promise<number> {
   const db = openDatabase({ file: loaded.paths.databaseFile });
   try {
-    const pidRecord = await readDaemonPid(loaded.paths.pidFile);
-    const pidState =
-      pidRecord === null ? null : await inspectDaemonProcess(pidRecord.pid, pidRecord.processBirth);
-    const alive = pidState?.alive === true && pidState.identityMatches;
-    const pid = pidRecord?.pid ?? null;
+    const daemon = await inspectDaemonControl(db.handle, loaded.paths.pidFile, loaded.paths.root);
+    const alive = daemon.process?.alive === true && daemon.process.identityMatches;
+    const pid = daemon.record?.pid ?? null;
 
     const counts = readLocalStatusCounts(db.handle);
     const live = readLocalLiveStatus(db.handle, {
       daemonRunning: alive,
       daemonPid: pid,
-      daemonStartedAt: pidRecord?.startedAt ?? null,
+      daemonStartedAt: daemon.record?.startedAt ?? null,
       nowMs: Date.now(),
       freshForMs: heartbeatFreshForMs(loaded.config.health.pollIntervalMs),
     });
@@ -801,12 +796,17 @@ async function outboxCommand(
       return 1;
     }
 
-    await assertDaemonStoppedForOutboxMutation(loaded, 'retrying a dead Telegram delivery');
+    await assertDaemonStoppedForOutboxMutation(
+      db.handle,
+      loaded,
+      'retrying a dead Telegram delivery',
+    );
     const result = retryDeadOutbox(
       db.handle,
       loaded.paths,
       selector ?? '',
       expected.snapshotSha256,
+      { requireDaemonStopped: true },
     );
     process.stdout.write(
       asJson
@@ -1032,15 +1032,20 @@ function remoteReconciliationProof(values: Record<string, unknown>): {
 }
 
 async function assertDaemonStoppedForOutboxMutation(
+  db: DatabaseSync,
   loaded: Awaited<ReturnType<typeof loadConfig>>,
   action: string,
 ): Promise<void> {
-  const record = await readDaemonPid(loaded.paths.pidFile);
-  if (record === null) return;
-  const state = await inspectDaemonProcess(record.pid, record.processBirth);
-  if (state.alive) {
-    throw new Error(`stop the OpenMurmur daemon before ${action} (pid ${record.pid})`);
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const daemon = await inspectDaemonControl(db, loaded.paths.pidFile, loaded.paths.root);
+    if (daemon.source === 'none' || daemon.record === null || daemon.process === null) return;
+    if (daemon.process.alive) {
+      throw new Error(`stop the OpenMurmur daemon before ${action} (pid ${daemon.record.pid})`);
+    }
+    if (daemon.source === 'legacy') return;
+    if (await releaseDaemonPid(db, loaded.paths.pidFile, daemon.record)) return;
   }
+  throw new Error(`daemon ownership changed while checking whether it was safe to ${action}`);
 }
 
 function writeRemoteReconciliationReport(
@@ -1138,7 +1143,7 @@ async function telegramDeliveryReconciliationCommand(
       return 1;
     }
 
-    await assertDaemonStoppedForOutboxMutation(loaded, 'reconciling remote delivery');
+    await assertDaemonStoppedForOutboxMutation(db.handle, loaded, 'reconciling remote delivery');
     const result = applyTelegramDeliveryReconciliation(db.handle, {
       deliveryPartId: deliveryPartId ?? '',
       telegramMessageId: proof.telegramMessageId,
@@ -1146,6 +1151,7 @@ async function telegramDeliveryReconciliationCommand(
       operatorId: proof.operatorId,
       evidence: proof.evidence,
       ...(expected === undefined ? {} : { expected }),
+      requireDaemonStopped: true,
     });
     writeRemoteReconciliationResult(result, asJson);
     return 0;

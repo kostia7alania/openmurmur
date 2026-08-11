@@ -72,6 +72,7 @@ describe('job lease generations', () => {
 
   it('reclaims a proven-dead daemon lease immediately without burning an attempt', () => {
     const deadDaemon = new JobQueue(db.handle, 'daemon-that-died');
+    const liveDaemon = new JobQueue(db.handle, 'daemon-still-live');
     const jobId = deadDaemon.enqueue({
       kind: 'asr',
       idempotencyKey: 'asr:daemon-death',
@@ -81,6 +82,15 @@ describe('job lease generations', () => {
     const abandoned = deadDaemon.claim(['asr']);
     assert.ok(abandoned);
     assert.equal(abandoned.attempts, 1);
+
+    const liveJobId = liveDaemon.enqueue({
+      kind: 'asr',
+      idempotencyKey: 'asr:other-daemon',
+      payload: {},
+    });
+    assert.ok(liveJobId);
+    const live = liveDaemon.claim(['asr']);
+    assert.ok(live);
 
     assert.equal(deadDaemon.recoverLeasesAfterProvenDaemonDeath(), 1);
     assert.deepEqual(
@@ -99,6 +109,7 @@ describe('job lease generations', () => {
       },
     );
     assert.equal(deadDaemon.renew(abandoned), false);
+    assert.equal(liveDaemon.renew(live), true, 'another daemon generation must remain leased');
 
     const replacement = new JobQueue(db.handle, 'replacement-daemon').claim(['asr']);
     assert.ok(replacement);

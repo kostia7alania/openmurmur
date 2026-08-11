@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { type FileHandle, open, rename, rm } from 'node:fs/promises';
+import { type FileHandle, link, open, rename, rm } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
 export interface AtomicTextOptions {
   /** Re-check external ownership after fsync but before the atomic publication. */
   readonly beforePublish?: (() => void) | undefined;
+  /** Fail with EEXIST instead of replacing a concurrently published path. */
+  readonly replaceExisting?: boolean | undefined;
 }
 
 /** Publishes a private text artefact without ever exposing a partial file. */
@@ -22,7 +24,12 @@ export async function writeTextAtomically(
     await handle.close();
     handle = null;
     options.beforePublish?.();
-    await rename(temporary, path);
+    if (options.replaceExisting === false) {
+      await link(temporary, path);
+      await rm(temporary);
+    } else {
+      await rename(temporary, path);
+    }
     await syncDirectory(directory);
   } catch (error) {
     await handle?.close().catch(() => {});

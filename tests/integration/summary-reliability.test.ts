@@ -431,6 +431,7 @@ describe('offline summary reliability', () => {
         '014_current_transcript_uniqueness.sql',
         '015_telegram_outbox_claim_generation.sql',
         '016_transcript_timestamp_provenance.sql',
+        '017_daemon_ownership.sql',
       ]);
       const live = legacy
         .prepare('SELECT summary_id FROM summaries WHERE revision_id = ?')

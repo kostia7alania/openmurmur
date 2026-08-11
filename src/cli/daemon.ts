@@ -1,5 +1,4 @@
-import { execFile } from 'node:child_process';
-import { access, readFile, rm, writeFile } from 'node:fs/promises';
+import { access } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { reconcileLanguages } from '../asr/languages.ts';
@@ -97,8 +96,24 @@ import {
 } from '../telegram/settings.ts';
 import { writeTextAtomically } from '../util/atomic-file.ts';
 import { createAsrBackend, createLlmBackend, createVadBackend } from './backends.ts';
+import {
+  claimDaemonPid,
+  type DaemonPidClaim,
+  daemonJobOwner,
+  releaseDaemonPid,
+} from './daemon-ownership.ts';
 import { writeDaemonHeartbeat } from './status.ts';
 import { VERSION } from './version.ts';
+
+export {
+  claimDaemonPid,
+  commandLooksLikeOpenMurmurDaemon,
+  inspectDaemonProcess,
+  parseDaemonPid,
+  processIdentityMatches,
+  readDaemonPid,
+  releaseDaemonPid,
+} from './daemon-ownership.ts';
 
 const DIGEST_TICK_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -133,7 +148,7 @@ export interface DaemonOptions {
 export class Daemon {
   readonly #options: DaemonOptions;
   readonly #db: Database;
-  readonly #jobs: JobQueue;
+  #jobs: JobQueue;
   readonly #outbox: Outbox;
   readonly #alerts: AlertEvaluator;
   readonly #recorder: Recorder;
@@ -161,7 +176,7 @@ export class Daemon {
   #startupPhaseDone: Promise<void> = Promise.resolve();
   #workersClosePromise: Promise<void> | null = null;
   #storageClosePromise: Promise<void> | null = null;
-  #pidClaimed = false;
+  #pidClaim: DaemonPidClaim | null = null;
   #daemonStartedAt: string | null = null;
   #stopPromise: Promise<void> | null = null;
   #nextSecretsRetryAt = 0;
@@ -251,9 +266,11 @@ export class Daemon {
       finishStartupPhase = resolve;
     });
     try {
-      const identity = await claimDaemonPid(paths.pidFile, paths.root);
-      this.#pidClaimed = true;
+      const identity = await claimDaemonPid(this.#db.handle, paths.pidFile, paths.root);
+      this.#pidClaim = identity;
       this.#daemonStartedAt = identity.startedAt;
+      this.#jobs = new JobQueue(this.#db.handle, daemonJobOwner(identity));
+      const reclaimedAfterDaemonDeath = identity.reclaimedJobs;
       if (this.#stopping) return;
       const staleNoticeCutoff = new Date().toISOString();
 
@@ -273,9 +290,7 @@ export class Daemon {
       }
       if (this.#stopping) return;
 
-      const reclaimedJobs = identity.reclaimedPreviousDaemon
-        ? this.#jobs.recoverLeasesAfterProvenDaemonDeath()
-        : this.#jobs.recoverStaleLeases();
+      const reclaimedJobs = reclaimedAfterDaemonDeath + this.#jobs.recoverStaleLeases();
       const reclaimedSends = this.#outbox.recoverSending();
       const retiredStaleNotices = retireStaleNotices(
         this.#db.handle,
@@ -455,9 +470,9 @@ export class Daemon {
       });
     }
     try {
-      if (this.#pidClaimed) {
-        await releaseDaemonPid(this.#options.loaded.paths.pidFile, process.pid);
-        this.#pidClaimed = false;
+      if (this.#pidClaim !== null) {
+        await releaseDaemonPid(this.#db.handle, this.#options.loaded.paths.pidFile, this.#pidClaim);
+        this.#pidClaim = null;
         this.#daemonStartedAt = null;
       }
     } finally {
@@ -1759,155 +1774,6 @@ function scheduledDigestDueAgeMs(
   return elapsedMinutes * 60 * 1000;
 }
 
-export interface DaemonPidRecord {
-  readonly pid: number;
-  readonly root: string | null;
-  readonly startedAt: string | null;
-  readonly processBirth: string | null;
-}
-
-export interface DaemonPidClaim extends DaemonPidRecord {
-  /** True only when this claim removed a PID file whose process was proven absent. */
-  readonly reclaimedPreviousDaemon: boolean;
-}
-
-export function parseDaemonPid(value: string): DaemonPidRecord | null {
-  const trimmed = value.trim();
-  if (/^\d+$/.test(trimmed)) {
-    const pid = Number.parseInt(trimmed, 10);
-    return pid > 0 ? { pid, root: null, startedAt: null, processBirth: null } : null;
-  }
-
-  try {
-    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-    const pid = parsed['pid'];
-    const root = parsed['root'];
-    const startedAt = parsed['startedAt'];
-    const processBirth = parsed['processBirth'];
-    if (!Number.isInteger(pid) || (pid as number) <= 0) return null;
-    if (typeof root !== 'string' || typeof startedAt !== 'string') return null;
-    if (processBirth !== undefined && typeof processBirth !== 'string') return null;
-    return {
-      pid: pid as number,
-      root,
-      startedAt,
-      processBirth: processBirth ?? null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-export async function readDaemonPid(pidFile: string): Promise<DaemonPidRecord | null> {
-  try {
-    return parseDaemonPid(await readFile(pidFile, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-export function commandLooksLikeOpenMurmurDaemon(command: string): boolean {
-  return command.toLowerCase().includes('openmurmur') && /(?:^|\s)start(?:\s|$)/.test(command);
-}
-
-export function processIdentityMatches(
-  command: string | null,
-  actualBirth: string | null,
-  expectedBirth: string | null,
-): boolean {
-  return (
-    command !== null &&
-    actualBirth !== null &&
-    expectedBirth !== null &&
-    actualBirth === expectedBirth &&
-    commandLooksLikeOpenMurmurDaemon(command)
-  );
-}
-
-export async function inspectDaemonProcess(
-  pid: number,
-  expectedBirth: string | null,
-): Promise<{
-  alive: boolean;
-  identityMatches: boolean;
-  command: string | null;
-  processBirth: string | null;
-}> {
-  try {
-    process.kill(pid, 0);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EPERM') {
-      return { alive: false, identityMatches: false, command: null, processBirth: null };
-    }
-  }
-
-  const [command, processBirth] = await Promise.all([processCommand(pid), processBirthMarker(pid)]);
-  return {
-    alive: true,
-    identityMatches: processIdentityMatches(command, processBirth, expectedBirth),
-    command,
-    processBirth,
-  };
-}
-
-interface DaemonPidClaimDependencies {
-  readonly birthMarker?: (pid: number) => Promise<string | null>;
-  readonly inspect?: typeof inspectDaemonProcess;
-}
-
-export async function claimDaemonPid(
-  pidFile: string,
-  root: string,
-  dependencies: DaemonPidClaimDependencies = {},
-): Promise<DaemonPidClaim> {
-  const birthMarker = dependencies.birthMarker ?? processBirthMarker;
-  const inspect = dependencies.inspect ?? inspectDaemonProcess;
-  const processBirth = await birthMarker(process.pid);
-  if (processBirth === null) {
-    throw new Error('could not establish daemon process birth identity');
-  }
-  const identity = {
-    pid: process.pid,
-    root,
-    startedAt: new Date().toISOString(),
-    processBirth,
-  } satisfies DaemonPidRecord;
-  const record = JSON.stringify(identity);
-  let reclaimedPreviousDaemon = false;
-
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      await writeFile(pidFile, `${record}\n`, { mode: 0o600, flag: 'wx' });
-      return { ...identity, reclaimedPreviousDaemon };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    }
-
-    const existing = await readDaemonPid(pidFile);
-    if (existing === null) {
-      throw new Error(`daemon pid file is invalid; inspect and remove it manually: ${pidFile}`);
-    }
-
-    const processState = await inspect(existing.pid, existing.processBirth);
-    if (processState.alive) {
-      const detail = processState.identityMatches
-        ? 'OpenMurmur is already running'
-        : 'pid is in use';
-      throw new Error(`${detail} (pid ${existing.pid}); refusing to replace ${pidFile}`);
-    }
-    await rm(pidFile, { force: true });
-    reclaimedPreviousDaemon = true;
-  }
-
-  throw new Error(`could not claim daemon pid file: ${pidFile}`);
-}
-
-export async function releaseDaemonPid(pidFile: string, expectedPid: number): Promise<void> {
-  const record = await readDaemonPid(pidFile);
-  if (record?.pid !== expectedPid) return;
-  await rm(pidFile, { force: true });
-}
-
 export function findIncomingFile(
   db: Database['handle'],
   telegramUniqueId: string,
@@ -2111,36 +1977,6 @@ export async function ensureIncomingWav(
     throw new IncomingRejected('corrupt_media', 'could not decode the audio');
   }
   return wavPath;
-}
-
-function processCommand(pid: number): Promise<string | null> {
-  return new Promise((resolve) => {
-    try {
-      execFile('/bin/ps', ['-p', String(pid), '-o', 'command='], (error, stdout) => {
-        if (error !== null) {
-          resolve(null);
-          return;
-        }
-        const command = stdout.trim();
-        resolve(command.length > 0 ? command : null);
-      });
-    } catch {
-      resolve(null);
-    }
-  });
-}
-
-function processBirthMarker(pid: number): Promise<string | null> {
-  return new Promise((resolve) => {
-    try {
-      execFile('/bin/ps', ['-p', String(pid), '-o', 'lstart='], (error, stdout) => {
-        const marker = stdout.trim();
-        resolve(error || marker.length === 0 ? null : marker);
-      });
-    } catch {
-      resolve(null);
-    }
-  });
 }
 
 /** `audio:<partId>`, `transcript:<sessionId>:2` -> the session id, if present. */
