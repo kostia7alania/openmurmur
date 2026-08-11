@@ -5,6 +5,8 @@ import { canRetryDeadJob, type DeadJob } from './queue.ts';
 
 const ALERT_JOB_LIMIT = 3;
 const ERROR_LIMIT = 240;
+const OPTIONAL_TOKENIZER_FAILURE =
+  /tokenization requires optional dependency [`'"]?(nagisa|soynlp)/i;
 
 export type FailureCategory =
   | 'asr_dependency'
@@ -96,9 +98,20 @@ export function renderDeadJobAlert(
   }
   if (jobs.length > ALERT_JOB_LIMIT) lines.push(`Ещё задач: ${jobs.length - ALERT_JOB_LIMIT}`);
 
+  const optionalTokenizerJob = jobs.find(
+    (job) =>
+      (job.kind === 'asr' || job.kind === 'incoming_audio') &&
+      job.lastError !== null &&
+      OPTIONAL_TOKENIZER_FAILURE.test(job.lastError),
+  );
   const categories = new Set(jobs.map((job) => failureCategory(job.lastError)));
+  const hasGeneralAsrFailure = jobs.some(
+    (job) =>
+      failureCategory(job.lastError) === 'asr_dependency' &&
+      (job.lastError === null || !OPTIONAL_TOKENIZER_FAILURE.test(job.lastError)),
+  );
   lines.push('', 'Что сделать на этом Mac:', '1. pnpm openmurmur doctor');
-  if (categories.has('asr_dependency')) {
+  if (hasGeneralAsrFailure) {
     lines.push(
       '   Если ASR/MLX не установлен: uv sync --project python/openmurmur_audio --extra mlx',
     );
@@ -110,12 +123,22 @@ export function renderDeadJobAlert(
       `   ${ollamaPullInstruction(llmModel)}`,
     );
   }
-  const retryable = jobs.find((job) => canRetryDeadJob(job.kind));
-  lines.push(
-    retryable === undefined
-      ? '2. Эти legacy-задачи не обслуживаются демоном; обнови OpenMurmur и снова запусти doctor.'
-      : `2. После исправления: pnpm openmurmur jobs retry ${retryable.jobId}`,
-  );
+  if (optionalTokenizerJob !== undefined) {
+    lines.push(
+      '2. Auto дошёл до необязательного токенизатора. Повтори задачу с фактическим языком аудио:',
+      `   Русский: pnpm openmurmur jobs retry ${optionalTokenizerJob.jobId} --language ru`,
+      `   Тайский: pnpm openmurmur jobs retry ${optionalTokenizerJob.jobId} --language th`,
+      `   English: pnpm openmurmur jobs retry ${optionalTokenizerJob.jobId} --language en`,
+      `   中文: pnpm openmurmur jobs retry ${optionalTokenizerJob.jobId} --language zh`,
+    );
+  } else {
+    const retryable = jobs.find((job) => canRetryDeadJob(job.kind));
+    lines.push(
+      retryable === undefined
+        ? '2. Эти legacy-задачи не обслуживаются демоном; обнови OpenMurmur и снова запусти doctor.'
+        : `2. После исправления: pnpm openmurmur jobs retry ${retryable.jobId}`,
+    );
+  }
 
   return {
     active: true,

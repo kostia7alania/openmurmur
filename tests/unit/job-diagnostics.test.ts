@@ -45,6 +45,26 @@ describe('failed job diagnostics', () => {
     assert.match(alert.detail, /ollama pull qwen3\.6:27b/);
   });
 
+  it('turns the optional-tokenizer failure into exact forced-language recovery commands', () => {
+    const alert = renderDeadJobAlert(
+      'prod-mac.local',
+      [
+        deadJob({
+          kind: 'incoming_audio',
+          lastError:
+            'ASR failed: RuntimeError: Japanese tokenization requires optional dependency `nagisa`.',
+        }),
+      ],
+      'qwen3.6:27b',
+    );
+
+    assert.match(alert.detail, /jobs retry job-1 --language ru/);
+    assert.match(alert.detail, /jobs retry job-1 --language th/);
+    assert.match(alert.detail, /jobs retry job-1 --language en/);
+    assert.match(alert.detail, /jobs retry job-1 --language zh/);
+    assert.ok(!alert.detail.includes('uv sync --project python/openmurmur_audio --extra mlx'));
+  });
+
   it('keeps technical exceptions local and makes copyable model commands safe', () => {
     const privateError = 'Ollama failed reading /Users/alice/private/recording.flac';
     const telegram = renderDeadJobAlert(

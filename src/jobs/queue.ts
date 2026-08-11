@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
+import { type AsrLanguageCode, modelLanguageName } from '../asr/preferences.ts';
 import { transaction } from '../database/db.ts';
 
 export type JobKind =
@@ -28,7 +29,11 @@ export function canRetryDeadJob(kind: JobKind): boolean {
   return DAEMON_JOB_KINDS.has(kind);
 }
 
-export type RetryDeadOutcome = 'requeued' | 'not_found' | 'unsupported';
+export type RetryDeadOutcome = 'requeued' | 'not_found' | 'unsupported' | 'language_unsupported';
+
+export interface RetryDeadOptions {
+  readonly language?: AsrLanguageCode;
+}
 
 export interface Job {
   readonly jobId: string;
@@ -79,6 +84,69 @@ const nowIso = () => new Date().toISOString();
 const isoIn = (ms: number) => new Date(Date.now() + ms).toISOString();
 export const DEFAULT_JOB_LEASE_MS = 10 * 60 * 1000;
 export const DEFAULT_JOB_HEARTBEAT_MS = 60 * 1000;
+
+function parseJobPayload(jobId: string, serialized: string): Record<string, unknown> {
+  const parsed = JSON.parse(serialized) as unknown;
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`job ${jobId} has an invalid payload`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function prepareAsrRetry(db: DatabaseSync, payload: Record<string, unknown>, ts: string): void {
+  const sessionId = payload['sessionId'];
+  if (typeof sessionId !== 'string') return;
+  db.prepare(
+    `UPDATE audio_sessions
+        SET state = 'PROCESSING', rejection_reason = NULL, updated_at = ?
+      WHERE session_id = ? AND state = 'FAILED' AND rejection_reason = 'asr_failed'`,
+  ).run(ts, sessionId);
+  db.prepare(
+    `UPDATE telegram_outbox
+        SET state = 'failed', last_error = ?, updated_at = ?
+      WHERE delivery_part_id = ? AND state = 'pending'`,
+  ).run('superseded by a manual ASR retry', ts, `session-status:asr-failed:${sessionId}`);
+}
+
+function prepareIncomingRetry(
+  db: DatabaseSync,
+  jobId: string,
+  payload: Record<string, unknown>,
+  ts: string,
+): void {
+  const fileUid = payload['fileUid'];
+  if (typeof fileUid !== 'string' || fileUid.length === 0) {
+    throw new Error(`incoming audio job ${jobId} has no valid fileUid`);
+  }
+
+  const reset = db
+    .prepare(
+      `UPDATE incoming_telegram_files
+          SET state = 'received', rejection_reason = NULL, updated_at = ?
+        WHERE file_uid = ? AND state = 'failed'
+          AND rejection_reason = 'processing_failed'`,
+    )
+    .run(ts, fileUid);
+  if (reset.changes !== 1) {
+    throw new Error(`incoming audio ${fileUid} is not in a retryable processing_failed state`);
+  }
+
+  const failureNoticeId = `incoming-failed:${fileUid}`;
+  db.prepare(
+    `DELETE FROM telegram_outbox
+      WHERE delivery_part_id = ? AND state = 'pending' AND attempts = 0
+        AND claim_generation = 0 AND telegram_message_id IS NULL`,
+  ).run(failureNoticeId);
+  const activeNotice = db
+    .prepare(
+      `SELECT 1 FROM telegram_outbox
+        WHERE delivery_part_id = ? AND state IN ('pending', 'sending')`,
+    )
+    .get(failureNoticeId);
+  if (activeNotice !== undefined) {
+    throw new Error(`incoming audio ${fileUid} still has an active failure notice`);
+  }
+}
 
 /** Exponential backoff with a ceiling, so a broken model does not hot-loop. */
 export function backoffMs(attempts: number): number {
@@ -350,47 +418,43 @@ export class JobQueue {
   }
 
   /** Re-drives one explicitly selected exhausted job after its cause was fixed. */
-  retryDead(jobId: string): RetryDeadOutcome {
+  retryDead(jobId: string, options: RetryDeadOptions = {}): RetryDeadOutcome {
     return transaction(this.#db, () => {
       const row = this.#db
         .prepare("SELECT kind, payload FROM jobs WHERE job_id = ? AND state = 'dead'")
         .get(jobId) as { kind: JobKind; payload: string } | undefined;
       if (row === undefined) return 'not_found';
       if (!canRetryDeadJob(row.kind)) return 'unsupported';
+      if (options.language !== undefined && row.kind !== 'asr' && row.kind !== 'incoming_audio') {
+        return 'language_unsupported';
+      }
+
+      const ts = nowIso();
+      let nextPayload = row.payload;
+
+      if (options.language !== undefined) {
+        const payload = parseJobPayload(jobId, row.payload);
+        nextPayload = JSON.stringify({
+          ...payload,
+          forcedLanguage: modelLanguageName(options.language),
+        });
+        if (row.kind === 'incoming_audio') {
+          prepareIncomingRetry(this.#db, jobId, payload, ts);
+        }
+      }
 
       if (row.kind === 'asr') {
-        const payload = JSON.parse(row.payload) as Record<string, unknown>;
-        const sessionId = payload['sessionId'];
-        if (typeof sessionId === 'string') {
-          this.#db
-            .prepare(
-              `UPDATE audio_sessions
-                  SET state = 'PROCESSING', rejection_reason = NULL, updated_at = ?
-                WHERE session_id = ? AND state = 'FAILED' AND rejection_reason = 'asr_failed'`,
-            )
-            .run(nowIso(), sessionId);
-          this.#db
-            .prepare(
-              `UPDATE telegram_outbox
-                  SET state = 'failed', last_error = ?, updated_at = ?
-                WHERE delivery_part_id = ? AND state = 'pending'`,
-            )
-            .run(
-              'superseded by a manual ASR retry',
-              nowIso(),
-              `session-status:asr-failed:${sessionId}`,
-            );
-        }
+        prepareAsrRetry(this.#db, parseJobPayload(jobId, row.payload), ts);
       }
 
       const result = this.#db
         .prepare(
           `UPDATE jobs
-              SET state = 'pending', attempts = 0, run_after = ?, lease_owner = NULL,
+              SET payload = ?, state = 'pending', attempts = 0, run_after = ?, lease_owner = NULL,
                   lease_expires_at = NULL, updated_at = ?
             WHERE job_id = ? AND state = 'dead'`,
         )
-        .run(nowIso(), nowIso(), jobId);
+        .run(nextPayload, ts, ts, jobId);
       return result.changes > 0 ? 'requeued' : 'not_found';
     });
   }

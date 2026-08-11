@@ -5,6 +5,7 @@ import { hostname } from 'node:os';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { parseArgs } from 'node:util';
+import { isAsrLanguageCode, modelLanguageName } from '../asr/preferences.ts';
 import { FfmpegCapture } from '../capture/ffmpeg.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
 import { recoverAfterCrash, renderRecoveryReport } from '../capture/recovery.ts';
@@ -90,6 +91,7 @@ Telegram
 Work
   jobs failed            Show exhausted background jobs and their causes.
   jobs retry JOB_ID      Re-queue one exhausted job after fixing its cause.
+  jobs retry JOB_ID --language CODE  Retry ASR/incoming audio as ru, th, en or zh.
   delivery reconcile     Report legacy delivered audio held without an exact ACK time.
   delivery reconcile apply  Set a selected exact ACK with confirmation and audit evidence.
   delivery reconcile-remote  Report outbox rows whose remote Telegram status is unknown.
@@ -107,6 +109,7 @@ Options
   --yes                  Skip the confirmation prompt.
   --limit N              Maximum search results (default 20).
   --since ISO --until ISO  Restrict search to a time range.
+  --language CODE        Force ru, th, en or zh when retrying ASR/incoming audio.
   --part ID | --session ID  Select delivery reconciliation scope.
   --ack-at UTC --operator ID --evidence TEXT  Exact manual reconciliation proof.
   --delivery-part ID --telegram-message-id N  Exact remote Telegram reconciliation identity.
@@ -125,6 +128,7 @@ async function main(argv: readonly string[]): Promise<number> {
       limit: { type: 'string' },
       since: { type: 'string' },
       until: { type: 'string' },
+      language: { type: 'string' },
       part: { type: 'string' },
       session: { type: 'string' },
       'delivery-part': { type: 'string' },
@@ -218,7 +222,7 @@ async function main(argv: readonly string[]): Promise<number> {
       return telegramCommand(loaded, positionals[1]);
 
     case 'jobs':
-      return jobsCommand(loaded, positionals[1], positionals[2], asJson);
+      return jobsCommand(loaded, positionals[1], positionals[2], values['language'], asJson);
 
     case 'delivery':
       return deliveryCommand(
@@ -653,6 +657,7 @@ function jobsCommand(
   loaded: Awaited<ReturnType<typeof loadConfig>>,
   subcommand: string | undefined,
   jobId: string | undefined,
+  languageOption: unknown,
   asJson: boolean,
 ): number {
   if (subcommand !== 'failed' && subcommand !== 'retry') {
@@ -664,6 +669,10 @@ function jobsCommand(
   try {
     const jobs = new JobQueue(db.handle);
     if (subcommand === 'failed') {
+      if (languageOption !== undefined) {
+        process.stderr.write('--language is only valid with jobs retry JOB_ID.\n');
+        return 1;
+      }
       const failed = jobs.deadJobs();
       if (asJson) {
         process.stdout.write(
@@ -696,31 +705,61 @@ function jobsCommand(
       return 0;
     }
 
-    if (jobId === undefined) {
-      process.stderr.write('Usage: openmurmur jobs retry JOB_ID\n');
-      return 1;
-    }
-    const outcome = jobs.retryDead(jobId);
-    if (outcome === 'not_found') {
-      process.stderr.write(`No failed job found with id ${jobId}.\n`);
-      return 1;
-    }
-    if (outcome === 'unsupported') {
-      process.stderr.write(
-        `Failed job ${jobId} has no daemon worker and cannot be retried. Run: pnpm openmurmur doctor\n`,
-      );
-      return 1;
-    }
-    const result = { jobId, requeued: true };
-    process.stdout.write(
-      asJson
-        ? `${JSON.stringify(result, null, 2)}\n`
-        : `Re-queued ${jobId}. It will run when the OpenMurmur daemon is running.\n`,
-    );
-    return 0;
+    return retryDeadJob(jobs, jobId, languageOption, asJson);
   } finally {
     db.close();
   }
+}
+
+function retryDeadJob(
+  jobs: JobQueue,
+  jobId: string | undefined,
+  languageOption: unknown,
+  asJson: boolean,
+): number {
+  if (jobId === undefined) {
+    process.stderr.write('Usage: pnpm openmurmur jobs retry JOB_ID [--language ru|th|en|zh]\n');
+    return 1;
+  }
+  if (languageOption !== undefined && !isAsrLanguageCode(languageOption)) {
+    process.stderr.write('--language must be one of: ru, th, en, zh.\n');
+    return 1;
+  }
+  const outcome = jobs.retryDead(
+    jobId,
+    languageOption === undefined ? {} : { language: languageOption },
+  );
+  if (outcome === 'not_found') {
+    process.stderr.write(`No failed job found with id ${jobId}.\n`);
+    return 1;
+  }
+  if (outcome === 'unsupported') {
+    process.stderr.write(
+      `Failed job ${jobId} has no daemon worker and cannot be retried. Run: pnpm openmurmur doctor\n`,
+    );
+    return 1;
+  }
+  if (outcome === 'language_unsupported') {
+    process.stderr.write(
+      `Failed job ${jobId} is not ASR or incoming audio; --language cannot be applied.\n`,
+    );
+    return 1;
+  }
+  const forcedLanguage =
+    languageOption === undefined ? undefined : modelLanguageName(languageOption);
+  const result = {
+    jobId,
+    requeued: true,
+    ...(forcedLanguage === undefined ? {} : { forcedLanguage }),
+  };
+  process.stdout.write(
+    asJson
+      ? `${JSON.stringify(result, null, 2)}\n`
+      : `Re-queued ${jobId}${
+          forcedLanguage === undefined ? '' : ` with forced language ${forcedLanguage}`
+        }. It will run when the OpenMurmur daemon is running.\n`,
+  );
+  return 0;
 }
 
 async function deliveryCommand(
