@@ -368,6 +368,24 @@ export class JobQueue {
     return Number(result.changes);
   }
 
+  /**
+   * Reclaims every in-flight generation after exclusive PID ownership proved
+   * that the daemon which held them is gone. Unlike ordinary lease expiry, a
+   * process death is not a handler attempt and must not consume retry budget.
+   */
+  recoverLeasesAfterProvenDaemonDeath(): number {
+    const now = nowIso();
+    const result = this.#db
+      .prepare(
+        `UPDATE jobs
+            SET state = 'pending', attempts = MAX(0, attempts - 1), run_after = ?,
+                lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+          WHERE state = 'leased'`,
+      )
+      .run(now, now);
+    return Number(result.changes);
+  }
+
   pendingCount(kind?: JobKind): number {
     const row =
       kind === undefined

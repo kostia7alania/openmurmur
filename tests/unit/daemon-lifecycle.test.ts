@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
@@ -105,7 +105,8 @@ describe('daemon PID ownership', () => {
         processBirth: 'birth-1',
       }),
     };
-    await claimDaemonPid(pidFile, dir, dependencies);
+    const firstClaim = await claimDaemonPid(pidFile, dir, dependencies);
+    assert.equal(firstClaim.reclaimedPreviousDaemon, false);
     const claimed = await readDaemonPid(pidFile);
     assert.equal(claimed?.pid, process.pid);
     assert.ok(claimed?.processBirth);
@@ -119,6 +120,27 @@ describe('daemon PID ownership', () => {
     assert.equal(existsSync(pidFile), true, 'a non-owner must not unlink the PID file');
     await releaseDaemonPid(pidFile, process.pid);
     assert.equal(existsSync(pidFile), false);
+
+    writeFileSync(
+      pidFile,
+      `${JSON.stringify({
+        pid: process.pid + 1000,
+        root: dir,
+        startedAt: '2026-08-11T00:00:00.000Z',
+        processBirth: 'dead-birth',
+      })}\n`,
+    );
+    const reclaimed = await claimDaemonPid(pidFile, dir, {
+      birthMarker: async () => 'birth-2',
+      inspect: async () => ({
+        alive: false,
+        identityMatches: false,
+        command: null,
+        processBirth: null,
+      }),
+    });
+    assert.equal(reclaimed.reclaimedPreviousDaemon, true);
+    await releaseDaemonPid(pidFile, process.pid);
   });
 });
 

@@ -273,7 +273,9 @@ export class Daemon {
       }
       if (this.#stopping) return;
 
-      const reclaimedJobs = this.#jobs.recoverStaleLeases();
+      const reclaimedJobs = identity.reclaimedPreviousDaemon
+        ? this.#jobs.recoverLeasesAfterProvenDaemonDeath()
+        : this.#jobs.recoverStaleLeases();
       const reclaimedSends = this.#outbox.recoverSending();
       const retiredStaleNotices = retireStaleNotices(
         this.#db.handle,
@@ -1764,6 +1766,11 @@ export interface DaemonPidRecord {
   readonly processBirth: string | null;
 }
 
+export interface DaemonPidClaim extends DaemonPidRecord {
+  /** True only when this claim removed a PID file whose process was proven absent. */
+  readonly reclaimedPreviousDaemon: boolean;
+}
+
 export function parseDaemonPid(value: string): DaemonPidRecord | null {
   const trimmed = value.trim();
   if (/^\d+$/.test(trimmed)) {
@@ -1852,7 +1859,7 @@ export async function claimDaemonPid(
   pidFile: string,
   root: string,
   dependencies: DaemonPidClaimDependencies = {},
-): Promise<DaemonPidRecord> {
+): Promise<DaemonPidClaim> {
   const birthMarker = dependencies.birthMarker ?? processBirthMarker;
   const inspect = dependencies.inspect ?? inspectDaemonProcess;
   const processBirth = await birthMarker(process.pid);
@@ -1866,11 +1873,12 @@ export async function claimDaemonPid(
     processBirth,
   } satisfies DaemonPidRecord;
   const record = JSON.stringify(identity);
+  let reclaimedPreviousDaemon = false;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await writeFile(pidFile, `${record}\n`, { mode: 0o600, flag: 'wx' });
-      return identity;
+      return { ...identity, reclaimedPreviousDaemon };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
@@ -1888,6 +1896,7 @@ export async function claimDaemonPid(
       throw new Error(`${detail} (pid ${existing.pid}); refusing to replace ${pidFile}`);
     }
     await rm(pidFile, { force: true });
+    reclaimedPreviousDaemon = true;
   }
 
   throw new Error(`could not claim daemon pid file: ${pidFile}`);

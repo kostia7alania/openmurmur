@@ -70,6 +70,42 @@ describe('job lease generations', () => {
     assert.equal(secondWorker.complete(current), true);
   });
 
+  it('reclaims a proven-dead daemon lease immediately without burning an attempt', () => {
+    const deadDaemon = new JobQueue(db.handle, 'daemon-that-died');
+    const jobId = deadDaemon.enqueue({
+      kind: 'asr',
+      idempotencyKey: 'asr:daemon-death',
+      payload: {},
+    });
+    assert.ok(jobId);
+    const abandoned = deadDaemon.claim(['asr']);
+    assert.ok(abandoned);
+    assert.equal(abandoned.attempts, 1);
+
+    assert.equal(deadDaemon.recoverLeasesAfterProvenDaemonDeath(), 1);
+    assert.deepEqual(
+      {
+        ...(db.handle
+          .prepare(
+            'SELECT state, attempts, lease_owner, lease_expires_at FROM jobs WHERE job_id = ?',
+          )
+          .get(jobId) as Record<string, unknown>),
+      },
+      {
+        state: 'pending',
+        attempts: 0,
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+    );
+    assert.equal(deadDaemon.renew(abandoned), false);
+
+    const replacement = new JobQueue(db.handle, 'replacement-daemon').claim(['asr']);
+    assert.ok(replacement);
+    assert.equal(replacement.jobId, jobId);
+    assert.equal(replacement.attempts, 1);
+  });
+
   it('renews a short lease while a slow handler is still running', async () => {
     const activeWorker = new JobQueue(db.handle, 'worker-active');
     activeWorker.enqueue({ kind: 'asr', idempotencyKey: 'asr:heartbeat', payload: {} });
