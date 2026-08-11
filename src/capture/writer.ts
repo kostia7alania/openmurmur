@@ -5,6 +5,8 @@ import { open, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 
+const ABORT_EXIT_GRACE_MS = 3000;
+
 /**
  * Writes one physical FLAC part.
  *
@@ -139,9 +141,19 @@ export class PartWriter {
   /** Abandons the part without publishing it. */
   async abort(): Promise<void> {
     const child = this.#child;
-    if (child !== null) {
+    const exitPromise = this.#exitPromise;
+    this.#closed = true;
+    if (child !== null && exitPromise !== null) {
       child.stdin.destroy();
       child.kill('SIGKILL');
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        exitPromise,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, ABORT_EXIT_GRACE_MS);
+        }),
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
       this.#child = null;
       this.#exitPromise = null;
     }

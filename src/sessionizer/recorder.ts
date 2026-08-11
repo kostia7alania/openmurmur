@@ -69,6 +69,7 @@ export class Recorder {
   /** Raw PCM held for pre-roll, aligned with the sessionizer's frame ring. */
   readonly #preRoll: CaptureFrame[] = [];
   #openPart: OpenPart | null = null;
+  #discardingSessionId: string | null = null;
   #sawFirstFrame = false;
   #running = false;
   #lastMonotonicMs = 0;
@@ -211,7 +212,7 @@ export class Recorder {
 
     // Keep raw PCM for the pre-roll while no part is open. The sessionizer
     // tracks the same window in frame counts; this holds the actual bytes.
-    const bufferedCurrentFrame = this.#openPart === null;
+    const bufferedCurrentFrame = this.#openPart === null && this.#discardingSessionId === null;
     if (bufferedCurrentFrame) {
       this.#preRoll.push(frame);
       const capacityMs = this.#options.config.sessionizer.preRollSeconds * 1000;
@@ -262,6 +263,9 @@ export class Recorder {
         break;
 
       case 'session_finalized': {
+        if (this.#discardingSessionId === intent.sessionId) {
+          this.#discardingSessionId = null;
+        }
         const finalizedParts = this.#parts
           .listForSession(intent.sessionId)
           .filter((part) => part.finalized === 1);
@@ -354,6 +358,9 @@ export class Recorder {
       }
 
       case 'session_rejected':
+        if (this.#discardingSessionId === intent.sessionId) {
+          this.#discardingSessionId = null;
+        }
         transaction(this.#options.db, () => {
           if (intent.endedWallMs !== undefined && intent.durationMs !== undefined) {
             const exact = {
@@ -454,12 +461,40 @@ export class Recorder {
     });
     writer.open();
 
-    const partId = this.#parts.open(
-      intent.sessionId,
-      intent.partIndex,
-      finalPath,
-      new Date(intent.startedWallMs).toISOString(),
-    );
+    let partId: string;
+    try {
+      partId = this.#parts.open(
+        intent.sessionId,
+        intent.partIndex,
+        finalPath,
+        new Date(intent.startedWallMs).toISOString(),
+      );
+    } catch (error) {
+      // The encoder exists but no durable row owns it. Reap it before reading
+      // more frames, and do not let audio from this failed session become the
+      // pre-roll of a later one.
+      this.#discardingSessionId = intent.sessionId;
+      this.#preRoll.length = 0;
+      this.#options.logger.error('failed to register audio part', {
+        sessionId: intent.sessionId,
+        partIndex: intent.partIndex,
+        error: (error as Error).message,
+      });
+      try {
+        await writer.abort();
+      } catch (cleanupError) {
+        this.#options.logger.error('failed to clean up unregistered audio part', {
+          sessionId: intent.sessionId,
+          partIndex: intent.partIndex,
+          error: (cleanupError as Error).message,
+        });
+      }
+      return;
+    }
+
+    if (this.#discardingSessionId === intent.sessionId) {
+      this.#discardingSessionId = null;
+    }
 
     this.#openPart = {
       partId,
