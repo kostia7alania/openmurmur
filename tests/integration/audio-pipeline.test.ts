@@ -98,6 +98,17 @@ function fakePcmSourceIgnoringTerm(frameCount: number): string {
   return path;
 }
 
+function fakePcmSourceStuckBeforeOutput(pidFile: string): string {
+  const path = join(dir, 'fake-pcm-source-stuck-before-output');
+  writeFileSync(
+    path,
+    `#!${process.execPath}\nprocess.on('SIGTERM', () => {});\nrequire('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+    { mode: 0o700 },
+  );
+  chmodSync(path, 0o700);
+  return path;
+}
+
 async function waitForCondition(
   condition: () => boolean,
   description: string,
@@ -556,6 +567,29 @@ describe('capture backend argument construction', () => {
       ffmpegPath: FFMPEG,
       clock: systemClock,
     });
+    assert.equal(capture.msSinceLastFrame(), null);
+  });
+
+  it('fails and reaps a capture child that never produces its first source frame', async () => {
+    const pidFile = join(dir, 'stuck-source.pid');
+    const capture = new FfmpegCapture({
+      sampleRate: 16_000,
+      channels: 1,
+      device: 'default',
+      frameSamples: 512,
+      ffmpegPath: fakePcmSourceStuckBeforeOutput(pidFile),
+      clock: systemClock,
+      firstSourceFrameTimeoutMs: 1_000,
+    });
+
+    const started = Date.now();
+    await assert.rejects(capture.start().next(), /No source audio frame arrived within 1 seconds/);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 3_900, `expected the SIGKILL fallback, stopped after ${elapsed}ms`);
+    assert.ok(elapsed < 6_000, `bounded first-frame failure took ${elapsed}ms`);
+
+    const childPid = Number(readFileSync(pidFile, 'utf8'));
+    assert.throws(() => process.kill(childPid, 0), { code: 'ESRCH' });
     assert.equal(capture.msSinceLastFrame(), null);
   });
 

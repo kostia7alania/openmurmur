@@ -11,10 +11,12 @@ import {
 import { CaptureBufferOverflowError, CaptureFrameBuffer } from './frame-buffer.ts';
 
 const MAX_PROCESSING_LAG_MS = 30_000;
+export const FIRST_SOURCE_FRAME_TIMEOUT_MS = 10_000;
 
 export interface FfmpegCaptureOptions extends CaptureBackendOptions {
   readonly ffmpegPath: string;
   readonly clock: Clock;
+  readonly firstSourceFrameTimeoutMs?: number;
 }
 
 /**
@@ -31,6 +33,7 @@ export class FfmpegCapture implements CaptureBackend {
   readonly #options: FfmpegCaptureOptions;
   readonly #bytesPerFrame: number;
   readonly #frameDurationMs: number;
+  readonly #firstSourceFrameTimeoutMs: number;
 
   #child: ChildProcessByStdio<null, Readable, Readable> | null = null;
   #exitPromise: Promise<CaptureError | null> | null = null;
@@ -44,6 +47,11 @@ export class FfmpegCapture implements CaptureBackend {
     this.#options = options;
     this.#bytesPerFrame = options.frameSamples * 2 * options.channels;
     this.#frameDurationMs = (options.frameSamples / options.sampleRate) * 1000;
+    this.#firstSourceFrameTimeoutMs =
+      options.firstSourceFrameTimeoutMs ?? FIRST_SOURCE_FRAME_TIMEOUT_MS;
+    if (!Number.isFinite(this.#firstSourceFrameTimeoutMs) || this.#firstSourceFrameTimeoutMs <= 0) {
+      throw new Error('first source frame timeout must be positive');
+    }
   }
 
   buildArgs(): string[] {
@@ -115,10 +123,26 @@ export class FfmpegCapture implements CaptureBackend {
     });
     this.#activeFrames = frames;
     const pump = this.#pumpFrames(child, frames, maxBufferedFrames, exited);
+    let firstFrameTimer: NodeJS.Timeout | undefined = setTimeout(() => {
+      const duration =
+        this.#firstSourceFrameTimeoutMs % 1000 === 0
+          ? `${this.#firstSourceFrameTimeoutMs / 1000} seconds`
+          : `${this.#firstSourceFrameTimeoutMs} ms`;
+      frames.abort(
+        new CaptureError(
+          'exit',
+          `No source audio frame arrived within ${duration}; microphone access may be blocked or the input device may be unavailable.`,
+        ),
+      );
+    }, this.#firstSourceFrameTimeoutMs);
     try {
       while (true) {
         const next = await frames.next();
         if (next.done) break;
+        if (firstFrameTimer !== undefined) {
+          clearTimeout(firstFrameTimer);
+          firstFrameTimer = undefined;
+        }
         this.#lastDeliveredFrameMonotonicMs = next.value.monotonicMs;
         yield next.value;
       }
@@ -126,6 +150,7 @@ export class FfmpegCapture implements CaptureBackend {
       const failure = await exited;
       if (failure !== null) throw failure;
     } finally {
+      if (firstFrameTimer !== undefined) clearTimeout(firstFrameTimer);
       await this.#terminateAndJoin(child, exited);
       if (this.#activeFrames === frames) this.#activeFrames = null;
       if (this.#exitPromise === exited) this.#exitPromise = null;
