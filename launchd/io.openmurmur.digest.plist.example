@@ -18,6 +18,8 @@
         <string>__REPO_DIR__/src/cli/main.ts</string>
         <string>digest</string>
         <string>scheduled</string>
+        <string>--root</string>
+        <string>__STATE_ROOT__</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -30,9 +32,9 @@
     <false/>
 
     <key>StandardOutPath</key>
-    <string>__HOME__/Library/Application Support/OpenMurmur/logs/digest.out.log</string>
+    <string>__STATE_ROOT__/logs/digest.out.log</string>
     <key>StandardErrorPath</key>
-    <string>__HOME__/Library/Application Support/OpenMurmur/logs/digest.err.log</string>
+    <string>__STATE_ROOT__/logs/digest.err.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>

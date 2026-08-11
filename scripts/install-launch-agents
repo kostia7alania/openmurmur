@@ -1,59 +1,475 @@
 #!/usr/bin/env bash
 # Installs the launchd agents from the templates in launchd/.
 #
-# Grant microphone access interactively FIRST (`openmurmur capture test`).
+# Grant microphone access interactively FIRST (`pnpm openmurmur capture test`).
 # launchd cannot always surface the macOS TCC prompt.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-REPO="$(pwd)"
+REPO="$(pwd -P)"
 AGENTS="$HOME/Library/LaunchAgents"
-NODE_BIN="$(command -v node)"
+RUNTIME_CONTRACT="$REPO/runtime-requirements.json"
+
+CHECK_ONLY=false
+ASSUME_YES=false
+REQUESTED_NODE=""
+REQUESTED_ROOT="${OPENMURMUR_HOME:-$HOME/Library/Application Support/OpenMurmur}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 ok()   { printf '\033[32m✓ %s\033[0m\n' "$1"; }
 warn() { printf '\033[33m! %s\033[0m\n' "$1"; }
+fail() { printf '\033[31m✗ %s\033[0m\n' "$1" >&2; }
+die()  { fail "$1"; exit 1; }
 
-[ "$(uname -s)" = "Darwin" ] || { echo "macOS only." >&2; exit 1; }
+usage() {
+  cat <<'USAGE'
+Usage: ./scripts/install-launch-agents [--check] [--yes] [--node PATH] [--root DIR]
 
-bold "Installing OpenMurmur launch agents"
-echo "  repo: $REPO"
-echo "  node: $NODE_BIN"
-echo
+  --check      Read-only: report runtime, state-root, template and registration drift.
+  --yes        Skip the interactive microphone-permission confirmation.
+  --node PATH  Use this Node binary. It must satisfy the project runtime floor.
+  --root DIR   Persist this canonical state root in every installed agent.
+USAGE
+}
 
-warn "Have you run 'openmurmur capture test' and granted microphone access?"
-warn "launchd may not be able to show the permission prompt."
-printf 'Continue? [y/N] '
-read -r reply
-case "$reply" in [yY]*) ;; *) echo "Cancelled."; exit 1 ;; esac
-
-mkdir -p "$AGENTS" "$HOME/Library/Application Support/OpenMurmur/logs"
-
-for template in launchd/*.plist.example; do
-  case "$(basename "$template")" in
-    io.openmurmur.telegram.plist.example)
-      warn "Skipping optional Telegram-only poller; the daemon already polls Telegram."
-      continue
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check)
+      CHECK_ONLY=true
+      shift
+      ;;
+    --yes)
+      ASSUME_YES=true
+      shift
+      ;;
+    --node)
+      [ "$#" -ge 2 ] || die "--node needs a path"
+      REQUESTED_NODE="$2"
+      shift 2
+      ;;
+    --root)
+      [ "$#" -ge 2 ] || die "--root needs a directory"
+      REQUESTED_ROOT="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "unknown option: $1"
       ;;
   esac
-
-  name="$(basename "$template" .example)"
-  target="$AGENTS/$name"
-
-  sed -e "s|__REPO_DIR__|$REPO|g" \
-      -e "s|__NODE_BIN__|$NODE_BIN|g" \
-      -e "s|__HOME__|$HOME|g" \
-      "$template" > "$target"
-
-  plutil -lint "$target" >/dev/null || { echo "Generated plist is invalid: $target" >&2; exit 1; }
-
-  launchctl bootout "gui/$(id -u)/${name%.plist}" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$target"
-  ok "$name"
 done
+
+[ "$(uname -s)" = "Darwin" ] || die "OpenMurmur launch agents require macOS."
+
+# The installer may be run from a shell whose `node` is older than the daemon's
+# pinned nvm runtime. Probe the exact project version first and trust only a
+# candidate that reports both its real executable and embedded SQLite version.
+PROBED_NODE_BIN=""
+PROBED_NODE_VERSION=""
+PROBED_SQLITE_VERSION=""
+LAST_PROBE_ERROR=""
+
+probe_node() {
+  local candidate="$1"
+  local output
+
+  if [ ! -x "$candidate" ]; then
+    LAST_PROBE_ERROR="$candidate is not executable"
+    return 1
+  fi
+
+  if ! output="$("$candidate" --input-type=module - "$RUNTIME_CONTRACT" 2>&1 <<'NODE'
+import { readFileSync } from 'node:fs';
+
+const contract = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const versionPattern = /^\d+\.\d+\.\d+$/;
+const keys = ['nodeMinimum', 'sqliteMinimum', 'pnpmExact'];
+if (contract.schemaVersion !== 1 || keys.some((key) => !versionPattern.test(contract[key]))) {
+  throw new Error('invalid runtime requirements contract');
+}
+
+function compare(left, right) {
+  const a = left.split('.').map(Number);
+  const b = right.split('.').map(Number);
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const delta = (a[i] ?? 0) - (b[i] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return 0;
+}
+
+const sqlite = process.versions.sqlite ?? '0.0.0';
+const problems = [];
+if (compare(process.versions.node, contract.nodeMinimum) < 0) {
+  problems.push(`Node ${process.versions.node} is below ${contract.nodeMinimum}`);
+}
+if (compare(sqlite, contract.sqliteMinimum) < 0) {
+  problems.push(`node:sqlite ${sqlite} is below ${contract.sqliteMinimum}`);
+}
+if (problems.length > 0) {
+  process.stderr.write(problems.join('; '));
+  process.exit(1);
+}
+process.stdout.write([process.execPath, process.versions.node, sqlite].join('\t'));
+NODE
+  )"; then
+    LAST_PROBE_ERROR="$candidate: $output"
+    return 1
+  fi
+
+  IFS=$'\t' read -r PROBED_NODE_BIN PROBED_NODE_VERSION PROBED_SQLITE_VERSION <<< "$output"
+  if [ -z "$PROBED_NODE_BIN" ] || [ "${PROBED_NODE_BIN#/}" = "$PROBED_NODE_BIN" ]; then
+    LAST_PROBE_ERROR="$candidate returned a non-absolute process.execPath"
+    return 1
+  fi
+  return 0
+}
+
+select_node() {
+  local expected_version
+  local candidate
+  local candidates=()
+
+  if [ -n "$REQUESTED_NODE" ]; then
+    candidates+=("$REQUESTED_NODE")
+  else
+    expected_version="$(tr -d '[:space:]' < .nvmrc)"
+    if [ -n "${NVM_DIR:-}" ]; then
+      candidates+=("$NVM_DIR/versions/node/v$expected_version/bin/node")
+    fi
+    candidates+=("$HOME/.nvm/versions/node/v$expected_version/bin/node")
+    candidate="$(command -v node 2>/dev/null || true)"
+    if [ -n "$candidate" ]; then candidates+=("$candidate"); fi
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    if probe_node "$candidate"; then return 0; fi
+  done
+
+  if [ -n "$REQUESTED_NODE" ]; then
+    die "Requested Node is incompatible: $LAST_PROBE_ERROR"
+  fi
+  die "No compatible Node runtime found. Run 'nvm install && nvm use'. Last probe: $LAST_PROBE_ERROR"
+}
+
+# This gate deliberately precedes mktemp, mkdir, plist writes and launchctl.
+select_node
+NODE_BIN="$PROBED_NODE_BIN"
+
+STATE_ROOT="$("$NODE_BIN" --input-type=module - "$REQUESTED_ROOT" <<'NODE'
+import { resolve } from 'node:path';
+process.stdout.write(resolve(process.argv[2]));
+NODE
+)"
+
+TMP_BASE="${TMPDIR:-/tmp}"
+WORK_DIR="$(mktemp -d "$TMP_BASE/openmurmur-launchd.XXXXXX")"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+NAMES=(
+  "io.openmurmur.daemon.plist"
+  "io.openmurmur.digest.plist"
+)
+TEMPLATES=(
+  "launchd/io.openmurmur.daemon.plist.example"
+  "launchd/io.openmurmur.digest.plist.example"
+)
+ROOT_ARGUMENT_INDEXES=(4 5)
+
+render_template() {
+  local template="$1"
+  local target="$2"
+  "$NODE_BIN" --input-type=module - \
+    "$template" "$target" "$REPO" "$NODE_BIN" "$HOME" "$STATE_ROOT" <<'NODE'
+import { readFileSync, writeFileSync } from 'node:fs';
+
+const [template, target, repo, nodeBin, home, stateRoot] = process.argv.slice(2);
+const escapeXml = (value) =>
+  value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+
+let text = readFileSync(template, 'utf8');
+for (const [placeholder, value] of Object.entries({
+  __REPO_DIR__: repo,
+  __NODE_BIN__: nodeBin,
+  __HOME__: home,
+  __STATE_ROOT__: stateRoot,
+})) {
+  text = text.replaceAll(placeholder, escapeXml(value));
+}
+if (/__[A-Z_]+__/.test(text)) throw new Error(`unresolved placeholder in ${template}`);
+writeFileSync(target, text, { mode: 0o600 });
+NODE
+}
+
+for index in "${!NAMES[@]}"; do
+  render_template "${TEMPLATES[$index]}" "$WORK_DIR/${NAMES[$index]}"
+  plutil -lint "$WORK_DIR/${NAMES[$index]}" >/dev/null || \
+    die "Rendered plist is invalid: ${NAMES[$index]}"
+done
+
+installed_value() {
+  local target="$1"
+  local key="$2"
+  /usr/libexec/PlistBuddy -c "Print :$key" "$target" 2>/dev/null || true
+}
+
+check_installation() {
+  local issues=0
+  local index name target installed_node installed_root root_index label
+
+  bold "OpenMurmur launch agent check"
+  echo "  repo:  $REPO"
+  echo "  node:  $NODE_BIN (v$PROBED_NODE_VERSION, SQLite $PROBED_SQLITE_VERSION)"
+  echo "  root:  $STATE_ROOT"
+  echo
+
+  for index in "${!NAMES[@]}"; do
+    name="${NAMES[$index]}"
+    target="$AGENTS/$name"
+    root_index="${ROOT_ARGUMENT_INDEXES[$index]}"
+    label="${name%.plist}"
+
+    if [ ! -f "$target" ]; then
+      fail "$name is not installed"
+      issues=$((issues + 1))
+    else
+      installed_node="$(installed_value "$target" "ProgramArguments:0")"
+      if [ "$installed_node" != "$NODE_BIN" ]; then
+        fail "$name runtime mismatch: ${installed_node:-unreadable} (expected $NODE_BIN)"
+        issues=$((issues + 1))
+      fi
+
+      installed_root="$(installed_value "$target" "ProgramArguments:$root_index")"
+      if [ "$installed_root" != "$STATE_ROOT" ]; then
+        fail "$name state-root mismatch: ${installed_root:-missing} (expected $STATE_ROOT)"
+        issues=$((issues + 1))
+      fi
+
+      if ! cmp -s "$WORK_DIR/$name" "$target"; then
+        fail "$name template drift"
+        issues=$((issues + 1))
+      else
+        ok "$name matches the current template"
+      fi
+    fi
+
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      ok "$label is registered"
+    else
+      fail "$label is not registered with launchd"
+      issues=$((issues + 1))
+    fi
+  done
+
+  if [ "$issues" -gt 0 ]; then
+    fail "$issues launch agent drift issue(s); no files or services were changed"
+    return 1
+  fi
+  ok "installed launch agents match this checkout and both labels are registered"
+}
+
+if [ "$CHECK_ONLY" = true ]; then
+  check_installation
+  exit $?
+fi
+
+bold "Installing OpenMurmur launch agents"
+echo "  repo:  $REPO"
+echo "  node:  $NODE_BIN (v$PROBED_NODE_VERSION, SQLite $PROBED_SQLITE_VERSION)"
+echo "  root:  $STATE_ROOT"
+echo
+
+if [ "$ASSUME_YES" != true ]; then
+  warn "Have you run 'pnpm openmurmur capture test' and granted microphone access?"
+  warn "launchd may not be able to show the permission prompt."
+  printf 'Continue? [y/N] '
+  read -r reply
+  case "$reply" in [yY]*) ;; *) echo "Cancelled."; exit 1 ;; esac
+fi
+
+# Everything above this point is read-only apart from the private render directory.
+install -d -m 0700 "$AGENTS" "$STATE_ROOT" "$STATE_ROOT/logs"
+
+EXISTED=()
+WAS_LOADED=()
+SERVICES_TOUCHED=false
+
+for index in "${!NAMES[@]}"; do
+  name="${NAMES[$index]}"
+  target="$AGENTS/$name"
+  if [ -f "$target" ]; then
+    cp "$target" "$WORK_DIR/$name.previous"
+    EXISTED[$index]=1
+  else
+    EXISTED[$index]=0
+  fi
+  if launchctl print "gui/$(id -u)/${name%.plist}" >/dev/null 2>&1; then
+    WAS_LOADED[$index]=1
+  else
+    WAS_LOADED[$index]=0
+  fi
+done
+
+restore_previous_installation() {
+  local index name target restored_all=true
+  set +e
+
+  if [ "$SERVICES_TOUCHED" = true ]; then
+    for index in "${!NAMES[@]}"; do
+      name="${NAMES[$index]}"
+      launchctl bootout "gui/$(id -u)/${name%.plist}" >/dev/null 2>&1
+    done
+  fi
+
+  for index in "${!NAMES[@]}"; do
+    name="${NAMES[$index]}"
+    target="$AGENTS/$name"
+    if [ "${EXISTED[$index]}" -eq 1 ]; then
+      cp "$WORK_DIR/$name.previous" "$target.restore" && \
+        chmod 0600 "$target.restore" && mv -f "$target.restore" "$target" || restored_all=false
+    else
+      rm -f "$target"
+    fi
+  done
+
+  if [ "$SERVICES_TOUCHED" = true ]; then
+    for index in "${!NAMES[@]}"; do
+      if [ "${WAS_LOADED[$index]}" -eq 1 ]; then
+        name="${NAMES[$index]}"
+        target="$AGENTS/$name"
+        if launchctl bootstrap "gui/$(id -u)" "$target" >/dev/null 2>&1; then
+          launchctl print "gui/$(id -u)/${name%.plist}" >/dev/null 2>&1 || restored_all=false
+        else
+          restored_all=false
+        fi
+      fi
+    done
+  fi
+
+  if [ "$restored_all" != true ]; then
+    fail "Automatic rollback was incomplete; inspect $AGENTS before retrying."
+  fi
+  set -e
+}
+
+publish_rendered_plists() {
+  local index name target staged
+  for index in "${!NAMES[@]}"; do
+    name="${NAMES[$index]}"
+    target="$AGENTS/$name"
+    staged="$target.openmurmur.$$"
+    if ! cp "$WORK_DIR/$name" "$staged" || \
+      ! chmod 0600 "$staged" || ! mv -f "$staged" "$target"; then
+      rm -f "$staged"
+      return 1
+    fi
+  done
+}
+
+DAEMON_HEALTH_ATTEMPTS=20
+DAEMON_HEALTH_LAST="not attempted"
+
+probe_daemon_health() {
+  local attempt=1
+  local output validation
+
+  while [ "$attempt" -le "$DAEMON_HEALTH_ATTEMPTS" ]; do
+    if output="$("$NODE_BIN" "$REPO/src/cli/main.ts" status --root "$STATE_ROOT" --json 2>&1)"; then
+      if validation="$("$NODE_BIN" --input-type=module - "$output" 2>&1 <<'NODE'
+let status;
+try {
+  status = JSON.parse(process.argv[2]);
+} catch {
+  process.stderr.write('status command returned invalid JSON');
+  process.exit(1);
+}
+
+const problems = [];
+if (status.daemon !== 'running' || !Number.isInteger(status.pid) || status.pid <= 0) {
+  problems.push('daemon identity is not running');
+}
+if (status.heartbeatStatus !== 'fresh') {
+  problems.push(`heartbeat is ${String(status.heartbeatStatus ?? 'missing')}`);
+}
+if (status.recorderRunning !== true) {
+  problems.push('recorder is not running');
+}
+if (
+  typeof status.lastSourceFrameAgeMs !== 'number' ||
+  !Number.isFinite(status.lastSourceFrameAgeMs) ||
+  status.lastSourceFrameAgeMs < 0
+) {
+  problems.push('no audio frame has been observed');
+}
+
+if (problems.length > 0) {
+  process.stderr.write(problems.join('; '));
+  process.exit(1);
+}
+NODE
+      )"; then
+        DAEMON_HEALTH_LAST="ready"
+        return 0
+      fi
+      DAEMON_HEALTH_LAST="$validation"
+    else
+      DAEMON_HEALTH_LAST="status command failed: $output"
+    fi
+
+    attempt=$((attempt + 1))
+    if [ "$attempt" -le "$DAEMON_HEALTH_ATTEMPTS" ]; then sleep 1; fi
+  done
+  return 1
+}
+
+if ! publish_rendered_plists; then
+  restore_previous_installation
+  die "Could not publish the rendered plists; the previous files were restored."
+fi
+
+SERVICES_TOUCHED=true
+for index in "${!NAMES[@]}"; do
+  if [ "${WAS_LOADED[$index]}" -eq 1 ]; then
+    name="${NAMES[$index]}"
+    if ! launchctl bootout "gui/$(id -u)/${name%.plist}"; then
+      restore_previous_installation
+      die "Could not unload $name; the previous installation was restored."
+    fi
+  fi
+done
+
+for index in "${!NAMES[@]}"; do
+  name="${NAMES[$index]}"
+  target="$AGENTS/$name"
+  if ! launchctl bootstrap "gui/$(id -u)" "$target"; then
+    restore_previous_installation
+    die "Could not load $name; the previous installation was restored where possible."
+  fi
+  if ! launchctl print "gui/$(id -u)/${name%.plist}" >/dev/null 2>&1; then
+    restore_previous_installation
+    die "launchctl accepted $name but ${name%.plist} is not registered; the previous installation was restored where possible."
+  fi
+  ok "$name registered"
+done
+
+if ! probe_daemon_health; then
+  restore_previous_installation
+  die "Daemon readiness failed after registration: $DAEMON_HEALTH_LAST; the previous installation was restored where possible."
+fi
+ok "daemon heartbeat is fresh and audio frames are arriving"
 
 echo
 bold "Installed. Check status with:"
+echo "  ./scripts/install-launch-agents --check --root \"$STATE_ROOT\""
 echo "  launchctl print gui/$(id -u)/io.openmurmur.daemon"
-echo "  openmurmur status"
-echo "  tail -f ~/Library/Application\\ Support/OpenMurmur/logs/daemon.err.log"
+echo "  pnpm openmurmur --root \"$STATE_ROOT\" status"
+echo "  tail -f \"$STATE_ROOT/logs/daemon.err.log\""
