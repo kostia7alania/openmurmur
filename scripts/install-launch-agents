@@ -8,6 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$(pwd -P)"
 AGENTS="$HOME/Library/LaunchAgents"
+SERVICE_DOMAIN="gui/$(id -u)"
 RUNTIME_CONTRACT="$REPO/runtime-requirements.json"
 
 CHECK_ONLY=false
@@ -168,7 +169,16 @@ NODE
 
 TMP_BASE="${TMPDIR:-/tmp}"
 WORK_DIR="$(mktemp -d "$TMP_BASE/openmurmur-launchd.XXXXXX")"
-trap 'rm -rf "$WORK_DIR"' EXIT
+PRESERVE_WORK_DIR=false
+
+cleanup_work_dir() {
+  if [ "$PRESERVE_WORK_DIR" = true ]; then
+    fail "Rollback evidence and previous plists were kept at $WORK_DIR."
+  else
+    rm -rf "$WORK_DIR"
+  fi
+}
+trap cleanup_work_dir EXIT
 
 NAMES=(
   "io.openmurmur.daemon.plist"
@@ -262,7 +272,7 @@ check_installation() {
       fi
     fi
 
-    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    if launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
       ok "$label is registered"
     else
       fail "$label is not registered with launchd"
@@ -312,21 +322,45 @@ for index in "${!NAMES[@]}"; do
   else
     EXISTED[$index]=0
   fi
-  if launchctl print "gui/$(id -u)/${name%.plist}" >/dev/null 2>&1; then
+  if launchctl print "$SERVICE_DOMAIN/${name%.plist}" >/dev/null 2>&1; then
     WAS_LOADED[$index]=1
   else
     WAS_LOADED[$index]=0
   fi
 done
 
+SERVICE_UNREGISTER_ATTEMPTS=100
+SERVICE_UNREGISTER_DELAY_SECONDS=0.1
+
+wait_until_unregistered() {
+  local label="$1"
+  local attempt=1
+
+  while launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; do
+    if [ "$attempt" -ge "$SERVICE_UNREGISTER_ATTEMPTS" ]; then return 1; fi
+    attempt=$((attempt + 1))
+    sleep "$SERVICE_UNREGISTER_DELAY_SECONDS"
+  done
+}
+
 restore_previous_installation() {
-  local index name target restored_all=true
+  local index name target label restored_all=true
   set +e
 
   if [ "$SERVICES_TOUCHED" = true ]; then
     for index in "${!NAMES[@]}"; do
       name="${NAMES[$index]}"
-      launchctl bootout "gui/$(id -u)/${name%.plist}" >/dev/null 2>&1
+      label="${name%.plist}"
+      if launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+        if ! launchctl bootout "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+          fail "Rollback could not unload $label."
+          restored_all=false
+        fi
+      fi
+      if ! wait_until_unregistered "$label"; then
+        fail "Rollback timed out waiting for $label to leave launchd."
+        restored_all=false
+      fi
     done
   fi
 
@@ -341,13 +375,13 @@ restore_previous_installation() {
     fi
   done
 
-  if [ "$SERVICES_TOUCHED" = true ]; then
+  if [ "$SERVICES_TOUCHED" = true ] && [ "$restored_all" = true ]; then
     for index in "${!NAMES[@]}"; do
       if [ "${WAS_LOADED[$index]}" -eq 1 ]; then
         name="${NAMES[$index]}"
         target="$AGENTS/$name"
-        if launchctl bootstrap "gui/$(id -u)" "$target" >/dev/null 2>&1; then
-          launchctl print "gui/$(id -u)/${name%.plist}" >/dev/null 2>&1 || restored_all=false
+        if launchctl bootstrap "$SERVICE_DOMAIN" "$target" >/dev/null 2>&1; then
+          launchctl print "$SERVICE_DOMAIN/${name%.plist}" >/dev/null 2>&1 || restored_all=false
         else
           restored_all=false
         fi
@@ -356,7 +390,8 @@ restore_previous_installation() {
   fi
 
   if [ "$restored_all" != true ]; then
-    fail "Automatic rollback was incomplete; inspect $AGENTS before retrying."
+    PRESERVE_WORK_DIR=true
+    fail "Automatic rollback was incomplete; inspect $AGENTS and $WORK_DIR before retrying."
   fi
   set -e
 }
@@ -440,9 +475,14 @@ SERVICES_TOUCHED=true
 for index in "${!NAMES[@]}"; do
   if [ "${WAS_LOADED[$index]}" -eq 1 ]; then
     name="${NAMES[$index]}"
-    if ! launchctl bootout "gui/$(id -u)/${name%.plist}"; then
+    label="${name%.plist}"
+    if ! launchctl bootout "$SERVICE_DOMAIN/$label"; then
       restore_previous_installation
       die "Could not unload $name; the previous installation was restored."
+    fi
+    if ! wait_until_unregistered "$label"; then
+      restore_previous_installation
+      die "Timed out waiting for $label to leave launchd after bootout; the previous installation was restored where possible."
     fi
   fi
 done
@@ -450,11 +490,11 @@ done
 for index in "${!NAMES[@]}"; do
   name="${NAMES[$index]}"
   target="$AGENTS/$name"
-  if ! launchctl bootstrap "gui/$(id -u)" "$target"; then
+  if ! launchctl bootstrap "$SERVICE_DOMAIN" "$target"; then
     restore_previous_installation
     die "Could not load $name; the previous installation was restored where possible."
   fi
-  if ! launchctl print "gui/$(id -u)/${name%.plist}" >/dev/null 2>&1; then
+  if ! launchctl print "$SERVICE_DOMAIN/${name%.plist}" >/dev/null 2>&1; then
     restore_previous_installation
     die "launchctl accepted $name but ${name%.plist} is not registered; the previous installation was restored where possible."
   fi

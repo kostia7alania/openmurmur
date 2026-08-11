@@ -75,6 +75,7 @@ function runCheck(
 function prepareLaunchctlHealthMocks(
   home: string,
   healthStatus: Record<string, unknown>,
+  unregisterDelayPolls = 0,
 ): {
   readonly bin: string;
   readonly launchLog: string;
@@ -108,13 +109,44 @@ function prepareLaunchctlHealthMocks(
   chmodSync(node, 0o700);
 
   const launchctl = join(bin, 'launchctl');
+  const launchState = join(home, 'launch-state');
+  mkdirSync(launchState);
+  for (const name of PLISTS) {
+    writeFileSync(join(launchState, name.replace(/\.plist$/, '')), 'loaded\n');
+  }
   writeFileSync(
     launchctl,
     [
       '#!/bin/sh',
       `printf '%s\\n' "$*" >> "${launchLog}"`,
       'case "$1" in',
-      '  print|bootstrap|bootout) exit 0 ;;',
+      '  print)',
+      `    label="\${2##*/}"`,
+      `    state="$(/bin/cat "${launchState}/$label" 2>/dev/null || printf absent)"`,
+      '    if [ "$state" = "loaded" ]; then exit 0; fi',
+      '    if [ "$state" = "removing" ]; then',
+      `      remaining="$(/bin/cat "${launchState}/$label.remaining")"`,
+      '      if [ "$remaining" -gt 0 ]; then',
+      `        printf '%s\\n' "$((remaining - 1))" > "${launchState}/$label.remaining"`,
+      '        exit 0',
+      '      fi',
+      `      printf 'absent\\n' > "${launchState}/$label"`,
+      '    fi',
+      '    exit 1',
+      '    ;;',
+      '  bootout)',
+      `    label="\${2##*/}"`,
+      `    printf 'removing\\n' > "${launchState}/$label"`,
+      `    printf '%s\\n' "${unregisterDelayPolls}" > "${launchState}/$label.remaining"`,
+      '    exit 0',
+      '    ;;',
+      '  bootstrap)',
+      `    label="\${3##*/}"`,
+      `    label="\${label%.plist}"`,
+      `    [ "$(/bin/cat "${launchState}/$label" 2>/dev/null)" = "absent" ] || exit 37`,
+      `    printf 'loaded\\n' > "${launchState}/$label"`,
+      '    exit 0',
+      '    ;;',
       'esac',
       'exit 2',
       '',
@@ -237,18 +269,34 @@ describe('launch agent installation check', () => {
       );
       const mockBin = join(home, 'mock-bin');
       const failedOnce = join(home, 'bootstrap-failed-once');
+      const launchState = join(home, 'rollback-launch-state');
       mkdirSync(mockBin);
+      mkdirSync(launchState);
+      for (const name of PLISTS) {
+        writeFileSync(join(launchState, name.replace(/\.plist$/, '')), 'loaded\n');
+      }
       const launchctl = join(mockBin, 'launchctl');
       writeFileSync(
         launchctl,
         [
           '#!/bin/sh',
           'case "$1" in',
-          '  print|bootout) exit 0 ;;',
+          '  print)',
+          `    label="\${2##*/}"`,
+          `    [ "$(/bin/cat "${launchState}/$label" 2>/dev/null)" = "loaded" ]`,
+          '    ;;',
+          '  bootout)',
+          `    label="\${2##*/}"`,
+          `    printf 'absent\\n' > "${launchState}/$label"`,
+          '    exit 0',
+          '    ;;',
           '  bootstrap)',
+          `    label="\${3##*/}"`,
+          `    label="\${label%.plist}"`,
           '    case "$3" in',
           `      *io.openmurmur.digest.plist) if [ ! -e "${failedOnce}" ]; then touch "${failedOnce}"; exit 1; fi ;;`,
           '    esac',
+          `    printf 'loaded\\n' > "${launchState}/$label"`,
           '    exit 0',
           '    ;;',
           'esac',
@@ -298,8 +346,13 @@ describe('launch agent installation check', () => {
       );
 
       const mockBin = join(home, 'mock-bin');
-      const printCount = join(home, 'print-count');
+      const launchState = join(home, 'registration-launch-state');
+      const skippedRegistration = join(home, 'skipped-registration');
       mkdirSync(mockBin);
+      mkdirSync(launchState);
+      for (const name of PLISTS) {
+        writeFileSync(join(launchState, name.replace(/\.plist$/, '')), 'loaded\n');
+      }
       const launchctl = join(mockBin, 'launchctl');
       writeFileSync(
         launchctl,
@@ -307,14 +360,24 @@ describe('launch agent installation check', () => {
           '#!/bin/sh',
           'case "$1" in',
           '  print)',
-          '    count=0',
-          `    [ ! -f "${printCount}" ] || count="$(/bin/cat "${printCount}")"`,
-          '    count=$((count + 1))',
-          `    printf '%s\\n' "$count" > "${printCount}"`,
-          '    [ "$count" -ne 4 ] || exit 1',
+          `    label="\${2##*/}"`,
+          `    [ "$(/bin/cat "${launchState}/$label" 2>/dev/null)" = "loaded" ]`,
+          '    ;;',
+          '  bootout)',
+          `    label="\${2##*/}"`,
+          `    printf 'absent\\n' > "${launchState}/$label"`,
           '    exit 0',
           '    ;;',
-          '  bootstrap|bootout) exit 0 ;;',
+          '  bootstrap)',
+          `    label="\${3##*/}"`,
+          `    label="\${label%.plist}"`,
+          `    if [ "$label" = "io.openmurmur.digest" ] && [ ! -e "${skippedRegistration}" ]; then`,
+          `      touch "${skippedRegistration}"`,
+          '      exit 0',
+          '    fi',
+          `    printf 'loaded\\n' > "${launchState}/$label"`,
+          '    exit 0',
+          '    ;;',
           'esac',
           'exit 2',
           '',
@@ -335,7 +398,6 @@ describe('launch agent installation check', () => {
 
       assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
       assert.match(result.stderr, /is not registered; the previous installation was restored/);
-      assert.equal(readFileSync(printCount, 'utf8').trim(), '6');
       for (const [name, content] of previous) {
         assert.equal(readFileSync(join(agents, name), 'utf8'), content, `${name} was not restored`);
       }
@@ -376,6 +438,56 @@ describe('launch agent installation check', () => {
         assert.match(
           readFileSync(join(home, 'Library', 'LaunchAgents', name), 'utf8'),
           /health-bin/,
+        );
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('waits for delayed launchd removal before bootstrapping replacements', () => {
+    const home = mkdtempSync(join(tmpdir(), 'om-launchd-delayed-bootout-'));
+    const stateRoot = join(home, 'state');
+    try {
+      renderInstalledPlists(home, stateRoot);
+      const mocks = prepareLaunchctlHealthMocks(
+        home,
+        {
+          daemon: 'running',
+          pid: 123,
+          heartbeatStatus: 'fresh',
+          recorderRunning: true,
+          lastSourceFrameAgeMs: 12,
+        },
+        2,
+      );
+
+      const result = spawnSync(
+        'bash',
+        [INSTALLER, '--yes', '--node', mocks.node, '--root', stateRoot],
+        {
+          cwd: REPO,
+          encoding: 'utf8',
+          env: { ...process.env, HOME: home, PATH: `${mocks.bin}:${process.env['PATH'] ?? ''}` },
+        },
+      );
+
+      assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+      const launchLines = readFileSync(mocks.launchLog, 'utf8').trim().split('\n');
+      for (const name of PLISTS) {
+        const label = name.replace(/\.plist$/, '');
+        const bootout = launchLines.findIndex(
+          (line) => line.startsWith('bootout ') && line.endsWith(`/${label}`),
+        );
+        const bootstrap = launchLines.findIndex(
+          (line) => line.startsWith('bootstrap ') && line.endsWith(`/${name}`),
+        );
+        assert.ok(bootout >= 0 && bootstrap > bootout, `${label} was not replaced in order`);
+        assert.ok(
+          launchLines
+            .slice(bootout + 1, bootstrap)
+            .filter((line) => line.startsWith('print ') && line.endsWith(`/${label}`)).length >= 3,
+          `${label} bootstrap did not wait for delayed removal`,
         );
       }
     } finally {
