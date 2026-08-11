@@ -316,6 +316,26 @@ This closes D071 at the independent production scheduler-command, timezone,
 atomic enqueue and replay boundary. It does not prove a real launchd wake,
 login/reboot scheduling or Telegram delivery; those remain D070, D098 and D122.
 
+### Disposable real launchctl rollback — 2026-08-12
+
+A one-use `0700` root under `/private/tmp` and a cryptographically unique
+`io.openmurmur.d065.*` label exercised the real `gui/502` launchd domain without
+touching either installed OpenMurmur service. An old harmless `/bin/sleep`
+LaunchAgent was registered and removed; a collision generation then occupied
+the same label, making the candidate `launchctl bootstrap` fail with exit 5.
+The rollback removed that generation, waited for label absence, restored the
+old plist byte-for-byte and registered it again. The restored plist SHA-256
+matched the original, and `launchctl print` showed the original `old` generation.
+
+Before/after SHA-256 manifests for the installed OpenMurmur daemon and digest
+plists were identical. The disposable label was booted out at the end and a
+fresh `launchctl print` returned not-found. An independent read-only audit
+rechecked root/file modes, plist validity, candidate failure, old/collision/
+restored generation facts, byte equality, production-plist equality and final
+absence. This closes D065's real launchctl failure/restore boundary. It does not
+apply the current OpenMurmur services, prove native capture readiness, or cover
+login/reboot; those remain D069, D121 and D122.
+
 ### Current-revision Ollama corpus — 2026-08-11
 
 The production `OllamaLlm` ran the checked-in single-language RU/EN/TH
