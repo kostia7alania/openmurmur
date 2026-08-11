@@ -344,6 +344,38 @@ offline slice is recorded on the item itself below.
 
 ### Current UX slice
 
+#### UX-00 ⬜ Guard ASR Auto against unsupported language drift
+
+- **Severity:** P0 · **Epic:** ASR reliability · **Estimate:** M · **Release:**
+  next repair release
+- **User value:** A long RU/TH/EN/ZH recording is not lost because Auto language
+  identification briefly drifts into Japanese or another unsupported language.
+- **Context:** A real incoming `#job9` voice exhausted all attempts after
+  Qwen's Auto path entered Japanese tokenization and the optional `nagisa`
+  dependency was missing. The product's practical language set is Russian,
+  Thai, English and Chinese; occasional foreign words must not turn the whole
+  job into a dead request.
+- **Scope:** Treat Auto language detection as untrusted. Keep Auto as a mode,
+  but bound its failure surface: install or document the optional tokenizer
+  dependency needed by the current model path, surface unsupported-language
+  errors as actionable ASR failures, and add a deterministic retry/correction
+  path so a dead incoming job can be rerun with one forced language (`ru`,
+  `th`, `en` or `zh`) instead of repeating the same Auto failure.
+- **Non-goals:** A fake multi-language priority list for Qwen; silently editing
+  transcript text; guessing Japanese/Korean/etc. as supported product
+  languages; cloud fallback.
+- **Acceptance:** A single foreign word in otherwise RU/TH/EN/ZH speech does
+  not make the job terminal; Auto choosing an unsupported language produces a
+  bounded operator-visible diagnosis; retrying the failed incoming job with a
+  forced supported language does not reuse the stale Auto failure; transcript
+  language metadata still distinguishes model claim, observed scripts and
+  forced mode.
+- **Tests:** Unit coverage for unsupported-language/optional-dependency error
+  classification; job retry snapshot proving forced language replaces Auto for
+  the selected retry; regression fixture for the `nagisa` failure message;
+  language reconciliation showing one stray foreign token does not add a new
+  product language.
+
 #### UX-01 🟡 Honest session lifecycle notifications
 
 - **Severity:** P0 · **Epic:** Recorder UX · **Estimate:** M · **Release:** next
