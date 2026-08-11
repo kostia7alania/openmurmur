@@ -341,6 +341,7 @@ pnpm openmurmur jobs failed         # show exhausted jobs and their causes
 pnpm openmurmur jobs retry JOB_ID   # retry one job after fixing its cause
 pnpm openmurmur telegram test       # send a test message
 pnpm openmurmur telegram poll       # poll once and show routing decisions
+pnpm openmurmur recall QUERY         # recall grounded sessions with provenance
 pnpm openmurmur search TEXT         # search every stored transcript
 pnpm openmurmur transcribe FILE     # transcribe one file locally
 pnpm openmurmur digest 2026-07-29   # build, queue and print a daily digest
@@ -429,7 +430,7 @@ Neither needs a microphone, a model, or a network.
 
 Honesty matters more than a green badge, so:
 
-**Verified on this revision by 459 offline TypeScript tests (90 suites) and 36
+**Verified on this revision by 486 offline TypeScript tests (94 suites) and 36
 Python tests:**
 sessionizer state machine with a fake clock, pre-roll,
 60-second close, 15-minute rotation, bounded capture ingress and sleep epochs,
@@ -440,10 +441,12 @@ recycling and crash recovery, actionable failed-job diagnostics and retry,
 outbox idempotency, 429 handling, Telegram endpoint confinement, metadata-only
 Keychain readiness, fail-closed local status heartbeats, daemon PID birth
 identity, launchd drift/readiness/rollback checks, crash recovery after a
-published-part database fault, stable Russian failure boundaries, HTML
-escaping, Unicode splitting, path traversal, chat allowlisting, update
-deduplication, secret redaction, prompt-injection fencing, health deduplication
-and migrations.
+published-part database fault, proof-based stale split cleanup, incoming
+transcript-ACK retention clocks, stable Russian failure boundaries, HTML
+entity-aware Telegram limits, Unicode splitting, grounded recall with
+session/time/source-audio provenance, path traversal, chat allowlisting,
+update deduplication, secret redaction, prompt-injection fencing, health
+deduplication and migrations.
 Model-facing automated tests use fake adapters and do not download weights.
 
 [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records earlier same-machine

@@ -208,6 +208,13 @@ NULL on legacy rows and are displayed as unknown rather than backfilled.
 `state`: `received` → `downloaded` → `validated` → `transcribed` → `delivered`,
 or `rejected` / `failed`.
 
+`delivered_at` is the last Telegram acknowledgement in one exact, contiguous
+incoming-transcript manifest. Every row must be sent and have the expected text
+payload; exactly the final row carries the settings keyboard. Missing or
+ambiguous legacy proof leaves this field NULL and therefore blocks retention.
+Once a delivery manifest exists, its current transcript revision cannot be
+superseded, so an acknowledgement cannot become evidence for different text.
+
 ### `alert_state`
 
 One row per alert identity. Proactive Telegram messages are sent when `active`
@@ -254,6 +261,8 @@ by tests.
    idempotent work keys.
 10. `deleted_at` is set only after `rm` succeeded.
 11. All timestamps are UTC.
+12. Incoming-audio retention starts only from a complete transcript-manifest
+    acknowledgement; NULL or ambiguous delivery time retains the source file.
 
 ## Retention eligibility
 
