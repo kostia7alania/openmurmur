@@ -468,7 +468,7 @@ async function captureAuthorize(): Promise<number> {
       settled = true;
       resolve(code);
     };
-    const child = spawn('/usr/bin/open', ['-W', app, '--args', '--authorize'], {
+    const child = spawn('/usr/bin/open', [app, '--args', '--authorize'], {
       stdio: 'inherit',
     });
     child.once('error', (error) => {
@@ -480,7 +480,7 @@ async function captureAuthorize(): Promise<number> {
       if (code === 0) finish(0);
       else {
         process.stderr.write(
-          `The authorization flow did not finish normally (${signal ?? `exit ${code}`}).\n`,
+          `The GUI launcher did not finish normally (${signal ?? `exit ${code}`}).\n`,
         );
         finish(1);
       }
@@ -488,7 +488,7 @@ async function captureAuthorize(): Promise<number> {
   });
   if (exitCode === 0) {
     process.stdout.write(
-      'Authorization flow closed. Set audio.captureBackend to "native", then prove real PCM with: pnpm openmurmur capture test\n',
+      'The GUI authorization flow was opened. Decide in macOS, then set audio.captureBackend to "native" and check the result with: pnpm openmurmur capture test\n',
     );
   }
   return exitCode;
