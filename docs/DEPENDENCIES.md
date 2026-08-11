@@ -153,6 +153,30 @@ permanent test fixture or network, microphone, Telegram credential or user
 recording. It does **not** prove the complete long-running daemon service,
 capture-to-delivery path or release gates D120–D122.
 
+### Real daemon-owned worker reuse — 2026-08-12
+
+A second private-root rehearsal instantiated the production `Daemon` itself,
+not only its exported pipeline components. The recorder stayed alive on local
+synthetic silence through the explicit energy VAD, Telegram secrets were a
+null injected provider, the LLM was the explicit fake backend, and two
+pre-seeded finalized sessions contained only locally synthesized English
+speech. The ASR backend remained real MLX/Qwen with the same enforced offline
+environment.
+
+The daemon acquired its SQLite singleton ownership and PID mirror, then its
+ordinary ASR timer claimed both jobs eight seconds apart. Each completed at
+attempt 1 with exactly one non-empty current revision. The same Python PID was
+observed after both jobs, proving the daemon reused its one loaded worker
+generation instead of constructing a backend per job. Both source hashes were
+unchanged. Orderly `Daemon.stop()` reaped the worker, cleared all leases,
+released the exact SQLite ownership row and removed its PID mirror; SQLite
+integrity remained `ok` with zero foreign-key violations.
+
+This closes D039 and D086 at their daemon-owned real-model boundary. The
+rehearsal did not use a microphone, Telegram, network, launchd, login/reboot or
+sleep/wake, and it did not turn the synthetic capture stream into the seeded
+sessions. Those complete capture-to-delivery and release gates remain live.
+
 ### Current-revision Ollama corpus — 2026-08-11
 
 The production `OllamaLlm` ran the checked-in single-language RU/EN/TH

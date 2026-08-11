@@ -487,7 +487,7 @@ Honesty matters more than a green badge, so:
 | Evidence level | Current authoritative evidence | Boundary it does **not** cross |
 | --- | --- | --- |
 | Offline automated | The exact current-revision Node and Python gate is recorded immediately below; every covered guarantee names deterministic repository tests. | No microphone, model weights, Telegram credential, Keychain mutation, launchd login session or sleep/wake cycle is exercised. |
-| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama runs, including real-Qwen CLI transcription, a real MLX worker-death `JobQueue` retry, and the RU/EN/TH summary corpus. | The Ollama corpus did not meet its acceptance threshold; these bounded runs are not the complete long-running daemon or current-revision live release evidence. |
+| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama runs, including real-Qwen CLI transcription, daemon-owned worker reuse, a real worker-death `JobQueue` retry, and the RU/EN/TH summary corpus. | The Ollama corpus did not meet its acceptance threshold; these bounded runs are not the complete capture-to-delivery or current-revision live release evidence. |
 | Live release | No current-revision end-to-end live run is recorded yet; D120–D122 in [`docs/MVP_123.md`](docs/MVP_123.md) are the required gates. | Until those rows are evidenced, the project does not claim real microphone → models → Telegram, launchd login/reboot or sleep/wake verification. |
 
 **Verified on this revision through offline TypeScript/Python checks and the
@@ -497,8 +497,9 @@ sessionizer state machine with a fake clock, pre-roll,
 unexpected clean capture-EOF handling,
 atomic FLAC and Markdown publication, lossless splitting, ffprobe validation of
 real media, staged audio-first delivery, delivery-clock retention proofs,
-lifecycle-status ordering, transcript revisions, job leases, real MLX worker
-death/retry, worker timeout recycling and a three-boundary real-SIGKILL recovery matrix, actionable
+lifecycle-status ordering, transcript revisions, job leases, real daemon-owned
+MLX reuse and worker death/retry, worker timeout recycling and a three-boundary
+real-SIGKILL recovery matrix, actionable
 failed-job diagnostics and retry,
 outbox idempotency, 429 handling, Telegram endpoint confinement, metadata-only
 Keychain readiness, fail-closed local status heartbeats, daemon PID birth
@@ -518,10 +519,11 @@ Model-facing automated tests use fake adapters and do not download weights.
 the pinned MLX/Qwen, Silero and Ollama dependencies. On this revision the real
 Qwen CLI path recognized local synthetic speech, and a killed Python worker
 converged through the production ASR job lease/failure/retry path without a
-stale transcript, outbox row, downstream job or duplicate revision. The real
-single-language Ollama corpus also exposed an output-language defect and
-verified its narrow RU/EN/TH prompt fix, but remains below its summary
-acceptance target.
+stale transcript, outbox row, downstream job or duplicate revision. A bounded
+live `Daemon` also processed two real Qwen jobs on one observed Python
+generation and reaped it on stop. The real single-language Ollama corpus also
+exposed an output-language defect and verified its narrow RU/EN/TH prompt fix,
+but remains below its summary acceptance target.
 That is useful bounded product evidence, but it is not the complete daemon
 service. **Still not verified end-to-end on this revision:** live microphone
 capture through the long-running daemon, real Telegram delivery, launchd under
