@@ -323,8 +323,10 @@ pnpm openmurmur start
 
 Wait until the log says `first audio frame received`, then speak for more than
 3 seconds. Stop talking and wait for 60 seconds of silence. Telegram should
-receive the source FLAC first, then the transcript, then the report. `Ctrl-C`
-stops the daemon and finalizes whatever was recording.
+receive the source FLAC first, then the transcript, then the report on the
+no-retry happy path. A delayed audio retry does not block a transcript or report
+that is already ready. `Ctrl-C` stops the daemon and finalizes whatever was
+recording.
 
 The first transcription loads the already-provisioned Qwen3-ASR snapshot from
 disk, so it is slower than later sessions. The model then stays resident and a

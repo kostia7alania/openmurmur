@@ -136,7 +136,10 @@ pnpm openmurmur start
 
 Keep that terminal open. After the log says `first audio frame received`, speak
 for more than 3 seconds, then stop and wait for 60 seconds of silence. Telegram
-should receive the source FLAC first, then the transcript, then the report.
+should receive the source FLAC first, then the transcript, then the report on
+the no-retry happy path. A delayed audio retry does not block a transcript or
+report that is already ready; the exact durable queue contract is documented in
+[Telegram delivery stages](docs/TELEGRAM.md#delivery-stages-and-queue-order).
 
 In another terminal:
 
