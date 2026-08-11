@@ -142,11 +142,17 @@ the prompt contract, all three single-language summaries used the requested
 language, carried bounded source-segment references and hit none of the corpus's forbidden facts.
 The final three calls took 10.129 s, 9.026 s and 7.762 s.
 
-The model still did **not** meet the checked-in acceptance threshold: exact
-claim recall was 50%, exact claim precision was 39.1%, and 0/3 cases passed.
-Most misses were grounded paraphrases, but the model also duplicated a task as
-a commitment and categorized an open question as an idea. D108 therefore
-remains partial rather than being presented as accepted model quality.
+The model still did **not** meet the checked-in exact-claim acceptance threshold.
+A fresh run after adding a single-home field contract produced 50% exact recall,
+50% exact precision, zero forbidden facts and 0/3 passing cases; the three calls
+took 7.627 s, 8.134 s and 7.889 s. In that run every list fact used its intended
+semantic field without task/commitment duplication or treating Acme as a place,
+and EN/TH carried claim-level source references. Most exact misses were grounded
+paraphrases or punctuation differences, but the RU summary also strengthened an
+assigned task into a promise. A further RU-only repeat varied wording and again
+classified budget context as a decision. The taxonomy prompt improves the common
+shape but is not a stable proof of the 80% recall/100% precision target. D108
+therefore remains partial rather than being presented as accepted model quality.
 The repository default model tag, mixed-language summaries and unknown language
 labels were not live-quality-tested by this corpus.
 

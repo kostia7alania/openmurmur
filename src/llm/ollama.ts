@@ -49,6 +49,22 @@ Rules:
   claimEvidence segment reference. Never invent a segment index.
 - Put anything you are unsure about — misheard names, unclear numbers, ambiguous
   references — in "uncertainties" rather than stating it as fact.
+- Give each event or fact one best list field; do not duplicate it across lists.
+  "tasks" are assigned future actions. "commitments" are only explicit personal
+  promises, never a copy of a task. "decisions" are choices that were actually
+  made. Monetary context is not itself a decision unless the transcript
+  explicitly says that an amount was chosen or approved. "expenses" are monetary
+  facts. "ideas" are explicit unaccepted proposals, never questions. "questions"
+  are explicit open questions, even when the transcript phrases them as
+  "whether" or an equivalent indirect question. "people" contains human names
+  only. "places" contains physical or geographic locations only, never companies,
+  customers or products. Entity lists do not count as duplicating the fact that
+  mentions them.
+- Preserve names, dates, amounts and the key nouns that identify each fact.
+- Keep "summary" to a short synthesis; do not copy the transcript or strengthen
+  a task into a promise or a proposal into a decision.
+- For every non-empty summary or list claim supported by a numbered segment,
+  include its field, zero-based item and source segment in "claimEvidence".
 - Leave a list empty when the transcript contains nothing for it.`;
 
 const TRANSCRIPT_OPEN = '<<<TRANSCRIPT_BEGIN>>>';
