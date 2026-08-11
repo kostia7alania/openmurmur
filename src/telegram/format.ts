@@ -13,6 +13,10 @@ import { speakerLabel } from '../asr/speakers.ts';
 
 /** Telegram's hard limit for a single text message. */
 export const TELEGRAM_MESSAGE_LIMIT = 4096;
+/** Telegram's hard limit for a document caption. */
+export const TELEGRAM_CAPTION_LIMIT = 1024;
+/** Telegram's hard limit for callback-query notification text. */
+export const TELEGRAM_CALLBACK_QUERY_TEXT_LIMIT = 200;
 
 export function escapeHtml(text: string): string {
   return text

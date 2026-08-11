@@ -1,6 +1,11 @@
 import { openAsBlob } from 'node:fs';
 import { basename, isAbsolute } from 'node:path';
 import { redact } from '../logging/redact.ts';
+import {
+  TELEGRAM_CALLBACK_QUERY_TEXT_LIMIT,
+  TELEGRAM_CAPTION_LIMIT,
+  TELEGRAM_MESSAGE_LIMIT,
+} from './format.ts';
 
 /**
  * Thin client over the official Bot API using Node's built-in fetch.
@@ -55,6 +60,85 @@ function apiError(
   error.retryWithoutAttempt = retryWithoutAttempt;
   error.clientShutdown = clientShutdown;
   return error;
+}
+
+function assertTextLength(
+  method: string,
+  field: string,
+  value: string,
+  minimum: number,
+  maximum: number,
+  parseMode?: 'HTML',
+): void {
+  const length = telegramEntityTextLength(value, parseMode);
+  if (length >= minimum && length <= maximum) return;
+  throw apiError(
+    method,
+    `${field} is ${length} UTF-16 code units after entity parsing; ` +
+      `OpenMurmur allows ${minimum}-${maximum}`,
+    400,
+  );
+}
+
+function telegramEntityTextLength(value: string, parseMode?: 'HTML'): number {
+  if (parseMode !== 'HTML') return value.length;
+
+  let length = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === '<') {
+      const tagEnd = htmlTagEnd(value, index);
+      if (tagEnd !== null) {
+        index = tagEnd;
+        continue;
+      }
+    }
+
+    if (value[index] === '&') {
+      const entity = htmlEntityAt(value, index);
+      if (entity !== null) {
+        length += entity.codeUnits;
+        index += entity.sourceLength - 1;
+        continue;
+      }
+    }
+
+    length += 1;
+  }
+  return length;
+}
+
+function htmlEntityAt(
+  value: string,
+  start: number,
+): { readonly sourceLength: number; readonly codeUnits: number } | null {
+  const entity = /^&(amp|lt|gt|quot|#\d+|#x[0-9a-f]+);/i.exec(value.slice(start));
+  if (entity === null) return null;
+  const body = entity[1] ?? '';
+  if (!body.startsWith('#')) return { sourceLength: entity[0].length, codeUnits: 1 };
+
+  const hexadecimal = body[1]?.toLowerCase() === 'x';
+  const codePoint = Number.parseInt(body.slice(hexadecimal ? 2 : 1), hexadecimal ? 16 : 10);
+  return {
+    sourceLength: entity[0].length,
+    codeUnits: Number.isFinite(codePoint) && codePoint > 0xffff ? 2 : 1,
+  };
+}
+
+function htmlTagEnd(value: string, start: number): number | null {
+  let quote: '"' | "'" | null = null;
+  for (let index = start + 1; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote !== null) {
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === '>') return index;
+  }
+  return null;
 }
 
 interface ApiResponse<T> {
@@ -267,6 +351,7 @@ export class TelegramClient {
       replyMarkup?: TelegramInlineKeyboardMarkup;
     } = {},
   ): Promise<TelegramMessage> {
+    assertTextLength('sendMessage', 'text', text, 1, TELEGRAM_MESSAGE_LIMIT, options.parseMode);
     return this.#json<TelegramMessage>('sendMessage', {
       chat_id: chatId,
       text,
@@ -277,6 +362,9 @@ export class TelegramClient {
   }
 
   answerCallbackQuery(callbackQueryId: string, text?: string): Promise<true> {
+    if (text !== undefined) {
+      assertTextLength('answerCallbackQuery', 'text', text, 0, TELEGRAM_CALLBACK_QUERY_TEXT_LIMIT);
+    }
     return this.#json<true>('answerCallbackQuery', {
       callback_query_id: callbackQueryId,
       ...(text !== undefined ? { text } : {}),
@@ -289,6 +377,7 @@ export class TelegramClient {
     text: string,
     options: { parseMode?: 'HTML'; replyMarkup?: TelegramInlineKeyboardMarkup } = {},
   ): Promise<TelegramMessage | true> {
+    assertTextLength('editMessageText', 'text', text, 1, TELEGRAM_MESSAGE_LIMIT, options.parseMode);
     return this.#json<TelegramMessage | true>('editMessageText', {
       chat_id: chatId,
       message_id: messageId,
@@ -321,6 +410,16 @@ export class TelegramClient {
       replyMarkup?: TelegramInlineKeyboardMarkup;
     } = {},
   ): Promise<TelegramMessage> {
+    if (options.caption !== undefined) {
+      assertTextLength(
+        'sendDocument',
+        'caption',
+        options.caption,
+        0,
+        TELEGRAM_CAPTION_LIMIT,
+        options.parseMode,
+      );
+    }
     const form = new FormData();
     form.set('chat_id', String(chatId));
     if (options.caption !== undefined) form.set('caption', options.caption);

@@ -343,6 +343,25 @@ describe('outbox delivery', () => {
     );
   });
 
+  it('marks an over-limit local payload dead without calling Telegram', async () => {
+    const { fetch: impl, calls } = scriptedFetch([() => okMessage()]);
+    const d = deps(impl);
+    d.outbox.enqueue({
+      deliveryPartId: 'too-long',
+      kind: 'status',
+      ordinal: 0,
+      payload: { type: 'text', text: 'x'.repeat(4097) },
+    });
+
+    assert.equal(await drainOutbox(d), 0);
+    const row = db.handle
+      .prepare("SELECT state, last_error FROM telegram_outbox WHERE delivery_part_id = 'too-long'")
+      .get() as { state: string; last_error: string };
+    assert.equal(row.state, 'dead');
+    assert.match(row.last_error, /4097 UTF-16 code units/);
+    assert.deepEqual(calls, []);
+  });
+
   it('retries a 5xx', async () => {
     const { fetch: impl } = scriptedFetch([
       () =>
