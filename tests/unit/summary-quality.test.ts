@@ -3,8 +3,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { parseSummary, type StructuredSummary } from '../../src/llm/schema.ts';
+import { EMPTY_SUMMARY, parseSummary, type StructuredSummary } from '../../src/llm/schema.ts';
 import {
+  measureSummaryCase,
   measureSummaryCorpus,
   type SummaryAcceptanceCase,
   type SummaryAcceptanceCorpus,
@@ -51,11 +52,18 @@ describe('multilingual summary acceptance corpus', () => {
     });
   });
 
-  it('measures deterministic candidates at 100% recall and claim precision', () => {
+  it('matches grounded paraphrases one-to-one at 100% recall and claim precision', () => {
     const corpus = loadCorpus();
     const candidates = new Map(
       corpus.cases.map((testCase) => [testCase.id, parseSummary(testCase.candidateSummary)]),
     );
+    const english = candidates.get('en-customer-followup');
+    assert.ok(english);
+    candidates.set('en-customer-followup', {
+      ...english,
+      decisions: ['On Tuesday, the beta goes to Acme.'],
+      tasks: ['By Monday, Priya will email the installation guide.'],
+    });
 
     const measurement = measureSummaryCorpus(corpus, candidates);
     assert.equal(measurement.groundedFactsExpected, 18);
@@ -87,9 +95,46 @@ describe('multilingual summary acceptance corpus', () => {
     assert.equal(measurement.forbiddenFactHits, 1);
     assert.equal(measurement.cases.find((item) => item.id === 'en-customer-followup')?.pass, false);
     assert.equal(measurement.pass, false);
+
+    const thresholds = corpus.thresholds;
+    const ambiguousCase = {
+      id: 'ambiguous-duplicates',
+      languages: ['en'],
+      transcript: 'Ship beta Tuesday and review beta Wednesday.',
+      expectedFacts: [
+        { field: 'decisions' as const, claim: 'Ship beta Tuesday.', terms: ['beta'] },
+        { field: 'decisions' as const, claim: 'Review beta Wednesday.', terms: ['beta'] },
+      ],
+      forbiddenFacts: [],
+    };
+    assert.throws(
+      () => validateSummaryAcceptanceCorpus({ thresholds, cases: [ambiguousCase] }),
+      /ambiguous decisions term signatures/,
+    );
+
+    const distinctCase = {
+      ...ambiguousCase,
+      expectedFacts: [
+        { field: 'decisions' as const, claim: 'Ship beta Tuesday.', terms: ['beta'] },
+        {
+          field: 'decisions' as const,
+          claim: 'Review beta Wednesday.',
+          terms: ['beta', 'Wednesday'],
+        },
+      ],
+    };
+    const duplicateOutput = parseSummary({
+      ...EMPTY_SUMMARY,
+      decisions: ['Beta Wednesday.', 'Beta Wednesday.'],
+    });
+    const duplicateMeasurement = measureSummaryCase(distinctCase, duplicateOutput, thresholds);
+    assert.equal(duplicateMeasurement.groundedFactsFound, 1);
+    assert.equal(duplicateMeasurement.outputClaims, 2);
+    assert.equal(duplicateMeasurement.claimPrecision, 0.5);
+    assert.equal(duplicateMeasurement.pass, false);
   });
 
-  it('rejects transcript copying and invented claims absent from the allowed gold semantics', () => {
+  it('rejects invented claims even when a transcript copy preserves fact recall', () => {
     const corpus = loadCorpus();
     const candidates = new Map(
       corpus.cases.map((testCase) => [testCase.id, parseSummary(testCase.candidateSummary)]),
@@ -109,7 +154,7 @@ describe('multilingual summary acceptance corpus', () => {
     assert.ok(measuredEnglish);
     assert.ok(measuredEnglish.groundedFactRecall >= corpus.thresholds.minimumGroundedFactRecall);
     assert.equal(measuredEnglish.forbiddenFactHits, 0);
-    assert.equal(measuredEnglish.unlistedClaims, 2);
+    assert.equal(measuredEnglish.unlistedClaims, 1);
     assert.ok(measuredEnglish.claimPrecision < corpus.thresholds.minimumClaimPrecision);
     assert.equal(measuredEnglish.pass, false);
     assert.equal(measurement.pass, false);

@@ -14,7 +14,7 @@
         {
           "field": "summary",
           "claim": "Команда спланировала выпуск MVP и подготовку к запуску.",
-          "terms": ["MVP"]
+          "terms": ["MVP", "подготов"]
         },
         {
           "field": "decisions",

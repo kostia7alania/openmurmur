@@ -357,6 +357,30 @@ runner did not preserve its exact segment and duration inputs, and the tested
 The repository default model tag, mixed-language summaries and unknown language
 labels were not live-quality-tested by this corpus.
 
+On 2026-08-12 the corpus scorer was corrected before any further prompt change.
+The fixture had always validated per-fact grounded `terms`, but the scorer then
+ignored them and required the model to reproduce the complete canonical wording;
+grounded paraphrases and punctuation changes therefore counted as both a miss
+and an invention. The corrected scorer matches output claims one-to-one within
+the exact semantic field only when every grounded term is present. Duplicate
+output occurrences remain in the precision denominator, ambiguous gold term
+signatures are rejected, and the zero-forbidden-fact boundary is unchanged.
+
+With that frozen scorer, cloud-disabled Ollama and the same
+`qwen3.6:latest` digest, one fresh non-thinking RU → EN → TH run plus one RU
+repeat produced 18/18 grounded facts, 18/19 matched output claims, 94.7% claim
+precision, zero forbidden hits and 2/3 passing cases. EN and TH each passed at
+6/6 recall and 100% precision. Both RU calls were byte-identical at the
+structured-fact level and failed at 6/7 precision because the model added
+`Утвержден бюджет запуска — 50 000 рублей` to decisions even though the source
+only states the budget amount. Manual review also found strengthened wording in
+the RU synthesis (`Анна обязалась`, `Утвержден бюджет`), so the semantic scorer
+is not being treated as a substitute for modality review. Calls took 16.711 s
+(including cold load), 8.742 s, 8.322 s and 7.601 s with `temperature=0`,
+`think=false`, `contextTokens=32768` and one complete source segment. D108 stays
+partial: the corrected measurement removed test wording noise but preserved the
+real repeatable model defect.
+
 Silero's **segment-assembly logic** is separately covered by pure Python tests,
 which take a list of probabilities and need no model.
 

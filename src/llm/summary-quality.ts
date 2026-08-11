@@ -7,9 +7,9 @@ import {
 
 export interface ExpectedSummaryFact {
   readonly field: SummaryClaimField;
-  /** Exact normalized output claim accepted by the deterministic corpus. */
+  /** Human-readable canonical wording for the grounded fact. */
   readonly claim: string;
-  /** Every term must occur in both the accepted claim and its transcript. */
+  /** Every term must occur in the transcript, canonical wording and a matching output claim. */
   readonly terms: readonly string[];
 }
 
@@ -73,6 +73,52 @@ function fieldClaims(summary: StructuredSummary, field: SummaryClaimField): read
   return claims.filter((claim) => normalized(claim).length > 0);
 }
 
+interface OutputClaim {
+  readonly field: SummaryClaimField;
+  readonly normalized: string;
+}
+
+function outputClaims(summary: StructuredSummary): OutputClaim[] {
+  return SUMMARY_CLAIM_FIELDS.flatMap((field) =>
+    fieldClaims(summary, field).map((claim) => ({ field, normalized: normalized(claim) })),
+  );
+}
+
+function claimMatchesFact(claim: OutputClaim, fact: ExpectedSummaryFact): boolean {
+  return (
+    claim.field === fact.field &&
+    fact.terms.every((term) => claim.normalized.includes(normalized(term)))
+  );
+}
+
+/** Maximum one-to-one matching prevents one broad claim or duplicate claims from earning extra credit. */
+function matchedFacts(
+  claims: readonly OutputClaim[],
+  facts: readonly ExpectedSummaryFact[],
+): number {
+  const factOwners = new Map<number, number>();
+  const assign = (claimIndex: number, seenFacts: Set<number>): boolean => {
+    const claim = claims[claimIndex];
+    if (claim === undefined) return false;
+    for (const [factIndex, fact] of facts.entries()) {
+      if (seenFacts.has(factIndex) || !claimMatchesFact(claim, fact)) continue;
+      seenFacts.add(factIndex);
+      const owner = factOwners.get(factIndex);
+      if (owner === undefined || assign(owner, seenFacts)) {
+        factOwners.set(factIndex, claimIndex);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  let matched = 0;
+  for (const claimIndex of claims.keys()) {
+    if (assign(claimIndex, new Set())) matched += 1;
+  }
+  return matched;
+}
+
 function allClaimText(summary: StructuredSummary): string {
   return SUMMARY_CLAIM_FIELDS.map((field) => fieldText(summary, field)).join('\n');
 }
@@ -112,6 +158,7 @@ function validateAcceptanceCase(testCase: SummaryAcceptanceCase, ids: Set<string
   }
   const transcript = normalized(testCase.transcript);
   const factKeys = new Set<string>();
+  const factTermKeys = new Set<string>();
   for (const fact of testCase.expectedFacts) {
     const claim = normalized(fact.claim);
     const key = `${fact.field}:${claim}`;
@@ -122,8 +169,15 @@ function validateAcceptanceCase(testCase: SummaryAcceptanceCase, ids: Set<string
     if (fact.terms.length === 0) {
       throw new Error(`summary acceptance case ${testCase.id} has an empty fact`);
     }
+    const termKeys = new Set<string>();
     for (const term of fact.terms) {
       const normalizedTerm = normalized(term);
+      if (termKeys.has(normalizedTerm)) {
+        throw new Error(
+          `summary acceptance fact ${testCase.id}/${fact.field} has a duplicate term: ${term}`,
+        );
+      }
+      termKeys.add(normalizedTerm);
       if (
         normalizedTerm.length === 0 ||
         !transcript.includes(normalizedTerm) ||
@@ -134,6 +188,13 @@ function validateAcceptanceCase(testCase: SummaryAcceptanceCase, ids: Set<string
         );
       }
     }
+    const termKey = `${fact.field}:${[...termKeys].sort().join('\u0000')}`;
+    if (factTermKeys.has(termKey)) {
+      throw new Error(
+        `summary acceptance case ${testCase.id} has ambiguous ${fact.field} term signatures`,
+      );
+    }
+    factTermKeys.add(termKey);
   }
   if (testCase.forbiddenFacts.some((fact) => normalized(fact).length === 0)) {
     throw new Error(`summary acceptance case ${testCase.id} has an empty forbidden fact`);
@@ -153,20 +214,17 @@ export function measureSummaryCase(
   summary: StructuredSummary,
   thresholds: SummaryAcceptanceThresholds,
 ): SummaryCaseMeasurement {
-  const allowedClaims = new Set(
-    testCase.expectedFacts.map((fact) => `${fact.field}:${normalized(fact.claim)}`),
-  );
-  const outputClaimKeys = SUMMARY_CLAIM_FIELDS.flatMap((field) =>
-    fieldClaims(summary, field).map((claim) => `${field}:${normalized(claim)}`),
-  );
-  const outputClaimSet = new Set(outputClaimKeys);
-  const groundedFactsFound = [...allowedClaims].filter((claim) => outputClaimSet.has(claim)).length;
+  const claims = outputClaims(summary);
+  const uniqueClaims = [
+    ...new Map(claims.map((claim) => [`${claim.field}\u0000${claim.normalized}`, claim])).values(),
+  ];
+  const groundedFactsFound = matchedFacts(uniqueClaims, testCase.expectedFacts);
   const groundedFactsExpected = testCase.expectedFacts.length;
   const groundedFactRecall = groundedFactsFound / groundedFactsExpected;
-  const matchedOutputClaims = outputClaimKeys.filter((claim) => allowedClaims.has(claim)).length;
-  const outputClaims = outputClaimKeys.length;
-  const unlistedClaims = outputClaims - matchedOutputClaims;
-  const claimPrecision = outputClaims === 0 ? 1 : matchedOutputClaims / outputClaims;
+  const matchedOutputClaims = groundedFactsFound;
+  const outputClaimCount = claims.length;
+  const unlistedClaims = outputClaimCount - matchedOutputClaims;
+  const claimPrecision = outputClaimCount === 0 ? 1 : matchedOutputClaims / outputClaimCount;
   const output = normalized(allClaimText(summary));
   const forbiddenFactHits = testCase.forbiddenFacts.filter((fact) =>
     output.includes(normalized(fact)),
@@ -176,7 +234,7 @@ export function measureSummaryCase(
     groundedFactsFound,
     groundedFactsExpected,
     groundedFactRecall,
-    outputClaims,
+    outputClaims: outputClaimCount,
     matchedOutputClaims,
     unlistedClaims,
     claimPrecision,
