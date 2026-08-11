@@ -3,7 +3,7 @@
 Instructions for AI coding agents working in this repository. Humans should
 read `CONTRIBUTING.md` — this file covers what an agent is likely to get wrong.
 
-## Before you change anything
+## Verification gates
 
 ```bash
 pnpm install
@@ -11,8 +11,37 @@ pnpm run check
 uv run --project python/openmurmur_audio pytest
 ```
 
-All of it must be green before and after your change. None of it needs a
+These are full-repository release and hand-off gates. Run them before a release,
+after a cross-cutting change, or when the affected boundary is unclear. For a
+bounded MVP iteration, run the smallest relevant checks first; do not repeatedly
+run the whole suite after every small hunk. None of the full gates needs a
 microphone, a model, a network, or a Telegram token.
+
+## MVP test budget
+
+OpenMurmur is still discovering its MVP. Optimize for shipped user value and
+fast learning, not test count, coverage percentage, or TDD ceremony.
+
+- Do not create tests, test tasks, matrices, fixtures, or abstractions merely to
+  increase coverage or make CI look comprehensive.
+- Do not use TDD by default while behavior and product requirements are still
+  exploratory. Build the thinnest real vertical slice, validate the actual user
+  flow, then automate only the proof justified by what was learned.
+- Add or expand an automated test only when it protects a concrete expensive
+  risk: a non-negotiable invariant, money, user data, deletion, migration,
+  security/privacy, concurrency/idempotency, a reproduced bug, or a stable
+  user-visible contract.
+- Prefer one high-signal regression, contract, or integration test over broad
+  duplicate unit coverage. Remove or simplify obsolete tests when the product
+  decision changes.
+- Every testing task must name the shipping decision or failure risk it buys
+  down. If neither is concrete, spend the time on implementation, live
+  validation, or user feedback instead.
+- Existing relevant checks still run before hand-off, and no one may weaken the
+  safety invariants below or claim verification that did not happen.
+
+Revisit broader regression coverage and stronger CI gates after revenue/product
+fit, or earlier only when the owner explicitly asks for it.
 
 ## Non-negotiable invariants
 
