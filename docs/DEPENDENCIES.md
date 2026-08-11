@@ -167,6 +167,31 @@ This closes the real local readiness and causal startup boundary, not
 microphone/TCC/native-helper behavior, live device cadence, timeout fallback,
 Telegram delivery or launchd.
 
+### Real source-gap isolation — 2026-08-12
+
+A private 0700 root drove the production `ProcessPcmCapture`, `Recorder`,
+SQLite repositories and real FFmpeg encoder from one synthetic OS child. The
+child emitted distinguishable A, C and D PCM values around two real source
+pauses of 871 ms and 519 ms. Delayed VAD kept pre-gap PCM queued while the
+capture pump advanced independently.
+
+Only 8 of 12 A frames reached the first finalized lossless FLAC; the queued
+tail was discarded when the first gap advanced the stream epoch. One C frame
+entered the fresh speech candidate, then the second gap reset that candidate
+before D arrived. Independent FFmpeg decoding found exactly 4,096 samples, all
+`+12000`, in the first artifact and exactly 6,144 samples, all `-12000`, in the
+second. No C sample and no A sample crossed into the D session.
+
+SQLite contained exactly two non-overlapping, exact-timing `PROCESSING`
+sessions with one finalized hash/byte-matching part each, two ASR plus two audio
+delivery jobs and the expected start/finalized lifecycle statuses. Leases,
+finalization journal and temp directory were empty; the source child was reaped
+and SQLite integrity/foreign-key checks were clean.
+
+This closes D012 once the current source-gap heuristic fires. It does not prove
+that the 250 ms threshold matches real AVFoundation chunk cadence; that live
+microphone calibration remains D014.
+
 ### Current-revision Qwen smoke — 2026-08-11
 
 Revision `fd333d0` ran the existing `transcribe` CLI through the production
