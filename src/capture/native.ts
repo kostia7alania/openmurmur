@@ -36,6 +36,13 @@ const EXPECTED_EXECUTABLE_NAME = 'OpenMurmurCapture';
 const AUDIO_INPUT_ENTITLEMENT = 'com.apple.security.device.audio-input';
 const COMMAND_TIMEOUT_MS = 3_000;
 
+export type NativeCaptureAuthorizationStatus =
+  | 'authorized'
+  | 'denied'
+  | 'restricted'
+  | 'not_determined'
+  | 'unavailable';
+
 interface CommandOutput {
   readonly stdout: string;
 }
@@ -154,6 +161,33 @@ export function nativeCaptureExecutableIsUsable(
   } catch {
     return false;
   }
+}
+
+/** Reads the helper's fixed, non-prompting TCC status contract. */
+export function nativeCaptureAuthorizationStatus(
+  executable = defaultNativeCaptureExecutable(),
+): NativeCaptureAuthorizationStatus {
+  const result = spawnSync(executable, ['--authorization-status'], {
+    encoding: 'utf8',
+    timeout: COMMAND_TIMEOUT_MS,
+    maxBuffer: 64 * 1024,
+  });
+  if (result.error !== undefined || result.signal !== null || result.stderr !== '') {
+    throw new Error('native capture authorization-status probe failed');
+  }
+
+  const contracts = new Map<string, NativeCaptureAuthorizationStatus>([
+    ['0:{"authorized":true,"status":"authorized"}\n', 'authorized'],
+    ['77:{"authorized":false,"status":"denied"}\n', 'denied'],
+    ['77:{"authorized":false,"status":"restricted"}\n', 'restricted'],
+    ['77:{"authorized":false,"status":"not_determined"}\n', 'not_determined'],
+    ['77:{"authorized":false,"status":"unavailable"}\n', 'unavailable'],
+  ]);
+  const status = contracts.get(`${result.status}:${result.stdout}`);
+  if (status === undefined) {
+    throw new Error('native capture authorization-status contract is invalid');
+  }
+  return status;
 }
 
 function classifyExit(stderr: string, code: number | null): CaptureError {

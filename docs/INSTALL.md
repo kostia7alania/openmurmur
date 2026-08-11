@@ -271,8 +271,13 @@ pnpm openmurmur capture authorize
 
 It first verifies the app at its permanent path, strict code signature, audio
 entitlement and signed source digest without opening the microphone. Only then
-does it launch `--authorize`. No setup, doctor, installer, test or daemon command
-runs this automatically. Native `--stream` never prompts.
+does it inspect the non-prompting authorization status. `not_determined` opens
+the GUI flow and waits at most 30 seconds for a decision; `denied` directs you to
+the System Settings toggle (and a scoped `tccutil` reset if it is stuck);
+`restricted` requires the Mac administrator or MDM policy owner. Re-running the
+GUI command cannot make macOS prompt after a denial. No setup, doctor, installer,
+test or daemon command requests permission automatically. Native `--stream`
+never prompts.
 
 Prove that the configured native backend produces real PCM, then check the
 installed identity and read-only authorization status:
@@ -379,13 +384,15 @@ tail -f ~/Library/Application\ Support/OpenMurmur/logs/daemon.err.log
 | Symptom | Cause and fix |
 | --- | --- |
 | `speech_detection` fails in `doctor` | Step 7 was skipped: `/usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx` |
-| Native helper reports that microphone authorization is required | From a GUI login session, run step 10's `pnpm openmurmur capture authorize`; it is the only intentional prompt path. |
+| Native helper reports `not_determined` | From a GUI login session, run step 10's `pnpm openmurmur capture authorize`; it is the only intentional prompt path. |
+| Native helper reports `denied` | macOS will not prompt again. Enable **OpenMurmur Capture** in System Settings → Privacy & Security → Microphone. If the entry is absent or stuck, run `/usr/bin/tccutil reset Microphone io.openmurmur.capture`, then authorize again from the GUI. |
+| Native helper reports `restricted` | A system policy, Screen Time or MDM owns the restriction. Ask the Mac administrator; repeated authorization cannot override it. |
 | FFmpeg works in Terminal but launchd has no frames | A Terminal FFmpeg grant is foreground-only proof. Install, configure and authorize the native helper in step 10. |
 | Nothing recorded, no error | Genuinely no speech: Silero rejects a fan, traffic and music by design, and a session under 3 seconds of speech is dropped as noise. `pnpm openmurmur status` shows the rejected count. |
 | `ollama` warns in `doctor` | Run `brew services start ollama`, then pull the configured model. Audio and transcripts are still delivered; only summaries stop. |
 | Node version errors | `node -v` must be 26+. See step 4. |
 | Telegram silent | `pnpm openmurmur telegram test`. Undelivered messages queue in the outbox and are retried; nothing is lost while it is offline. |
-| It stopped recording after a macOS update | Major updates can reset TCC. Re-run the explicit native authorization and PCM checks in step 10. |
+| It stopped recording after a macOS update | Inspect the status with `./scripts/install-capture-app --check`, follow the status-specific `not_determined`/`denied`/`restricted` recovery above, then repeat the real PCM check. |
 
 ## Removing it
 

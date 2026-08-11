@@ -68,9 +68,9 @@ export function classifyFfmpegFailure(stderr: string): CaptureError {
     return new CaptureError(
       'permission',
       'macOS denied microphone access.\n' +
-        'Grant it in System Settings -> Privacy & Security -> Microphone, for the app that ' +
-        'launches OpenMurmur (Terminal, iTerm, or the launchd agent).\n' +
-        'The first run must be started interactively so macOS can show the prompt.',
+        'For foreground FFmpeg, enable the Terminal or iTerm app in System Settings -> ' +
+        'Privacy & Security -> Microphone. A launchd FFmpeg process is not the supported ' +
+        'background permission path; install and authorize OpenMurmur Capture instead.',
     );
   }
   if (

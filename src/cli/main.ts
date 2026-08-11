@@ -10,6 +10,8 @@ import { isAsrLanguageCode, modelLanguageName } from '../asr/preferences.ts';
 import {
   createCaptureBackend,
   defaultNativeCaptureExecutable,
+  type NativeCaptureAuthorizationStatus,
+  nativeCaptureAuthorizationStatus,
   nativeCaptureExecutableIsUsable,
 } from '../capture/native.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
@@ -87,7 +89,7 @@ Setup and diagnostics
   doctor                 Check every dependency. Read-only: changes nothing.
   setup                  Create directories, config and database (shows a plan first).
   setup telegram owner|send-only  Connect a Telegram bot with one explicit input role.
-  capture authorize      Explicitly open the native helper's GUI permission flow.
+  capture authorize      Inspect native microphone access; request it only when undecided.
   capture test           Record a few seconds and report input levels.
   recover                Report recordings an unclean shutdown left behind.
 
@@ -474,6 +476,17 @@ async function captureAuthorize(): Promise<number> {
     return 1;
   }
 
+  let status: NativeCaptureAuthorizationStatus;
+  try {
+    status = nativeCaptureAuthorizationStatus(executable);
+  } catch {
+    process.stderr.write(
+      'Could not read the native helper microphone authorization status. Reinstall it with ./scripts/install-capture-app.\n',
+    );
+    return 1;
+  }
+  if (status !== 'not_determined') return renderNativeAuthorizationResult(status);
+
   const app = dirname(dirname(dirname(executable)));
   process.stdout.write(
     'Opening the native capture helper. macOS may ask for microphone access now.\n',
@@ -503,12 +516,59 @@ async function captureAuthorize(): Promise<number> {
       }
     });
   });
-  if (exitCode === 0) {
-    process.stdout.write(
-      'The GUI authorization flow was opened. Decide in macOS, then set audio.captureBackend to "native" and check the result with: pnpm openmurmur capture test\n',
-    );
+  if (exitCode !== 0) return exitCode;
+
+  const deadline = Date.now() + 30_000;
+  do {
+    try {
+      status = nativeCaptureAuthorizationStatus(executable);
+    } catch {
+      process.stderr.write(
+        'The GUI flow opened, but its authorization status could not be read safely. No permission is claimed.\n',
+      );
+      return 1;
+    }
+    if (status !== 'not_determined') return renderNativeAuthorizationResult(status);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  } while (Date.now() < deadline);
+
+  process.stderr.write(
+    'The GUI flow opened, but no macOS decision was observed within 30 seconds. No permission is claimed.\n' +
+      'Finish the dialog in the GUI session, then prove real PCM with: pnpm openmurmur capture test\n',
+  );
+  return 1;
+}
+
+function renderNativeAuthorizationResult(status: NativeCaptureAuthorizationStatus): number {
+  switch (status) {
+    case 'authorized':
+      process.stdout.write(
+        'Microphone access is granted to OpenMurmur Capture. Prove real PCM with: pnpm openmurmur capture test\n',
+      );
+      return 0;
+    case 'denied':
+      process.stderr.write(
+        'Microphone access is denied. macOS will not show the prompt again for this app identity.\n' +
+          'Open System Settings -> Privacy & Security -> Microphone and enable “OpenMurmur Capture”.\n' +
+          'If the entry is absent or stuck, reset only this app, then retry from a GUI session:\n' +
+          '  /usr/bin/tccutil reset Microphone io.openmurmur.capture\n' +
+          '  pnpm openmurmur capture authorize\n',
+      );
+      return 1;
+    case 'restricted':
+      process.stderr.write(
+        'Microphone access is restricted by macOS policy, Screen Time, or MDM. Re-running authorization cannot override it; ask the Mac administrator to allow microphone access for OpenMurmur Capture.\n',
+      );
+      return 1;
+    case 'unavailable':
+      process.stderr.write(
+        'macOS did not return a supported microphone authorization state. Reinstall the helper and inspect System Settings -> Privacy & Security -> Microphone.\n',
+      );
+      return 1;
+    case 'not_determined':
+      process.stderr.write('Microphone authorization has not been decided.\n');
+      return 1;
   }
-  return exitCode;
 }
 
 async function startDaemon(

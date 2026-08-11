@@ -33,7 +33,9 @@ daemon and `capture test`.
 Use `audio.captureBackend="native"` for reliable launchd capture. The operator
 installs the app at `~/Applications/OpenMurmur Capture.app`, explicitly runs
 `pnpm openmurmur capture authorize` in a GUI login session, and then runs
-`capture test`. No setup, installer, doctor, test, daemon or stream operation
+`capture test`. The command reads the non-prompting status first and opens the
+GUI flow only for `not_determined`; denied and restricted states get distinct
+recovery guidance. No setup, installer, doctor, test, daemon or stream operation
 invokes authorization automatically.
 
 The runtime accepts only the canonical installed bundle after strict signature,

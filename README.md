@@ -222,10 +222,11 @@ OpenMurmur adds **no** consent window, no menu bar item, no overlay, no coloured
 dot and no persistent notification. macOS already handles this and doing it
 twice is worse than doing it once:
 
-- `pnpm openmurmur capture authorize` is the only command that deliberately
-  opens a GUI microphone-permission flow. It verifies the installed native app
-  without opening the microphone, then launches its explicit `--authorize`
-  mode. It is never run by setup, start, doctor, capture test or an installer.
+- `pnpm openmurmur capture authorize` is the only command that may deliberately
+  open a GUI microphone-permission flow. It verifies the installed native app
+  and reads its non-prompting status first; only `not_determined` launches the
+  explicit `--authorize` mode. It is never run by setup, start, doctor, capture
+  test or an installer.
 - The default FFmpeg backend can still trigger a Terminal/iTerm permission
   prompt when tested interactively. That grant proves the foreground command;
   it is not a reliable permission identity for a launchd daemon.
@@ -371,7 +372,7 @@ pnpm openmurmur doctor              # check every dependency (read-only)
 pnpm openmurmur setup               # create dirs, config, database (shows a plan first)
 pnpm openmurmur setup telegram owner     # connect the one bot input owner
 pnpm openmurmur setup telegram send-only # connect an output-only host
-pnpm openmurmur capture authorize   # explicitly open native GUI permission flow
+pnpm openmurmur capture authorize   # inspect permission; prompt only when undecided
 pnpm openmurmur capture test        # record 5s and report levels
 pnpm openmurmur recover             # report what an unclean shutdown left behind
 pnpm openmurmur start               # run the daemon

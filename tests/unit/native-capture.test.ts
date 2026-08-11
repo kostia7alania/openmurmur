@@ -18,6 +18,7 @@ import {
   createCaptureBackend,
   defaultNativeCaptureExecutable,
   NativeCapture,
+  nativeCaptureAuthorizationStatus,
   nativeCaptureExecutableIsUsable,
 } from '../../src/capture/native.ts';
 import { FakeClock } from '../../src/util/clock.ts';
@@ -66,6 +67,10 @@ int main(int argc, char **argv) {
   if (strcmp(argv[1], "--source-digest") == 0) {
     fputs(${JSON.stringify(`${sourceDigest}\n`)}, stdout);
     return 0;
+  }
+  if (strcmp(argv[1], "--authorization-status") == 0) {
+    fputs("{\\"authorized\\":false,\\"status\\":\\"denied\\"}\\n", stdout);
+    return 77;
   }
   if (strcmp(argv[1], "--stream") != 0) return 64;
   signal(SIGTERM, SIG_IGN);
@@ -134,6 +139,7 @@ int main(int argc, char **argv) {
       ),
     );
     assert.equal(nativeCaptureExecutableIsUsable(executable), true);
+    assert.equal(nativeCaptureAuthorizationStatus(executable), 'denied');
     const linkedHome = join(root, 'linked-home');
     mkdirSync(linkedHome);
     symlinkSync(applications, join(linkedHome, 'Applications'), 'dir');

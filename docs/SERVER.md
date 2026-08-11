@@ -170,6 +170,12 @@ pnpm openmurmur capture authorize
 The dialog appears on the virtual display. A human clicks Allow. This is the
 only command that intentionally requests microphone permission; setup,
 installers, doctor, capture test and the daemon never run it automatically.
+If the status is already `denied`, macOS will not show another dialog: enable
+**OpenMurmur Capture** in System Settings → Privacy & Security → Microphone, or
+reset only this app with
+`/usr/bin/tccutil reset Microphone io.openmurmur.capture` before retrying.
+`restricted` is an administrator/MDM policy and cannot be changed by repeating
+the command.
 
 The native app's `--stream` mode refuses to prompt. Prove the configured backend
 with actual PCM and then inspect its signed/read-only state:
@@ -353,13 +359,15 @@ ssh you@server 'cd ~/openmurmur && ./scripts/server-preflight'
 
 | Symptom | Cause |
 | --- | --- |
-| Native helper says authorization is required, no dialog appears | `capture authorize` was run over SSH. Repeat step 5 in a GUI Screen Sharing session. |
+| Native helper says `not_determined`, no dialog appears | `capture authorize` was run over SSH. Repeat step 5 in a GUI Screen Sharing session. |
+| Native helper says `denied`, no dialog appears | macOS does not prompt twice. Use the Screen Sharing GUI to enable **OpenMurmur Capture** under Privacy & Security → Microphone; use the scoped `tccutil` reset above only if the entry is absent or stuck. |
+| Native helper says `restricted` | Ask the Mac administrator or MDM owner to change the microphone policy; the authorization command cannot override it. |
 | FFmpeg works in Terminal but the LaunchAgent has no frames | Foreground Terminal permission is not the launchd identity. Configure and authorize the native helper in step 5. |
 | Telegram "not configured" although it was set up | Locked Keychain. Step 6, check the exit code. |
 | Works until reboot, then nothing | No automatic login, so no GUI session for the agent. Step 3. |
 | `🔴 Запись остановлена` at every start | No usable audio input device. Check `./scripts/server-preflight`. |
 | Recording stops at night | Sleep. Step 4, confirm with `pmset -g assertions`. |
-| Stopped working after a macOS update | Updates can reset TCC. Repeat step 5. |
+| Stopped working after a macOS update | Run the read-only helper check, follow its status-specific recovery, then repeat the real PCM proof in step 5. |
 | Grant lapsed after rebuilding the ad-hoc native app | Ad-hoc signing proves local integrity, not a stable release identity. Repeat step 5; Developer ID plus notarization is the release-grade path. |
 
 The native helper decouples launchd microphone permission from Node and the

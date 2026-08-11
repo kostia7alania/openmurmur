@@ -203,6 +203,29 @@ probe_authorization_contract() {
   esac
 }
 
+print_authorization_recovery() {
+  case "$AUTHORIZATION_STATUS" in
+    not_determined)
+      echo "  Request it explicitly from a logged-in GUI session:"
+      echo "    pnpm openmurmur capture authorize"
+      ;;
+    denied)
+      echo "  macOS will not show the prompt again. Enable OpenMurmur Capture in:"
+      echo "    System Settings -> Privacy & Security -> Microphone"
+      echo "  If the entry is absent or stuck, reset only this app, then authorize again:"
+      echo "    /usr/bin/tccutil reset Microphone io.openmurmur.capture"
+      echo "    pnpm openmurmur capture authorize"
+      ;;
+    restricted)
+      echo "  A system policy, Screen Time, or MDM restriction must be changed by the Mac administrator."
+      ;;
+    unavailable)
+      echo "  Reinstall the helper and inspect System Settings -> Privacy & Security -> Microphone."
+      ;;
+  esac
+  echo "  Final proof is real PCM: pnpm openmurmur capture test"
+}
+
 verify_bundle() {
   local app="$1"
   local expected_digest="$2"
@@ -304,7 +327,9 @@ if [ "$CHECK_ONLY" = true ]; then
     die "Installed capture app check failed: $VERIFY_ERROR"
   fi
   if [ "$AUTHORIZATION_STATUS" != "authorized" ]; then
-    die "Installed capture app is not authorized for the microphone ($AUTHORIZATION_STATUS); no prompt was requested."
+    warn "Installed capture app is not authorized for the microphone ($AUTHORIZATION_STATUS); no prompt was requested."
+    print_authorization_recovery
+    exit 1
   fi
   ok "OpenMurmur Capture matches source and has a strict $SIGNING_CLASS signature"
   ok "Microphone authorization is granted (read-only status probe)"
@@ -395,7 +420,5 @@ if [ "$AUTHORIZATION_STATUS" = "authorized" ]; then
   ok "Microphone authorization is already granted"
 else
   warn "Microphone authorization is $AUTHORIZATION_STATUS. The installer did not request it."
-  echo "  Authorize explicitly while logged in:"
-  printf '    open -W %q --args --authorize\n' "$INSTALLED_APP"
-  echo "  Then verify without opening the microphone: ./scripts/install-capture-app --check"
+  print_authorization_recovery
 fi
