@@ -550,7 +550,7 @@ async function stopDaemon(loaded: Awaited<ReturnType<typeof loadConfig>>): Promi
     }
     if (result.outcome === 'stale') {
       process.stderr.write(
-        `Daemon pid ${result.pid} is no longer running; cleared its exact SQLite ownership.\n`,
+        `Daemon pid ${result.pid} is no longer running; no live daemon was signalled.\n`,
       );
       return 1;
     }

@@ -115,7 +115,7 @@ blocked even if its task appears earlier.
 
 ## 11. launchd installation, shutdown and log lifecycle
 
-- [ ] **CS-31 · P1 · gap** — Strengthen daemon PID identity beyond a command substring. Evidence: `src/cli/daemon.ts:1462-1516` and `src/cli/main.ts:364-390`. Accept: PID reuse cannot signal another OpenMurmur process; identity includes start time/executable or launchd ownership.
+- [ ] **CS-31 · P1 · partial-in-2d71e5c** — SQLite now owns one exact daemon generation per data root; the no-replace PID mirror, exact lease owner and offline mutation gates close ownership/lease ABA, proven by a real two-process CAS rehearsal on 2026-08-12. Remaining: `stop` still signals a numeric PID after its final birth check, so process exit plus immediate PID reuse can race that signal; closing the original acceptance needs a launchd-owned target or another atomic process-handle boundary. Evidence: `src/cli/daemon-ownership.ts`, `src/database/migrations/017_daemon_ownership.sql`.
 - [ ] **CS-33 · P1 · verify-live** — Prove bounded shutdown across encoder, ASR worker and Telegram loop. Evidence: components have independent waits. Accept: one deadline escalates stuck children, persists recoverable state and exits predictably in an injected-wedge test.
 - [ ] **RO-07 · P1 · gap** — Add a real local launchd readiness preflight. Evidence: `scripts/install-launch-agents:17-30` only prompts. Accept: Node, paths, config, permissions and plist tools are checked before mutation.
 - [ ] **RO-08 · P1 · confirmed** — Install plists atomically with rollback. Evidence: `scripts/install-launch-agents:40-51` overwrites before lint. Accept: temp file passes `plutil` before rename; failed bootstrap restores the previous service.

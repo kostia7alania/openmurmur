@@ -412,10 +412,12 @@ Only then install the agents:
 The launchd process never tries to surface a TCC prompt. A Terminal FFmpeg grant
 is only a foreground proof and is not substituted for the native helper grant.
 
-Only one daemon may own an OpenMurmur data root. Startup claims its PID record
-exclusively; `status` and `stop` verify the live process identity before trusting
-or signalling that PID. The launchd templates remain unverified in a real login
-session.
+Only one daemon may own an OpenMurmur data root. SQLite is the atomic ownership
+authority; the PID file is only an operator-facing mirror published without
+replacing a concurrent generation. `status` and `stop` compare the exact process
+birth and ownership generation before acting. A final numeric-PID reuse window
+between that check and the signal remains tracked as CS-31. The launchd
+templates remain unverified in a real login session.
 
 ## Retention
 
@@ -488,15 +490,16 @@ Honesty matters more than a green badge, so:
 | Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama component runs, including a current-revision real-Qwen CLI transcription and real RU/EN/TH summary corpus. | The Ollama corpus did not meet its acceptance threshold; a component smoke run is not the complete daemon pipeline or current-revision live release evidence. |
 | Live release | No current-revision end-to-end live run is recorded yet; D120–D122 in [`docs/MVP_123.md`](docs/MVP_123.md) are the required gates. | Until those rows are evidenced, the project does not claim real microphone → models → Telegram, launchd login/reboot or sleep/wake verification. |
 
-**Verified on this revision by 572 offline TypeScript tests (108 suites) and 36
-Python tests:**
+**Verified on this revision through offline TypeScript/Python checks and the
+stated live rehearsals:**
 sessionizer state machine with a fake clock, pre-roll,
 60-second close, 15-minute rotation, bounded capture ingress and sleep epochs,
 unexpected clean capture-EOF handling,
 atomic FLAC and Markdown publication, lossless splitting, ffprobe validation of
 real media, staged audio-first delivery, delivery-clock retention proofs,
 lifecycle-status ordering, transcript revisions, job leases, worker timeout
-recycling and crash recovery, actionable failed-job diagnostics and retry,
+recycling and a three-boundary real-SIGKILL recovery matrix, actionable
+failed-job diagnostics and retry,
 outbox idempotency, 429 handling, Telegram endpoint confinement, metadata-only
 Keychain readiness, fail-closed local status heartbeats, daemon PID birth
 identity, launchd drift/readiness/rollback checks, crash recovery after a
