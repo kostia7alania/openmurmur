@@ -4,8 +4,10 @@ import type { DatabaseSync } from 'node:sqlite';
 import { transaction } from '../database/db.ts';
 import type { Logger } from '../logging/logger.ts';
 import {
+  isClientShutdown,
   isRetryable,
   shouldRetryWithoutAttempt,
+  type TelegramApiError,
   type TelegramClient,
   type TelegramInlineKeyboardMarkup,
 } from './client.ts';
@@ -75,9 +77,31 @@ export type OutboxState = 'pending' | 'sending' | 'sent' | 'failed' | 'dead';
 
 const nowIso = () => new Date().toISOString();
 const isoIn = (ms: number) => new Date(Date.now() + ms).toISOString();
+const MAX_RETRY_DELAY_MS = 10 * 60 * 1000;
+
+function retryDelayMs(attempts: number, outboxId: string, claimGeneration: number): number {
+  const base = Math.min(2 ** attempts * 1000, Math.floor(MAX_RETRY_DELAY_MS / 1.1));
+  const maxJitter = Math.floor(base / 10);
+  let hash = 2_166_136_261;
+  for (const character of `${outboxId}:${claimGeneration}`) {
+    hash = Math.imul(hash ^ character.charCodeAt(0), 16_777_619) >>> 0;
+  }
+  return Math.min(MAX_RETRY_DELAY_MS, base + (hash % (maxJitter + 1)));
+}
+
+function isTelegramChannelFailure(error: unknown): boolean {
+  const apiError = error as Partial<TelegramApiError>;
+  return (
+    typeof apiError.method === 'string' &&
+    (typeof apiError.errorCode !== 'number' ||
+      apiError.errorCode === 429 ||
+      apiError.errorCode >= 500)
+  );
+}
 
 export class Outbox {
   readonly #db: DatabaseSync;
+  #channelBlockedUntil = 0;
   constructor(db: DatabaseSync) {
     this.#db = db;
   }
@@ -108,6 +132,7 @@ export class Outbox {
   }
 
   claimNext(): ClaimedOutboxRow | null {
+    if (Date.now() < this.#channelBlockedUntil) return null;
     return transaction(this.#db, () => {
       const row = this.#db
         .prepare(
@@ -173,13 +198,17 @@ export class Outbox {
       .run(
         exhausted ? 'dead' : 'pending',
         error.slice(0, 2000),
-        isoIn(exhausted ? 0 : Math.min(2 ** attempts * 1000, 10 * 60 * 1000)),
+        isoIn(exhausted ? 0 : retryDelayMs(attempts, claim.outbox_id, claim.claim_generation)),
         nowIso(),
         claim.outbox_id,
         claim.claim_generation,
       );
     if (updated.changes !== 1) return 'lost';
     return exhausted ? 'dead' : 'retry';
+  }
+
+  pauseChannelFor(delayMs: number): void {
+    this.#channelBlockedUntil = Math.max(this.#channelBlockedUntil, Date.now() + delayMs);
   }
 
   /**
@@ -282,6 +311,56 @@ export interface OutboxWorkerDeps {
   }) => void;
 }
 
+type OutboxSendError = Error & { retryAfterSeconds?: number };
+
+function pauseDeferredChannel(outbox: Outbox, outcome: OutboxDeferOutcome, delayMs: number): void {
+  if (outcome !== 'lost') outbox.pauseChannelFor(delayMs);
+}
+
+function pauseInterruptedChannel(
+  outbox: Outbox,
+  outcome: OutboxDeferOutcome,
+  delayMs: number,
+  error: OutboxSendError,
+): void {
+  if (outcome !== 'lost' && !isClientShutdown(error)) outbox.pauseChannelFor(delayMs);
+}
+
+function markPermanentFailure(
+  deps: OutboxWorkerDeps,
+  row: ClaimedOutboxRow,
+  error: OutboxSendError,
+): void {
+  const outcome = deps.outbox.markFailed(row, error.message, row.max_attempts, row.max_attempts);
+  if (outcome === 'lost') {
+    deps.logger.warn('ignored permanent failure from a stale outbox sender', {
+      kind: row.kind,
+      deliveryPartId: row.delivery_part_id,
+      claimGeneration: row.claim_generation,
+    });
+    return;
+  }
+  deps.logger.error('telegram send reached a terminal outcome', {
+    kind: row.kind,
+    deliveryPartId: row.delivery_part_id,
+    error: error.message,
+    outcome,
+  });
+}
+
+function stopAfterChannelFailure(
+  outbox: Outbox,
+  row: ClaimedOutboxRow,
+  error: OutboxSendError,
+  outcome: OutboxFailureOutcome,
+): boolean {
+  if (!isTelegramChannelFailure(error)) return false;
+  if (outcome !== 'lost') {
+    outbox.pauseChannelFor(retryDelayMs(row.attempts, row.outbox_id, row.claim_generation));
+  }
+  return true;
+}
+
 /**
  * Drains the outbox once. Returns the number of rows successfully sent.
  *
@@ -315,48 +394,33 @@ export async function drainOutbox(deps: OutboxWorkerDeps, budget = 25): Promise<
       await cleanupEphemeralPayload(payload, deps.logger);
       sent += 1;
     } catch (error) {
-      const err = error as Error & { retryAfterSeconds?: number };
+      const err = error as OutboxSendError;
       if (shouldRetryWithoutAttempt(err)) {
-        const outcome = deps.outbox.defer(row, 1000, err.message);
+        const delayMs = 1000;
+        const outcome = deps.outbox.defer(row, delayMs, err.message);
         deps.logger.info('telegram send interrupted; outbox claim released', {
           kind: row.kind,
           deliveryPartId: row.delivery_part_id,
           outcome,
         });
+        pauseInterruptedChannel(deps.outbox, outcome, delayMs, err);
         break;
       }
       if (!isRetryable(err)) {
-        const outcome = deps.outbox.markFailed(
-          row,
-          err.message,
-          row.max_attempts,
-          row.max_attempts,
-        );
-        if (outcome === 'lost') {
-          deps.logger.warn('ignored permanent failure from a stale outbox sender', {
-            kind: row.kind,
-            deliveryPartId: row.delivery_part_id,
-            claimGeneration: row.claim_generation,
-          });
-          continue;
-        }
-        deps.logger.error('telegram send reached a terminal outcome', {
-          kind: row.kind,
-          deliveryPartId: row.delivery_part_id,
-          error: err.message,
-          outcome,
-        });
+        markPermanentFailure(deps, row, err);
         continue;
       }
       // Honour Telegram's own backpressure signal rather than guessing, and
       // stop draining: every further send would hit the same limit.
       if (typeof err.retryAfterSeconds === 'number') {
-        const outcome = deps.outbox.defer(row, err.retryAfterSeconds * 1000, err.message);
+        const delayMs = err.retryAfterSeconds * 1000;
+        const outcome = deps.outbox.defer(row, delayMs, err.message);
         deps.logger.warn('telegram rate limited', {
           retryAfterSeconds: err.retryAfterSeconds,
           kind: row.kind,
           outcome,
         });
+        pauseDeferredChannel(deps.outbox, outcome, delayMs);
         break;
       }
       const outcome = deps.outbox.markFailed(row, err.message, row.attempts, row.max_attempts);
@@ -366,6 +430,7 @@ export async function drainOutbox(deps: OutboxWorkerDeps, budget = 25): Promise<
         attempts: row.attempts,
         error: err.message,
       });
+      if (stopAfterChannelFailure(deps.outbox, row, err, outcome)) break;
     }
   }
   return sent;

@@ -539,6 +539,54 @@ describe('outbox delivery', () => {
     assert.equal(row.state, 'pending');
   });
 
+  it('stops the batch after one retryable Telegram transport failure', async () => {
+    const { fetch: impl, calls } = scriptedFetch([
+      () => {
+        throw new TypeError('fetch failed');
+      },
+    ]);
+    const d = deps(impl);
+    for (const id of ['a', 'b', 'c']) {
+      d.outbox.enqueue({
+        deliveryPartId: id,
+        kind: 'status',
+        ordinal: 0,
+        payload: { type: 'text', text: id },
+      });
+    }
+
+    assert.equal(await drainOutbox(d), 0);
+    assert.equal(calls.length, 1, 'one channel outage must stop the current drain');
+    assert.equal(await drainOutbox(d), 0);
+    assert.equal(calls.length, 1, 'the next drain must honor the failed row backoff');
+    const rows = db.handle
+      .prepare(
+        `SELECT delivery_part_id, state, attempts, run_after
+           FROM telegram_outbox ORDER BY created_at, rowid`,
+      )
+      .all()
+      .map((row) => ({ ...row })) as {
+      delivery_part_id: string;
+      state: string;
+      attempts: number;
+      run_after: string;
+    }[];
+    assert.deepEqual(
+      rows.map(({ delivery_part_id, state, attempts }) => ({
+        delivery_part_id,
+        state,
+        attempts,
+      })),
+      [
+        { delivery_part_id: 'a', state: 'pending', attempts: 1 },
+        { delivery_part_id: 'b', state: 'pending', attempts: 0 },
+        { delivery_part_id: 'c', state: 'pending', attempts: 0 },
+      ],
+    );
+    assert.ok(Date.parse(rows[0]?.run_after ?? '') > Date.now());
+    assert.ok(Date.parse(rows[0]?.run_after ?? '') <= Date.now() + 10 * 60 * 1000);
+  });
+
   it('returns a timed-out send to pending without burning its last attempt', async () => {
     const d = deps(abortableHangingFetch, 50 * 1024 * 1024, 20);
     d.outbox.enqueue({
