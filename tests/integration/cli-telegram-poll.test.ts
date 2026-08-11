@@ -25,36 +25,39 @@ describe('telegram poll CLI', () => {
     const botScope = 'production-bot';
     writeOffset(db.handle, 700, botScope);
     const requestedOffsets: number[] = [];
-    const result = await pollTelegramReadOnly(
-      db.handle,
-      {
-        async getUpdates(offset: number) {
-          requestedOffsets.push(offset);
-          return [
-            {
-              update_id: 700,
-              message: {
-                message_id: 1,
-                date: 0,
-                chat: { id: 42, type: 'private' },
-                text: '/help',
-              },
+    const client = {
+      async getUpdates(offset: number) {
+        requestedOffsets.push(offset);
+        return [
+          {
+            update_id: 700,
+            message: {
+              message_id: 1,
+              date: 0,
+              chat: { id: 42, type: 'private' },
+              text: '/help',
             },
-            {
-              update_id: 701,
-              message: {
-                message_id: 2,
-                date: 0,
-                chat: { id: 99, type: 'private' },
-                text: 'not allowlisted',
-              },
+          },
+          {
+            update_id: 701,
+            message: {
+              message_id: 2,
+              date: 0,
+              chat: { id: 99, type: 'private' },
+              text: 'not allowlisted',
             },
-          ];
-        },
+          },
+        ];
       },
-      botScope,
-      42,
+    };
+
+    await assert.rejects(
+      pollTelegramReadOnly(db.handle, client, botScope, 42, false),
+      /disabled on this send-only host/,
     );
+    assert.deepEqual(requestedOffsets, [], 'send-only diagnostics must not call getUpdates');
+
+    const result = await pollTelegramReadOnly(db.handle, client, botScope, 42, true);
 
     assert.deepEqual(requestedOffsets, [700]);
     assert.deepEqual(result, {

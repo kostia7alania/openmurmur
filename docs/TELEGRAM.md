@@ -5,10 +5,22 @@ it yourself. This document describes exactly what crosses that boundary.
 
 ## Setup
 
-From the repository checkout:
+Choose the role before setup. Configuration defaults to send-only, so a second
+host cannot silently start consuming the same bot's updates. On the one input
+owner, set:
+
+```json
+{
+  "telegram": {
+    "receiveUpdates": true
+  }
+}
+```
+
+Then, from the repository checkout, run:
 
 ```bash
-pnpm openmurmur setup telegram
+pnpm openmurmur setup telegram owner
 ```
 
 1. Create a bot: message [@BotFather](https://t.me/BotFather), send `/newbot`.
@@ -27,12 +39,26 @@ pnpm openmurmur setup telegram
    replaced, versioned **macOS Keychain** item (service `io.openmurmur`).
 9. A test message confirms the whole path.
 
+Every other host using that token stays at the default
+`telegram.receiveUpdates: false` and runs:
+
+```bash
+pnpm openmurmur setup telegram send-only
+```
+
+Send-only setup asks for the positive private chat ID printed by the owner
+setup. It verifies the token with `getMe` and the recipient with `sendMessage`,
+but makes **zero** `getUpdates` calls and creates no update cursor. Bare
+`setup telegram` is rejected: the role must agree exactly with
+`telegram.receiveUpdates`. The diagnostic `telegram poll` command is likewise
+rejected before contacting Telegram on a send-only host.
+
 SQLite and Keychain cannot share one transaction, so publication order is the
 privacy boundary: a hard death before step 8 leaves only inactive, non-secret
 cursor metadata; a hard death after step 8 leaves the complete pair with its
 matching cursor. Startup refuses to poll a concrete credential fingerprint when
 that cursor is absent. This fail-closed state is repaired only by running
-`pnpm openmurmur setup telegram` again, which establishes a new explicit
+`pnpm openmurmur setup telegram owner` again, which establishes a new explicit
 `/start` boundary; it never guesses by polling from zero.
 
 One fail-closed trade-off remains when rebinding the same bot token to a
@@ -70,11 +96,12 @@ replying "you are not authorized" would confirm the bot exists to anyone who
 found its username.
 
 Exactly one daemon may receive updates for a bot token. This is currently an
-operator-enforced ownership rule: set `telegram.receiveUpdates` to `true` only
-on the designated input host, and to `false` on every send-only host using the
-same token. Independent polling hosts keep independent SQLite offsets and can
-consume each other's updates; OpenMurmur cannot detect that cross-host conflict
-without a shared coordinator. Separate bots are the stronger isolation option.
+operator-enforced ownership rule: the fail-closed default is
+`telegram.receiveUpdates: false`; set it to `true` only on the designated input
+host, and run setup with the matching explicit role. Independent polling hosts
+keep independent SQLite offsets and can consume each other's updates;
+OpenMurmur cannot detect that cross-host conflict without a shared coordinator.
+Separate bots are the stronger isolation option.
 Within one data root, update ids, offsets, acknowledgement keys and incoming
 jobs are credential-scoped, so switching bots cannot collide with the previous
 bot's history. That protects rebinding; it does not coordinate two live hosts.

@@ -35,12 +35,9 @@ describe('config parsing', () => {
     assert.equal(config.sessionizer.preRollSeconds, DEFAULT_CONFIG.sessionizer.preRollSeconds);
   });
 
-  it('supports a send-only Telegram instance while receiving remains the default', () => {
-    assert.equal(DEFAULT_CONFIG.telegram.receiveUpdates, true);
-    assert.equal(
-      parseConfig({ telegram: { receiveUpdates: false } }).telegram.receiveUpdates,
-      false,
-    );
+  it('fails closed to send-only until one Telegram input owner is explicit', () => {
+    assert.equal(DEFAULT_CONFIG.telegram.receiveUpdates, false);
+    assert.equal(parseConfig({ telegram: { receiveUpdates: true } }).telegram.receiveUpdates, true);
     assert.throws(
       () => parseConfig({ telegram: { receiveUpdates: 'no' } }),
       /telegram\.receiveUpdates.*boolean/,

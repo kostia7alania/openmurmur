@@ -103,7 +103,9 @@ export function renderSetupNextSteps(telegramConfigured: boolean): string {
   const lines = ['Next, verify the complete foreground path:'];
   let step = 1;
   if (!telegramConfigured) {
-    lines.push(`  ${step}. Connect Telegram: pnpm openmurmur setup telegram`);
+    lines.push(
+      `  ${step}. Choose the one input owner, set telegram.receiveUpdates=true there, then run: pnpm openmurmur setup telegram owner`,
+    );
     step += 1;
   }
   lines.push(`  ${step}. Verify the microphone: pnpm openmurmur capture test`);
@@ -131,6 +133,17 @@ export async function applySetup(paths: Paths, plan: SetupPlan): Promise<void> {
 export interface TelegramSetupResult {
   readonly botUsername: string;
   readonly chatId: number;
+  readonly role: TelegramSetupRole;
+}
+
+export type TelegramSetupRole = 'owner' | 'send-only';
+
+export interface TelegramSetupDependencies {
+  readonly promptToken?: () => Promise<string>;
+  readonly promptSendOnlyChatId?: () => Promise<number>;
+  readonly confirmRecipient?: (prompt: string) => Promise<boolean>;
+  readonly secrets?: SecretsStore;
+  readonly fetchImpl?: typeof fetch;
 }
 
 export function renderSetupCompletion(): string {
@@ -138,25 +151,32 @@ export function renderSetupCompletion(): string {
 }
 
 export function renderTelegramSetupCompletion(result: TelegramSetupResult): string {
-  return `✅ Connected @${result.botUsername}, chat ${result.chatId}\n\n${renderSetupNextSteps(true)}`;
+  return `✅ Connected @${result.botUsername}, chat ${result.chatId} (${result.role})\n\n${renderSetupNextSteps(true)}`;
 }
 
 /**
- * Interactive Telegram onboarding.
- *
- * The token is read from a hidden prompt and goes straight to the Keychain.
- * The chat ID is discovered from a `/start` the user sends, so the user never
- * has to look up a numeric ID, and only that one chat is ever accepted.
+ * Interactive Telegram onboarding with an explicit input-owner/send-only role.
+ * The owner discovers the chat through a fresh `/start`; a send-only sibling
+ * copies that confirmed private chat ID without touching the update stream.
  */
 export async function setupTelegram(
   paths: Paths,
   apiBaseUrl: string,
+  role: TelegramSetupRole,
   log: (message: string) => void,
+  dependencies: TelegramSetupDependencies = {},
 ): Promise<TelegramSetupResult> {
-  const token = await promptSecret('Telegram bot token (input hidden): ');
+  const token = await (
+    dependencies.promptToken ?? (() => promptSecret('Telegram bot token (input hidden): '))
+  )();
   if (token.trim().length === 0) throw new Error('no token entered');
 
-  const client = new TelegramClient({ token: token.trim(), baseUrl: apiBaseUrl });
+  const client = new TelegramClient({
+    token: token.trim(),
+    baseUrl: apiBaseUrl,
+    ...(dependencies.fetchImpl === undefined ? {} : { fetchImpl: dependencies.fetchImpl }),
+  });
+  const confirmRecipient = dependencies.confirmRecipient ?? confirmTelegramOwner;
 
   log('Verifying the token with getMe...');
   const me = await client.getMe();
@@ -164,36 +184,62 @@ export async function setupTelegram(
   const username = me.username ?? me.first_name;
   log(`  Bot: @${username} (id ${me.id})`);
 
-  // Establish the boundary before asking for /start. Otherwise a message left
-  // in this bot's queue by an earlier owner could silently become the allowlist.
-  const baselineOffset = await drainUpdateBacklog(client);
+  let chatId: number;
+  let commit: TelegramSetupCommit;
+  if (role === 'owner') {
+    // Establish the boundary before asking for /start. Otherwise a message left
+    // in this bot's queue by an earlier owner could silently become the allowlist.
+    const baselineOffset = await drainUpdateBacklog(client);
 
-  log('');
-  log(`Now open Telegram, find @${username}, and send it:  /start`);
-  log('Waiting for the message...');
+    log('');
+    log(`Now open Telegram, find @${username}, and send it:  /start`);
+    log('Waiting for the message...');
 
-  const accepted = await waitForStart(client, baselineOffset, username);
-  const chatId = accepted.chatId;
-  const account = accepted.username === null ? accepted.firstName : `@${accepted.username}`;
-  log(`  Account: ${account} (user id ${accepted.userId})`);
-  log(`  Chat ID: ${chatId}`);
-  if (!(await confirmTelegramOwner(`Use ${account}, chat ${chatId}? [y/N] `))) {
-    throw new Error('Telegram setup cancelled; nothing was stored');
+    const accepted = await waitForStart(client, baselineOffset, username);
+    chatId = accepted.chatId;
+    const account = accepted.username === null ? accepted.firstName : `@${accepted.username}`;
+    log(`  Account: ${account} (user id ${accepted.userId})`);
+    log(`  Chat ID: ${chatId}`);
+    if (
+      !(await confirmRecipient(`Use ${account}, chat ${chatId} as this bot's input owner? [y/N] `))
+    ) {
+      throw new Error('Telegram setup cancelled; nothing was stored');
+    }
+    commit = { role, nextOffset: accepted.nextOffset };
+  } else {
+    log('');
+    log('This host will only send. Copy the private chat ID printed by the input-owner setup.');
+    chatId = await (dependencies.promptSendOnlyChatId ?? (() => promptTelegramChatId()))();
+    if (!Number.isSafeInteger(chatId) || chatId <= 0) {
+      throw new Error('Telegram chat ID must be a positive safe integer copied from owner setup');
+    }
+    log(`  Chat ID: ${chatId}`);
+    if (
+      !(await confirmRecipient(
+        `Send to chat ${chatId} without receiving updates on this host? [y/N] `,
+      ))
+    ) {
+      throw new Error('Telegram setup cancelled; nothing was stored');
+    }
+    commit = { role };
   }
 
   const db = openDatabase({ file: paths.databaseFile });
   try {
     await commitTelegramSetup(
       db.handle,
-      keychain,
+      dependencies.secrets ?? keychain,
       { token: token.trim(), chatId },
-      accepted.nextOffset,
+      commit,
       () =>
         client.sendMessage(
           chatId,
-          '✅ OpenMurmur подключён.\n\n' +
-            'Этот чат будет получать аудио, транскрипты, отчёты и статус записи.\n' +
-            'Команды: /status, /health, /settings, /help',
+          role === 'owner'
+            ? '✅ OpenMurmur подключён.\n\n' +
+                'Этот чат будет получать аудио, транскрипты, отчёты и статус записи.\n' +
+                'Команды: /status, /health, /settings, /help'
+            : '✅ OpenMurmur подключён в режиме только отправки.\n\n' +
+                'Команды обрабатывает назначенный input-owner этого бота.',
         ),
     );
   } finally {
@@ -202,34 +248,76 @@ export async function setupTelegram(
   log('  Stored the token and chat ID in the macOS Keychain (service io.openmurmur).');
   log('  Sent a test message.');
 
-  return { botUsername: username, chatId };
+  return { botUsername: username, chatId, role };
+}
+
+export async function promptTelegramChatId(): Promise<number> {
+  if (!stdin.isTTY) {
+    throw new Error('The send-only chat ID must be entered in an interactive terminal.');
+  }
+  const input = createInterface({ input: stdin, output: stdout });
+  try {
+    const value = Number(
+      (await input.question('Private chat ID copied from owner setup: ')).trim(),
+    );
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error('Telegram chat ID must be a positive safe integer copied from owner setup');
+    }
+    return value;
+  } finally {
+    input.close();
+  }
+}
+
+export type TelegramSetupCommit =
+  | { readonly role: 'owner'; readonly nextOffset: number }
+  | { readonly role: 'send-only' };
+
+function publishTelegramSetupCursor(
+  db: DatabaseSync,
+  newBotScope: string,
+  previousBotScope: string,
+  commit: TelegramSetupCommit,
+): () => void {
+  if (commit.role === 'send-only') {
+    const previous = db
+      .prepare('SELECT next_offset FROM telegram_offset WHERE bot_scope = ?')
+      .get(newBotScope) as { next_offset: number } | undefined;
+    clearOffset(db, newBotScope);
+    return previous === undefined
+      ? () => clearOffset(db, newBotScope)
+      : () => writeOffset(db, previous.next_offset, newBotScope);
+  }
+
+  const previousOffset = readOffsetOrZero(db, previousBotScope);
+  writeOffset(db, commit.nextOffset, newBotScope);
+  return newBotScope === previousBotScope
+    ? () => writeOffset(db, previousOffset, previousBotScope)
+    : () => clearOffset(db, newBotScope);
 }
 
 /**
- * Commits the allowlisted recipient and that bot's update cursor as one setup
- * operation. SQLite publishes the credential-scoped cursor first. A hard death
- * before the Keychain update leaves inactive cursor metadata; a hard death
- * after it leaves a complete credential pair with its matching cursor. Ordinary
- * failures restore the previous pair and cursor or fail closed with no secrets.
+ * Commits the allowlisted recipient and, for the sole owner, its update cursor.
+ * Send-only never creates or advances a cursor. Owner setup publishes the
+ * credential-scoped cursor before Keychain credentials; ordinary failures
+ * restore the previous pair and cursor or fail closed with no secrets.
  */
 export async function commitTelegramSetup(
   db: DatabaseSync,
   store: SecretsStore,
   secrets: TelegramSecrets,
-  nextOffset: number,
+  commit: TelegramSetupCommit,
   confirmDelivery: () => Promise<unknown>,
 ): Promise<void> {
   const previousSecrets = await store.load();
   const newBotScope = telegramBotScope(secrets.token);
   const previousBotScope =
     previousSecrets === null ? 'legacy' : telegramBotScope(previousSecrets.token);
-  const previousOffset = readOffsetOrZero(db, previousBotScope);
   let stored = false;
-  let offsetWritten = false;
+  let restoreCursor: (() => void) | null = null;
 
   try {
-    writeOffset(db, nextOffset, newBotScope);
-    offsetWritten = true;
+    restoreCursor = publishTelegramSetupCursor(db, newBotScope, previousBotScope, commit);
     await store.storeSecrets(secrets);
     stored = true;
     await confirmDelivery();
@@ -243,14 +331,10 @@ export async function commitTelegramSetup(
       }
     }
 
-    let offsetRestored = !offsetWritten;
-    if (offsetWritten) {
+    let offsetRestored = restoreCursor === null;
+    if (restoreCursor !== null) {
       try {
-        if (newBotScope === previousBotScope) {
-          writeOffset(db, previousOffset, previousBotScope);
-        } else {
-          clearOffset(db, newBotScope);
-        }
+        restoreCursor();
         offsetRestored = true;
       } catch (rollbackError) {
         rollbackErrors.push(rollbackError);
@@ -327,7 +411,7 @@ export async function waitForStart(
   }
   throw new Error(
     'No message arrived. Make sure you messaged the right bot, then run ' +
-      '`pnpm openmurmur setup telegram` again.',
+      '`pnpm openmurmur setup telegram owner` again.',
   );
 }
 

@@ -49,7 +49,10 @@ import { Outbox } from '../../src/telegram/outbox.ts';
 let dir: string;
 let db: Database;
 
-const CONFIG = DEFAULT_CONFIG;
+const CONFIG = {
+  ...DEFAULT_CONFIG,
+  telegram: { ...DEFAULT_CONFIG.telegram, receiveUpdates: true },
+};
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'om-deliver-'));

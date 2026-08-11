@@ -1,12 +1,17 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
   commitTelegramSetup,
   drainUpdateBacklog,
   renderSetupCompletion,
   renderTelegramSetupCompletion,
+  setupTelegram,
   waitForStart,
 } from '../../src/cli/setup.ts';
+import { resolvePaths } from '../../src/config/paths.ts';
 import { openDatabase } from '../../src/database/db.ts';
 import type { TelegramUpdate } from '../../src/telegram/client.ts';
 import {
@@ -38,7 +43,7 @@ describe('setup completion output', () => {
   it('leads a fresh setup through Telegram to one verifiable ambient session', () => {
     const output = renderSetupCompletion();
     const expectedInOrder = [
-      'pnpm openmurmur setup telegram',
+      'pnpm openmurmur setup telegram owner',
       'pnpm openmurmur capture test',
       'pnpm openmurmur start',
       'speak for more than 3 seconds',
@@ -55,9 +60,13 @@ describe('setup completion output', () => {
   });
 
   it('continues a completed Telegram setup without promising a global binary', () => {
-    const output = renderTelegramSetupCompletion({ botUsername: 'murmur_bot', chatId: 42 });
+    const output = renderTelegramSetupCompletion({
+      botUsername: 'murmur_bot',
+      chatId: 42,
+      role: 'owner',
+    });
 
-    assert.match(output, /^✅ Connected @murmur_bot, chat 42$/m);
+    assert.match(output, /^✅ Connected @murmur_bot, chat 42 \(owner\)$/m);
     assert.doesNotMatch(output, /setup telegram/);
     assert.match(output, /pnpm openmurmur capture test/);
     assert.match(output, /pnpm openmurmur start/);
@@ -66,6 +75,126 @@ describe('setup completion output', () => {
 });
 
 describe('Telegram setup ownership handshake', () => {
+  it('lets only the explicit owner poll while send-only proves delivery', async () => {
+    const ownerRoot = mkdtempSync(join(tmpdir(), 'om-telegram-owner-'));
+    const senderRoot = mkdtempSync(join(tmpdir(), 'om-telegram-sender-'));
+    const calls: string[] = [];
+    let actor: 'owner' | 'send-only' = 'owner';
+    let ownerPoll = 0;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = url.slice(url.lastIndexOf('/') + 1);
+      assert.match(url, /botshared-token/);
+      calls.push(`${actor}:${method}`);
+
+      let result: unknown;
+      if (method === 'getMe') {
+        result = {
+          id: actor === 'owner' ? 1 : 2,
+          is_bot: true,
+          first_name: actor,
+          username: `${actor.replace('-', '_')}_bot`,
+        };
+      } else if (method === 'getUpdates') {
+        ownerPoll += 1;
+        result = ownerPoll === 1 ? [] : [update(7, 700, '/start')];
+      } else {
+        const body = JSON.parse(String(init?.body)) as { chat_id: number };
+        result = { message_id: 1, date: 0, chat: { id: body.chat_id, type: 'private' } };
+      }
+      return new Response(JSON.stringify({ ok: true, result }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    const ownerSecrets = memorySecrets(null);
+    const senderSecrets = memorySecrets(null);
+    try {
+      const staleSenderDb = openDatabase({ file: resolvePaths(senderRoot).databaseFile });
+      try {
+        const scope = telegramBotScope('shared-token');
+        writeOffset(staleSenderDb.handle, 41, scope);
+        await assert.rejects(
+          commitTelegramSetup(
+            staleSenderDb.handle,
+            senderSecrets.store,
+            { token: 'shared-token', chatId: 700 },
+            { role: 'send-only' },
+            async () => {
+              throw new Error('send capability failed');
+            },
+          ),
+          /send capability failed/,
+        );
+        assert.equal(readOffset(staleSenderDb.handle, scope), 41);
+        assert.equal(senderSecrets.get(), null);
+      } finally {
+        staleSenderDb.close();
+      }
+
+      const owner = await setupTelegram(
+        resolvePaths(ownerRoot),
+        'https://api.telegram.org',
+        'owner',
+        () => {},
+        {
+          promptToken: async () => 'shared-token',
+          confirmRecipient: async () => true,
+          secrets: ownerSecrets.store,
+          fetchImpl,
+        },
+      );
+      actor = 'send-only';
+      const sender = await setupTelegram(
+        resolvePaths(senderRoot),
+        'https://api.telegram.org',
+        'send-only',
+        () => {},
+        {
+          promptToken: async () => 'shared-token',
+          promptSendOnlyChatId: async () => owner.chatId,
+          confirmRecipient: async () => true,
+          secrets: senderSecrets.store,
+          fetchImpl,
+        },
+      );
+
+      assert.deepEqual(owner, { botUsername: 'owner_bot', chatId: 700, role: 'owner' });
+      assert.deepEqual(sender, {
+        botUsername: 'send_only_bot',
+        chatId: 700,
+        role: 'send-only',
+      });
+      assert.deepEqual(calls, [
+        'owner:getMe',
+        'owner:getUpdates',
+        'owner:getUpdates',
+        'owner:sendMessage',
+        'send-only:getMe',
+        'send-only:sendMessage',
+      ]);
+      assert.deepEqual(ownerSecrets.get(), { token: 'shared-token', chatId: 700 });
+      assert.deepEqual(senderSecrets.get(), { token: 'shared-token', chatId: 700 });
+
+      const ownerDb = openDatabase({ file: resolvePaths(ownerRoot).databaseFile });
+      const senderDb = openDatabase({ file: resolvePaths(senderRoot).databaseFile });
+      try {
+        assert.equal(readOffset(ownerDb.handle, telegramBotScope('shared-token')), 8);
+        assert.throws(
+          () => readOffset(senderDb.handle, telegramBotScope('shared-token')),
+          /Telegram update offset is missing/,
+        );
+      } finally {
+        ownerDb.close();
+        senderDb.close();
+      }
+    } finally {
+      rmSync(ownerRoot, { recursive: true, force: true });
+      rmSync(senderRoot, { recursive: true, force: true });
+    }
+  });
+
   it('drains every pre-existing update batch before asking for /start', async () => {
     const offsets: number[] = [];
     const client = {
@@ -190,7 +319,13 @@ describe('Telegram setup persistence', () => {
       },
     };
     try {
-      await commitTelegramSetup(db.handle, store, next, 101, async () => {});
+      await commitTelegramSetup(
+        db.handle,
+        store,
+        next,
+        { role: 'owner', nextOffset: 101 },
+        async () => {},
+      );
       assert.deepEqual(stored, next);
     } finally {
       db.close();
@@ -205,7 +340,7 @@ describe('Telegram setup persistence', () => {
         db.handle,
         secrets.store,
         { token: 'new-token', chatId: 20 },
-        101,
+        { role: 'owner', nextOffset: 101 },
         async () => {},
       );
 
@@ -228,7 +363,7 @@ describe('Telegram setup persistence', () => {
           db.handle,
           secrets.store,
           { token: 'new-token', chatId: 20 },
-          101,
+          { role: 'owner', nextOffset: 101 },
           async () => {
             throw new Error('confirmation failed');
           },
@@ -265,7 +400,7 @@ describe('Telegram setup persistence', () => {
           db.handle,
           store,
           { token: 'new-token', chatId: 20 },
-          101,
+          { role: 'owner', nextOffset: 101 },
           async () => {},
         ),
         /Keychain write failed/,
@@ -304,7 +439,7 @@ describe('Telegram setup persistence', () => {
           db.handle,
           store,
           { token: old.token, chatId: 20 },
-          101,
+          { role: 'owner', nextOffset: 101 },
           async () => {},
         ),
         /Keychain write failed/,

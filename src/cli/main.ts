@@ -85,7 +85,7 @@ Usage: pnpm openmurmur <command> [options]
 Setup and diagnostics
   doctor                 Check every dependency. Read-only: changes nothing.
   setup                  Create directories, config and database (shows a plan first).
-  setup telegram         Connect a Telegram bot. Token is entered hidden.
+  setup telegram owner|send-only  Connect a Telegram bot with one explicit input role.
   capture authorize      Explicitly open the native helper's GUI permission flow.
   capture test           Record a few seconds and report input levels.
   recover                Report recordings an unclean shutdown left behind.
@@ -184,7 +184,7 @@ async function main(argv: readonly string[]): Promise<number> {
     }
 
     case 'setup':
-      return setupCommand(loaded, positionals[1], values['yes'] === true);
+      return setupCommand(loaded, positionals[1], positionals[2], values['yes'] === true);
 
     case 'capture':
       return captureCommand(positionals[1], loaded.config.audio);
@@ -399,12 +399,28 @@ async function recallCommand(
 async function setupCommand(
   loaded: Awaited<ReturnType<typeof loadConfig>>,
   subcommand: string | undefined,
+  telegramRole: string | undefined,
   yes: boolean,
 ): Promise<number> {
   if (subcommand === 'telegram') {
+    if (telegramRole !== 'owner' && telegramRole !== 'send-only') {
+      process.stderr.write('Usage: pnpm openmurmur setup telegram <owner|send-only>\n');
+      return 1;
+    }
+    const configuredRole = loaded.config.telegram.receiveUpdates ? 'owner' : 'send-only';
+    if (telegramRole !== configuredRole) {
+      process.stderr.write(
+        `Telegram setup role is ${telegramRole}, but telegram.receiveUpdates selects ${configuredRole}. ` +
+          `Set it to ${telegramRole === 'owner' ? 'true' : 'false'} and retry.\n`,
+      );
+      return 1;
+    }
     await ensureDirectories(loaded.paths);
-    const result = await setupTelegram(loaded.paths, loaded.config.telegram.apiBaseUrl, (message) =>
-      process.stdout.write(`${message}\n`),
+    const result = await setupTelegram(
+      loaded.paths,
+      loaded.config.telegram.apiBaseUrl,
+      telegramRole,
+      (message) => process.stdout.write(`${message}\n`),
     );
     process.stdout.write(`\n${renderTelegramSetupCompletion(result)}\n`);
     return 0;
@@ -1144,15 +1160,17 @@ async function telegramCommand(
 ): Promise<number> {
   const secrets = await keychain.load();
   if (secrets === null) {
-    process.stderr.write('Telegram is not configured. Run: pnpm openmurmur setup telegram\n');
+    const role = loaded.config.telegram.receiveUpdates ? 'owner' : 'send-only';
+    process.stderr.write(
+      `Telegram is not configured. Run: pnpm openmurmur setup telegram ${role}\n`,
+    );
     return 1;
   }
-  const client = new TelegramClient({
-    token: secrets.token,
-    baseUrl: loaded.config.telegram.apiBaseUrl,
-  });
-
   if (subcommand === 'test') {
+    const client = new TelegramClient({
+      token: secrets.token,
+      baseUrl: loaded.config.telegram.apiBaseUrl,
+    });
     const me = await client.getMe();
     await client.sendMessage(
       secrets.chatId,
@@ -1163,10 +1181,26 @@ async function telegramCommand(
   }
 
   if (subcommand === 'poll') {
+    if (!loaded.config.telegram.receiveUpdates) {
+      process.stderr.write(
+        'Telegram polling is disabled on this send-only host. Run this only on the explicit input owner with telegram.receiveUpdates=true.\n',
+      );
+      return 1;
+    }
+    const client = new TelegramClient({
+      token: secrets.token,
+      baseUrl: loaded.config.telegram.apiBaseUrl,
+    });
     const db = openDatabase({ file: loaded.paths.databaseFile });
     try {
       const botScope = telegramBotScope(secrets.token);
-      const inspection = await pollTelegramReadOnly(db.handle, client, botScope, secrets.chatId);
+      const inspection = await pollTelegramReadOnly(
+        db.handle,
+        client,
+        botScope,
+        secrets.chatId,
+        true,
+      );
       process.stdout.write(
         `Fetched ${inspection.updates.length} update(s) from offset ${inspection.offset} ` +
           '(read-only; offset unchanged).\n',
@@ -1193,10 +1227,14 @@ export async function pollTelegramReadOnly(
   client: TelegramUpdatePoller,
   botScope: string,
   chatId: number,
+  receiveUpdates: boolean,
 ): Promise<{
   readonly offset: number;
   readonly updates: readonly { readonly updateId: number; readonly kind: string }[];
 }> {
+  if (!receiveUpdates) {
+    throw new Error('Telegram polling is disabled on this send-only host');
+  }
   const offset = readOffset(db, botScope);
   const updates = await client.getUpdates(offset, 5);
   return {
