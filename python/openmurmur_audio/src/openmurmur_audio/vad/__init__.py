@@ -48,7 +48,8 @@ def find_model_path() -> Path:
         raise SileroModelMissingError(
             "silero-vad is not installed.\n"
             "Install the local model stack:\n"
-            "  uv sync --project python/openmurmur_audio --extra mlx\n"
+            "  /usr/bin/env -u UV_PROJECT_ENVIRONMENT \\\n"
+            "    uv sync --project python/openmurmur_audio --extra mlx\n"
             "Without it the daemon can still run with the fake adapters, but it "
             "cannot detect speech."
         ) from exc
@@ -62,7 +63,8 @@ def find_model_path() -> Path:
 
     raise SileroModelMissingError(
         f"silero-vad is installed but no ONNX model was found in {data_dir}. "
-        "Reinstall it with: uv sync --project python/openmurmur_audio --extra mlx"
+        "Reinstall it with: /usr/bin/env -u UV_PROJECT_ENVIRONMENT "
+        "uv sync --project python/openmurmur_audio --extra mlx"
     )
 
 

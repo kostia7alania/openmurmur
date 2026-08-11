@@ -79,11 +79,24 @@ network or writes to the Hugging Face cache. It distinguishes:
   be determined.
 
 The human-readable result never prints the environment or cache path. A missing
-snapshot is blocking because otherwise the first unattended transcription would
-try to obtain multi-gigabyte weights. Populate it deliberately with one
-foreground transcription while online, then rerun doctor. `speech_detection`
+snapshot is blocking because unattended work must not obtain multi-gigabyte
+weights. Provision it only with the explicit foreground `hf download` command
+in [INSTALL.md](INSTALL.md#7-the-local-model-stack), then rerun doctor. The
+default snapshot occupied about 4.4 GiB when measured on the development
+machine; the readiness threshold keeps at least 6 GB free. `speech_detection`
 remains the separate live, local Silero frame probe; it does not load the ASR
 model.
+
+Every Python worker gets `UV_OFFLINE=1`, `HF_HUB_OFFLINE=1`, telemetry and
+implicit-token use disabled, and only the cache-location variables it needs.
+`uv run --no-sync` does not sync packages. A missing environment or cache
+therefore fails locally instead of turning daemon startup, `doctor` or a job
+retry into a network operation.
+
+The runtime environment is fixed at `python/openmurmur_audio/.venv`.
+`UV_PROJECT_ENVIRONMENT` is deliberately not inherited by `doctor`, daemon or
+launchd: installing the extra elsewhere must fail readiness instead of making
+an interactive shell and the background runtime inspect different packages.
 
 Silero's **segment-assembly logic** is separately covered by pure Python tests,
 which take a list of probabilities and need no model.

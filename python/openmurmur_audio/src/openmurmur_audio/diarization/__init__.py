@@ -101,7 +101,8 @@ class Diarizer:
             raise DiarizationUnavailableError(
                 "sherpa-onnx is not installed.\n"
                 "Install the local model stack:\n"
-                "  uv sync --project python/openmurmur_audio --extra mlx"
+                "  /usr/bin/env -u UV_PROJECT_ENVIRONMENT \\\n"
+                "    uv sync --project python/openmurmur_audio --extra mlx"
             ) from exc
 
         segmentation, embedding = find_models()

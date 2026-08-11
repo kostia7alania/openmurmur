@@ -4,8 +4,8 @@ Reads requests from stdin, writes responses to stdout, keeps the ASR model
 resident in between. Started by the TypeScript daemon via
 `uv run --project python/openmurmur_audio openmurmur-audio-worker`.
 
-The worker receives no secrets and makes no network calls of its own beyond the
-model download that Hugging Face performs on first load.
+The worker receives no secrets and is launched with Hugging Face offline mode
+enabled. Model provisioning is a separate, explicit foreground operator step.
 """
 
 from __future__ import annotations

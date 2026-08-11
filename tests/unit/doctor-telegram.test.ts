@@ -41,7 +41,7 @@ describe('Telegram setup readiness', () => {
       name: 'telegram_setup',
       level: 'warn',
       detail: 'no Telegram credential items found in the macOS Keychain',
-      fix: 'Run `pnpm openmurmur setup telegram` from the repository checkout.',
+      fix: 'Set telegram.receiveUpdates for this host, then run either `pnpm openmurmur setup telegram owner` or `pnpm openmurmur setup telegram send-only` from the repository checkout.',
     });
   });
 

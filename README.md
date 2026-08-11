@@ -14,8 +14,9 @@ lossless FLAC for Telegram while Qwen3-ASR transcribes it on-device. The full
 transcript follows when ready, and the local LLM produces a structured report
 independently.
 
-No account. No cloud ASR. No telemetry. Telegram is the one and only network
-destination, and you configure it yourself.
+No account. No cloud ASR. No telemetry. During normal operation, Telegram is
+the only external network destination, and you configure it yourself. ASR
+weights are obtained only by the explicit foreground provisioning step below.
 
 > ⚠️ **Recording other people has legal and ethical consequences.** Consent
 > requirements for recording conversations vary by country and by state, and in
@@ -61,7 +62,7 @@ release record** — see [What is verified](#what-is-verified).
 
 | Item | Approx. size |
 | --- | --- |
-| Qwen3-ASR-1.7B (8-bit MLX) | ~2 GB |
+| Qwen3-ASR-1.7B (8-bit MLX) | ~4.4 GiB verified cache footprint; keep at least 6 GB free |
 | `qwen3.6:27b` (Q4_K_M) | ~17 GB |
 | Silero VAD (ONNX) | ~2 MB |
 | Session audio | ~19 MB per hour of recording (16 kHz mono FLAC) |
@@ -83,11 +84,26 @@ cd openmurmur
 ```
 
 ```bash
-uv sync --project python/openmurmur_audio --extra mlx
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx
 ```
 
 `bootstrap` deliberately installs only the CI-safe Python subset. The MLX extra
 above is required for both Silero speech detection and Qwen transcription.
+It installs packages but does not provision the ASR weights. Download the
+default public model in this foreground terminal:
+
+```bash
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT \
+  HF_ENDPOINT=https://huggingface.co HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
+  uv run --no-sync --project python/openmurmur_audio \
+  hf download Qwen/Qwen3-ASR-1.7B \
+  --include '*.json' --include '*.safetensors' --include '*.txt' --include '*.model'
+```
+
+This contacts `https://huggingface.co` and storage/CDN hosts selected by it,
+and stores about 4.4 GiB in the Hugging Face cache. It discloses the public
+model id plus ordinary HTTPS metadata such as your IP and user agent; it sends
+no audio, transcript or Telegram secret. See [PRIVACY.md](PRIVACY.md).
 
 ```bash
 pnpm openmurmur doctor
@@ -97,8 +113,12 @@ pnpm openmurmur doctor
 pnpm openmurmur setup
 ```
 
+On the one Mac that receives bot updates, first set
+`telegram.receiveUpdates=true` in `openmurmur.json`. Other Macs sharing the bot
+must use `send-only`; there must be exactly one input owner.
+
 ```bash
-pnpm openmurmur setup telegram
+pnpm openmurmur setup telegram owner
 ```
 
 ```bash
@@ -124,12 +144,12 @@ In another terminal:
 pnpm openmurmur status
 ```
 
-Budget 10–15 minutes to your first complete session in Telegram, not counting
-model downloads.
+Budget 10–15 minutes to your first complete session in Telegram after the
+explicit model download above finishes.
 
 ### Creating the bot
 
-Before `pnpm openmurmur setup telegram`, message
+Before `pnpm openmurmur setup telegram owner`, message
 [@BotFather](https://t.me/BotFather) on
 Telegram, send `/newbot`, and keep the token it gives you. The setup flow
 will ask for it with hidden input and store it in the macOS Keychain. It is
@@ -345,7 +365,8 @@ able to stop your recorder or delete your data.
 ```bash
 pnpm openmurmur doctor              # check every dependency (read-only)
 pnpm openmurmur setup               # create dirs, config, database (shows a plan first)
-pnpm openmurmur setup telegram      # connect a bot (hidden token prompt)
+pnpm openmurmur setup telegram owner     # connect the one bot input owner
+pnpm openmurmur setup telegram send-only # connect an output-only host
 pnpm openmurmur capture authorize   # explicitly open native GUI permission flow
 pnpm openmurmur capture test        # record 5s and report levels
 pnpm openmurmur recover             # report what an unclean shutdown left behind

@@ -50,6 +50,28 @@ interface WorkerGeneration {
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;
 const DEFAULT_TERMINATION_GRACE_MS = 1000;
+const CACHE_ENVIRONMENT_KEYS = [
+  'HF_HOME',
+  'HF_HUB_CACHE',
+  'HUGGINGFACE_HUB_CACHE',
+  'XDG_CACHE_HOME',
+] as const;
+
+function workerEnvironment(): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    PATH: process.env['PATH'] ?? '',
+    HOME: process.env['HOME'] ?? '',
+    UV_OFFLINE: '1',
+    HF_HUB_OFFLINE: '1',
+    HF_HUB_DISABLE_TELEMETRY: '1',
+    HF_HUB_DISABLE_IMPLICIT_TOKEN: '1',
+  };
+  for (const key of CACHE_ENVIRONMENT_KEYS) {
+    const value = process.env[key]?.trim();
+    if (value) environment[key] = value;
+  }
+  return environment;
+}
 
 export class WorkerProcess {
   readonly #options: WorkerProcessOptions;
@@ -89,8 +111,8 @@ export class WorkerProcess {
       child = spawn(this.#options.command, [...this.#options.args], {
         cwd: this.#options.cwd,
         stdio: ['pipe', 'pipe', 'pipe'],
-        // The worker gets no secrets. It only ever sees audio.
-        env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '' },
+        // The worker gets no secrets and cannot provision models implicitly.
+        env: workerEnvironment(),
       });
     } catch (error) {
       return Promise.reject(

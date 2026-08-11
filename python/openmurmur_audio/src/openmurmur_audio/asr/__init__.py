@@ -94,7 +94,8 @@ class QwenAsr:
             raise AsrUnavailableError(
                 "mlx-qwen3-asr is not installed.\n"
                 "Install the local model stack:\n"
-                "  uv sync --project python/openmurmur_audio --extra mlx\n"
+                "  /usr/bin/env -u UV_PROJECT_ENVIRONMENT \\\n"
+                "    uv sync --project python/openmurmur_audio --extra mlx\n"
                 "OpenMurmur transcribes on-device only and has no cloud fallback."
             ) from exc
 

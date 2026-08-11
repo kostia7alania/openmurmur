@@ -16,9 +16,9 @@ followed top to bottom, verifying after each step.
    SIP protects the TCC database, so `tccutil` can reset a permission but never
    add one. A human must click Allow in a Screen Sharing session.
 2. **Creating the Telegram bot and entering its token.** The token comes from
-   @BotFather in a Telegram client, and `setup telegram` reads it from a hidden
-   TTY prompt on purpose — it must never reach argv, a file, an environment
-   variable or a log.
+   @BotFather in a Telegram client, and `setup telegram owner` reads it from a
+   hidden TTY prompt on purpose — it must never reach argv, a file, an
+   environment variable or a log.
 
 Everything else below is scriptable. Reach those two points, then stop and
 report what is needed, rather than looking for a way around them.
@@ -56,10 +56,24 @@ Command Line Tools, Homebrew (**including the two PATH lines it prints**),
 FFmpeg, Node 26.7.0 or newer, Ollama, `./scripts/bootstrap`, and then the model stack:
 
 ```bash
-uv sync --project python/openmurmur_audio --extra mlx
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx
 ```
 
-Without that last one there is no speech detection and no transcription.
+Without that package step there is no speech detection and no transcription.
+Provision the default ASR snapshot only with the explicit foreground command
+from [INSTALL step 7](INSTALL.md#7-the-local-model-stack):
+
+```bash
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT \
+  HF_ENDPOINT=https://huggingface.co HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
+  uv run --no-sync --project python/openmurmur_audio \
+  hf download Qwen/Qwen3-ASR-1.7B \
+  --include '*.json' --include '*.safetensors' --include '*.txt' --include '*.model'
+```
+
+It contacts Hugging Face and its storage/CDN hosts, uses about 4.4 GiB of cache
+for the verified snapshot and sends no audio, transcript or Telegram secret.
+The daemon and `doctor` stay offline and fail if this cache is missing.
 
 Verify — this starts the real worker and scores an audio frame, so a green tick
 means the detector actually loads:
@@ -178,8 +192,11 @@ error; the prompt is never shown.
 A human creates the bot: message [@BotFather](https://t.me/BotFather), send
 `/newbot`, follow the prompts, keep the token.
 
+Set `telegram.receiveUpdates=true` in `openmurmur.json`; this server is the one
+explicit input owner. Every other host sharing this token must be `send-only`.
+
 ```bash
-pnpm openmurmur setup telegram
+pnpm openmurmur setup telegram owner
 ```
 
 In order, it:
@@ -209,7 +226,7 @@ security find-generic-password -s io.openmurmur -a telegram-secrets-v1 -w > /dev
 | Exit | Meaning | Action |
 | --- | --- | --- |
 | 0 | Stored and readable | Something else is wrong; `server-preflight` also detects an empty value |
-| 44 | Genuinely not stored | Run `setup telegram` |
+| 44 | Genuinely not stored | Run `pnpm openmurmur setup telegram owner` |
 | anything else | **Locked Keychain** — the token is intact | Enable automatic login (step 3), or `security unlock-keychain ~/Library/Keychains/login.keychain-db` |
 
 Older installations may still have `telegram-bot-token` and
@@ -352,7 +369,7 @@ into a notarized, identity-stable release.
 ## Memory, on a 64 GB machine
 
 The defaults assume this much: a 27B summarizer (~17 GB) and a resident
-Qwen3-ASR-1.7B (~2 GB) coexist comfortably.
+Qwen3-ASR-1.7B (about 4.4 GiB in the verified cache) coexist comfortably.
 
 **Do not run anything else heavy on the GPU at the same time.** Ollama, MLX and
 PyTorch all allocate from the same unified pool, and three large models at once

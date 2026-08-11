@@ -119,7 +119,7 @@ export function renderDeadJobAlert(
   lines.push('', 'Что сделать на этом Mac:', '1. pnpm openmurmur doctor');
   if (hasGeneralAsrFailure) {
     lines.push(
-      '   Если ASR/MLX не установлен: uv sync --project python/openmurmur_audio --extra mlx',
+      '   Если ASR/MLX не установлен: /usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx',
     );
   }
   if (categories.has('llm_dependency')) {
@@ -160,7 +160,7 @@ export function renderAsrUnavailableDetail(hostName: string, reason: string): st
     '',
     'Что сделать на этом Mac:',
     '1. pnpm openmurmur doctor',
-    '2. Если ASR/MLX не установлен: uv sync --project python/openmurmur_audio --extra mlx',
+    '2. Если ASR/MLX не установлен: /usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx',
   ].join('\n');
 }
 

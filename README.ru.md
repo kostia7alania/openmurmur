@@ -36,16 +36,33 @@ SSH: [docs/SERVER.md](docs/SERVER.md).
 git clone https://github.com/kostia7alania/openmurmur.git
 cd openmurmur
 ./scripts/bootstrap
-uv sync --project python/openmurmur_audio --extra mlx
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT \
+  HF_ENDPOINT=https://huggingface.co HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
+  uv run --no-sync --project python/openmurmur_audio \
+  hf download Qwen/Qwen3-ASR-1.7B \
+  --include '*.json' --include '*.safetensors' --include '*.txt' --include '*.model'
 pnpm openmurmur doctor
 pnpm openmurmur setup
-pnpm openmurmur setup telegram
+```
+
+На единственном Mac, который принимает update бота, установите
+`telegram.receiveUpdates=true` в `openmurmur.json`, затем продолжайте:
+
+```bash
+pnpm openmurmur setup telegram owner
 pnpm openmurmur capture test
 pnpm openmurmur start
 ```
 
 Команда `uv sync ... --extra mlx` обязательна: `bootstrap` ставит только
-CI-safe набор, без которого Silero и Qwen не запустятся.
+CI-safe набор, без которого Silero и Qwen не запустятся. Следующая команда —
+единственный явный foreground-шаг загрузки ASR: она обращается к Hugging Face и
+его storage/CDN, занимает около 4,4 GiB cache (оставьте минимум 6 GB свободными)
+и не отправляет аудио, транскрипты или Telegram secret. Daemon и `doctor`
+работают с model Hub только offline. Полная граница описана в
+[docs/INSTALL.md](docs/INSTALL.md#7-the-local-model-stack) и
+[PRIVACY.md](PRIVACY.md).
 
 Оставьте последнюю команду работать в foreground. Когда в логе появится
 `first audio frame received`, говорите дольше 3 секунд, затем помолчите 60
@@ -64,9 +81,10 @@ CI-safe набор, без которого Silero и Qwen не запустят
 - краткое содержание и структурированный отчёт;
 - статусы записи, очередей и здоровья демона.
 
-Telegram — единственная сетевая граница, но bot chat не имеет end-to-end
-шифрования. Если Telegram не должен получать исходное аудио, этот продукт вам
-не подходит. Подробнее: [PRIVACY.md](PRIVACY.md) и
+Во время обычной работы Telegram — единственная внешняя сетевая граница;
+явная установка packages и ASR weights выполняется раньше в foreground. Bot
+chat не имеет end-to-end шифрования. Если Telegram не должен получать исходное
+аудио, этот продукт вам не подходит. Подробнее: [PRIVACY.md](PRIVACY.md) и
 [docs/TELEGRAM.md](docs/TELEGRAM.md).
 
 ## Команды бота

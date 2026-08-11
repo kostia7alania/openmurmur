@@ -15,15 +15,20 @@ The worker receives **no secrets**. It only ever sees audio file paths.
 ## Install
 
 ```bash
-uv sync --project python/openmurmur_audio
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio
 ```
 
 That installs the CI-safe subset (numpy, onnxruntime, soundfile). The MLX stack
-is an optional extra because it pulls several GB of weights and needs Metal:
+is an optional extra because its packages and dependencies use several GB and
+need Metal:
 
 ```bash
-uv sync --project python/openmurmur_audio --extra mlx
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx
 ```
+
+The extra installs code only; it does not provision ASR weights. Download the
+configured model only with the explicit foreground Hugging Face step in
+[the installation guide](../../docs/INSTALL.md#7-the-local-model-stack).
 
 ## Protocol
 

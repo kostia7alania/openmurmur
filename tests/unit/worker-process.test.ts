@@ -91,6 +91,48 @@ async function waitForReady(dir: string, timeoutMs = 5000): Promise<void> {
 }
 
 describe('worker shutdown lifecycle', () => {
+  it('starts model workers offline with only approved cache settings', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'openmurmur-worker-env-'));
+    const environmentPath = join(directory, 'environment.json');
+    const previousCache = process.env['HF_HUB_CACHE'];
+    const previousProjectEnvironment = process.env['UV_PROJECT_ENVIRONMENT'];
+    const previousSecret = process.env['OPENMURMUR_TEST_SECRET'];
+    process.env['HF_HUB_CACHE'] = join(directory, 'model-cache');
+    process.env['UV_PROJECT_ENVIRONMENT'] = join(directory, 'other-python');
+    process.env['OPENMURMUR_TEST_SECRET'] = 'must-not-reach-worker';
+    const worker = new WorkerProcess({
+      command: process.execPath,
+      args: ['-e', ENVIRONMENT_WORKER, environmentPath],
+      cwd: process.cwd(),
+      logger: nullLogger,
+      label: 'ASR',
+    });
+    let childEnvironment = {} as NodeJS.ProcessEnv;
+
+    try {
+      await worker.ensureStarted();
+      await waitForFile(environmentPath);
+      childEnvironment = JSON.parse(readFileSync(environmentPath, 'utf8')) as NodeJS.ProcessEnv;
+    } finally {
+      await worker.close('shutdown-environment-test');
+      if (previousCache === undefined) delete process.env['HF_HUB_CACHE'];
+      else process.env['HF_HUB_CACHE'] = previousCache;
+      if (previousProjectEnvironment === undefined) delete process.env['UV_PROJECT_ENVIRONMENT'];
+      else process.env['UV_PROJECT_ENVIRONMENT'] = previousProjectEnvironment;
+      if (previousSecret === undefined) delete process.env['OPENMURMUR_TEST_SECRET'];
+      else process.env['OPENMURMUR_TEST_SECRET'] = previousSecret;
+      rmSync(directory, { recursive: true, force: true });
+    }
+
+    assert.equal(childEnvironment['UV_OFFLINE'], '1');
+    assert.equal(childEnvironment['HF_HUB_OFFLINE'], '1');
+    assert.equal(childEnvironment['HF_HUB_DISABLE_TELEMETRY'], '1');
+    assert.equal(childEnvironment['HF_HUB_DISABLE_IMPLICIT_TOKEN'], '1');
+    assert.equal(childEnvironment['HF_HUB_CACHE'], join(directory, 'model-cache'));
+    assert.equal(childEnvironment['UV_PROJECT_ENVIRONMENT'], undefined);
+    assert.equal(childEnvironment['OPENMURMUR_TEST_SECRET'], undefined);
+  });
+
   it('does not start again after an intentional close', async () => {
     const worker = new WorkerProcess({
       command: process.execPath,
@@ -245,6 +287,28 @@ describe('worker shutdown lifecycle', () => {
   });
 });
 
+const ENVIRONMENT_WORKER = String.raw`
+const fs = require('node:fs');
+fs.writeFileSync(process.argv[1], JSON.stringify(process.env));
+
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  input += chunk;
+  const lines = input.split('\n');
+  input = lines.pop() || '';
+  for (const line of lines) {
+    if (!line) continue;
+    const request = JSON.parse(line);
+    const response = request.op === 'shutdown'
+      ? { id: request.id, ok: true, op: 'shutdown' }
+      : { id: request.id, ok: true, op: 'ping', worker_version: 'environment' };
+    process.stdout.write(JSON.stringify(response) + '\n');
+    if (request.op === 'shutdown') setImmediate(() => process.exit(0));
+  }
+});
+`;
+
 describe('worker recovery hint', () => {
   it('prints a doctor command that is runnable from the source checkout', () => {
     const hint = missingWorkerHint('uv', 'not found');
@@ -292,4 +356,13 @@ async function waitForGeneration(file: string, expected: number): Promise<void> 
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`worker generation ${expected} did not start`);
+}
+
+async function waitForFile(file: string): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    if (existsSync(file)) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`worker did not write ${file}`);
 }

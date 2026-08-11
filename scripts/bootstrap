@@ -2,7 +2,7 @@
 # Installs everything OpenMurmur needs. Idempotent: safe to re-run.
 #
 # It never installs models (multi-gigabyte, and your choice) and never touches
-# the Keychain. Run `openmurmur setup telegram` for that.
+# the Keychain. Run `pnpm openmurmur setup telegram owner|send-only` for that.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -123,12 +123,12 @@ bold "Installing Node dependencies"
 "$PNPM_BIN" install --frozen-lockfile
 
 bold "Installing the Python audio worker (CI-safe subset)"
-uv sync --project python/openmurmur_audio --inexact
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --inexact
 ok "Python worker ready"
 
 echo
 warn "The MLX ASR stack is NOT installed by default (several GB, needs Metal):"
-echo "    uv sync --project python/openmurmur_audio --extra mlx"
+echo "    /usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx"
 echo
 warn "Ollama is optional. Without it you get audio and transcripts, but no summaries:"
 echo "    brew install ollama && ollama serve && ollama pull qwen3.6:27b"
@@ -138,7 +138,8 @@ bold "Next steps"
 cat <<'STEPS'
   pnpm openmurmur doctor           # verify everything
   pnpm openmurmur setup            # create directories and config
-  pnpm openmurmur setup telegram   # connect your bot
+  pnpm openmurmur setup telegram owner     # input owner; first set receiveUpdates=true
+  pnpm openmurmur setup telegram send-only # output-only host; default config role
   pnpm openmurmur capture test     # prove foreground PCM and check levels
   pnpm openmurmur start            # run the daemon
 STEPS

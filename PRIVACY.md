@@ -28,9 +28,13 @@ Everything lives under `~/Library/Application Support/OpenMurmur/`, mode `0700`:
 The bot token and chat ID are in the **macOS Keychain**, service `io.openmurmur`
 — never in a file.
 
-## What leaves your machine
+## What leaves your machine during normal operation
 
-**Only to the Telegram chat you configured:**
+The ASR worker is forced into Hugging Face offline mode. It cannot provision a
+missing model while the daemon, `doctor` or a retry is running. It also receives
+no cached Hugging Face token and has telemetry disabled.
+
+The only external runtime destination is the Telegram chat you configured:
 
 - Source FLAC audio of each session
 - Full transcripts
@@ -40,10 +44,35 @@ The bot token and chat ID are in the **macOS Keychain**, service `io.openmurmur`
 - Health and status messages
 - Transcripts of audio you send the bot
 
-**Nothing else, to nowhere else.** VAD and ASR run entirely on your Mac. The LLM
-endpoint is validated as loopback-only before transcript content can be sent to
-it. There is no telemetry, no analytics, no crash reporting, no update check,
-and no OpenMurmur server — there is no OpenMurmur server to have.
+VAD and ASR run entirely on your Mac. The LLM endpoint is validated as
+loopback-only before transcript content can be sent to it. There is no
+OpenMurmur telemetry, analytics, crash reporting, update check or server.
+
+## Explicit model provisioning
+
+OpenMurmur never hides a model download inside daemon startup or transcription.
+The foreground `hf download` command in [docs/INSTALL.md](docs/INSTALL.md) is the
+only documented ASR provisioning step. For the default model it:
+
+- connects to `https://huggingface.co` and may follow signed redirects to
+  storage/CDN hosts selected by Hugging Face;
+- discloses `Qwen/Qwen3-ASR-1.7B` and ordinary HTTPS metadata such as the
+  machine's IP address and user agent;
+- receives model configuration, tokenizer files and weights, but sends no
+  microphone audio, transcript, summary, Telegram credential or chat id;
+- disables Hugging Face telemetry and use of any cached implicit Hub token.
+
+The verified default-model cache footprint on the development machine is about
+4.4 GiB; installation requires at least 6 GB free on that volume. Hugging Face
+uses `HF_HUB_CACHE`, then `HUGGINGFACE_HUB_CACHE`, then `HF_HOME/hub`, falling
+back to `~/.cache/huggingface/hub`. Beyond the required `PATH` and `HOME`,
+OpenMurmur passes only those cache-location settings (and `XDG_CACHE_HOME`) to
+the offline worker, never arbitrary parent environment variables.
+
+`uv sync --extra mlx` is also an explicit foreground network action: it obtains
+the pinned Python package graph from the configured Python package indexes. It
+does not receive recordings or Telegram secrets and does not download the ASR
+weights.
 
 ## The Telegram caveat, stated plainly
 

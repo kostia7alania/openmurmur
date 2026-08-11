@@ -208,7 +208,7 @@ export class MlxAsr implements AsrBackend {
           model: this.#options.model,
           quantization: this.#options.quantization,
         },
-        // First load may download several GB of weights.
+        // Loading a provisioned snapshot can still be slow on the first local use.
         Math.max(this.#options.requestTimeoutMs, 30 * 60 * 1000),
       );
       if (!response.ok) {

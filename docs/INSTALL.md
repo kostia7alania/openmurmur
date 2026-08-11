@@ -33,7 +33,8 @@ uname -m && sw_vers -productVersion
 ### If you have 16 GB or 24 GB
 
 The default config loads a 27B summarizer (~17 GB) alongside a resident 1.7B ASR
-model (~2 GB). That does not fit. It still works — use a smaller summarizer:
+model (about 4.4 GiB in the verified Hugging Face cache). That does not fit. It
+still works — use a smaller summarizer:
 
 ```bash
 ollama pull qwen3.6:8b
@@ -150,12 +151,43 @@ This is the part `bootstrap` leaves to you, because it is several gigabytes and
 pulls PyTorch:
 
 ```bash
-uv sync --project python/openmurmur_audio --extra mlx
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx
 ```
+
+Clearing `UV_PROJECT_ENVIRONMENT` is intentional. The daemon, launchd and
+`doctor` all use the checkout's fixed `python/openmurmur_audio/.venv`; an
+interactive-shell-only environment would make readiness lie about the
+background runtime.
 
 Without this extra there is **no speech detection and no transcription** — the
 daemon starts, but `doctor` reports `speech_detection` as failed. The MLX ASR
 runtime, and Silero VAD, both live here.
+
+Package installation does not provision the ASR weights. Download the default
+public model explicitly, in this foreground terminal:
+
+```bash
+/usr/bin/env -u UV_PROJECT_ENVIRONMENT \
+  HF_ENDPOINT=https://huggingface.co HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
+  uv run --no-sync --project python/openmurmur_audio \
+  hf download Qwen/Qwen3-ASR-1.7B \
+  --include '*.json' --include '*.safetensors' --include '*.txt' --include '*.model'
+```
+
+The verified snapshot occupies about 4.4 GiB; keep at least 6 GB free on the
+cache volume. The command contacts `https://huggingface.co` and storage/CDN
+hosts selected by it. Hugging Face sees the public model id and ordinary HTTPS
+metadata such as your IP and user agent. It receives no audio, transcript or
+Telegram secret, and the command disables telemetry and use of a cached Hub
+token. The cache is selected by `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE` or
+`HF_HOME` and otherwise defaults to `~/.cache/huggingface/hub`. See
+[PRIVACY.md](../PRIVACY.md) for the complete boundary.
+
+The daemon and `doctor` always launch the worker with Hugging Face offline mode
+and uv offline mode enabled. They never install Python, sync packages or
+download a missing model; `mlx_readiness` fails with this step as the fix
+instead. If you changed `asr.model`, replace the default repository id in the
+foreground command with the configured public model.
 
 ## 8. Check everything
 
@@ -172,6 +204,7 @@ Read the output. It is the difference between "it should work" and "it does":
 ✅ ffmpeg             ffmpeg version 8.1.2
 ✅ audio_devices      [0] MacBook Pro Microphone
 ✅ uv                 uv 0.11.14
+✅ mlx_readiness      configured model snapshot evidence present; 183 GB free on cache volume
 ✅ speech_detection   Silero VAD answered in 1291 ms
 ✅ ollama             qwen3.6:27b available at http://127.0.0.1:11434
 ⚠️  state_directory    ... (missing or not writable)
@@ -259,8 +292,12 @@ OpenMurmur adds no indicator of its own and does not try to hide that one.
 Message [@BotFather](https://t.me/BotFather), send `/newbot`, follow the
 prompts, and keep the token.
 
+This Mac is the input owner, so first set `telegram.receiveUpdates=true` in
+`openmurmur.json`. Any other Mac sharing the bot must use `setup telegram
+send-only`; exactly one host may receive updates.
+
 ```bash
-pnpm openmurmur setup telegram
+pnpm openmurmur setup telegram owner
 ```
 
 It asks for the token with **hidden input** and stores the complete token/chat
@@ -289,9 +326,10 @@ Wait until the log says `first audio frame received`, then speak for more than
 receive the source FLAC first, then the transcript, then the report. `Ctrl-C`
 stops the daemon and finalizes whatever was recording.
 
-The first transcription is slow — it downloads Qwen3-ASR-1.7B (~2 GB) and loads
-it. After that the model stays resident and a session is transcribed in a
-fraction of its duration.
+The first transcription loads the already-provisioned Qwen3-ASR snapshot from
+disk, so it is slower than later sessions. The model then stays resident and a
+session is transcribed in a fraction of its duration. If the snapshot is
+missing, the job fails locally and never starts a background download.
 
 ### Then in the background
 
@@ -335,7 +373,7 @@ tail -f ~/Library/Application\ Support/OpenMurmur/logs/daemon.err.log
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `speech_detection` fails in `doctor` | Step 7 was skipped: `uv sync --project python/openmurmur_audio --extra mlx` |
+| `speech_detection` fails in `doctor` | Step 7 was skipped: `/usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx` |
 | Native helper reports that microphone authorization is required | From a GUI login session, run step 10's `pnpm openmurmur capture authorize`; it is the only intentional prompt path. |
 | FFmpeg works in Terminal but launchd has no frames | A Terminal FFmpeg grant is foreground-only proof. Install, configure and authorize the native helper in step 10. |
 | Nothing recorded, no error | Genuinely no speech: Silero rejects a fan, traffic and music by design, and a session under 3 seconds of speech is dropped as noise. `pnpm openmurmur status` shows the rejected count. |

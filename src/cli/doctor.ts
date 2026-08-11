@@ -156,13 +156,6 @@ function resolveConfiguredPath(value: string, relativeTo: string): string {
   return isAbsolute(expanded) ? expanded : resolve(relativeTo, expanded);
 }
 
-function pythonEnvironmentPath(): string {
-  const configured = process.env['UV_PROJECT_ENVIRONMENT']?.trim();
-  return configured
-    ? resolveConfiguredPath(configured, PYTHON_PROJECT)
-    : join(PYTHON_PROJECT, '.venv');
-}
-
 function huggingFaceCacheRoot(): string {
   const explicit =
     process.env['HF_HUB_CACHE']?.trim() || process.env['HUGGINGFACE_HUB_CACHE']?.trim();
@@ -302,7 +295,7 @@ export async function checkMlxReadiness(
     };
   }
 
-  const environment = options.pythonEnvironment ?? pythonEnvironmentPath();
+  const environment = options.pythonEnvironment ?? join(PYTHON_PROJECT, '.venv');
   const cacheRoot = options.cacheRoot ?? huggingFaceCacheRoot();
   const packages = await inspectMlxPackages(environment);
   const modelCached = await configuredModelIsCached(cacheRoot, asr.model);
@@ -328,12 +321,12 @@ export async function checkMlxReadiness(
   const fixes: string[] = [];
   if (packageFailure) {
     fixes.push(
-      'Install the local package stack: uv sync --project python/openmurmur_audio --extra mlx',
+      'Install the local package stack: /usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx',
     );
   }
   if (!modelCached) {
     fixes.push(
-      'Populate the configured ASR model with one explicit foreground transcription while online, then rerun doctor.',
+      'Download the configured ASR weights explicitly in the foreground; see docs/INSTALL.md step 7, then rerun doctor.',
     );
   }
   if (diskLow) {
@@ -409,7 +402,7 @@ async function checkSpeechDetection(loaded: LoadedConfig): Promise<Check> {
       detail: (error as Error).message.split('\n')[0] ?? 'unavailable',
       fix:
         'Sessions cannot be detected without it. Install the local model stack:\n' +
-        '  uv sync --project python/openmurmur_audio --extra mlx\n' +
+        '  /usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx\n' +
         'Or set sessionizer.vadBackend to "energy" to cut sessions by loudness instead, ' +
         'accepting that noise will be recorded as speech.',
     };
@@ -578,7 +571,7 @@ export async function checkTelegramSetup(
       name: 'telegram_setup',
       level: 'warn',
       detail: 'no Telegram credential items found in the macOS Keychain',
-      fix: 'Run `pnpm openmurmur setup telegram` from the repository checkout.',
+      fix: 'Set telegram.receiveUpdates for this host, then run either `pnpm openmurmur setup telegram owner` or `pnpm openmurmur setup telegram send-only` from the repository checkout.',
     };
   }
   if (result.status === 'incomplete_legacy') {
@@ -586,7 +579,7 @@ export async function checkTelegramSetup(
       name: 'telegram_setup',
       level: 'warn',
       detail: 'an incomplete legacy Telegram credential pair is present in the macOS Keychain',
-      fix: 'Run `pnpm openmurmur setup telegram` to replace it atomically.',
+      fix: 'Set telegram.receiveUpdates for this host, then run either `pnpm openmurmur setup telegram owner` or `pnpm openmurmur setup telegram send-only` to replace it atomically.',
     };
   }
   return {
