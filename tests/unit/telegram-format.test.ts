@@ -399,43 +399,56 @@ describe('session report', () => {
 
   it('puts a bounded immutable source excerpt beside model-linked claims', () => {
     const longSource = `<точный & источник>${'я'.repeat(140)}`;
+    const misleadingPrefix = `САМОЕ НАЧАЛО НЕ ДОЛЖНО ПОПАСТЬ. ${'Нерелевантное вступление. '.repeat(20)}`;
+    const modalitySource =
+      `${misleadingPrefix}Я постараюсь отправить отчёт до пятницы, но пока не обещаю. ` +
+      'После этого разговор ушёл в другую тему.'.repeat(10);
     const input = {
       ...base,
       summary: {
         ...EMPTY_SUMMARY,
-        summary: 'Краткий итог',
-        decisions: ['Выпустить MVP.'],
+        summary: 'Точный источник',
+        decisions: ['Отправлю отчёт до пятницы.'],
+        tasks: ['alpha beta'],
+        questions: ['The report is ready'],
         people: ['Анна'],
         claimEvidence: [
           { field: 'summary' as const, item: 0, segments: [0] },
           { field: 'decisions' as const, item: 0, segments: [1] },
+          { field: 'tasks' as const, item: 0, segments: [2] },
+          { field: 'questions' as const, item: 0, segments: [3] },
           { field: 'people' as const, item: 0, segments: [1] },
         ],
       },
       transcriptSegments: [
         { startMs: 0, endMs: 1_000, text: longSource },
-        { startMs: 1_000, endMs: 2_000, text: 'Команда решила выпустить MVP.' },
+        { startMs: 1_000, endMs: 2_000, text: modalitySource },
+        { startMs: 2_000, endMs: 3_000, text: `alpha${'&'.repeat(100)}beta` },
+        { startMs: 3_000, endMs: 4_000, text: 'The budget is uncertain and unrelated.' },
       ],
     };
 
     const html = renderSessionReport(input);
     const htmlLabels = [...html.matchAll(/<i>\[([^\n]+?)\]<\/i>/g)].map((match) => match[1] ?? '');
-    assert.equal(htmlLabels.length, 3);
-    assert.equal(html.match(/\n↳ <i>/g)?.length, 3);
+    assert.equal(htmlLabels.length, 5);
+    assert.equal(html.match(/\n↳ <i>/g)?.length, 5);
     assert.match(
       htmlLabels[0] ?? '',
       /ссылка модели: сегм\. 1; фрагмент: «&lt;точный &amp; источник&gt;я+…»/,
     );
     assert.doesNotMatch(htmlLabels[0] ?? '', /я{121}/);
-    assert.equal(
-      htmlLabels.filter((label) =>
-        label.includes('ссылка модели: сегм. 2; фрагмент: «Команда решила выпустить MVP.»'),
-      ).length,
-      2,
+    assert.match(
+      htmlLabels[1] ?? '',
+      /ссылка модели: сегм\. 2; фрагмент: «….*Я постараюсь отправить отчёт до пятницы, но пока не обещаю\./,
     );
+    assert.doesNotMatch(htmlLabels[1] ?? '', /САМОЕ НАЧАЛО/);
+    assert.equal(htmlLabels[2], 'ссылка модели: сегм. 3; фрагмент внутри сегмента не локализован');
+    assert.equal(htmlLabels[3], 'ссылка модели: сегм. 4; фрагмент внутри сегмента не локализован');
+    assert.equal(htmlLabels[4], 'ссылка модели: сегм. 2; фрагмент внутри сегмента не локализован');
 
     const markdown = renderSessionReportMarkdown(input);
-    assert.equal(markdown.match(/ссылка модели: сегм\\\. 2; фрагмент/g)?.length, 2);
+    assert.match(markdown, /Я постараюсь отправить отчёт до пятницы, но пока не обещаю/);
+    assert.match(markdown, /фрагмент внутри сегмента не локализован/);
     assert.match(markdown, /&lt;точный &amp; источник&gt;я+…/);
 
     const hugeCluster = `a${'\u0301'.repeat(5_000)}`;
@@ -450,7 +463,7 @@ describe('session report', () => {
     };
     const preview = renderSessionSummaryPreview(hostileUnicodeInput);
     assert.ok(preview.length <= TELEGRAM_MESSAGE_LIMIT);
-    assert.match(preview, /фрагмент: «…»/);
+    assert.match(preview, /фрагмент внутри сегмента не локализован/);
     assert.ok(renderSessionReportMarkdown(hostileUnicodeInput).includes(hugeCluster));
   });
 
