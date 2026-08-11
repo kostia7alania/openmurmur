@@ -22,6 +22,8 @@ export interface DigestRow {
 }
 
 export interface Digest {
+  readonly sourceKind: 'local_daily_digest';
+  readonly processingHost: string;
   readonly date: string;
   readonly sessionCount: number;
   readonly totalSpeechMs: number;
@@ -112,7 +114,12 @@ export function localDayBounds(
   };
 }
 
-export function buildDigest(db: DatabaseSync, date: string, timezone: number | string): Digest {
+export function buildDigest(
+  db: DatabaseSync,
+  date: string,
+  timezone: number | string,
+  processingHost: string,
+): Digest {
   const { fromIso, toIso } = localDayBounds(date, timezone);
 
   const rows = db
@@ -158,6 +165,8 @@ export function buildDigest(db: DatabaseSync, date: string, timezone: number | s
   });
 
   return {
+    sourceKind: 'local_daily_digest',
+    processingHost,
     date,
     sessionCount: digestRows.length,
     totalSpeechMs: digestRows.reduce((sum, r) => sum + r.speechMs, 0),
@@ -246,8 +255,9 @@ function startOfLocalDate(year: number, month: number, day: number, timezone: st
 const pad2 = (value: number) => String(value).padStart(2, '0');
 
 export function renderDigest(digest: Digest, timezone: number | string): string {
+  const provenance = renderDigestProvenanceHtml(digest);
   if (digest.sessionCount === 0) {
-    return `📅 <b>Дайджест за ${escapeHtml(digest.date)}</b>\n\nСессий не было.`;
+    return `📅 <b>Дайджест за ${escapeHtml(digest.date)}</b>\n\n${provenance}\n\nСессий не было.`;
   }
 
   const allTasks = digest.rows.flatMap((r) => r.tasks);
@@ -256,6 +266,8 @@ export function renderDigest(digest: Digest, timezone: number | string): string 
 
   const lines = [
     `📅 <b>Дайджест за ${escapeHtml(digest.date)}</b>`,
+    '',
+    provenance,
     '',
     `Сессий: ${digest.sessionCount}`,
     `Всего речи: ${formatDuration(digest.totalSpeechMs)}`,
@@ -288,6 +300,8 @@ export function renderDigestMarkdown(digest: Digest, timezone: number | string):
   const lines = [
     `# Дайджест OpenMurmur — ${digest.date}`,
     '',
+    `- Источник: локальный дневной дайджест OpenMurmur`,
+    `- Хост обработки: ${escapeMarkdown(digest.processingHost)}`,
     `- Сессий: ${digest.sessionCount}`,
     `- Всего речи: ${formatDuration(digest.totalSpeechMs)}`,
   ];
@@ -320,6 +334,17 @@ export function renderDigestMarkdown(digest: Digest, timezone: number | string):
   return `${lines.join('\n')}\n`;
 }
 
+export function renderDigestCaption(digest: Digest): string {
+  return `📅 Дайджест за ${digest.date}\n\n${renderDigestProvenanceHtml(digest)}`;
+}
+
+function renderDigestProvenanceHtml(digest: Digest): string {
+  return [
+    'Источник: локальный дневной дайджест OpenMurmur',
+    `Хост обработки: <code>${escapeHtml(digest.processingHost)}</code>`,
+  ].join('\n');
+}
+
 function formatClockInZone(iso: string, timezone: number | string): string {
   const epochMs = Date.parse(iso);
   if (typeof timezone === 'number') {
@@ -344,6 +369,112 @@ export function storeDigest(db: DatabaseSync, digest: Digest): void {
     digest.totalSpeechMs,
     JSON.stringify(digest),
     new Date().toISOString(),
+  );
+}
+
+export function readStoredDigest(db: DatabaseSync, date: string): Digest | undefined {
+  const row = db.prepare('SELECT payload FROM digests WHERE digest_date = ?').get(date) as
+    | { payload: string }
+    | undefined;
+  if (row === undefined) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.payload);
+  } catch (error) {
+    throw new Error(`stored digest ${date} has invalid payload JSON`, { cause: error });
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return invalidStoredDigest(date, 'payload', 'an object');
+  }
+  const record = parsed as Record<string, unknown>;
+  if (record['sourceKind'] !== 'local_daily_digest') {
+    return invalidStoredDigest(date, 'sourceKind', 'local_daily_digest');
+  }
+  if (typeof record['processingHost'] !== 'string' || record['processingHost'].trim() === '') {
+    return invalidStoredDigest(date, 'processingHost', 'a non-empty string');
+  }
+  if (record['date'] !== date) {
+    return invalidStoredDigest(date, 'date', `the requested date ${date}`);
+  }
+  const sessionCount = record['sessionCount'];
+  if (!Number.isInteger(sessionCount) || (sessionCount as number) < 0) {
+    return invalidStoredDigest(date, 'sessionCount', 'a non-negative integer');
+  }
+  const totalSpeechMs = record['totalSpeechMs'];
+  if (typeof totalSpeechMs !== 'number' || !Number.isFinite(totalSpeechMs) || totalSpeechMs < 0) {
+    return invalidStoredDigest(date, 'totalSpeechMs', 'a finite non-negative number');
+  }
+  const rawRows = record['rows'];
+  if (!Array.isArray(rawRows)) {
+    return invalidStoredDigest(date, 'rows', 'an array');
+  }
+  if (sessionCount !== rawRows.length) {
+    return invalidStoredDigest(date, 'sessionCount', `rows.length (${rawRows.length})`);
+  }
+  const rows = rawRows.map((row, index) => validateStoredDigestRow(date, row, index));
+  const rowSpeechMs = rows.reduce((sum, row) => sum + row.speechMs, 0);
+  if (!Number.isFinite(rowSpeechMs) || totalSpeechMs !== rowSpeechMs) {
+    return invalidStoredDigest(date, 'totalSpeechMs', `the row speech sum (${rowSpeechMs})`);
+  }
+  return {
+    sourceKind: 'local_daily_digest',
+    processingHost: record['processingHost'],
+    date,
+    sessionCount,
+    totalSpeechMs,
+    rows,
+  };
+}
+
+function validateStoredDigestRow(date: string, value: unknown, index: number): DigestRow {
+  const field = (name: string) => `rows[${index}].${name}`;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return invalidStoredDigest(date, `rows[${index}]`, 'an object');
+  }
+  const row = value as Record<string, unknown>;
+  if (typeof row['sessionId'] !== 'string' || row['sessionId'].trim() === '') {
+    return invalidStoredDigest(date, field('sessionId'), 'a non-empty string');
+  }
+  if (!isCanonicalIsoTimestamp(row['startedAt'])) {
+    return invalidStoredDigest(date, field('startedAt'), 'a canonical UTC ISO timestamp');
+  }
+  if (
+    typeof row['speechMs'] !== 'number' ||
+    !Number.isFinite(row['speechMs']) ||
+    row['speechMs'] < 0
+  ) {
+    return invalidStoredDigest(date, field('speechMs'), 'a finite non-negative number');
+  }
+  if (typeof row['summary'] !== 'string') {
+    return invalidStoredDigest(date, field('summary'), 'a string');
+  }
+  for (const name of ['decisions', 'tasks', 'questions'] as const) {
+    const list = row[name];
+    if (!Array.isArray(list) || !list.every((item) => typeof item === 'string')) {
+      return invalidStoredDigest(date, field(name), 'an array of strings');
+    }
+  }
+  return {
+    sessionId: row['sessionId'],
+    startedAt: row['startedAt'],
+    speechMs: row['speechMs'],
+    summary: row['summary'],
+    decisions: row['decisions'] as string[],
+    tasks: row['tasks'] as string[],
+    questions: row['questions'] as string[],
+  };
+}
+
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const epochMs = Date.parse(value);
+  return Number.isFinite(epochMs) && new Date(epochMs).toISOString() === value;
+}
+
+function invalidStoredDigest(date: string, field: string, expected: string): never {
+  throw new Error(
+    `stored digest ${date} has invalid ${field}; expected ${expected}. The durable snapshot was left unchanged.`,
   );
 }
 

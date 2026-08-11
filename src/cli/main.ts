@@ -16,7 +16,9 @@ import { renderSearchResults, searchTranscripts } from '../database/search.ts';
 import {
   buildDigest,
   hasUnfinishedSessionsForDate,
+  readStoredDigest,
   renderDigest,
+  renderDigestCaption,
   renderDigestMarkdown,
   scheduledDigestDate,
   storeDigest,
@@ -294,14 +296,21 @@ async function digestCommand(
       }
     }
 
-    const digest = buildDigest(db.handle, date, loaded.config.digest.timezone);
+    const stored = readStoredDigest(db.handle, date);
+    if (stored !== undefined) {
+      const rendered = renderDigest(stored, loaded.config.digest.timezone);
+      process.stdout.write(asJson ? `${JSON.stringify(stored, null, 2)}\n` : `${rendered}\n`);
+      return 0;
+    }
+
+    const digest = buildDigest(db.handle, date, loaded.config.digest.timezone, hostname());
     const rendered = renderDigest(digest, loaded.config.digest.timezone);
     let payload: OutboxPayload = { type: 'text', text: rendered, parseMode: 'HTML' };
     if (rendered.length > loaded.config.telegram.transcriptInlineLimit) {
       const filename = `digest-${date}.md`;
       const path = join(loaded.paths.transcriptsDir, filename);
       await writeTextAtomically(path, renderDigestMarkdown(digest, loaded.config.digest.timezone));
-      payload = { type: 'document', path, filename, caption: `📅 Дайджест за ${date}` };
+      payload = { type: 'document', path, filename, caption: renderDigestCaption(digest) };
     }
     transaction(db.handle, () => {
       storeDigest(db.handle, digest);

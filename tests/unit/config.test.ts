@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { decodeResponse, encodeRequest, LineSplitter } from '../../src/asr/protocol.ts';
 import { sessionIdFromDeliveryPart } from '../../src/cli/daemon.ts';
@@ -10,11 +14,15 @@ import {
   buildDigest,
   hasUnfinishedSessionsForDate,
   localDayBounds,
+  readStoredDigest,
   renderDigest,
+  renderDigestCaption,
   renderDigestMarkdown,
   scheduledDigestDate,
+  storeDigest,
 } from '../../src/digest/daily.ts';
 import { EnergyVad, rmsDbfs } from '../../src/sessionizer/vad.ts';
+import { Outbox } from '../../src/telegram/outbox.ts';
 
 describe('config parsing', () => {
   it('accepts an empty object and returns defaults', () => {
@@ -466,12 +474,15 @@ describe('digest day boundaries', () => {
         .prepare("UPDATE audio_sessions SET state = 'DONE' WHERE session_id = 'pending'")
         .run();
       assert.equal(hasUnfinishedSessionsForDate(db.handle, '2026-08-09', 'UTC'), false);
-      assert.equal(buildDigest(db.handle, '2026-08-09', 'UTC').sessionCount, 2);
+      const built = buildDigest(db.handle, '2026-08-09', 'UTC', 'digest-mac');
+      assert.equal(built.sessionCount, 2);
+      assert.equal(built.sourceKind, 'local_daily_digest');
+      assert.equal(built.processingHost, 'digest-mac');
 
       db.handle
         .prepare("UPDATE audio_sessions SET state = 'DELIVERING' WHERE session_id = 'pending'")
         .run();
-      assert.equal(buildDigest(db.handle, '2026-08-09', 'UTC').sessionCount, 1);
+      assert.equal(buildDigest(db.handle, '2026-08-09', 'UTC', 'digest-mac').sessionCount, 1);
     } finally {
       db.close();
     }
@@ -481,8 +492,13 @@ describe('digest day boundaries', () => {
     assert.throws(() => localDayBounds('2026-02-30', 'UTC'), /does not exist/);
   });
 
-  it('renders a complete safe Markdown artifact for a large digest', () => {
+  it('keeps the host-A digest artifact and payloads on an explicit host-B repeat', () => {
+    const root = mkdtempSync(join(tmpdir(), 'om-digest-repeat-'));
+    const db = openDatabase({ file: join(root, 'openmurmur.db') });
+    const processingHost = `snapshot-before-${hostname()}`;
     const digest = {
+      sourceKind: 'local_daily_digest' as const,
+      processingHost,
       date: '2026-08-09',
       sessionCount: 1,
       totalSpeechMs: 60_000,
@@ -492,19 +508,122 @@ describe('digest day boundaries', () => {
           startedAt: '2026-08-09T10:00:00.000Z',
           speechMs: 60_000,
           summary: '<script>alert(1)</script> **heading**',
-          decisions: ['ship [now](https://example.com)'],
+          decisions: Array.from(
+            { length: 20 },
+            (_, index) => `ship item ${index}: [now](https://example.com) ${'x'.repeat(220)}`,
+          ),
           tasks: [],
           questions: [],
         },
       ],
     };
-    const markdown = renderDigestMarkdown(digest, 'America/New_York');
-    const telegram = renderDigest(digest, 'America/New_York');
-    assert.match(markdown, /# Дайджест OpenMurmur/);
-    assert.match(markdown, /06:00/);
-    assert.match(telegram, /06:00/);
-    assert.doesNotMatch(markdown, /<script>/);
-    assert.doesNotMatch(markdown, /\*\*heading\*\*/);
+    try {
+      const markdown = renderDigestMarkdown(digest, 'America/New_York');
+      const telegram = renderDigest(digest, 'America/New_York');
+      const caption = renderDigestCaption(digest);
+      assert.ok(telegram.length > DEFAULT_CONFIG.telegram.transcriptInlineLimit);
+      for (const rendered of [telegram, caption]) {
+        assert.match(rendered, /локальный дневной дайджест OpenMurmur/);
+        assert.ok(rendered.includes(processingHost));
+      }
+      assert.match(markdown, /локальный дневной дайджест OpenMurmur/);
+      assert.ok(markdown.includes(processingHost.replaceAll('-', '\\-').replaceAll('.', '\\.')));
+      const empty = renderDigest(
+        { ...digest, sessionCount: 0, totalSpeechMs: 0, rows: [] },
+        'America/New_York',
+      );
+      assert.match(empty, /локальный дневной дайджест OpenMurmur/);
+      assert.ok(empty.includes(processingHost));
+      assert.match(markdown, /# Дайджест OpenMurmur/);
+      assert.match(markdown, /06:00/);
+      assert.match(telegram, /06:00/);
+      assert.doesNotMatch(markdown, /<script>/);
+      assert.doesNotMatch(markdown, /\*\*heading\*\*/);
+      storeDigest(db.handle, digest);
+      const stored = db.handle
+        .prepare('SELECT payload FROM digests WHERE digest_date = ?')
+        .get(digest.date) as { payload: string };
+      assert.deepEqual(JSON.parse(stored.payload), digest);
+
+      const outbox = new Outbox(db.handle);
+      const artifactPath = join(root, 'transcripts', `digest-${digest.date}.md`);
+      mkdirSync(join(root, 'transcripts'), { recursive: true });
+      writeFileSync(artifactPath, markdown);
+      outbox.enqueue({
+        deliveryPartId: `digest:${digest.date}`,
+        kind: 'digest',
+        ordinal: 30,
+        payload: {
+          type: 'document',
+          path: artifactPath,
+          filename: `digest-${digest.date}.md`,
+          caption,
+        },
+      });
+      const storedBeforeRepeat = stored.payload;
+      const outboxBeforeRepeat = db.handle
+        .prepare('SELECT payload FROM telegram_outbox WHERE delivery_part_id = ?')
+        .get(`digest:${digest.date}`) as { payload: string };
+      const artifactBeforeRepeat = readFileSync(artifactPath);
+
+      const repeated = spawnSync(
+        process.execPath,
+        ['src/cli/main.ts', 'digest', digest.date, '--json', '--root', root],
+        { cwd: process.cwd(), encoding: 'utf8' },
+      );
+      assert.equal(repeated.status, 0, repeated.stderr);
+      assert.deepEqual(JSON.parse(repeated.stdout), digest);
+      assert.deepEqual(readFileSync(artifactPath), artifactBeforeRepeat);
+      assert.equal(
+        (
+          db.handle
+            .prepare('SELECT payload FROM digests WHERE digest_date = ?')
+            .get(digest.date) as { payload: string }
+        ).payload,
+        storedBeforeRepeat,
+      );
+      assert.equal(
+        (
+          db.handle
+            .prepare('SELECT payload FROM telegram_outbox WHERE delivery_part_id = ?')
+            .get(`digest:${digest.date}`) as { payload: string }
+        ).payload,
+        outboxBeforeRepeat.payload,
+      );
+
+      const first = outbox.claimNext();
+      assert.ok(first);
+      outbox.recoverSending();
+      const retried = outbox.claimNext();
+      assert.ok(retried);
+      assert.equal(retried.payload, first.payload);
+      assert.ok(retried.payload.includes(processingHost));
+
+      const malformed = [
+        ['sessionCount', { ...digest, sessionCount: 2 }],
+        ['totalSpeechMs', { ...digest, totalSpeechMs: 60_001 }],
+        ['rows\\[0\\]\\.sessionId', { ...digest, rows: [{}] }],
+        [
+          'rows\\[0\\]\\.startedAt',
+          { ...digest, rows: [{ ...digest.rows[0], startedAt: '2026-08-09 10:00:00Z' }] },
+        ],
+        ['rows\\[0\\]\\.speechMs', { ...digest, rows: [{ ...digest.rows[0], speechMs: -1 }] }],
+        ['rows\\[0\\]\\.summary', { ...digest, rows: [{ ...digest.rows[0], summary: 7 }] }],
+        [
+          'rows\\[0\\]\\.decisions',
+          { ...digest, rows: [{ ...digest.rows[0], decisions: ['valid', 7] }] },
+        ],
+      ] as const;
+      for (const [field, payload] of malformed) {
+        db.handle
+          .prepare('UPDATE digests SET payload = ? WHERE digest_date = ?')
+          .run(JSON.stringify(payload), digest.date);
+        assert.throws(() => readStoredDigest(db.handle, digest.date), new RegExp(field));
+      }
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

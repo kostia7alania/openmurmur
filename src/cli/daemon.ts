@@ -27,6 +27,7 @@ import {
   hasUnfinishedSessionsForDate,
   hoursSinceLastDigest,
   renderDigest,
+  renderDigestCaption,
   renderDigestMarkdown,
   scheduledDigestDate,
   storeDigest,
@@ -1339,14 +1340,14 @@ export class Daemon {
       return;
     }
 
-    const digest = buildDigest(this.#db.handle, date, config.digest.timezone);
+    const digest = buildDigest(this.#db.handle, date, config.digest.timezone, hostname());
     const rendered = renderDigest(digest, config.digest.timezone);
     let payload: OutboxPayload = { type: 'text', text: rendered, parseMode: 'HTML' };
     if (rendered.length > config.telegram.transcriptInlineLimit) {
       const filename = `digest-${date}.md`;
       const path = join(this.#options.loaded.paths.transcriptsDir, filename);
       await writeTextAtomically(path, renderDigestMarkdown(digest, config.digest.timezone));
-      payload = { type: 'document', path, filename, caption: `📅 Дайджест за ${date}` };
+      payload = { type: 'document', path, filename, caption: renderDigestCaption(digest) };
     }
     transaction(this.#db.handle, () => {
       storeDigest(this.#db.handle, digest);

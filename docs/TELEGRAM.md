@@ -136,9 +136,16 @@ Source audio captions, transcripts, reports and incoming-file acknowledgements
 are self-identifying. A live session shows `фоновая запись OpenMurmur`, the
 persisted daemon hostname and capture IANA timezone, original wall date/time and
 session UID. Telegram-supplied audio shows whether it was sent directly or
-forwarded, attachment type, processing daemon, original forwarded time when
+forwarded, attachment type, claiming daemon, original forwarded time when
 Telegram supplies one, the later bot-chat message time, update/message ids,
 original claimed filename when present, and the stable OpenMurmur file UID.
+
+Daily digests identify themselves as a local OpenMurmur roll-up and snapshot the
+processing hostname in both the stored digest payload and the Telegram output.
+The same hostname is retained when an outbox delivery is retried; it is not
+reconstructed from whichever daemon later retries the send. Re-running
+`pnpm openmurmur digest DATE` prints that exact stored snapshot and does not
+rewrite its Markdown artifact or enqueue a replacement.
 
 Forward provenance uses the official `forward_origin.date`; it is never confused
 with `message.date`, which is when the forwarded copy reached the bot. Legacy
