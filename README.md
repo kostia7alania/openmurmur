@@ -487,7 +487,7 @@ Honesty matters more than a green badge, so:
 | Evidence level | Current authoritative evidence | Boundary it does **not** cross |
 | --- | --- | --- |
 | Offline automated | The exact current-revision Node and Python gate is recorded immediately below; every covered guarantee names deterministic repository tests. | No microphone, model weights, Telegram credential, Keychain mutation, launchd login session or sleep/wake cycle is exercised. |
-| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama runs, including real-Qwen CLI transcription, daemon-owned worker reuse, a real worker-death `JobQueue` retry, and the RU/EN/TH summary corpus. | The Ollama corpus did not meet its acceptance threshold; these bounded runs are not the complete capture-to-delivery or current-revision live release evidence. |
+| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama runs, including real-Qwen CLI transcription, daemon-owned worker reuse, a real worker-death `JobQueue` retry, real-model source-audio-first outbox eligibility, and the RU/EN/TH summary corpus. | The Ollama corpus did not meet its acceptance threshold; these bounded runs are not the complete capture-to-delivery or current-revision live release evidence. |
 | Live release | No current-revision end-to-end live run is recorded yet; D120–D122 in [`docs/MVP_123.md`](docs/MVP_123.md) are the required gates. | Until those rows are evidenced, the project does not claim real microphone → models → Telegram, launchd login/reboot or sleep/wake verification. |
 
 **Verified on this revision through offline TypeScript/Python checks and the
@@ -496,7 +496,8 @@ sessionizer state machine with a fake clock, pre-roll,
 60-second close, 15-minute rotation, bounded capture ingress and sleep epochs,
 unexpected clean capture-EOF handling,
 atomic FLAC and Markdown publication, lossless splitting, ffprobe validation of
-real media, staged audio-first delivery, delivery-clock retention proofs,
+real media, real-model source-audio-first outbox eligibility,
+delivery-clock retention proofs,
 lifecycle-status ordering, transcript revisions, job leases, real daemon-owned
 MLX reuse and worker death/retry, worker timeout recycling and a three-boundary
 real-SIGKILL recovery matrix, actionable

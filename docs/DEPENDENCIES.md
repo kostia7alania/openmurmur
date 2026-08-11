@@ -177,6 +177,28 @@ rehearsal did not use a microphone, Telegram, network, launchd, login/reboot or
 sleep/wake, and it did not turn the synthetic capture stream into the seeded
 sessions. Those complete capture-to-delivery and release gates remain live.
 
+### Real-model source-audio-first eligibility — 2026-08-12
+
+A separate private-root rehearsal ran the production `Daemon` with the real
+offline MLX/Qwen backend, a null Telegram provider and one pre-seeded finalized
+session containing locally synthesized English speech. Its independent 500 ms
+delivery loop completed `deliver_audio` once and durably created the exact
+pending source-audio outbox row while the independent ASR loop already held a
+live lease and no transcript revision existed. The source part was finalized,
+undeleted and still matched its recorded path and SHA-256 at that snapshot.
+
+Real ASR then completed once and created exactly one current revision. The
+audio-outbox `created_at` preceded the revision by about 2.85 seconds; the
+source hash remained unchanged. Orderly shutdown left no leases, daemon
+ownership or PID mirror, and SQLite integrity remained `ok` with zero
+foreign-key violations.
+
+This closes D032 only at the durable upload/outbox-eligibility boundary. The
+outbox remained pending and the source part remained undelivered, so the run
+does not claim a Telegram request or ACK, retention eligibility/deletion,
+Recorder or microphone enqueue, oversized splitting, backlog fairness or
+launchd behavior.
+
 ### Current-revision Ollama corpus — 2026-08-11
 
 The production `OllamaLlm` ran the checked-in single-language RU/EN/TH
