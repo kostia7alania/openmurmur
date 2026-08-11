@@ -609,6 +609,14 @@ offline slice is recorded on the item itself below.
 - **Tests:** Fault injection after download, insert, normalization, ASR, and
   transcript insert; same-file resend; process restart on every state; FK and
   quarantine-leak assertions.
+- **2026-08-11 evidence:** Startup now reconciles strict generated quarantine
+  and normalized-WAV names against durable UID owners, repeats ownership proof
+  immediately before unlink, preserves present-UID publish-before-path windows,
+  symlinks and corrupt/out-of-root ownership, and never scans the recording
+  archive. Focused tests cover report-only mode, both path kinds, NULL and
+  non-NULL crash windows, a late owner, root replacement, capture-first startup,
+  idempotency and ambient archive preservation. AR-03 remains yellow until D083
+  completes the end-to-end fault injection matrix.
 
 #### AR-04 🟡 Enforce a safe daemon singleton and PID identity
 

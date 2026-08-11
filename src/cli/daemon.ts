@@ -71,6 +71,7 @@ import {
   rejectionMessage,
   validateProbe,
 } from '../telegram/incoming.ts';
+import { reconcileIncomingArtifacts } from '../telegram/incoming-recovery.ts';
 import { keychainProvider, type SecretsProvider, telegramBotScope } from '../telegram/keychain.ts';
 import { drainOutbox, Outbox, type OutboxPayload } from '../telegram/outbox.ts';
 import {
@@ -99,6 +100,16 @@ import { writeDaemonHeartbeat } from './status.ts';
 import { VERSION } from './version.ts';
 
 const DIGEST_TICK_INTERVAL_MS = 5 * 60 * 1000;
+
+/** Calls the recorder synchronously before making cleanup runnable. */
+export function startRecorderBeforeBackgroundRecovery(
+  startRecorder: () => Promise<void>,
+  scheduleRecovery: () => void,
+): Promise<void> {
+  const recorderDone = startRecorder();
+  scheduleRecovery();
+  return recorderDone;
+}
 
 /**
  * The long-running daemon.
@@ -321,7 +332,16 @@ export class Daemon {
 
     try {
       this.#recorderSettled = false;
-      this.#recorderDone = this.#recorder.run().finally(() => {
+      this.#recorderDone = startRecorderBeforeBackgroundRecovery(
+        () => this.#recorder.run(),
+        () => {
+          this.#trackTask('incoming artifact startup cleanup', () =>
+            reconcileIncomingArtifacts(this.#db.handle, paths, logger, { remove: true }).then(
+              () => {},
+            ),
+          );
+        },
+      ).finally(() => {
         this.#recorderSettled = true;
       });
       await this.#recorderDone;

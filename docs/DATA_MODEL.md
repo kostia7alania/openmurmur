@@ -218,6 +218,14 @@ NULL on legacy rows and are displayed as unknown rather than backfilled.
 `state`: `received` → `downloaded` → `validated` → `transcribed` → `delivered`,
 or `rejected` / `failed`.
 
+`quarantine_path` and `normalized_path` are the durable owners of generated
+incoming artifacts. Startup scans only strict OpenMurmur UUID names inside
+`quarantine/`. An artifact whose UID is absent from every owner is removed only
+after ownership is read again immediately before unlink. Every present file UID
+protects all of its generated path variants, covering crashes after publication
+but before a NULL or older path is updated. Invalid or out-of-root ownership
+makes the whole cleanup fail closed; session audio is never scanned.
+
 `delivered_at` is the last Telegram acknowledgement in one exact, contiguous
 incoming-transcript manifest. Every row must be sent and have the expected text
 payload; exactly the final row carries the settings keyboard. Missing or

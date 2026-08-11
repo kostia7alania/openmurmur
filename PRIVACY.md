@@ -74,6 +74,13 @@ All configurable in `openmurmur.json`. These values are eligibility thresholds,
 not permission to delete without proof. The running daemon evaluates the same
 proof-based retention plan hourly.
 
+Superseded app-generated downloads and normalized WAVs are separate from these
+age thresholds: startup removes one only when its strict UUID path is absent
+from every durable incoming-file UID and a final ownership read still proves
+that immediately before unlink. A present/corrupt owner, a symlink or any
+nonconforming name is preserved; the recording archive is never scanned by
+this cleanup.
+
 Audio is deleted only when the database can prove it is safe: finalized,
 checksummed, delivered at a known time, transcript delivered, no pending work.
 The delivery clock is the final Telegram acknowledgement for one exact direct or
