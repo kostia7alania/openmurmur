@@ -177,8 +177,8 @@ export function renderAlert(
       down: '🟢 Запись восстановлена',
     },
     worker_crashed: {
-      up: '🟡 Локальный ASR worker остановился',
-      down: '🟢 ASR worker восстановлен',
+      up: '🟡 Локальное распознавание остановилось',
+      down: '🟢 Локальное распознавание восстановлено',
     },
     llm_unavailable: {
       up: '🟡 Структурный отчёт временно недоступен',
@@ -201,8 +201,11 @@ export function renderAlert(
   };
 
   const headline = cleared ? body[alertId].down : body[alertId].up;
+  // A recovery edge must never repeat the stale failure detail under a green
+  // headline, even if a caller accidentally passes the previous observation.
+  const renderedDetail = cleared ? '' : detail.trim();
   return {
-    text: detail.length > 0 ? `${headline}\n\n${detail}` : headline,
+    text: renderedDetail.length > 0 ? `${headline}\n\n${renderedDetail}` : headline,
     deliveryPartId: `alert:${alertId}:${cleared ? 'clear' : 'raise'}:${epoch}`,
   };
 }

@@ -4,8 +4,21 @@ import type { HealthConfig } from '../config/schema.ts';
 
 export type HealthStatus = 'healthy' | 'degraded' | 'failed' | 'recovering';
 
+export type HealthComponent =
+  | 'recorder'
+  | 'capture_pipeline'
+  | 'asr_worker'
+  | 'dead_jobs'
+  | 'llm'
+  | 'dead_outbox'
+  | 'asr_backlog'
+  | 'telegram_outbox'
+  | 'disk'
+  | 'sqlite'
+  | 'digest';
+
 export interface HealthCheck {
-  readonly component: string;
+  readonly component: HealthComponent;
   readonly status: HealthStatus;
   readonly detail: string;
 }
@@ -35,6 +48,13 @@ export interface HealthReport {
 }
 
 const RANK: Record<HealthStatus, number> = { healthy: 0, recovering: 1, degraded: 2, failed: 3 };
+
+const HEALTH_STATUS_LABELS: Readonly<Record<HealthStatus, string | null>> = {
+  healthy: null,
+  recovering: 'ВНИМАНИЕ',
+  degraded: 'ВНИМАНИЕ',
+  failed: 'ОШИБКА',
+};
 
 export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): HealthReport {
   const checks: HealthCheck[] = [];
@@ -153,13 +173,14 @@ export function renderHealthLines(report: HealthReport): string {
   if (problems.length === 0) return '✅ Всё в порядке';
   return problems
     .map((c) => {
-      const level = c.status === 'failed' ? 'ОШИБКА' : 'ВНИМАНИЕ';
+      const level = HEALTH_STATUS_LABELS[c.status];
+      if (level === null) throw new Error('healthy check reached the unhealthy renderer');
       return `${level}: ${healthComponentLabel(c.component)} — ${healthDetail(c)}`;
     })
     .join('\n');
 }
 
-const HEALTH_COMPONENT_LABELS: Readonly<Record<string, string>> = {
+const HEALTH_COMPONENT_LABELS: Readonly<Record<HealthComponent, string>> = {
   recorder: 'запись',
   capture_pipeline: 'обработка аудио',
   asr_worker: 'распознавание',
@@ -173,8 +194,8 @@ const HEALTH_COMPONENT_LABELS: Readonly<Record<string, string>> = {
   digest: 'дайджест',
 };
 
-function healthComponentLabel(component: string): string {
-  return HEALTH_COMPONENT_LABELS[component] ?? 'компонент';
+function healthComponentLabel(component: HealthComponent): string {
+  return HEALTH_COMPONENT_LABELS[component];
 }
 
 /**
@@ -183,7 +204,8 @@ function healthComponentLabel(component: string): string {
  */
 function healthDetail(check: HealthCheck): string {
   const count = firstNumber(check.detail);
-  switch (check.component) {
+  const component = check.component;
+  switch (component) {
     case 'recorder':
       if (check.status === 'recovering') return 'ожидаю первый аудиокадр';
       return count === null ? 'процесс записи не работает' : `нет аудиокадров ${count} сек`;
@@ -196,13 +218,23 @@ function healthDetail(check: HealthCheck): string {
     case 'dead_jobs':
       return count === null
         ? 'есть задачи, исчерпавшие попытки'
-        : `${count} ${russianCount(count, 'задача', 'задачи', 'задач')} исчерпали попытки`;
+        : `${count} ${russianCount(count, 'задача', 'задачи', 'задач')} ${russianCount(
+            count,
+            'исчерпала',
+            'исчерпали',
+            'исчерпали',
+          )} попытки`;
     case 'llm':
       return 'локальные отчёты недоступны; транскрипты продолжат работать';
     case 'dead_outbox':
       return count === null
         ? 'есть сообщения, исчерпавшие попытки'
-        : `${count} ${russianCount(count, 'сообщение', 'сообщения', 'сообщений')} не доставлены`;
+        : `${count} ${russianCount(count, 'сообщение', 'сообщения', 'сообщений')} ${russianCount(
+            count,
+            'не доставлено',
+            'не доставлены',
+            'не доставлены',
+          )}`;
     case 'asr_backlog':
       return count === null ? 'очередь растёт' : `старейшей задаче ${count} мин`;
     case 'telegram_outbox':
@@ -213,9 +245,12 @@ function healthDetail(check: HealthCheck): string {
       return 'база данных недоступна для записи';
     case 'digest':
       return count === null ? 'дайджест не сформирован' : `последний дайджест ${count} ч назад`;
-    default:
-      return 'требует внимания';
   }
+  return unreachableComponent(component);
+}
+
+function unreachableComponent(component: never): never {
+  throw new Error(`unsupported health component: ${component}`);
 }
 
 function firstNumber(detail: string): number | null {
