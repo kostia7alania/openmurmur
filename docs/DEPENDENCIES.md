@@ -268,6 +268,21 @@ assigned task into a promise. A further RU-only repeat varied wording and again
 classified budget context as a decision. The taxonomy prompt improves the common
 shape but is not a stable proof of the 80% recall/100% precision target. D108
 therefore remains partial rather than being presented as accepted model quality.
+
+A bounded follow-up on 2026-08-12 held the checked-in corpus, production JSON
+schema and adapter, model digest, `temperature=0` and `contextTokens=32768`
+fixed, while enabling `think=true`. It ran sequentially as RU → EN → TH → RU
+repeat, with each complete transcript exposed as source segment 0 and
+`durationMs=0`. The three-case result remained 50% exact recall, 50% exact
+precision, zero forbidden hits and 0/3 passing cases; the RU repeat was also
+50%/50% with the same structured output. Calls took 76.741 s, 71.863 s,
+67.189 s and 70.701 s, averaging about 71.6 s versus about 7.9 s for the prior
+non-thinking three-case run. Because bounded thinking added roughly 9× latency
+without improving the frozen gate, the production `think=false` default was not
+changed. This is not a byte-identical A/B comparison: the older disposable
+runner did not preserve its exact segment and duration inputs, and the tested
+`qwen3.6:latest` tag is not the repository's `qwen3.6:27b` default.
+
 The repository default model tag, mixed-language summaries and unknown language
 labels were not live-quality-tested by this corpus.
 
