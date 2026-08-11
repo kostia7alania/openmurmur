@@ -1041,7 +1041,7 @@ describe('session completion and retention handoff', () => {
 
     assert.throws(
       () =>
-        outbox.markSent(finalRow.outbox_id, 501, () => {
+        outbox.markSent(finalRow, 501, () => {
           reconcileIncomingDelivery(db.handle, fileUid);
           throw new Error('injected failure after incoming delivery proof');
         }),
@@ -1064,7 +1064,7 @@ describe('session completion and retention handoff', () => {
       { state: 'transcribed', delivered_at: null, outbox_state: 'sending' },
     );
 
-    outbox.markSent(finalRow.outbox_id, 501, () => {
+    outbox.markSent(finalRow, 501, () => {
       reconcileIncomingDelivery(db.handle, fileUid);
     });
     const delivered = db.handle
@@ -1126,7 +1126,7 @@ describe('session completion and retention handoff', () => {
 
     assert.throws(
       () =>
-        outbox.markSent(claimed.outbox_id, 101, () => {
+        outbox.markSent(claimed, 101, () => {
           markAudioDelivered(db.handle, part.part_id);
           throw new Error('injected failure after audio domain update');
         }),
@@ -1150,7 +1150,7 @@ describe('session completion and retention handoff', () => {
       'the Telegram acknowledgement and audio delivery proof are one commit',
     );
 
-    outbox.markSent(claimed.outbox_id, 101, () => {
+    outbox.markSent(claimed, 101, () => {
       markAudioDelivered(db.handle, part.part_id);
     });
     const retried = db.handle
@@ -1193,12 +1193,15 @@ describe('session completion and retention handoff', () => {
         )
         .run(finalKind, sessionId);
       const finalRow = db.handle
-        .prepare('SELECT outbox_id FROM telegram_outbox WHERE session_id = ? AND kind = ?')
-        .get(sessionId, finalKind) as { outbox_id: string };
+        .prepare(
+          `SELECT outbox_id, claim_generation
+             FROM telegram_outbox WHERE session_id = ? AND kind = ?`,
+        )
+        .get(sessionId, finalKind) as { outbox_id: string; claim_generation: number };
 
       assert.throws(
         () =>
-          outbox.markSent(finalRow.outbox_id, 202, () => {
+          outbox.markSent(finalRow, 202, () => {
             reconcileSessionDelivery(db.handle, sessionId, nullLogger);
             throw new Error(`injected failure after ${finalKind} domain update`);
           }),
@@ -1207,7 +1210,7 @@ describe('session completion and retention handoff', () => {
       assert.equal(outbox.stateOf(`${finalKind}:${sessionId}`), 'sending');
       assert.equal(new SessionRepository(db.handle).get(sessionId)?.state, 'DELIVERING');
 
-      outbox.markSent(finalRow.outbox_id, 202, () => {
+      outbox.markSent(finalRow, 202, () => {
         reconcileSessionDelivery(db.handle, sessionId, nullLogger);
       });
       assert.equal(outbox.stateOf(`${finalKind}:${sessionId}`), 'sent');

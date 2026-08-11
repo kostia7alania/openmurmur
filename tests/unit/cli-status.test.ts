@@ -40,7 +40,7 @@ describe('local status', () => {
       });
       const deadMessage = outbox.claimNext();
       assert.ok(deadMessage);
-      assert.equal(outbox.markFailed(deadMessage.outbox_id, 'terminal send failure', 8, 8), 'dead');
+      assert.equal(outbox.markFailed(deadMessage, 'terminal send failure', 8, 8), 'dead');
       outbox.enqueue({
         deliveryPartId: 'pending',
         kind: 'status',

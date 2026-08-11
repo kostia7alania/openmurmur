@@ -183,7 +183,7 @@ describe('outbox idempotency', () => {
       const row = outbox.claimNext();
       assert.ok(row);
       claimed.push(row.delivery_part_id);
-      outbox.markSent(row.outbox_id, index + 1);
+      assert.equal(outbox.markSent(row, index + 1), 'sent');
     }
 
     assert.deepEqual(claimed.slice(0, 3), ['old-report-1', 'old-report-2', 'old-report-3']);
@@ -197,17 +197,16 @@ describe('outbox idempotency', () => {
       ordinal: 0,
       payload: { type: 'text', text: 'x' },
     });
-    const row = db.handle.prepare('SELECT outbox_id FROM telegram_outbox').get() as {
-      outbox_id: string;
-    };
+    const row = outbox.claimNext();
+    assert.ok(row);
 
     assert.throws(() =>
-      outbox.markSent(row.outbox_id, 1, () => {
+      outbox.markSent(row, 1, () => {
         throw new Error('delivery fact failed');
       }),
     );
     const state = db.handle.prepare('SELECT state FROM telegram_outbox').get() as { state: string };
-    assert.equal(state.state, 'pending', 'a failed delivery callback rolls back markSent too');
+    assert.equal(state.state, 'sending', 'a failed delivery callback rolls back markSent too');
   });
 
   it('re-queues rows a crash left in flight', () => {
@@ -223,6 +222,134 @@ describe('outbox idempotency', () => {
 
     assert.equal(outbox.recoverSending(), 1);
     assert.ok(outbox.claimNext(), 'the row comes back after recovery');
+  });
+
+  it('fences every stale sender mutation after another generation reclaims the row', () => {
+    const outbox = new Outbox(db.handle);
+    outbox.enqueue({
+      deliveryPartId: 'fenced',
+      kind: 'status',
+      ordinal: 0,
+      payload: { type: 'text', text: 'x' },
+    });
+    const stale = outbox.claimNext();
+    assert.ok(stale);
+    assert.equal(outbox.recoverSending(), 1);
+    const current = outbox.claimNext();
+    assert.ok(current);
+    assert.ok(current.claim_generation > stale.claim_generation);
+
+    let deliveredCallbacks = 0;
+    assert.equal(
+      outbox.markSent(stale, 100, () => {
+        deliveredCallbacks += 1;
+      }),
+      'lost',
+    );
+    assert.equal(outbox.markFailed(stale, 'late retry', 1, 8), 'lost');
+    assert.equal(outbox.markFailed(stale, 'late terminal failure', 8, 8), 'lost');
+    assert.equal(outbox.defer(stale, 30_000, 'late rate limit'), 'lost');
+    assert.equal(deliveredCallbacks, 0, 'a stale acknowledgement has no domain side effects');
+
+    const duringCurrentClaim = db.handle
+      .prepare(
+        `SELECT state, attempts, claim_generation, telegram_message_id, last_error
+           FROM telegram_outbox WHERE outbox_id = ?`,
+      )
+      .get(current.outbox_id) as Record<string, unknown>;
+    assert.deepEqual(
+      { ...duringCurrentClaim },
+      {
+        state: 'sending',
+        attempts: 2,
+        claim_generation: current.claim_generation,
+        telegram_message_id: null,
+        last_error: null,
+      },
+    );
+    assert.equal(
+      outbox.markSent(current, 200, () => {
+        deliveredCallbacks += 1;
+      }),
+      'sent',
+    );
+    assert.equal(deliveredCallbacks, 1);
+  });
+
+  it('does not reuse a generation when a no-fault defer refunds the attempt', () => {
+    const outbox = new Outbox(db.handle);
+    outbox.enqueue({
+      deliveryPartId: 'defer-generation',
+      kind: 'status',
+      ordinal: 0,
+      payload: { type: 'text', text: 'x' },
+    });
+    const first = outbox.claimNext();
+    assert.ok(first);
+    assert.equal(outbox.defer(first, 0, 'rate limit'), 'deferred');
+    const second = outbox.claimNext();
+    assert.ok(second);
+    assert.equal(second.attempts, first.attempts, 'the Telegram-owned defer refunds the attempt');
+    assert.ok(second.claim_generation > first.claim_generation, 'the fencing token never rewinds');
+    assert.equal(outbox.markSent(first, 100), 'lost');
+    assert.equal(outbox.markSent(second, 200), 'sent');
+  });
+
+  it('does not clean up or acknowledge a stale sender after its upload returns', async () => {
+    const filePath = join(dir, 'stale.split000.flac');
+    writeFileSync(filePath, Buffer.alloc(100));
+    let releaseFetch: (response: Response) => void = () => {
+      throw new Error('controlled fetch was not started');
+    };
+    let markFetchStarted: () => void = () => {};
+    const fetchStarted = new Promise<void>((resolve) => {
+      markFetchStarted = resolve;
+    });
+    const controlledFetch = (async () => {
+      markFetchStarted();
+      return new Promise<Response>((resolve) => {
+        releaseFetch = resolve;
+      });
+    }) as typeof fetch;
+    const d = deps(controlledFetch, 500);
+    d.outbox.enqueue({
+      deliveryPartId: 'audio:stale:split0',
+      kind: 'audio',
+      ordinal: 0,
+      payload: {
+        type: 'document',
+        path: filePath,
+        filename: 'stale.split000.flac',
+        deleteAfterSend: true,
+      },
+    });
+    let delivered = 0;
+    const staleDrain = drainOutbox(
+      {
+        ...d,
+        onDelivered: () => {
+          delivered += 1;
+        },
+      },
+      1,
+    );
+    await fetchStarted;
+    assert.equal(d.outbox.recoverSending(), 1);
+    const current = d.outbox.claimNext();
+    assert.ok(current);
+
+    releaseFetch(okMessage(321));
+    assert.equal(await staleDrain, 0);
+    assert.equal(delivered, 0);
+    assert.equal(existsSync(filePath), true, 'the current generation still owns its upload file');
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT state FROM telegram_outbox WHERE outbox_id = ?')
+          .get(current.outbox_id) as { state: string }
+      ).state,
+      'sending',
+    );
   });
 });
 

@@ -275,6 +275,7 @@ describe('migrations', () => {
         '012_summary_revision_uniqueness.sql',
         '013_audio_finalization_journal.sql',
         '014_current_transcript_uniqueness.sql',
+        '015_telegram_outbox_claim_generation.sql',
       ]);
       const rows = legacy
         .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')
@@ -528,7 +529,12 @@ describe('migrations', () => {
     db.handle.exec(`
       DROP INDEX idx_transcript_current_session;
       DROP INDEX idx_transcript_current_incoming;
-      DELETE FROM schema_migrations WHERE name = '014_current_transcript_uniqueness.sql';
+      ALTER TABLE telegram_outbox DROP COLUMN claim_generation;
+      DELETE FROM schema_migrations
+       WHERE name IN (
+         '014_current_transcript_uniqueness.sql',
+         '015_telegram_outbox_claim_generation.sql'
+       );
     `);
     const at = '2026-08-11T01:00:00.000Z';
     new SessionRepository(db.handle).create('duplicate-session', at);
@@ -552,7 +558,10 @@ describe('migrations', () => {
     insertRevision.run('incoming-r1', null, 'duplicate-incoming', 1, 'old incoming', at);
     insertRevision.run('incoming-r2', null, 'duplicate-incoming', 2, 'new incoming', at);
 
-    assert.deepEqual(migrate(db.handle), ['014_current_transcript_uniqueness.sql']);
+    assert.deepEqual(migrate(db.handle), [
+      '014_current_transcript_uniqueness.sql',
+      '015_telegram_outbox_claim_generation.sql',
+    ]);
     const pointers = db.handle
       .prepare(
         `SELECT revision_id, is_current

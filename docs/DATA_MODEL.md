@@ -165,7 +165,15 @@ persisted `PROCESSING` session cannot exist without its audio and ASR work.
 | `delivery_part_id` | `UNIQUE`. Stable per logical delivery unit. |
 | `ordinal` | Delivery-stage metadata retained for stable rows; it does not let a newly queued row overtake older ready work. |
 | `state` | `pending` → `sending` → `sent` / `failed` / `dead`. |
+| `claim_generation` | Monotonic token incremented on every claim; terminal, retry and defer writes require the exact live generation. |
 | `telegram_message_id` | Recorded on success. |
+
+Recovery may return an abandoned `sending` row to `pending`, but the next claim
+gets a new generation. A late sender from the old generation therefore cannot
+record a false acknowledgement, invoke the delivery callback, overwrite the
+replacement failure state or remove its artifact. Telegram itself exposes no
+idempotency key, so a network-level duplicate remains possible if the old send
+was remotely accepted before the local generation check.
 
 The claim query selects `pending` rows whose `run_after` is ready, FIFO by
 creation time and insertion order. `delivery_part_id` makes re-enqueueing the

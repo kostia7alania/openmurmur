@@ -55,15 +55,21 @@ export interface EnqueueMessage {
   readonly payload: OutboxPayload;
 }
 
-interface OutboxRow {
-  outbox_id: string;
-  delivery_part_id: string;
-  session_id: string | null;
-  kind: OutboxKind;
-  payload: string;
-  attempts: number;
-  max_attempts: number;
+export interface ClaimedOutboxRow {
+  readonly outbox_id: string;
+  readonly delivery_part_id: string;
+  readonly session_id: string | null;
+  readonly kind: OutboxKind;
+  readonly payload: string;
+  readonly attempts: number;
+  readonly max_attempts: number;
+  /** Monotonic token fencing this claim after any recovery and reclaim. */
+  readonly claim_generation: number;
 }
+
+export type OutboxFailureOutcome = 'retry' | 'dead' | 'lost';
+export type OutboxSentOutcome = 'sent' | 'lost';
+export type OutboxDeferOutcome = 'deferred' | 'lost';
 
 export type OutboxState = 'pending' | 'sending' | 'sent' | 'failed' | 'dead';
 
@@ -101,60 +107,78 @@ export class Outbox {
     return result.changes > 0;
   }
 
-  claimNext(): OutboxRow | null {
+  claimNext(): ClaimedOutboxRow | null {
     return transaction(this.#db, () => {
       const row = this.#db
         .prepare(
-          `SELECT outbox_id, delivery_part_id, session_id, kind, payload, attempts, max_attempts
+          `SELECT outbox_id, delivery_part_id, session_id, kind, payload, attempts, max_attempts,
+                  claim_generation
              FROM telegram_outbox
             WHERE state = 'pending' AND run_after <= ?
             ORDER BY created_at, rowid, ordinal
             LIMIT 1`,
         )
-        .get(nowIso()) as OutboxRow | undefined;
+        .get(nowIso()) as ClaimedOutboxRow | undefined;
       if (row === undefined) return null;
 
-      this.#db
+      const updated = this.#db
         .prepare(
-          `UPDATE telegram_outbox SET state = 'sending', attempts = attempts + 1, updated_at = ?
-            WHERE outbox_id = ?`,
+          `UPDATE telegram_outbox
+              SET state = 'sending', attempts = attempts + 1,
+                  claim_generation = claim_generation + 1, updated_at = ?
+            WHERE outbox_id = ? AND state = 'pending' AND claim_generation = ?`,
         )
-        .run(nowIso(), row.outbox_id);
-      return { ...row, attempts: row.attempts + 1 };
+        .run(nowIso(), row.outbox_id, row.claim_generation);
+      if (updated.changes !== 1) {
+        throw new Error(`outbox row ${row.outbox_id} changed while being claimed`);
+      }
+      return {
+        ...row,
+        attempts: row.attempts + 1,
+        claim_generation: row.claim_generation + 1,
+      };
     });
   }
 
-  markSent(outboxId: string, messageId: number | null, afterMark?: () => void): void {
-    transaction(this.#db, () => {
-      this.#db
+  markSent(
+    claim: Pick<ClaimedOutboxRow, 'outbox_id' | 'claim_generation'>,
+    messageId: number | null,
+    afterMark?: () => void,
+  ): OutboxSentOutcome {
+    return transaction(this.#db, () => {
+      const updated = this.#db
         .prepare(
           `UPDATE telegram_outbox SET state = 'sent', telegram_message_id = ?, updated_at = ?
-            WHERE outbox_id = ?`,
+            WHERE outbox_id = ? AND state = 'sending' AND claim_generation = ?`,
         )
-        .run(messageId, nowIso(), outboxId);
+        .run(messageId, nowIso(), claim.outbox_id, claim.claim_generation);
+      if (updated.changes !== 1) return 'lost';
       afterMark?.();
+      return 'sent';
     });
   }
 
   markFailed(
-    outboxId: string,
+    claim: Pick<ClaimedOutboxRow, 'outbox_id' | 'claim_generation'>,
     error: string,
     attempts: number,
     maxAttempts: number,
-  ): 'retry' | 'dead' {
+  ): OutboxFailureOutcome {
     const exhausted = attempts >= maxAttempts;
-    this.#db
+    const updated = this.#db
       .prepare(
         `UPDATE telegram_outbox SET state = ?, last_error = ?, run_after = ?, updated_at = ?
-          WHERE outbox_id = ?`,
+          WHERE outbox_id = ? AND state = 'sending' AND claim_generation = ?`,
       )
       .run(
         exhausted ? 'dead' : 'pending',
         error.slice(0, 2000),
         isoIn(exhausted ? 0 : Math.min(2 ** attempts * 1000, 10 * 60 * 1000)),
         nowIso(),
-        outboxId,
+        claim.outbox_id,
+        claim.claim_generation,
       );
+    if (updated.changes !== 1) return 'lost';
     return exhausted ? 'dead' : 'retry';
   }
 
@@ -163,15 +187,26 @@ export class Outbox {
    * `delayMs`. Used for HTTP 429, where Telegram tells us exactly how long to
    * wait and the send was never our fault.
    */
-  defer(outboxId: string, delayMs: number, reason: string): void {
-    this.#db
+  defer(
+    claim: Pick<ClaimedOutboxRow, 'outbox_id' | 'claim_generation'>,
+    delayMs: number,
+    reason: string,
+  ): OutboxDeferOutcome {
+    const updated = this.#db
       .prepare(
         `UPDATE telegram_outbox
             SET state = 'pending', attempts = MAX(0, attempts - 1), run_after = ?,
                 last_error = ?, updated_at = ?
-          WHERE outbox_id = ?`,
+          WHERE outbox_id = ? AND state = 'sending' AND claim_generation = ?`,
       )
-      .run(isoIn(delayMs), reason.slice(0, 2000), nowIso(), outboxId);
+      .run(
+        isoIn(delayMs),
+        reason.slice(0, 2000),
+        nowIso(),
+        claim.outbox_id,
+        claim.claim_generation,
+      );
+    return updated.changes === 1 ? 'deferred' : 'lost';
   }
 
   /** Re-queues rows left in `sending` by a crash. */
@@ -262,51 +297,70 @@ export async function drainOutbox(deps: OutboxWorkerDeps, budget = 25): Promise<
     const payload = JSON.parse(row.payload) as OutboxPayload;
     try {
       const messageId = await sendPayload(deps, payload);
-      deps.outbox.markSent(row.outbox_id, messageId, () => {
+      const outcome = deps.outbox.markSent(row, messageId, () => {
         deps.onDelivered?.({
           deliveryPartId: row.delivery_part_id,
           sessionId: row.session_id,
           payload,
         });
       });
+      if (outcome === 'lost') {
+        deps.logger.warn('ignored Telegram acknowledgement from a stale outbox sender', {
+          kind: row.kind,
+          deliveryPartId: row.delivery_part_id,
+          claimGeneration: row.claim_generation,
+        });
+        continue;
+      }
       await cleanupEphemeralPayload(payload, deps.logger);
       sent += 1;
     } catch (error) {
       const err = error as Error & { retryAfterSeconds?: number };
       if (shouldRetryWithoutAttempt(err)) {
-        deps.outbox.defer(row.outbox_id, 1000, err.message);
-        deps.logger.info('telegram send interrupted; returned to the outbox', {
+        const outcome = deps.outbox.defer(row, 1000, err.message);
+        deps.logger.info('telegram send interrupted; outbox claim released', {
           kind: row.kind,
           deliveryPartId: row.delivery_part_id,
+          outcome,
         });
         break;
       }
       if (!isRetryable(err)) {
-        deps.outbox.markFailed(row.outbox_id, err.message, row.max_attempts, row.max_attempts);
+        const outcome = deps.outbox.markFailed(
+          row,
+          err.message,
+          row.max_attempts,
+          row.max_attempts,
+        );
+        if (outcome === 'lost') {
+          deps.logger.warn('ignored permanent failure from a stale outbox sender', {
+            kind: row.kind,
+            deliveryPartId: row.delivery_part_id,
+            claimGeneration: row.claim_generation,
+          });
+          continue;
+        }
         await cleanupEphemeralPayload(payload, deps.logger);
-        deps.logger.error('telegram send permanently failed', {
+        deps.logger.error('telegram send reached a terminal outcome', {
           kind: row.kind,
           deliveryPartId: row.delivery_part_id,
           error: err.message,
+          outcome,
         });
         continue;
       }
       // Honour Telegram's own backpressure signal rather than guessing, and
       // stop draining: every further send would hit the same limit.
       if (typeof err.retryAfterSeconds === 'number') {
-        deps.outbox.defer(row.outbox_id, err.retryAfterSeconds * 1000, err.message);
+        const outcome = deps.outbox.defer(row, err.retryAfterSeconds * 1000, err.message);
         deps.logger.warn('telegram rate limited', {
           retryAfterSeconds: err.retryAfterSeconds,
           kind: row.kind,
+          outcome,
         });
         break;
       }
-      const outcome = deps.outbox.markFailed(
-        row.outbox_id,
-        err.message,
-        row.attempts,
-        row.max_attempts,
-      );
+      const outcome = deps.outbox.markFailed(row, err.message, row.attempts, row.max_attempts);
       if (outcome === 'dead') await cleanupEphemeralPayload(payload, deps.logger);
       deps.logger.warn('telegram send failed', {
         kind: row.kind,
