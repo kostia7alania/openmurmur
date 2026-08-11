@@ -45,6 +45,12 @@ export function compactJobError(error: string | null): string {
   return compact.length <= ERROR_LIMIT ? compact : `${compact.slice(0, ERROR_LIMIT - 1)}…`;
 }
 
+function humanTechnicalJobError(error: string | null): string {
+  const compact = compactJobError(error);
+  if (error === null || !OPTIONAL_TOKENIZER_FAILURE.test(error)) return compact;
+  return compact.replace(/\s+Install with:\s+pip install\b.*$/i, '').trim();
+}
+
 export function failureCategory(error: string | null): FailureCategory {
   if (error === null) return 'internal';
   if (/model_load_failed|could not start the local audio worker|mlx|no module named/i.test(error)) {
@@ -91,7 +97,7 @@ export function renderDeadJobAlert(
       `${index + 1}. ${job.kind} — ${job.jobId}`,
       `Причина: ${
         options.technicalDetails
-          ? compactJobError(job.lastError)
+          ? humanTechnicalJobError(job.lastError)
           : publicJobFailureReason(job.lastError)
       }`,
     );

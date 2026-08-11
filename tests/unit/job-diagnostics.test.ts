@@ -46,22 +46,27 @@ describe('failed job diagnostics', () => {
   });
 
   it('turns the optional-tokenizer failure into exact forced-language recovery commands', () => {
+    const lastError =
+      'ASR failed: RuntimeError: Japanese tokenization requires optional dependency `nagisa`. Install with: pip install "mlx-qwen3-asr[aligner]"';
     const alert = renderDeadJobAlert(
       'prod-mac.local',
       [
         deadJob({
           kind: 'incoming_audio',
-          lastError:
-            'ASR failed: RuntimeError: Japanese tokenization requires optional dependency `nagisa`.',
+          lastError,
         }),
       ],
       'qwen3.6:27b',
+      { technicalDetails: true },
     );
 
+    assert.match(alert.detail, /requires optional dependency `nagisa`/);
     assert.match(alert.detail, /jobs retry job-1 --language ru/);
     assert.match(alert.detail, /jobs retry job-1 --language th/);
     assert.match(alert.detail, /jobs retry job-1 --language en/);
     assert.match(alert.detail, /jobs retry job-1 --language zh/);
+    assert.match(compactJobError(lastError), /pip install/);
+    assert.ok(!alert.detail.includes('pip install'));
     assert.ok(!alert.detail.includes('uv sync --project python/openmurmur_audio --extra mlx'));
   });
 
