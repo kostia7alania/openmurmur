@@ -71,9 +71,9 @@ interface RetentionLanePlan {
   readonly blocked: RetentionPlan['blocked'];
 }
 
-const NO_ACTIVE_INCOMING_JOB = `AND NOT EXISTS (
+const NO_RECOVERABLE_INCOMING_JOB = `AND NOT EXISTS (
   SELECT 1 FROM jobs j
-   WHERE j.state IN ('pending','leased')
+   WHERE j.state IN ('pending','leased','dead')
      AND j.kind = 'incoming_audio'
      AND CASE
            WHEN json_valid(j.payload) = 0 THEN 1
@@ -263,7 +263,7 @@ function planIncomingAudio(
           AND EXISTS (
                 SELECT 1 FROM transcript_revisions r WHERE r.incoming_file_id = file_uid
               )
-          ${NO_ACTIVE_INCOMING_JOB}
+          ${NO_RECOVERABLE_INCOMING_JOB}
           AND NOT EXISTS (
                 SELECT 1 FROM telegram_outbox o
                  WHERE o.state IN ('pending','sending')
@@ -304,28 +304,36 @@ function planQuarantine(
   const fileArgs = fileUid === undefined ? [] : [fileUid];
   const rows = db
     .prepare(
-      `SELECT file_uid, quarantine_path, COALESCE(actual_bytes, 0) AS bytes
+      `SELECT file_uid, quarantine_path, normalized_path, COALESCE(actual_bytes, 0) AS bytes
          FROM incoming_telegram_files
         WHERE deleted_at IS NULL
           AND state IN ('rejected','failed')
           AND quarantine_path IS NOT NULL
           AND updated_at <= ?
-          ${NO_ACTIVE_INCOMING_JOB}
+          ${NO_RECOVERABLE_INCOMING_JOB}
           ${exactFile}`,
     )
     .all(cutoff, ...fileArgs) as {
     file_uid: string;
     quarantine_path: string;
+    normalized_path: string | null;
     bytes: number;
   }[];
+  const candidates: DeletionCandidate[] = [];
+  for (const row of rows) {
+    for (const path of [row.quarantine_path, row.normalized_path]) {
+      if (path === null) continue;
+      candidates.push({
+        kind: 'quarantine',
+        id: row.file_uid,
+        path,
+        bytes: row.bytes,
+        reason: `rejected, older than ${config.quarantineHours}h`,
+      });
+    }
+  }
   return {
-    candidates: rows.map((row) => ({
-      kind: 'quarantine',
-      id: row.file_uid,
-      path: row.quarantine_path,
-      bytes: row.bytes,
-      reason: `rejected, older than ${config.quarantineHours}h`,
-    })),
+    candidates,
     blocked: [],
   };
 }

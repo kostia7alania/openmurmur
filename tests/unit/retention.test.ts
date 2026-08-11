@@ -7,6 +7,7 @@ import { DEFAULT_CONFIG } from '../../src/config/schema.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
 import { AlertEvaluator, renderAlert } from '../../src/health/alerts.ts';
 import { evaluateHealth, renderHealthLines } from '../../src/health/monitor.ts';
+import { JobQueue } from '../../src/jobs/queue.ts';
 import { applyRetention, planRetention } from '../../src/retention/policy.ts';
 
 let dir: string;
@@ -460,6 +461,82 @@ describe('retention: what must never be deleted', () => {
 });
 
 describe('retention: dry-run and apply agree', () => {
+  it('retains both incoming sources while a dead job can still be retried', async () => {
+    const fileUid = 'incoming-retryable-dead';
+    const quarantinePath = join(dir, `${fileUid}.ogg`);
+    const normalizedPath = join(dir, `${fileUid}.16k.wav`);
+    writeFileSync(quarantinePath, Buffer.alloc(100));
+    writeFileSync(normalizedPath, Buffer.alloc(200));
+    db.handle
+      .prepare(
+        `INSERT INTO incoming_telegram_files
+           (file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id,
+            actual_bytes, state, quarantine_path, normalized_path, created_at, updated_at)
+         VALUES (?, 'file-retryable', 'unique-retryable', 42, 1,
+                 100, 'validated', ?, ?, ?, ?)`,
+      )
+      .run(fileUid, quarantinePath, normalizedPath, OLD, OLD);
+
+    const jobs = new JobQueue(db.handle, 'retention-test');
+    const jobId = jobs.enqueue({
+      kind: 'incoming_audio',
+      idempotencyKey: 'incoming:bot-scope:1',
+      payload: { fileUid, message: {}, forcedLanguage: null },
+      maxAttempts: 1,
+    });
+    assert.ok(jobId);
+    const failedClaim = jobs.claim(['incoming_audio']);
+    assert.ok(failedClaim);
+    assert.equal(jobs.fail(failedClaim, 'model unavailable'), 'dead');
+    db.handle
+      .prepare(
+        `UPDATE incoming_telegram_files
+            SET state = 'failed', rejection_reason = 'processing_failed', updated_at = ?
+          WHERE file_uid = ?`,
+      )
+      .run(OLD, fileUid);
+
+    const blocked = planRetention(db.handle, RETENTION);
+    assert.equal(blocked.candidates.length, 0);
+    assert.equal((await applyRetention(db.handle, blocked)).deleted, 0);
+    assert.equal(existsSync(quarantinePath), true);
+    assert.equal(existsSync(normalizedPath), true);
+
+    assert.equal(jobs.retryDead(jobId, { language: 'ru' }), 'requeued');
+    const retryClaim = jobs.claim(['incoming_audio']);
+    assert.ok(retryClaim);
+    const terminalAt = '2026-01-01T00:00:00.000Z';
+    db.handle
+      .prepare(
+        `UPDATE incoming_telegram_files
+            SET state = 'rejected', rejection_reason = 'unsupported_media', updated_at = ?
+          WHERE file_uid = ?`,
+      )
+      .run(terminalAt, fileUid);
+    assert.equal(jobs.complete(retryClaim), true);
+
+    const afterWindow = Date.parse(terminalAt) + (RETENTION.quarantineHours + 1) * 60 * 60_000;
+    const eligible = planRetention(db.handle, RETENTION, afterWindow);
+    assert.deepEqual(
+      eligible.candidates.map((candidate) => candidate.path),
+      [quarantinePath, normalizedPath],
+    );
+
+    const applied = await applyRetention(db.handle, eligible);
+    assert.equal(applied.deleted, 2);
+    assert.equal(applied.errors.length, 0);
+    assert.equal(existsSync(quarantinePath), false);
+    assert.equal(existsSync(normalizedPath), false);
+    assert.notEqual(
+      (
+        db.handle
+          .prepare('SELECT deleted_at FROM incoming_telegram_files WHERE file_uid = ?')
+          .get(fileUid) as { deleted_at: string | null }
+      ).deleted_at,
+      null,
+    );
+  });
+
   it('apply deletes exactly what dry-run listed', async () => {
     const deletable = seedDeliveredSession('s1');
     const kept = seedDeliveredSession('s2', { delivered: 0 });
