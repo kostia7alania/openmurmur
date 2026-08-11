@@ -21,7 +21,7 @@ import { JobQueue } from '../../src/jobs/queue.ts';
 import { FakeLlm } from '../../src/llm/ollama.ts';
 import { nullLogger } from '../../src/logging/logger.ts';
 import { Recorder } from '../../src/sessionizer/recorder.ts';
-import { EnergyVad } from '../../src/sessionizer/vad.ts';
+import { EnergyVad, type Vad } from '../../src/sessionizer/vad.ts';
 import { Outbox } from '../../src/telegram/outbox.ts';
 
 /**
@@ -138,6 +138,85 @@ class ScriptedCapture implements CaptureBackend {
   }
 }
 
+class BoundaryCapture implements CaptureBackend {
+  readonly name = 'boundary-scripted';
+  #epoch = 0;
+  #stopped = false;
+  #finish: (() => void) | undefined;
+  discardCalls = 0;
+
+  async *start(): AsyncIterableIterator<CaptureFrame> {
+    for (let index = 0; index < 2; index += 1) {
+      yield {
+        pcm: quietFrame(),
+        monotonicMs: index * FRAME_MS,
+        wallMs: Date.UTC(2026, 6, 31) + index * FRAME_MS,
+        durationMs: FRAME_MS,
+        streamEpoch: 0,
+      };
+    }
+    if (!this.#stopped) {
+      await new Promise<void>((resolve) => {
+        this.#finish = resolve;
+      });
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.#stopped = true;
+    this.#finish?.();
+  }
+
+  msSinceLastFrame(): number | null {
+    return 0;
+  }
+
+  discardBufferedFrames(): number {
+    this.discardCalls += 1;
+    this.#epoch += 1;
+    return 1;
+  }
+
+  currentStreamEpoch(): number {
+    return this.#epoch;
+  }
+}
+
+class BlockingVad implements Vad {
+  readonly name = 'blocking';
+  calls = 0;
+  resetWhilePending = false;
+  readonly started: Promise<void>;
+  #markStarted: (() => void) | undefined;
+  #release: (() => void) | undefined;
+  #pending = false;
+
+  constructor() {
+    this.started = new Promise<void>((resolve) => {
+      this.#markStarted = resolve;
+    });
+  }
+
+  async probability(): Promise<number> {
+    this.calls += 1;
+    this.#pending = true;
+    this.#markStarted?.();
+    await new Promise<void>((resolve) => {
+      this.#release = resolve;
+    });
+    this.#pending = false;
+    return 0;
+  }
+
+  release(): void {
+    this.#release?.();
+  }
+
+  reset(): void {
+    if (this.#pending) this.resetWhilePending = true;
+  }
+}
+
 function recorderFor(script: readonly ScriptedSegment[], overrides = {}, ffmpegPath = FFMPEG) {
   const config = {
     ...DEFAULT_CONFIG,
@@ -177,6 +256,64 @@ function recorderFor(script: readonly ScriptedSegment[], overrides = {}, ffmpegP
 }
 
 describe('end to end: capture through delivery, without a microphone', () => {
+  it('serializes a sleep boundary and rejects already-resolved frames from the old epoch', async () => {
+    const capture = new BoundaryCapture();
+    const vad = new BlockingVad();
+    const recorder = new Recorder({
+      config: DEFAULT_CONFIG,
+      paths: resolvePaths(dir),
+      db: db.handle,
+      capture,
+      vad,
+      logger: nullLogger,
+    });
+
+    const run = recorder.run();
+    await vad.started;
+    let boundaryResolved = false;
+    const boundary = recorder.closeOpenSession('machine slept').then((result) => {
+      boundaryResolved = true;
+      return result;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(boundaryResolved, false, 'control must wait for the in-flight frame mutation');
+
+    vad.release();
+    assert.equal(await boundary, null);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(vad.resetWhilePending, false);
+    assert.equal(vad.calls, 1, 'the already-resolved old-epoch frame must be discarded');
+    assert.equal(capture.discardCalls, 1);
+
+    await recorder.stop();
+    await run;
+  });
+
+  it('stops capture immediately even while VAD holds the recorder mutation lane', async () => {
+    const capture = new BoundaryCapture();
+    const vad = new BlockingVad();
+    const recorder = new Recorder({
+      config: DEFAULT_CONFIG,
+      paths: resolvePaths(dir),
+      db: db.handle,
+      capture,
+      vad,
+      logger: nullLogger,
+    });
+
+    const run = recorder.run();
+    await vad.started;
+    const stopped = recorder.stop();
+    const outcome = await Promise.race([
+      stopped.then(() => 'stopped' as const),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 100)),
+    ]);
+    assert.equal(outcome, 'stopped', 'capture stop must not wait behind blocked VAD');
+
+    vad.release();
+    await run;
+  });
+
   it('records a session, writes a valid FLAC, transcribes and queues delivery', async (t) => {
     if (!hasFfmpeg) return t.skip('ffmpeg not available');
 

@@ -8,6 +8,9 @@ import {
   type CaptureFrame,
   classifyFfmpegFailure,
 } from './backend.ts';
+import { CaptureBufferOverflowError, CaptureFrameBuffer } from './frame-buffer.ts';
+
+const MAX_PROCESSING_LAG_MS = 30_000;
 
 export interface FfmpegCaptureOptions extends CaptureBackendOptions {
   readonly ffmpegPath: string;
@@ -30,7 +33,11 @@ export class FfmpegCapture implements CaptureBackend {
   readonly #frameDurationMs: number;
 
   #child: ChildProcessByStdio<null, Readable, Readable> | null = null;
-  #lastFrameMonotonicMs: number | null = null;
+  #exitPromise: Promise<CaptureError | null> | null = null;
+  #activeFrames: CaptureFrameBuffer | null = null;
+  #lastIngressAtMonotonicMs: number | null = null;
+  #lastDeliveredFrameMonotonicMs: number | null = null;
+  #latestIngressFrameMonotonicMs: number | null = null;
   #stopping = false;
 
   constructor(options: FfmpegCaptureOptions) {
@@ -84,55 +91,127 @@ export class FfmpegCapture implements CaptureBackend {
         else resolve(classifyFfmpegFailure(stderr || `ffmpeg exited with code ${code}`));
       });
     });
+    this.#exitPromise = exited;
 
-    // Chunks arriving from the pipe are not frame-aligned, so a partial frame
-    // is carried across reads rather than dropped.
-    let carry: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    // FFmpeg's stdout is drained by its own pump. VAD, encoder backpressure and
+    // part fsync/hash can delay the consumer without pushing that delay back to
+    // the microphone until the explicit bounded-overload limit is reached.
+    const maxBufferedFrames = Math.ceil(MAX_PROCESSING_LAG_MS / this.#frameDurationMs);
+    const frames = new CaptureFrameBuffer({
+      bytesPerFrame: this.#bytesPerFrame,
+      frameDurationMs: this.#frameDurationMs,
+      maxBufferedFrames,
+      clock: this.#options.clock,
+    });
+    this.#activeFrames = frames;
+    const pump = this.#pumpFrames(child, frames, maxBufferedFrames, exited);
+    try {
+      while (true) {
+        const next = await frames.next();
+        if (next.done) break;
+        this.#lastDeliveredFrameMonotonicMs = next.value.monotonicMs;
+        yield next.value;
+      }
+      await pump;
+      const failure = await exited;
+      if (failure !== null) throw failure;
+    } finally {
+      await this.#terminateAndJoin(child, exited);
+      if (this.#activeFrames === frames) this.#activeFrames = null;
+      if (this.#exitPromise === exited) this.#exitPromise = null;
+      if (this.#child === child) this.#child = null;
+    }
+  }
+
+  async #pumpFrames(
+    child: ChildProcessByStdio<null, Readable, Readable>,
+    frames: CaptureFrameBuffer,
+    maxBufferedFrames: number,
+    exited: Promise<CaptureError | null>,
+  ): Promise<void> {
     try {
       for await (const chunk of child.stdout) {
-        const bytes = chunk as Buffer<ArrayBufferLike>;
-        carry = carry.length === 0 ? bytes : Buffer.concat([carry, bytes]);
-        while (carry.length >= this.#bytesPerFrame) {
-          const pcm: Uint8Array = carry.subarray(0, this.#bytesPerFrame);
-          carry = carry.subarray(this.#bytesPerFrame);
-          const monotonicMs = this.#options.clock.monotonicMs();
-          this.#lastFrameMonotonicMs = monotonicMs;
-          yield {
-            pcm,
-            monotonicMs,
-            wallMs: this.#options.clock.wallMs(),
-            durationMs: this.#frameDurationMs,
-          };
+        this.#lastIngressAtMonotonicMs = this.#options.clock.monotonicMs();
+        try {
+          frames.write(chunk as Buffer<ArrayBufferLike>);
+        } finally {
+          this.#latestIngressFrameMonotonicMs = frames.latestFrameMonotonicMs;
         }
       }
-    } finally {
-      this.#child = null;
+      const failure = await exited;
+      if (failure === null) frames.close();
+      else frames.abort(failure);
+    } catch (error) {
+      const failure =
+        error instanceof CaptureBufferOverflowError
+          ? new CaptureError(
+              'exit',
+              `Capture processing fell more than ${Math.round(
+                (maxBufferedFrames * this.#frameDurationMs) / 1000,
+              )} seconds behind. Recording stopped before audio could be dropped silently.`,
+            )
+          : error;
+      // A terminal source/overload failure is reported as soon as the current
+      // consumer operation returns. Keeping a stale queue here would leave the
+      // user told recording is active for up to another 30 seconds.
+      frames.abort(failure);
+      if (!this.#stopping && child.exitCode === null) child.kill('SIGTERM');
     }
-
-    const failure = await exited;
-    if (failure !== null) throw failure;
   }
 
   async stop(): Promise<void> {
     const child = this.#child;
-    if (child === null) return;
+    const exited = this.#exitPromise;
+    if (child === null || exited === null) return;
     this.#stopping = true;
-    child.kill('SIGTERM');
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        resolve();
-      }, 3000);
-      child.once('close', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
-    this.#child = null;
+    this.#activeFrames?.stop();
+    await this.#terminateAndJoin(child, exited);
   }
 
   msSinceLastFrame(): number | null {
-    if (this.#lastFrameMonotonicMs === null) return null;
-    return this.#options.clock.monotonicMs() - this.#lastFrameMonotonicMs;
+    if (this.#lastIngressAtMonotonicMs === null) return null;
+    return Math.max(0, this.#options.clock.monotonicMs() - this.#lastIngressAtMonotonicMs);
+  }
+
+  processingLagMs(): number | null {
+    if (
+      this.#latestIngressFrameMonotonicMs === null ||
+      this.#lastDeliveredFrameMonotonicMs === null
+    ) {
+      return null;
+    }
+    return Math.max(0, this.#latestIngressFrameMonotonicMs - this.#lastDeliveredFrameMonotonicMs);
+  }
+
+  discardBufferedFrames(): number {
+    return this.#activeFrames?.discardBufferedFrames() ?? 0;
+  }
+
+  currentStreamEpoch(): number {
+    return this.#activeFrames?.streamEpoch ?? 0;
+  }
+
+  async #terminateAndJoin(
+    child: ChildProcessByStdio<null, Readable, Readable>,
+    exited: Promise<CaptureError | null>,
+  ): Promise<void> {
+    if (child.exitCode !== null) {
+      await exited;
+      return;
+    }
+
+    child.kill('SIGTERM');
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = await Promise.race([
+      exited.then(() => false),
+      new Promise<true>((resolve) => {
+        timer = setTimeout(() => resolve(true), 3000);
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (timedOut && child.exitCode === null) {
+      child.kill('SIGKILL');
+      await exited;
+    }
   }
 }

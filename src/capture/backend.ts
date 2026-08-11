@@ -13,6 +13,10 @@ export interface CaptureFrame {
   readonly monotonicMs: number;
   readonly wallMs: number;
   readonly durationMs: number;
+  /** Changes when queued PCM is discarded across a capture/control boundary. */
+  readonly streamEpoch?: number;
+  /** Missing source time before this frame, never ordinary processing lag. */
+  readonly discontinuityBeforeMs?: number;
 }
 
 export interface CaptureBackendOptions {
@@ -35,6 +39,9 @@ export interface CaptureBackend {
   stop(): Promise<void>;
   /** Milliseconds since the last frame, or null if none has ever arrived. */
   msSinceLastFrame(): number | null;
+  /** Drops PCM not yet handed to the recorder and starts a new stream epoch. */
+  discardBufferedFrames?(): number;
+  currentStreamEpoch?(): number;
 }
 
 export class CaptureError extends Error {

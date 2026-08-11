@@ -66,6 +66,7 @@ export class Recorder {
   #sawFirstFrame = false;
   #running = false;
   #lastMonotonicMs = 0;
+  #mutationTail: Promise<void> = Promise.resolve();
 
   constructor(options: RecorderOptions) {
     this.#options = options;
@@ -99,22 +100,33 @@ export class Recorder {
           this.#sawFirstFrame = true;
           this.#options.onFirstFrame?.();
         }
-        await this.#handleFrame(frame);
+        await this.#withMutation(() => this.#handleFrame(frame));
       }
     } finally {
       this.#running = false;
-      // A stopped capture must still leave a valid file behind.
-      for (const intent of this.#machine.forceFinalize()) {
-        await this.#applyIntent(intent, null);
-      }
-      if (this.#openPart !== null) {
-        await this.#closeOpenPart(Date.now(), this.#lastMonotonicMs);
-      }
+      await this.#withMutation(async () => {
+        // A stopped capture must still leave a valid file behind.
+        for (const intent of this.#machine.forceFinalize()) {
+          await this.#applyIntent(intent, null);
+        }
+        if (this.#openPart !== null) {
+          await this.#closeOpenPart(Date.now(), this.#lastMonotonicMs);
+        }
+      });
     }
   }
 
   async stop(): Promise<void> {
+    // Stop ingress immediately. Waiting behind VAD/writer mutation here would
+    // keep the microphone open precisely when processing is wedged.
+    let discarded = this.#options.capture.discardBufferedFrames?.() ?? 0;
     await this.#options.capture.stop();
+    discarded += this.#options.capture.discardBufferedFrames?.() ?? 0;
+    if (discarded > 0) {
+      this.#options.logger.warn('discarded buffered capture frames during recorder stop', {
+        frames: discarded,
+      });
+    }
   }
 
   /**
@@ -125,6 +137,19 @@ export class Recorder {
    * span the gap. Returns the session id that was closed, if any.
    */
   async closeOpenSession(reason: string): Promise<string | null> {
+    return this.#withMutation(() => this.#closeOpenSession(reason, true));
+  }
+
+  async #closeOpenSession(reason: string, discardBuffered: boolean): Promise<string | null> {
+    if (discardBuffered) {
+      const discarded = this.#options.capture.discardBufferedFrames?.() ?? 0;
+      if (discarded > 0) {
+        this.#options.logger.warn('discarded buffered frames across a recorder boundary', {
+          frames: discarded,
+          reason,
+        });
+      }
+    }
     const sessionId = this.#machine.sessionId;
     if (sessionId === null) {
       // A sleep gap can happen while speech is still only a candidate. Clear
@@ -149,6 +174,24 @@ export class Recorder {
   }
 
   async #handleFrame(frame: CaptureFrame): Promise<void> {
+    const currentEpoch = this.#options.capture.currentStreamEpoch?.();
+    if (
+      frame.streamEpoch !== undefined &&
+      currentEpoch !== undefined &&
+      frame.streamEpoch !== currentEpoch
+    ) {
+      this.#options.logger.warn('discarded a stale frame from an earlier capture epoch', {
+        frameEpoch: frame.streamEpoch,
+        currentEpoch,
+      });
+      return;
+    }
+    if ((frame.discontinuityBeforeMs ?? 0) > 0) {
+      await this.#closeOpenSession('capture stream discontinuity', false);
+      this.#options.logger.warn('capture stream resumed after a source gap', {
+        gapMs: frame.discontinuityBeforeMs,
+      });
+    }
     this.#lastMonotonicMs = frame.monotonicMs;
     const probability = await this.#options.vad.probability(frame.pcm);
 
@@ -335,6 +378,15 @@ export class Recorder {
     } catch (error) {
       this.#options.logger.warn('recorder observer failed', { error: (error as Error).message });
     }
+  }
+
+  #withMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.#mutationTail.then(operation);
+    this.#mutationTail = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
   }
 
   async #openNewPart(intent: Extract<SessionIntent, { kind: 'open_part' }>): Promise<void> {

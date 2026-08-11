@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -70,6 +70,44 @@ function pcmTone(seconds: number, amplitude = 0.4): Buffer {
     );
   }
   return buffer;
+}
+
+function fakePcmSource(
+  frameCount: number,
+  options: { readonly linger?: boolean; readonly exitCode?: number } = {},
+): string {
+  const path = join(dir, 'fake-pcm-source');
+  const tail = options.linger === false ? `exit ${options.exitCode ?? 0}` : 'exec /bin/sleep 5';
+  writeFileSync(
+    path,
+    `#!/bin/sh\n/bin/dd if=/dev/zero bs=2 count=${frameCount} 2>/dev/null\n${tail}\n`,
+    { mode: 0o700 },
+  );
+  chmodSync(path, 0o700);
+  return path;
+}
+
+function fakePcmSourceIgnoringTerm(frameCount: number): string {
+  const path = join(dir, 'fake-pcm-source-ignoring-term');
+  writeFileSync(
+    path,
+    `#!${process.execPath}\nprocess.on('SIGTERM', () => {});\nprocess.stdout.write(Buffer.alloc(${frameCount * 2}));\nsetInterval(() => {}, 1000);\n`,
+    { mode: 0o700 },
+  );
+  chmodSync(path, 0o700);
+  return path;
+}
+
+async function waitForCondition(
+  condition: () => boolean,
+  description: string,
+  timeoutMs = 5000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${description}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 before(async () => {
@@ -251,9 +289,16 @@ describe('lossless splitting for oversize parts', {
 
     const sourceSize = (await stat(source)).size;
     const limit = Math.floor(sourceSize / 3);
+    const staleGappedArtifact = join(dir, 'big.split999.flac');
+    writeFileSync(staleGappedArtifact, 'unowned stale split');
     const chunks = await splitFlacLossless(FFMPEG, source, dir, limit, 120_000);
 
     assert.ok(chunks.length > 1, `expected several chunks, got ${chunks.length}`);
+    assert.equal(
+      existsSync(staleGappedArtifact),
+      false,
+      'cleanup must not stop at the first missing split index',
+    );
     for (const chunk of chunks) {
       const size = (await stat(chunk)).size;
       assert.ok(size <= limit, `chunk of ${size} bytes exceeds the ${limit} byte limit`);
@@ -442,6 +487,99 @@ describe('capture backend argument construction', () => {
       clock: systemClock,
     });
     assert.equal(capture.msSinceLastFrame(), null);
+  });
+
+  it('fails an overloaded consumer immediately and reaps the capture child', async () => {
+    const capture = new FfmpegCapture({
+      sampleRate: 1,
+      channels: 1,
+      device: 'default',
+      frameSamples: 1,
+      ffmpegPath: fakePcmSource(40),
+      clock: systemClock,
+    });
+    const iterator = capture.start();
+    assert.equal((await iterator.next()).done, false);
+    // Pipe reads may split the producer's writes differently under load. Wait
+    // for the observable overload condition instead of assuming the next read
+    // already consumed all 40 frames.
+    await waitForCondition(
+      () => (capture.processingLagMs() ?? 0) > 30_000,
+      'capture processing lag to cross its explicit bound',
+    );
+    await assert.rejects(iterator.next(), /fell more than 30 seconds behind/);
+    assert.ok((capture.processingLagMs() ?? 0) >= 30_000);
+
+    // A terminal path must join the old child and release single-instance
+    // ownership, otherwise a retry would fail with "capture already running".
+    const retry = capture.start();
+    assert.equal((await retry.next()).done, false);
+    await capture.stop();
+    await retry.return?.();
+  });
+
+  it('discards buffered PCM immediately when the capture child exits non-zero', async () => {
+    const capture = new FfmpegCapture({
+      sampleRate: 1,
+      channels: 1,
+      device: 'default',
+      frameSamples: 1,
+      ffmpegPath: fakePcmSource(10, { linger: false, exitCode: 7 }),
+      clock: systemClock,
+    });
+    const iterator = capture.start();
+    assert.equal((await iterator.next()).done, false);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await assert.rejects(iterator.next(), /ffmpeg exited with code 7/);
+
+    const retry = capture.start();
+    assert.equal((await retry.next()).done, false);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await assert.rejects(retry.next(), /ffmpeg exited with code 7/);
+  });
+
+  it('can stop while frames are buffered without leaving the child behind', async () => {
+    const capture = new FfmpegCapture({
+      sampleRate: 1,
+      channels: 1,
+      device: 'default',
+      frameSamples: 1,
+      ffmpegPath: fakePcmSource(10),
+      clock: systemClock,
+    });
+    const iterator = capture.start();
+    assert.equal((await iterator.next()).done, false);
+    assert.ok((capture.processingLagMs() ?? 0) > 0);
+
+    capture.discardBufferedFrames();
+    await capture.stop();
+    await iterator.return?.();
+
+    const retry = capture.start();
+    assert.equal((await retry.next()).done, false);
+    await capture.stop();
+    await retry.return?.();
+  });
+
+  it('SIGKILLs and joins a capture child that ignores the stop signal', async () => {
+    const capture = new FfmpegCapture({
+      sampleRate: 1,
+      channels: 1,
+      device: 'default',
+      frameSamples: 1,
+      ffmpegPath: fakePcmSourceIgnoringTerm(10),
+      clock: systemClock,
+    });
+    const iterator = capture.start();
+    assert.equal((await iterator.next()).done, false);
+
+    const started = Date.now();
+    capture.discardBufferedFrames();
+    await capture.stop();
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 2_900, `expected the SIGKILL fallback, stopped after ${elapsed}ms`);
+    assert.ok(elapsed < 5_000, `bounded join took ${elapsed}ms`);
+    await iterator.return?.();
   });
 });
 
