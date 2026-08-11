@@ -98,6 +98,20 @@ The runtime environment is fixed at `python/openmurmur_audio/.venv`.
 launchd: installing the extra elsewhere must fail readiness instead of making
 an interactive shell and the background runtime inspect different packages.
 
+### Current-revision Qwen smoke — 2026-08-11
+
+Revision `fd333d0` ran the existing `transcribe` CLI through the production
+`MlxAsr` and `WorkerProcess` against 4.510 seconds of locally synthesized English
+speech. The cached `Qwen/Qwen3-ASR-1.7B` model returned the sentence exactly,
+language `en`, and 11 word-level `aligner` segments in 3.63 seconds. macOS
+`/usr/bin/time -l` reported 6,159,007,744 bytes (about 5.74 GiB) maximum RSS.
+The worker used the enforced uv and Hugging Face offline settings; no
+provisioning command ran.
+
+This proves the current local package, cache, tokenizer, aligner and real-model
+CLI path. It does **not** prove microphone capture, daemon job scheduling,
+Telegram delivery or the complete release path.
+
 Silero's **segment-assembly logic** is separately covered by pure Python tests,
 which take a list of probabilities and need no model.
 

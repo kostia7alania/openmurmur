@@ -485,7 +485,7 @@ Honesty matters more than a green badge, so:
 | Evidence level | Current authoritative evidence | Boundary it does **not** cross |
 | --- | --- | --- |
 | Offline automated | The exact current-revision Node and Python gate is recorded immediately below; every covered guarantee names deterministic repository tests. | No microphone, model weights, Telegram credential, Keychain mutation, launchd login session or sleep/wake cycle is exercised. |
-| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama component runs. | A component smoke run is not the complete daemon pipeline and is not current-revision live release evidence. |
+| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama component runs, including a current-revision real-Qwen CLI transcription. | A component smoke run is not the complete daemon pipeline and is not current-revision live release evidence. |
 | Live release | No current-revision end-to-end live run is recorded yet; D120–D122 in [`docs/MVP_123.md`](docs/MVP_123.md) are the required gates. | Until those rows are evidenced, the project does not claim real microphone → models → Telegram, launchd login/reboot or sleep/wake verification. |
 
 **Verified on this revision by 572 offline TypeScript tests (108 suites) and 36
@@ -511,11 +511,12 @@ provenance, path traversal, chat allowlisting, update deduplication, secret
 redaction, prompt-injection fencing, health deduplication and migrations.
 Model-facing automated tests use fake adapters and do not download weights.
 
-[`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records earlier same-machine
-smoke runs of the pinned MLX/Qwen, Silero and Ollama dependencies. Those runs
-are useful compatibility evidence, but the complete live path was not repeated
-after this implementation pass. **Still not verified end-to-end on this
-revision:** live microphone capture, real model processing through the daemon,
+[`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records same-machine smoke runs of
+the pinned MLX/Qwen, Silero and Ollama dependencies. On this revision the real
+Qwen CLI path was repeated through the production worker and recognized local
+synthetic speech exactly. That is useful compatibility evidence, but it is not
+the complete daemon pipeline. **Still not verified end-to-end on this
+revision:** live microphone capture, real model processing through a daemon job,
 real Telegram delivery, launchd under a login session, and sleep/wake behaviour.
 
 See [docs/BACKLOG.md](docs/BACKLOG.md) for what closes these gaps.
