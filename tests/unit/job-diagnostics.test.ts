@@ -96,9 +96,8 @@ describe('failed job diagnostics', () => {
   });
 
   it('redacts tokens and bounds an untrusted stored error', () => {
-    const compact = compactJobError(
-      `request 123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ${'x'.repeat(500)}`,
-    );
+    const token = `123456789:${'A'.repeat(36)}`;
+    const compact = compactJobError(`request ${token} ${'x'.repeat(500)}`);
     assert.ok(!compact.includes('123456789:'));
     assert.ok(compact.length <= 240);
   });
