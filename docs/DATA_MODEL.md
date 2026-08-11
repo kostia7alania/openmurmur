@@ -95,7 +95,10 @@ segment timings, where no word-level aligner exists.
 previous one is demoted (`is_current = 0`), never overwritten.
 
 A row belongs to *either* a session *or* an incoming Telegram file, enforced by
-a `CHECK` constraint. `revision_number` is unique per owner.
+a `CHECK` constraint. `revision_number` is unique per owner. Partial unique
+indexes prevent more than one current revision for either owner type, including
+through direct SQL; the repository replacement transaction makes each append
+leave one current pointer.
 
 This is deliberate: a model upgrade that turns out to be worse must be
 recoverable, and the transcript is the artefact users keep forever.
@@ -283,7 +286,9 @@ by tests.
 3. `delivered = 1` means Telegram acknowledged *that specific part*.
 4. `delivered_at` is the last acknowledgement in its proven direct/split audio
    manifest and never moves backwards.
-5. Exactly one `transcript_revisions` row per owner has `is_current = 1`.
+5. At most one `transcript_revisions` row per owner can have `is_current = 1`
+   (partial unique indexes); every successful repository append leaves exactly
+   one current revision.
 6. A transcript revision belongs to a session **or** an incoming file, never
    both and never neither (`CHECK`).
 7. `jobs.idempotency_key` is unique, so a unit of work exists at most once.
@@ -345,6 +350,12 @@ and never block the recorder.
 Filename-ordered `.sql` files in `src/database/migrations/`, each applied in its
 own transaction and recorded in `schema_migrations`. Re-running is a no-op,
 which is what makes daemon restarts safe. Tested explicitly for idempotency.
+
+Before WAL or any migration write, startup validates the ledger's canonical
+STRICT shape, UTC timestamps and exact contiguous filename-ordered prefix. It
+refuses malformed values, gaps and names absent from this build. This prevents
+an older binary or forged ledger from silently skipping, downgrading or
+mutating schema.
 
 Migrations are forward-only. There is no `down` — a rollback on a database
 containing the user's only copy of a transcript is more dangerous than the

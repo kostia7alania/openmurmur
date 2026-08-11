@@ -126,7 +126,10 @@ describe('migrations', () => {
           deleted_at TEXT
         ) STRICT;
         CREATE TABLE transcript_revisions (
+          revision_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+          session_id TEXT,
           incoming_file_id TEXT,
+          revision_number INTEGER NOT NULL DEFAULT 1,
           is_current INTEGER NOT NULL
         ) STRICT;
         CREATE TABLE summaries (
@@ -271,6 +274,7 @@ describe('migrations', () => {
         '011_telegram_delivery_reconciliation.sql',
         '012_summary_revision_uniqueness.sql',
         '013_audio_finalization_journal.sql',
+        '014_current_transcript_uniqueness.sql',
       ]);
       const rows = legacy
         .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')
@@ -321,6 +325,254 @@ describe('migrations', () => {
     const fk = db.handle.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number };
     assert.equal(journal.journal_mode, 'wal');
     assert.equal(fk.foreign_keys, 1);
+  });
+
+  it('refuses a future migration ledger before changing or migrating the database', () => {
+    const futurePath = join(dir, 'future.db');
+    const seed = new DatabaseSync(futurePath);
+    seed.exec(`
+      CREATE TABLE schema_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      ) STRICT
+    `);
+    seed
+      .prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)')
+      .run('999_future_schema.sql', '2026-08-11T00:00:00.000Z');
+    assert.equal(
+      (seed.prepare('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode,
+      'delete',
+    );
+    seed.close();
+
+    assert.throws(
+      () => openDatabase({ file: futurePath }),
+      /unknown or future migrations: 999_future_schema\.sql.*Upgrade OpenMurmur.*refusing to downgrade or write/is,
+    );
+
+    const inspected = new DatabaseSync(futurePath);
+    try {
+      assert.equal(
+        (inspected.prepare('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode,
+        'delete',
+        'the read-only guard must run before WAL changes the database',
+      );
+      const tables = inspected
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+        .all() as { name: string }[];
+      assert.deepEqual(
+        tables.map((row) => row.name),
+        ['schema_migrations'],
+        'no known migration may run before the future-ledger refusal',
+      );
+      assert.deepEqual(
+        inspected
+          .prepare('SELECT name, applied_at FROM schema_migrations')
+          .all()
+          .map((row) => ({ ...row })),
+        [
+          {
+            name: '999_future_schema.sql',
+            applied_at: '2026-08-11T00:00:00.000Z',
+          },
+        ],
+      );
+    } finally {
+      inspected.close();
+    }
+  });
+
+  it('refuses a malformed migration ledger before changing the database', () => {
+    const malformedPath = join(dir, 'malformed-ledger.db');
+    const seed = new DatabaseSync(malformedPath);
+    seed.exec(`
+      CREATE TABLE schema_migrations (name, applied_at);
+      INSERT INTO schema_migrations (name, applied_at)
+      VALUES ('001_initial.sql', NULL), ('001_initial.sql', 17);
+    `);
+    seed.close();
+
+    assert.throws(
+      () => openDatabase({ file: malformedPath }),
+      /Invalid database migration ledger: schema_migrations does not have the canonical STRICT shape.*refusing to downgrade or write/is,
+    );
+
+    const inspected = new DatabaseSync(malformedPath);
+    try {
+      assert.equal(
+        (inspected.prepare('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode,
+        'delete',
+      );
+      assert.deepEqual(
+        inspected
+          .prepare(
+            `SELECT name, applied_at, typeof(name) AS name_type,
+                    typeof(applied_at) AS applied_at_type
+               FROM schema_migrations ORDER BY rowid`,
+          )
+          .all()
+          .map((row) => ({ ...row })),
+        [
+          {
+            name: '001_initial.sql',
+            applied_at: null,
+            name_type: 'text',
+            applied_at_type: 'null',
+          },
+          {
+            name: '001_initial.sql',
+            applied_at: 17,
+            name_type: 'text',
+            applied_at_type: 'integer',
+          },
+        ],
+        'the malformed, duplicate ledger remains byte-for-byte logical input',
+      );
+      assert.deepEqual(
+        (
+          inspected
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+            .all() as { name: string }[]
+        ).map((row) => row.name),
+        ['schema_migrations'],
+      );
+    } finally {
+      inspected.close();
+    }
+  });
+
+  it('refuses malformed values in a canonical ledger before changing the database', () => {
+    const malformedValuePath = join(dir, 'malformed-ledger-value.db');
+    const seed = new DatabaseSync(malformedValuePath);
+    seed.exec(`
+      CREATE TABLE schema_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      ) STRICT
+    `);
+    seed
+      .prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)')
+      .run('001_initial.sql', 'not-a-timestamp');
+    seed.close();
+
+    assert.throws(
+      () => openDatabase({ file: malformedValuePath }),
+      /applied_at must be a canonical UTC timestamp.*refusing to downgrade or write/is,
+    );
+
+    const inspected = new DatabaseSync(malformedValuePath);
+    try {
+      assert.equal(
+        (inspected.prepare('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode,
+        'delete',
+      );
+      assert.deepEqual(
+        inspected
+          .prepare('SELECT name, applied_at FROM schema_migrations')
+          .all()
+          .map((row) => ({ ...row })),
+        [{ name: '001_initial.sql', applied_at: 'not-a-timestamp' }],
+      );
+    } finally {
+      inspected.close();
+    }
+  });
+
+  it('refuses known migrations after a ledger gap before changing the database', () => {
+    const gapPath = join(dir, 'known-gap.db');
+    const seed = new DatabaseSync(gapPath);
+    seed.exec(`
+      CREATE TABLE schema_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      ) STRICT
+    `);
+    const insert = seed.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)');
+    insert.run('001_initial.sql', '2026-08-11T00:00:00.000Z');
+    insert.run('003_output_provenance.sql', '2026-08-11T00:03:00.000Z');
+    seed.close();
+
+    assert.throws(
+      () => openDatabase({ file: gapPath }),
+      /not a contiguous filename-ordered prefix; expected 002_speaker_diarization\.sql but found 003_output_provenance\.sql.*refusing to downgrade or write/is,
+    );
+
+    const inspected = new DatabaseSync(gapPath);
+    try {
+      assert.equal(
+        (inspected.prepare('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode,
+        'delete',
+      );
+      assert.deepEqual(
+        (
+          inspected.prepare('SELECT name FROM schema_migrations ORDER BY name').all() as {
+            name: string;
+          }[]
+        ).map((row) => row.name),
+        ['001_initial.sql', '003_output_provenance.sql'],
+      );
+      assert.deepEqual(
+        (
+          inspected
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+            .all() as { name: string }[]
+        ).map((row) => row.name),
+        ['schema_migrations'],
+      );
+    } finally {
+      inspected.close();
+    }
+  });
+
+  it('repairs duplicate current pointers before installing the database constraint', () => {
+    db.handle.exec(`
+      DROP INDEX idx_transcript_current_session;
+      DROP INDEX idx_transcript_current_incoming;
+      DELETE FROM schema_migrations WHERE name = '014_current_transcript_uniqueness.sql';
+    `);
+    const at = '2026-08-11T01:00:00.000Z';
+    new SessionRepository(db.handle).create('duplicate-session', at);
+    db.handle
+      .prepare(
+        `INSERT INTO incoming_telegram_files
+           (file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id,
+            state, created_at, updated_at)
+         VALUES ('duplicate-incoming', 'file-id', 'unique-id', 42, 1,
+                 'transcribed', ?, ?)`,
+      )
+      .run(at, at);
+    const insertRevision = db.handle.prepare(
+      `INSERT INTO transcript_revisions
+         (revision_id, session_id, incoming_file_id, revision_number, engine, model,
+          languages, text, word_count, is_current, created_at)
+       VALUES (?, ?, ?, ?, 'e', 'm', '[]', ?, 1, 1, ?)`,
+    );
+    insertRevision.run('session-r1', 'duplicate-session', null, 1, 'old session', at);
+    insertRevision.run('session-r2', 'duplicate-session', null, 2, 'new session', at);
+    insertRevision.run('incoming-r1', null, 'duplicate-incoming', 1, 'old incoming', at);
+    insertRevision.run('incoming-r2', null, 'duplicate-incoming', 2, 'new incoming', at);
+
+    assert.deepEqual(migrate(db.handle), ['014_current_transcript_uniqueness.sql']);
+    const pointers = db.handle
+      .prepare(
+        `SELECT revision_id, is_current
+           FROM transcript_revisions
+          WHERE session_id = 'duplicate-session'
+             OR incoming_file_id = 'duplicate-incoming'
+          ORDER BY revision_id`,
+      )
+      .all() as { revision_id: string; is_current: number }[];
+    assert.deepEqual(
+      pointers.map((row) => ({ ...row })),
+      [
+        { revision_id: 'incoming-r1', is_current: 0 },
+        { revision_id: 'incoming-r2', is_current: 1 },
+        { revision_id: 'session-r1', is_current: 0 },
+        { revision_id: 'session-r2', is_current: 1 },
+      ],
+      'the migration preserves all immutable rows and retains the highest revision pointer',
+    );
+    assert.deepEqual(migrate(db.handle), []);
   });
 
   it('enforces foreign keys', () => {
@@ -680,6 +932,69 @@ describe('immutable transcript revisions', () => {
     assert.equal(rows[1]?.is_current, 1);
     assert.equal(rows[0]?.text, 'первый вариант', 'a re-run must not destroy the original');
     assert.equal(transcripts.current('s1')?.text, 'второй вариант');
+  });
+
+  it('rejects a second current revision from an independent direct SQL writer', () => {
+    const at = '2026-08-11T02:00:00.000Z';
+    const sessions = new SessionRepository(db.handle);
+    const transcripts = new TranscriptRepository(db.handle);
+    sessions.create('unique-session', at);
+    transcripts.append({
+      sessionId: 'unique-session',
+      engine: 'e',
+      model: 'm',
+      languages: ['ru'],
+      text: 'session current',
+      segments: [],
+    });
+    db.handle
+      .prepare(
+        `INSERT INTO incoming_telegram_files
+           (file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id,
+            state, created_at, updated_at)
+         VALUES ('unique-incoming', 'file-id', 'unique-id', 42, 1,
+                 'transcribed', ?, ?)`,
+      )
+      .run(at, at);
+    transcripts.append({
+      incomingFileId: 'unique-incoming',
+      engine: 'e',
+      model: 'm',
+      languages: ['ru'],
+      text: 'incoming current',
+      segments: [],
+    });
+
+    const otherWriter = new DatabaseSync(join(dir, 'test.db'));
+    try {
+      const insertCurrent = otherWriter.prepare(
+        `INSERT INTO transcript_revisions
+           (revision_id, session_id, incoming_file_id, revision_number, engine, model,
+            languages, text, word_count, is_current, created_at)
+         VALUES (?, ?, ?, 2, 'e', 'm2', '[]', 'duplicate', 1, 1, ?)`,
+      );
+      assert.throws(
+        () => insertCurrent.run('direct-session-r2', 'unique-session', null, at),
+        /UNIQUE constraint failed: transcript_revisions\.session_id/,
+      );
+      assert.throws(
+        () => insertCurrent.run('direct-incoming-r2', null, 'unique-incoming', at),
+        /UNIQUE constraint failed: transcript_revisions\.incoming_file_id/,
+      );
+    } finally {
+      otherWriter.close();
+    }
+
+    const currentCounts = db.handle
+      .prepare(
+        `SELECT
+           (SELECT count(*) FROM transcript_revisions
+             WHERE session_id = 'unique-session' AND is_current = 1) AS session_count,
+           (SELECT count(*) FROM transcript_revisions
+             WHERE incoming_file_id = 'unique-incoming' AND is_current = 1) AS incoming_count`,
+      )
+      .get() as { session_count: number; incoming_count: number };
+    assert.deepEqual({ ...currentCounts }, { session_count: 1, incoming_count: 1 });
   });
 
   it('stores segments with their timestamp provenance', () => {

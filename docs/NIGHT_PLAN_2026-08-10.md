@@ -89,9 +89,9 @@ blocked even if its task appears earlier.
 
 - [x] **CS-25 · P1 · fixed-in-eff3dc1** — Exercise a real previous-schema upgrade. Evidence: `tests/unit/database.test.ts` in `eff3dc1` builds a migration-005 database, applies migration 006 and verifies alert/outbox reconciliation. Accept: fixture remains data-preserving and idempotent.
 - [ ] **CS-26 · P2 · gap** — Record and verify migration SQL checksums. Evidence: `src/database/db.ts:82-109` stores only migration names. Accept: modified applied SQL fails with an actionable integrity error; unchanged history opens normally.
-- [ ] **CS-27 · P1 · gap** — Refuse unknown/future schema versions. Evidence: `src/database/db.ts:90-117` has no forward-version guard. Accept: an extra ledger row aborts before writes with an upgrade/downgrade explanation.
+- [x] **CS-27 · P1 · fixed-current** — A read-only ledger guard runs before WAL and migrations and requires the canonical ledger shape plus an exact contiguous local prefix, refusing malformed values, gaps and unknown/future names with an upgrade/downgrade explanation. Evidence: `src/database/db.ts`, `tests/unit/database.test.ts`.
 - [ ] **CS-28 · P1 · verify-live** — Define pre-migration integrity and backup policy. Evidence: `openDatabase` migrates immediately. Accept: documented backup/integrity gate is atomic enough for SQLite and failure recovery is tested on a copied fixture.
-- [ ] **CS-29 · P1 · gap** — Enforce exactly one current transcript at the database layer. Evidence: no partial unique index protects `is_current`. Accept: concurrent revision creation cannot leave two current rows.
+- [x] **CS-29 · P1 · fixed-current** — Partial unique indexes protect both session and incoming current pointers; migration 014 repairs legacy duplicates by keeping the highest revision without deleting history. Evidence: `src/database/migrations/014_current_transcript_uniqueness.sql`, `tests/unit/database.test.ts`.
 - [x] **RO-19 · P1 · fixed-in-eff3dc1** — Retire legacy ASR-backlog alert state during the fingerprint migration. Evidence: `eff3dc1` migration 006 resets `asr_backlog` and fails pending legacy alert rows; its upgrade test covers it. Accept: upgrade emits neither false recovery nor stale warning.
 
 ## 9. Health signals, alerts and bounded observability
