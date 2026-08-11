@@ -160,6 +160,35 @@ describe('outbox idempotency', () => {
     assert.equal(outbox.claimNext()?.kind, 'audio');
   });
 
+  it('drains an old ready backlog while new session audio keeps arriving', () => {
+    const outbox = new Outbox(db.handle);
+    for (const id of ['old-report-1', 'old-report-2', 'old-report-3']) {
+      outbox.enqueue({
+        deliveryPartId: id,
+        kind: 'report',
+        ordinal: 20,
+        payload: { type: 'text', text: id },
+      });
+    }
+    db.handle.prepare("UPDATE telegram_outbox SET created_at = '2000-01-01T00:00:00.000Z'").run();
+
+    const claimed: string[] = [];
+    for (let index = 0; index < 40; index += 1) {
+      outbox.enqueue({
+        deliveryPartId: `new-audio-${index}`,
+        kind: 'audio',
+        ordinal: 0,
+        payload: { type: 'text', text: `new audio ${index}` },
+      });
+      const row = outbox.claimNext();
+      assert.ok(row);
+      claimed.push(row.delivery_part_id);
+      outbox.markSent(row.outbox_id, index + 1);
+    }
+
+    assert.deepEqual(claimed.slice(0, 3), ['old-report-1', 'old-report-2', 'old-report-3']);
+  });
+
   it('commits the sent row and its delivery facts atomically', () => {
     const outbox = new Outbox(db.handle);
     outbox.enqueue({

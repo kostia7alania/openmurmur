@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { mkdir, stat } from 'node:fs/promises';
+import { mkdir, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, before, beforeEach, describe, it } from 'node:test';
@@ -290,7 +290,9 @@ describe('lossless splitting for oversize parts', {
     const sourceSize = (await stat(source)).size;
     const limit = Math.floor(sourceSize / 3);
     const staleGappedArtifact = join(dir, 'big.split999.flac');
+    const staleFourDigitArtifact = join(dir, 'big.split1000.flac');
     writeFileSync(staleGappedArtifact, 'unowned stale split');
+    writeFileSync(staleFourDigitArtifact, 'unowned four-digit split');
     const chunks = await splitFlacLossless(FFMPEG, source, dir, limit, 120_000);
 
     assert.ok(chunks.length > 1, `expected several chunks, got ${chunks.length}`);
@@ -298,6 +300,11 @@ describe('lossless splitting for oversize parts', {
       existsSync(staleGappedArtifact),
       false,
       'cleanup must not stop at the first missing split index',
+    );
+    assert.equal(
+      existsSync(staleFourDigitArtifact),
+      false,
+      'ffmpeg %03d is a minimum width, so split1000 must also be enumerated',
     );
     for (const chunk of chunks) {
       const size = (await stat(chunk)).size;
@@ -307,6 +314,69 @@ describe('lossless splitting for oversize parts', {
       const probe = await probeAudio(FFPROBE, chunk);
       assert.equal(probe?.codec, 'flac', 'splitting must not change the codec');
     }
+  });
+
+  it('remeasures and retries when the initial bitrate estimate is far too low', async (t) => {
+    if (!hasFfmpeg) return t.skip('ffmpeg not available');
+
+    const source = join(dir, 'underestimated.flac');
+    await run(FFMPEG, [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=880:sample_rate=16000:duration=30',
+      '-ac',
+      '1',
+      '-c:a',
+      'flac',
+      '-y',
+      source,
+    ]);
+
+    const sourceSize = (await stat(source)).size;
+    const limit = Math.floor(sourceSize / 4);
+    const chunks = await splitFlacLossless(FFMPEG, source, dir, limit, 30 * 60 * 1000);
+
+    assert.ok(chunks.length > 1, 'the oversize first attempt must be replaced by smaller chunks');
+    for (const chunk of chunks) {
+      const size = (await stat(chunk)).size;
+      assert.ok(size <= limit, `remeasured chunk of ${size} bytes exceeds ${limit}`);
+    }
+  });
+
+  it('fails explicitly and cleans derived files when one-second chunks still exceed the limit', async (t) => {
+    if (!hasFfmpeg) return t.skip('ffmpeg not available');
+
+    const source = join(dir, 'unsplittable.flac');
+    await run(FFMPEG, [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=660:sample_rate=16000:duration=2',
+      '-ac',
+      '1',
+      '-c:a',
+      'flac',
+      '-y',
+      source,
+    ]);
+
+    await assert.rejects(
+      splitFlacLossless(FFMPEG, source, dir, 1, 2000),
+      /cannot split .* below the Telegram limit of 1 bytes without re-encoding/,
+    );
+    assert.equal(existsSync(source), true, 'an upload-limit failure must preserve the source FLAC');
+    assert.deepEqual(
+      (await readdir(dir)).filter((entry) => entry.startsWith('unsplittable.split')),
+      [],
+      'an explicit split failure must not leave unowned derived artifacts',
+    );
   });
 });
 

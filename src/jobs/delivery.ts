@@ -648,12 +648,16 @@ async function listSplitArtifacts(tempDir: string, stem: string): Promise<string
 
   const prefix = `${stem}.split`;
   return entries
-    .filter((entry) => {
+    .map((entry) => {
       if (!entry.startsWith(prefix) || !entry.endsWith('.flac')) return false;
-      return /^\d{3}$/.test(entry.slice(prefix.length, -'.flac'.length));
+      const suffix = entry.slice(prefix.length, -'.flac'.length);
+      if (!/^\d{3,}$/.test(suffix)) return false;
+      const index = Number(suffix);
+      return Number.isSafeInteger(index) ? { entry, index } : false;
     })
-    .sort()
-    .map((entry) => join(tempDir, entry));
+    .filter((entry): entry is { entry: string; index: number } => entry !== false)
+    .sort((left, right) => left.index - right.index)
+    .map(({ entry }) => join(tempDir, entry));
 }
 
 async function removeSplitArtifacts(tempDir: string, stem: string): Promise<void> {
