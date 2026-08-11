@@ -422,6 +422,50 @@ that unavoidable acknowledgement window.
 | Crash mid-send | Row recovered from `sending` to `pending` at startup. |
 | Oversize file | Rejected before any network call. |
 
+### Reconciling one independently proven remote acknowledgement
+
+Telegram does not provide this outbox with a post-hoc `getMessage` lookup or an
+idempotency key. A local `pending`, `sending` or attempted row therefore proves
+only local state — never that Telegram accepted or rejected it. The default
+operator command is report-only and labels the remote result as unknown:
+
+```bash
+pnpm openmurmur delivery reconcile-remote report \
+  --delivery-part 'report:SESSION_ID'
+```
+
+The report includes the exact `delivery_part_id`, a control-character-safe
+preview of the visible text/caption/filename and SHA-256 of the complete stored
+request payload. Stop the daemon, then compare those visible fields with
+independent Telegram evidence such as a Telegram Desktop JSON export. If and
+only if the same remote message is visible, record its exact positive Telegram
+message id, its exact UTC message time, the operator identity and a short
+evidence reference:
+
+```bash
+pnpm openmurmur delivery reconcile-remote apply \
+  --delivery-part 'report:SESSION_ID' \
+  --telegram-message-id 501 \
+  --ack-at '2026-08-11T10:05:00.000Z' \
+  --operator 'operator@example' \
+  --evidence 'Telegram Desktop JSON export message 501 matched the reported payload' \
+  --yes
+```
+
+Apply handles exactly one delivery row. It aborts if no local send attempt was
+recorded, the preview changed, the ACK predates the durable outbox request, the
+daemon may still be running, or the row cannot be matched to its durable audio,
+session or incoming-transcript owner. The outbox state, Telegram message id,
+exact ACK clock, applicable domain transition and immutable operator audit are
+one SQLite transaction. Repeating the exact same evidence is idempotent;
+different evidence for an already reconciled row is rejected.
+
+This workflow does not eliminate the acknowledgement window. Without the
+independent message identity it deliberately leaves the row pending and keeps
+at-least-once retry semantics, including the possibility of a visible
+duplicate. No timestamp, attempt count or payload similarity is promoted into
+a fabricated remote ACK.
+
 Health alerts do not amplify an outage. A `telegram_delivery` failure is kept
 in the local log and `/health` while Telegram is delayed; putting that warning
 into the unavailable channel would only deliver a stale warning after recovery

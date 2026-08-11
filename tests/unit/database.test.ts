@@ -58,6 +58,7 @@ describe('migrations', () => {
       'telegram_outbox',
       'incoming_telegram_files',
       'audio_delivery_reconciliation_audit',
+      'telegram_delivery_reconciliation_audit',
       'asr_preferences',
       'schema_migrations',
     ]) {
@@ -96,7 +97,8 @@ describe('migrations', () => {
           deleted_at TEXT
         ) STRICT;
         CREATE TABLE telegram_outbox (
-          delivery_part_id TEXT PRIMARY KEY,
+          outbox_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+          delivery_part_id TEXT NOT NULL UNIQUE,
           session_id TEXT,
           kind TEXT NOT NULL,
           payload TEXT NOT NULL DEFAULT '{}',
@@ -112,6 +114,16 @@ describe('migrations', () => {
         CREATE TABLE transcript_revisions (
           incoming_file_id TEXT,
           is_current INTEGER NOT NULL
+        ) STRICT;
+        CREATE TABLE summaries (
+          summary_id TEXT PRIMARY KEY,
+          session_id TEXT,
+          incoming_file_id TEXT,
+          revision_id TEXT NOT NULL,
+          engine TEXT NOT NULL,
+          model TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          created_at TEXT NOT NULL
         ) STRICT;
         CREATE TABLE alert_state (
           alert_id TEXT PRIMARY KEY,
@@ -242,6 +254,8 @@ describe('migrations', () => {
         '008_daemon_heartbeat.sql',
         '009_incoming_delivery_time.sql',
         '010_audio_delivery_reconciliation.sql',
+        '011_telegram_delivery_reconciliation.sql',
+        '012_summary_revision_uniqueness.sql',
       ]);
       const rows = legacy
         .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')

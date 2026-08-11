@@ -284,6 +284,17 @@ describe('ASR job', () => {
       .prepare('UPDATE summaries SET payload = ? WHERE session_id = ?')
       .run(JSON.stringify(payload), 's1');
 
+    await handleJob(
+      { ...deps(), llm: groundedLlm },
+      {
+        jobId: 'report-provenance',
+        kind: 'deliver_report',
+        payload: { sessionId: 's1', revisionId },
+        attempts: 1,
+        maxAttempts: 5,
+      },
+    );
+
     const newerRevisionId = new TranscriptRepository(db.handle).append({
       sessionId: 's1',
       engine: 'fixture',
@@ -305,17 +316,17 @@ describe('ASR job', () => {
     await handleJob(
       { ...deps(), llm: groundedLlm },
       {
-        jobId: 'report-provenance',
+        jobId: 'stale-report-provenance',
         kind: 'deliver_report',
-        payload: { sessionId: 's1' },
+        payload: { sessionId: 's1', revisionId },
         attempts: 1,
         maxAttempts: 5,
       },
     );
 
     const reportRow = db.handle
-      .prepare("SELECT payload FROM telegram_outbox WHERE delivery_part_id = 'report:s1'")
-      .get() as { payload: string };
+      .prepare('SELECT payload FROM telegram_outbox WHERE delivery_part_id = ?')
+      .get(`report:s1:${revisionId}`) as { payload: string };
     const reportPayload = JSON.parse(reportRow.payload) as { type: string; text: string };
     assert.equal(reportPayload.type, 'text');
     assert.match(reportPayload.text, new RegExp(revisionId));
@@ -754,10 +765,12 @@ describe('delivery enqueue', () => {
     const rows = db.handle
       .prepare("SELECT delivery_part_id, payload FROM telegram_outbox WHERE kind = 'report'")
       .all() as { delivery_part_id: string; payload: string }[];
-    const preview = rows.find((row) => row.delivery_part_id === 'report-summary:s1');
+    const revisionId = new TranscriptRepository(db.handle).current('s1')?.revision_id;
+    assert.ok(revisionId);
+    const preview = rows.find((row) => row.delivery_part_id === `report-summary:s1:${revisionId}`);
     assert.ok(preview);
     assert.match(preview.payload, /blockquote expandable/);
-    const file = rows.find((row) => row.delivery_part_id === 'report:s1');
+    const file = rows.find((row) => row.delivery_part_id === `report:s1:${revisionId}`);
     assert.ok(file);
     const payload = JSON.parse(file.payload) as { type: string; path: string; filename: string };
     assert.equal(payload.type, 'document');

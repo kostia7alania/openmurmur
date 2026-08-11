@@ -129,10 +129,49 @@ interface OllamaChatResponse {
 }
 
 class SummaryChunkOutputError extends Error {
-  constructor(message: string) {
+  readonly kind: 'malformed-json' | 'schema-invalid';
+
+  constructor(kind: 'malformed-json' | 'schema-invalid', message: string) {
     super(message);
     this.name = 'SummaryChunkOutputError';
+    this.kind = kind;
   }
+}
+
+interface SummaryCompletion {
+  readonly deadlineReached: boolean;
+  readonly plannedChunks: number;
+  readonly malformedChunks: number;
+  readonly schemaInvalidChunks: number;
+}
+
+function isSummaryComplete(completion: SummaryCompletion): boolean {
+  return (
+    !completion.deadlineReached &&
+    completion.plannedChunks <= MAX_SUMMARY_CHUNK_CALLS &&
+    completion.malformedChunks === 0 &&
+    completion.schemaInvalidChunks === 0
+  );
+}
+
+function responseCount(count: number, description: string): string {
+  return `${count} ${description} chunk response${count === 1 ? '' : 's'}`;
+}
+
+function incompleteReasons(completion: SummaryCompletion, timeoutMs: number): string[] {
+  const reasons: string[] = [];
+  if (completion.malformedChunks > 0) {
+    reasons.push(`rejected ${responseCount(completion.malformedChunks, 'malformed JSON')}`);
+  }
+  if (completion.schemaInvalidChunks > 0) {
+    reasons.push(`rejected ${responseCount(completion.schemaInvalidChunks, 'schema-invalid')}`);
+  }
+  if (completion.deadlineReached) {
+    reasons.push(`reached the overall ${timeoutMs} ms deadline`);
+  } else if (completion.plannedChunks > MAX_SUMMARY_CHUNK_CALLS) {
+    reasons.push(`reached the ${MAX_SUMMARY_CHUNK_CALLS}-chunk work limit`);
+  }
+  return reasons;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -140,7 +179,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function schemaInvalid(reason: string): never {
-  throw new SummaryChunkOutputError(`schema-invalid summary: ${reason}`);
+  throw new SummaryChunkOutputError('schema-invalid', `schema-invalid summary: ${reason}`);
 }
 
 function validateModelSummaryShape(raw: unknown): Record<string, unknown> {
@@ -197,7 +236,7 @@ function parseChunkSummary(content: string): StructuredSummary {
   try {
     raw = JSON.parse(content);
   } catch {
-    throw new SummaryChunkOutputError('invalid summary JSON');
+    throw new SummaryChunkOutputError('malformed-json', 'malformed summary JSON');
   }
   const record = validateModelSummaryShape(raw);
   const overflow =
@@ -322,7 +361,7 @@ export class OllamaLlm implements LlmBackend {
     const chunks = plan.slice(0, MAX_SUMMARY_CHUNK_CALLS);
     const results = [];
     let deadlineReached = false;
-    let invalidChunks = 0;
+    const outputFailures = { malformed: 0, schemaInvalid: 0 };
     for (const chunk of chunks) {
       const remainingMs = deadline - this.#now();
       if (remainingMs <= 0) {
@@ -350,23 +389,22 @@ export class OllamaLlm implements LlmBackend {
           break;
         }
         if (error instanceof SummaryChunkOutputError) {
-          invalidChunks += 1;
+          if (error.kind === 'malformed-json') outputFailures.malformed += 1;
+          else outputFailures.schemaInvalid += 1;
           continue;
         }
         throw error;
       }
     }
     const summary = aggregateChunkSummaries(results);
-    if (!deadlineReached && plan.length <= MAX_SUMMARY_CHUNK_CALLS && invalidChunks === 0) {
-      return summary;
-    }
-    const reasons: string[] = [];
-    if (invalidChunks > 0) reasons.push(`rejected ${invalidChunks} schema-invalid chunk responses`);
-    if (deadlineReached) {
-      reasons.push(`reached the overall ${this.#config.requestTimeoutMs} ms deadline`);
-    } else if (plan.length > MAX_SUMMARY_CHUNK_CALLS) {
-      reasons.push(`reached the ${MAX_SUMMARY_CHUNK_CALLS}-chunk work limit`);
-    }
+    const completion = {
+      deadlineReached,
+      plannedChunks: plan.length,
+      malformedChunks: outputFailures.malformed,
+      schemaInvalidChunks: outputFailures.schemaInvalid,
+    };
+    if (isSummaryComplete(completion)) return summary;
+    const reasons = incompleteReasons(completion, this.#config.requestTimeoutMs);
     const notice = `Long-session summary incomplete: processed ${results.length} of ${plan.length} chunks; ${reasons.join('; ')}. The complete transcript remains available.`;
     return {
       ...summary,
@@ -417,7 +455,10 @@ export class OllamaLlm implements LlmBackend {
     } catch (error) {
       // Constrained decoding should make this unreachable, but a truncated
       // chunk must not disappear inside an otherwise plausible partial report.
+      const kind =
+        error instanceof SummaryChunkOutputError ? error.kind : ('malformed-json' as const);
       throw new SummaryChunkOutputError(
+        kind,
         `Ollama returned invalid output for summary ${chunkId}: ${(error as Error).message}`,
       );
     }

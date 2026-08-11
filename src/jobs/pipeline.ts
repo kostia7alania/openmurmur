@@ -305,9 +305,9 @@ async function handleAsr(deps: PipelineDeps, job: Job): Promise<void> {
         speaker: assignSpeaker(segment.startMs, segment.endMs, turns),
       })),
     },
-    () => {
+    (revisionId) => {
       sessions.setLanguages(sessionId, reconciled);
-      enqueuePostAsrJobs(deps, sessionId);
+      enqueuePostAsrJobs(deps, sessionId, revisionId);
     },
   );
   deps.logger.info('transcript stored', {
@@ -362,22 +362,22 @@ function replayStoredTranscript(
 ): boolean {
   const existing = deps.db
     .prepare(
-      `SELECT languages FROM transcript_revisions
+      `SELECT revision_id, languages FROM transcript_revisions
         WHERE session_id = ? AND is_current = 1`,
     )
-    .get(sessionId) as { languages: string } | undefined;
+    .get(sessionId) as { revision_id: string; languages: string } | undefined;
   if (existing === undefined) return false;
 
   const languages = JSON.parse(existing.languages) as string[];
   transaction(deps.db, () => {
     sessions.setLanguages(sessionId, languages);
-    enqueuePostAsrJobs(deps, sessionId);
+    enqueuePostAsrJobs(deps, sessionId, existing.revision_id);
   });
   return true;
 }
 
 /** Makes transcript delivery and summarization independently replayable. */
-function enqueuePostAsrJobs(deps: PipelineDeps, sessionId: string): void {
+function enqueuePostAsrJobs(deps: PipelineDeps, sessionId: string, revisionId: string): void {
   deps.jobs.enqueue({
     kind: 'deliver_transcript',
     idempotencyKey: `deliver-transcript:${sessionId}`,
@@ -385,8 +385,8 @@ function enqueuePostAsrJobs(deps: PipelineDeps, sessionId: string): void {
   });
   deps.jobs.enqueue({
     kind: 'summarize',
-    idempotencyKey: `summarize:${sessionId}`,
-    payload: { sessionId },
+    idempotencyKey: `summarize:${sessionId}:${revisionId}`,
+    payload: { sessionId, revisionId },
   });
 }
 
@@ -405,8 +405,11 @@ async function handleSummarize(deps: PipelineDeps, job: Job): Promise<void> {
   const transcripts = new TranscriptRepository(deps.db);
   const sessions = new SessionRepository(deps.db);
 
-  const current = transcripts.current(sessionId);
-  if (current === undefined) throw new Error(`session ${sessionId} has no transcript`);
+  const revisionId = revisionIdOf(deps, job, sessionId);
+  const revision = transcripts.revision(sessionId, revisionId);
+  if (revision === undefined) {
+    throw new Error(`transcript revision ${revisionId} does not belong to session ${sessionId}`);
+  }
   const session = sessions.get(sessionId);
   if (session === undefined) throw new Error(`unknown session ${sessionId}`);
 
@@ -416,25 +419,21 @@ async function handleSummarize(deps: PipelineDeps, job: Job): Promise<void> {
         WHERE session_id = ? AND revision_id = ?
         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
     )
-    .get(sessionId, current.revision_id) as { payload: string } | undefined;
+    .get(sessionId, revisionId) as { payload: string } | undefined;
   if (existing !== undefined) {
-    deps.jobs.enqueue({
-      kind: 'deliver_report',
-      idempotencyKey: `deliver-report:${sessionId}`,
-      payload: { sessionId },
-    });
+    enqueueReportJob(deps, sessionId, revisionId);
     return;
   }
 
-  const segments = transcripts.segments(current.revision_id).map((s) => s.text);
+  const segments = transcripts.segments(revisionId).map((s) => s.text);
   let summary = EMPTY_SUMMARY;
   try {
     summary = boundClaimEvidence(
       parseSummary(
         await deps.llm.summarize({
-          transcript: current.text,
+          transcript: revision.text,
           segments,
-          languages: session.languages === null ? [] : (JSON.parse(session.languages) as string[]),
+          languages: JSON.parse(revision.languages) as string[],
           durationMs: session.duration_ms ?? 0,
         }),
       ),
@@ -454,41 +453,52 @@ async function handleSummarize(deps: PipelineDeps, job: Job): Promise<void> {
       .prepare(
         `INSERT INTO summaries
            (summary_id, session_id, revision_id, engine, model, payload, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (revision_id) DO NOTHING`,
       )
       .run(
         randomUUID(),
         sessionId,
-        current.revision_id,
+        revisionId,
         deps.llm.name,
         deps.config.llm.model,
         JSON.stringify(summary),
         new Date().toISOString(),
       );
 
-    deps.jobs.enqueue({
-      kind: 'deliver_report',
-      idempotencyKey: `deliver-report:${sessionId}`,
-      payload: { sessionId },
-    });
+    enqueueReportJob(deps, sessionId, revisionId);
   });
 }
 
 async function handleDeliverReport(deps: PipelineDeps, job: Job): Promise<void> {
   const sessionId = sessionIdOf(job);
+  const revisionId = revisionIdOf(deps, job, sessionId);
+  const current = new TranscriptRepository(deps.db).current(sessionId);
+  if (current === undefined) throw new Error(`session ${sessionId} has no transcript`);
+  if (current.revision_id !== revisionId) {
+    deps.logger.info('stale report revision skipped', {
+      sessionId,
+      revisionId,
+      currentRevisionId: current.revision_id,
+    });
+    return;
+  }
   const row = deps.db
     .prepare(
       `SELECT payload, revision_id
          FROM summaries
-        WHERE session_id = ?
-        ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+        WHERE session_id = ? AND revision_id = ?`,
     )
-    .get(sessionId) as { payload: string; revision_id: string } | undefined;
-  const summary = row === undefined ? EMPTY_SUMMARY : parseStoredSummary(row.payload);
+    .get(sessionId, revisionId) as { payload: string; revision_id: string } | undefined;
+  if (row === undefined) {
+    throw new Error(`session ${sessionId} has no summary for revision ${revisionId}`);
+  }
+  const summary = parseStoredSummary(row.payload);
   const rows = await enqueueSessionReport(deps.db, {
     sessionId,
     summary,
-    ...(row === undefined ? {} : { summaryRevisionId: row.revision_id }),
+    summaryRevisionId: row.revision_id,
+    requireCurrentRevision: true,
     config: deps.config,
     paths: deps.paths,
   });
@@ -497,14 +507,16 @@ async function handleDeliverReport(deps: PipelineDeps, job: Job): Promise<void> 
 
 async function handleDeliver(deps: PipelineDeps, job: Job): Promise<void> {
   const sessionId = sessionIdOf(job);
+  const current = new TranscriptRepository(deps.db).current(sessionId);
   const row = deps.db
     .prepare(
       `SELECT payload, revision_id
          FROM summaries
-        WHERE session_id = ?
-        ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+        WHERE session_id = ? AND revision_id = ?`,
     )
-    .get(sessionId) as { payload: string; revision_id: string } | undefined;
+    .get(sessionId, current?.revision_id ?? '') as
+    | { payload: string; revision_id: string }
+    | undefined;
 
   const summary = row === undefined ? EMPTY_SUMMARY : parseStoredSummary(row.payload);
   const plan = await enqueueSessionDelivery(deps.db, {
@@ -522,6 +534,77 @@ async function handleDeliver(deps: PipelineDeps, job: Job): Promise<void> {
     report: plan.reportRows,
     oversizeParts: plan.oversizeParts.length,
   });
+}
+
+function enqueueReportJob(deps: PipelineDeps, sessionId: string, revisionId: string): void {
+  deps.jobs.enqueue({
+    kind: 'deliver_report',
+    idempotencyKey: `deliver-report:${sessionId}:${revisionId}`,
+    payload: { sessionId, revisionId },
+  });
+}
+
+/**
+ * Pre-revision jobs bind their first observed current revision into the durable
+ * job payload. A reclaimed lease then reads the same revision instead of
+ * drifting to whichever transcript became current while the worker was down.
+ */
+function revisionIdOf(deps: PipelineDeps, job: Job, sessionId: string): string {
+  const payloadRevisionId = job.payload['revisionId'];
+  if (typeof payloadRevisionId === 'string' && payloadRevisionId.length > 0) {
+    return payloadRevisionId;
+  }
+  if (payloadRevisionId !== undefined) {
+    throw new Error(`job ${job.jobId} has an invalid revisionId`);
+  }
+
+  return transaction(deps.db, () => {
+    const stored = deps.db.prepare('SELECT payload FROM jobs WHERE job_id = ?').get(job.jobId) as
+      | { payload: string }
+      | undefined;
+    if (stored !== undefined) {
+      const payload = parseJobPayload(stored.payload, job.jobId);
+      if (payload['sessionId'] !== sessionId) {
+        throw new Error(`job ${job.jobId} has a mismatched durable sessionId`);
+      }
+      const storedRevisionId = payload['revisionId'];
+      if (typeof storedRevisionId === 'string' && storedRevisionId.length > 0) {
+        return storedRevisionId;
+      }
+      if (storedRevisionId !== undefined) {
+        throw new Error(`job ${job.jobId} has an invalid durable revisionId`);
+      }
+
+      const current = new TranscriptRepository(deps.db).current(sessionId);
+      if (current === undefined) throw new Error(`session ${sessionId} has no transcript`);
+      deps.db
+        .prepare('UPDATE jobs SET payload = ?, updated_at = ? WHERE job_id = ?')
+        .run(
+          JSON.stringify({ ...payload, revisionId: current.revision_id }),
+          new Date().toISOString(),
+          job.jobId,
+        );
+      return current.revision_id;
+    }
+
+    // Direct handler calls in unit tests have no durable queue row. Production
+    // workers always take this path through a claimed job stored above.
+    const current = new TranscriptRepository(deps.db).current(sessionId);
+    if (current === undefined) throw new Error(`session ${sessionId} has no transcript`);
+    return current.revision_id;
+  });
+}
+
+function parseJobPayload(payload: string, jobId: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // The explicit error below is stable and does not echo untrusted payload.
+  }
+  throw new Error(`job ${jobId} has an invalid durable payload`);
 }
 
 function parseStoredSummary(payload: string): StructuredSummary {

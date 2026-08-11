@@ -426,6 +426,14 @@ export interface TranscriptInput {
   readonly segments: readonly TranscriptSegmentInput[];
 }
 
+export interface TranscriptRevisionRow {
+  readonly revision_id: string;
+  readonly text: string;
+  readonly word_count: number;
+  readonly languages: string;
+  readonly forced_language: string | null;
+}
+
 export class TranscriptRepository {
   readonly #db: DatabaseSync;
   constructor(db: DatabaseSync) {
@@ -529,30 +537,25 @@ export class TranscriptRepository {
     });
   }
 
-  current(sessionId: string):
-    | {
-        revision_id: string;
-        text: string;
-        word_count: number;
-        languages: string;
-        forced_language: string | null;
-      }
-    | undefined {
+  current(sessionId: string): TranscriptRevisionRow | undefined {
     return this.#db
       .prepare(
         `SELECT revision_id, text, word_count, languages, forced_language
            FROM transcript_revisions
           WHERE session_id = ? AND is_current = 1`,
       )
-      .get(sessionId) as
-      | {
-          revision_id: string;
-          text: string;
-          word_count: number;
-          languages: string;
-          forced_language: string | null;
-        }
-      | undefined;
+      .get(sessionId) as TranscriptRevisionRow | undefined;
+  }
+
+  /** Loads one immutable revision and proves that it belongs to this session. */
+  revision(sessionId: string, revisionId: string): TranscriptRevisionRow | undefined {
+    return this.#db
+      .prepare(
+        `SELECT revision_id, text, word_count, languages, forced_language
+           FROM transcript_revisions
+          WHERE session_id = ? AND revision_id = ?`,
+      )
+      .get(sessionId, revisionId) as TranscriptRevisionRow | undefined;
   }
 
   segments(revisionId: string): TranscriptSegmentInput[] {

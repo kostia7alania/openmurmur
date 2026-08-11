@@ -49,6 +49,8 @@ export interface EnqueueReportInput extends EnqueueDeliveryInput {
   readonly summary: StructuredSummary;
   /** Exact immutable transcript revision from the summaries row. */
   readonly summaryRevisionId?: string | undefined;
+  /** Pipeline reports publish only while their source revision is still current. */
+  readonly requireCurrentRevision?: boolean | undefined;
 }
 
 export interface DeliveryPlan {
@@ -435,6 +437,9 @@ export async function enqueueSessionReport(
     input.sessionId,
     input.summaryRevisionId,
   );
+  if (reportRevisionIsStale(transcripts, input)) {
+    return 0;
+  }
   const languages =
     transcript === undefined
       ? session.languages === null
@@ -467,10 +472,12 @@ export async function enqueueSessionReport(
     provenance: liveCaptureProvenance(session),
   };
   const report = renderSessionReport(reportInput);
+  const reportRevisionId = transcript?.revision_id ?? 'no-transcript';
+  const reportId = `report:${input.sessionId}:${reportRevisionId}`;
   let reportRows = 0;
   if (report.length <= input.config.telegram.transcriptInlineLimit) {
     reportRows = outbox.enqueue({
-      deliveryPartId: `report:${input.sessionId}`,
+      deliveryPartId: reportId,
       kind: 'report',
       sessionId: input.sessionId,
       ordinal: 20,
@@ -479,12 +486,13 @@ export async function enqueueSessionReport(
       ? 1
       : 0;
   } else {
-    const reportPath = join(input.paths.transcriptsDir, `${input.sessionId}.report.md`);
+    const reportArtifactName = `${input.sessionId}.${reportRevisionId}.report.md`;
+    const reportPath = join(input.paths.transcriptsDir, reportArtifactName);
     await writeTextAtomically(reportPath, renderSessionReportMarkdown(reportInput));
     const preview = renderSessionSummaryPreview(reportInput);
     if (preview.length > 0) {
       reportRows += outbox.enqueue({
-        deliveryPartId: `report-summary:${input.sessionId}`,
+        deliveryPartId: `report-summary:${input.sessionId}:${reportRevisionId}`,
         kind: 'report',
         sessionId: input.sessionId,
         ordinal: 20,
@@ -494,7 +502,7 @@ export async function enqueueSessionReport(
         : 0;
     }
     reportRows = outbox.enqueue({
-      deliveryPartId: `report:${input.sessionId}`,
+      deliveryPartId: reportId,
       kind: 'report',
       sessionId: input.sessionId,
       ordinal: 21,
@@ -511,6 +519,15 @@ export async function enqueueSessionReport(
 
   sessions.setState(input.sessionId, 'DELIVERING');
   return reportRows;
+}
+
+function reportRevisionIsStale(
+  transcripts: TranscriptRepository,
+  input: EnqueueReportInput,
+): boolean {
+  if (input.requireCurrentRevision !== true) return false;
+  if (input.summaryRevisionId === undefined) return true;
+  return transcripts.current(input.sessionId)?.revision_id !== input.summaryRevisionId;
 }
 
 export function renderTranscriptMarkdown(

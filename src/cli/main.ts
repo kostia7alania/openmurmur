@@ -35,6 +35,11 @@ import { EnergyVad, rmsDbfs } from '../sessionizer/vad.ts';
 import { TelegramClient } from '../telegram/client.ts';
 import { keychain, telegramBotScope } from '../telegram/keychain.ts';
 import { Outbox, type OutboxPayload } from '../telegram/outbox.ts';
+import {
+  applyTelegramDeliveryReconciliation,
+  listUnacknowledgedTelegramDeliveries,
+  renderUnacknowledgedTelegramDeliveries,
+} from '../telegram/reconcile-delivery.ts';
 import { nextOffsetFor, readOffset, routeUpdate, writeOffset } from '../telegram/router.ts';
 import { writeTextAtomically } from '../util/atomic-file.ts';
 import { systemClock } from '../util/clock.ts';
@@ -84,6 +89,8 @@ Work
   jobs retry JOB_ID      Re-queue one exhausted job after fixing its cause.
   delivery reconcile     Report legacy delivered audio held without an exact ACK time.
   delivery reconcile apply  Set a selected exact ACK with confirmation and audit evidence.
+  delivery reconcile-remote  Report outbox rows whose remote Telegram status is unknown.
+  delivery reconcile-remote apply  Record one independently proven remote Telegram ACK.
   recall QUERY           Recall grounded sessions with provenance and audio availability.
   search TEXT            Search every stored transcript.
   transcribe FILE        Transcribe one audio file locally and print the text.
@@ -99,6 +106,7 @@ Options
   --since ISO --until ISO  Restrict search to a time range.
   --part ID | --session ID  Select delivery reconciliation scope.
   --ack-at UTC --operator ID --evidence TEXT  Exact manual reconciliation proof.
+  --delivery-part ID --telegram-message-id N  Exact remote Telegram reconciliation identity.
   --help, --version
 `;
 
@@ -116,6 +124,8 @@ async function main(argv: readonly string[]): Promise<number> {
       until: { type: 'string' },
       part: { type: 'string' },
       session: { type: 'string' },
+      'delivery-part': { type: 'string' },
+      'telegram-message-id': { type: 'string' },
       'ack-at': { type: 'string' },
       operator: { type: 'string' },
       evidence: { type: 'string' },
@@ -711,6 +721,9 @@ async function deliveryCommand(
   yes: boolean,
   asJson: boolean,
 ): Promise<number> {
+  if (subcommand === 'reconcile-remote') {
+    return telegramDeliveryReconciliationCommand(loaded, action, values, yes, asJson);
+  }
   if (
     subcommand !== 'reconcile' ||
     (action !== undefined && action !== 'report' && action !== 'apply')
@@ -791,6 +804,157 @@ async function deliveryCommand(
         ? `${JSON.stringify(result, null, 2)}\n`
         : `Reconciled ${result.partIds.length} part(s) at exact ACK ${result.acknowledgedAt}.\n`,
     );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+function parsedTelegramMessageId(value: unknown): number | null {
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function remoteReconciliationProof(values: Record<string, unknown>): {
+  readonly telegramMessageId: number;
+  readonly acknowledgedAt: string;
+  readonly operatorId: string;
+  readonly evidence: string;
+} | null {
+  const telegramMessageId = parsedTelegramMessageId(values['telegram-message-id']);
+  const acknowledgedAt = values['ack-at'];
+  const operatorId = values['operator'];
+  const evidence = values['evidence'];
+  if (
+    telegramMessageId === null ||
+    typeof acknowledgedAt !== 'string' ||
+    typeof operatorId !== 'string' ||
+    typeof evidence !== 'string'
+  ) {
+    return null;
+  }
+  return { telegramMessageId, acknowledgedAt, operatorId, evidence };
+}
+
+async function assertDaemonStoppedForReconciliation(
+  loaded: Awaited<ReturnType<typeof loadConfig>>,
+): Promise<void> {
+  const record = await readDaemonPid(loaded.paths.pidFile);
+  if (record === null) return;
+  const state = await inspectDaemonProcess(record.pid, record.processBirth);
+  if (state.alive) {
+    throw new Error(
+      `stop the OpenMurmur daemon before reconciling remote delivery (pid ${record.pid})`,
+    );
+  }
+}
+
+function writeRemoteReconciliationReport(
+  report: ReturnType<typeof listUnacknowledgedTelegramDeliveries>,
+  asJson: boolean,
+): void {
+  process.stdout.write(
+    asJson
+      ? `${JSON.stringify(report, null, 2)}\n`
+      : `${renderUnacknowledgedTelegramDeliveries(report)}\n`,
+  );
+}
+
+function writeRemoteReconciliationResult(
+  result: ReturnType<typeof applyTelegramDeliveryReconciliation>,
+  asJson: boolean,
+): void {
+  if (asJson) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else if (result.alreadyApplied) {
+    process.stdout.write(
+      `Remote ACK was already reconciled by audit ${result.reconciliationId}.\n`,
+    );
+  } else {
+    process.stdout.write(
+      `Reconciled ${result.deliveryPartId} to Telegram message ${result.telegramMessageId} at ${result.acknowledgedAt}.\n`,
+    );
+  }
+}
+
+async function telegramDeliveryReconciliationCommand(
+  loaded: Awaited<ReturnType<typeof loadConfig>>,
+  action: string | undefined,
+  values: Record<string, unknown>,
+  yes: boolean,
+  asJson: boolean,
+): Promise<number> {
+  if (action !== undefined && action !== 'report' && action !== 'apply') {
+    process.stderr.write(
+      'Usage: pnpm openmurmur delivery reconcile-remote [report|apply] [--delivery-part ID]\n',
+    );
+    return 1;
+  }
+  const mode = action ?? 'report';
+  const deliveryPartId =
+    typeof values['delivery-part'] === 'string' ? values['delivery-part'].trim() : undefined;
+  if (mode === 'apply' && (deliveryPartId === undefined || deliveryPartId.length === 0)) {
+    process.stderr.write('Apply requires one exact --delivery-part selector.\n');
+    return 1;
+  }
+
+  const db = openDatabase({ file: loaded.paths.databaseFile });
+  try {
+    const report = listUnacknowledgedTelegramDeliveries(db.handle, {
+      ...(deliveryPartId === undefined ? {} : { deliveryPartId }),
+    });
+    if (mode === 'report') {
+      writeRemoteReconciliationReport(report, asJson);
+      return 0;
+    }
+
+    const proof = remoteReconciliationProof(values);
+    if (proof === null) {
+      process.stderr.write(
+        'Apply requires --telegram-message-id N, --ack-at YYYY-MM-DDTHH:mm:ss.sssZ, --operator ID and --evidence TEXT.\n',
+      );
+      return 1;
+    }
+    if (report.deliveries.length > 1) {
+      process.stderr.write('Exact --delivery-part selector resolved to multiple rows.\n');
+      return 1;
+    }
+    const expected = report.deliveries[0];
+    if (expected?.blockedReason) {
+      process.stderr.write(`Delivery cannot be reconciled: ${expected.blockedReason}.\n`);
+      return 1;
+    }
+    if (asJson && !yes) {
+      process.stderr.write('JSON apply requires explicit --yes confirmation.\n');
+      return 1;
+    }
+    if (!asJson) {
+      process.stdout.write(`${renderUnacknowledgedTelegramDeliveries(report)}\n`);
+      process.stdout.write(
+        'Warning: Telegram has no post-hoc lookup here. Apply only after comparing the payload hash with independent Telegram evidence.\n',
+      );
+    }
+    if (
+      !yes &&
+      !(await confirm(
+        `\nRecord Telegram message ${proof.telegramMessageId} as the exact ACK for ${deliveryPartId}? [y/N] `,
+      ))
+    ) {
+      process.stdout.write('Cancelled. No outbox or domain facts were changed.\n');
+      return 1;
+    }
+
+    await assertDaemonStoppedForReconciliation(loaded);
+    const result = applyTelegramDeliveryReconciliation(db.handle, {
+      deliveryPartId: deliveryPartId ?? '',
+      telegramMessageId: proof.telegramMessageId,
+      acknowledgedAt: proof.acknowledgedAt,
+      operatorId: proof.operatorId,
+      evidence: proof.evidence,
+      ...(expected === undefined ? {} : { expected }),
+    });
+    writeRemoteReconciliationResult(result, asJson);
     return 0;
   } finally {
     db.close();

@@ -149,6 +149,9 @@ reported as runnable.
 Recorded sessions use staged jobs rather than one serial delivery job:
 `deliver_audio` is eligible alongside `asr`; ASR creates
 `deliver_transcript` and `summarize`; summarize creates `deliver_report`.
+Summarize and report jobs carry the immutable transcript revision in both their
+payload and idempotency key, so a reclaimed job cannot drift to a newer current
+revision.
 Session finalization and the first two job inserts share one transaction, so a
 persisted `PROCESSING` session cannot exist without its audio and ASR work.
 
@@ -177,12 +180,14 @@ audio or ASR work.
 
 Session content uses `transcript:<sessionId>:1` for an inline transcript or
 `transcript-md:<sessionId>` for its document. Reports use
-`report:<sessionId>`; when a long report also has a compact collapsed summary,
-that companion row is `report-summary:<sessionId>`. Replaying a delivery stage
-therefore cannot create a second logical copy of either presentation.
+`report:<sessionId>:<revisionId>`; when a long report also has a compact
+collapsed summary, that companion row is
+`report-summary:<sessionId>:<revisionId>`. Replaying a delivery stage therefore
+cannot create a second logical copy of either presentation.
 
 Long reports and digests are document payloads pointing only at trusted
-`<sessionId>.report.md` and `digest-YYYY-MM-DD.md` paths.
+`<sessionId>.<revisionId>.report.md` and `digest-YYYY-MM-DD.md` paths. Telegram's
+user-facing report filename remains `<sessionId>.report.md`.
 
 ### `telegram_updates` and `telegram_offset`
 
@@ -245,9 +250,12 @@ of duplicate messages.
 
 ### `health_events`, `summaries`, `digests`, `schema_migrations`
 
-Append-only records, a JSON summary payload per session, one digest per local
-date (`UNIQUE`, upserted), and the applied-migration ledger. Each summary row is
-bound to one immutable `transcript_revisions.revision_id`. Its optional
+Append-only records, one live JSON summary payload per immutable transcript
+revision, one digest per local date (`UNIQUE`, upserted), and the
+applied-migration ledger. Migration 012 archives ambiguous legacy duplicates in
+`summary_revision_conflicts` before enforcing revision uniqueness; no payload
+is discarded. Each summary row is bound to one immutable
+`transcript_revisions.revision_id`. Its optional
 `claimEvidence` entries name a normalized summary field/item and revision-local
 segment indexes. The indexes are bounded both before storage and again before
 delivery; reports name the revision and enumerate those exact source segments.
