@@ -1,0 +1,401 @@
+#!/bin/bash
+# Builds and atomically installs the native capture helper at its one supported path.
+# This script never opens the microphone or requests TCC authorization.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+REPO="$(pwd -P)"
+BUILD_SCRIPT="$REPO/native/OpenMurmurCapture/build.sh"
+APPLICATIONS_DIR="$HOME/Applications"
+INSTALLED_APP="$APPLICATIONS_DIR/OpenMurmur Capture.app"
+INSTALLED_EXECUTABLE="$INSTALLED_APP/Contents/MacOS/OpenMurmurCapture"
+EXPECTED_BUNDLE_ID="io.openmurmur.capture"
+
+CHECK_ONLY=false
+CODESIGN_IDENTITY="-"
+WORK_DIR=""
+PUBLISH_DIR=""
+PRESERVE_EVIDENCE=false
+PUBLISH_IN_PROGRESS=false
+VERIFY_ERROR=""
+SIGNING_CLASS=""
+AUTHORIZATION_STATUS=""
+BOUNDARY_ERROR=""
+
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+ok()   { printf '\033[32m✓ %s\033[0m\n' "$1"; }
+warn() { printf '\033[33m! %s\033[0m\n' "$1"; }
+fail() { printf '\033[31m✗ %s\033[0m\n' "$1" >&2; }
+die()  { fail "$1"; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+Usage: ./scripts/install-capture-app [--check] [--codesign-identity IDENTITY]
+
+  --check                    Read-only: verify the installed bundle, source
+                             digest, signature and microphone authorization.
+  --codesign-identity VALUE  Sign a local build with this exact identity.
+                             The default is ad-hoc signing ("-").
+
+The installer never launches the app or requests microphone access.
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check)
+      CHECK_ONLY=true
+      shift
+      ;;
+    --codesign-identity)
+      [ "$#" -ge 2 ] || die "--codesign-identity needs a value"
+      CODESIGN_IDENTITY="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+[ "$(uname -s)" = "Darwin" ] || die "OpenMurmur Capture requires macOS."
+[ -n "${HOME:-}" ] && [ "${HOME#/}" != "$HOME" ] || die "HOME must be an absolute path."
+[ -x "$BUILD_SCRIPT" ] || die "Native capture build script is missing or not executable: $BUILD_SCRIPT"
+
+if [ "$CHECK_ONLY" = true ] && [ "$CODESIGN_IDENTITY" != "-" ]; then
+  die "--codesign-identity cannot be used with --check"
+fi
+
+cleanup() {
+  if [ "$PUBLISH_IN_PROGRESS" = true ]; then
+    PRESERVE_EVIDENCE=true
+    fail "Installation stopped inside the publish transaction; automatic cleanup was disabled."
+  fi
+  if [ "$PRESERVE_EVIDENCE" = true ]; then
+    fail "Incomplete rollback evidence was preserved."
+    [ -n "$PUBLISH_DIR" ] && fail "  publish: $PUBLISH_DIR"
+    [ -n "$WORK_DIR" ] && fail "  build:   $WORK_DIR"
+    return
+  fi
+  if [ -n "$PUBLISH_DIR" ] && [ -d "$PUBLISH_DIR" ]; then
+    rm -rf "$PUBLISH_DIR"
+  fi
+  if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+    rm -rf "$WORK_DIR"
+  fi
+}
+trap cleanup EXIT
+
+valid_digest() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+verify_install_boundary() {
+  local physical_home physical_applications
+  BOUNDARY_ERROR=""
+
+  if [ ! -d "$HOME" ] || [ -L "$HOME" ]; then
+    BOUNDARY_ERROR="HOME is missing, not a directory, or is a symlink"
+    return 1
+  fi
+  if ! physical_home="$(cd -P "$HOME" && pwd -P)" || [ "$physical_home" != "$HOME" ]; then
+    BOUNDARY_ERROR="HOME is not its canonical physical path"
+    return 1
+  fi
+
+  if [ -e "$APPLICATIONS_DIR" ] || [ -L "$APPLICATIONS_DIR" ]; then
+    if [ ! -d "$APPLICATIONS_DIR" ] || [ -L "$APPLICATIONS_DIR" ]; then
+      BOUNDARY_ERROR="HOME/Applications is not a real directory"
+      return 1
+    fi
+    if ! physical_applications="$(cd -P "$APPLICATIONS_DIR" && pwd -P)" || \
+      [ "$physical_applications" != "$APPLICATIONS_DIR" ]; then
+      BOUNDARY_ERROR="HOME/Applications is not its canonical physical path"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+source_digest() {
+  local digest
+  if ! digest="$("$BUILD_SCRIPT" --source-digest)"; then
+    return 1
+  fi
+  valid_digest "$digest" || return 1
+  printf '%s\n' "$digest"
+}
+
+read_plist_value() {
+  /usr/bin/plutil -extract "$2" raw -o - "$1" 2>/dev/null
+}
+
+classify_signature() {
+  local app="$1"
+  local details team
+
+  if ! details="$(/usr/bin/codesign -dv --verbose=4 "$app" 2>&1)"; then
+    VERIFY_ERROR="codesign could not inspect the bundle"
+    return 1
+  fi
+
+  if ! grep -q '^CodeDirectory .*flags=.*runtime' <<< "$details"; then
+    VERIFY_ERROR="code signature does not enable hardened runtime"
+    return 1
+  fi
+
+  if grep -q '^Signature=adhoc$' <<< "$details"; then
+    SIGNING_CLASS="ad-hoc (local proof only; authorization may not survive rebuilds)"
+    return 0
+  fi
+
+  team="$(sed -n 's/^TeamIdentifier=//p' <<< "$details" | head -n 1)"
+  if grep -q '^Authority=Developer ID Application:' <<< "$details" && \
+    [ -n "$team" ] && [ "$team" != "not set" ]; then
+    SIGNING_CLASS="Developer ID Application (Team ID $team; notarization not verified here)"
+    return 0
+  fi
+
+  VERIFY_ERROR="signature is neither ad-hoc nor Developer ID Application"
+  return 1
+}
+
+probe_authorization_contract() {
+  local executable="$1"
+  local output exit_code
+
+  if output="$("$executable" --authorization-status 2>&1)"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+
+  case "$exit_code:$output" in
+    '0:{"authorized":true,"status":"authorized"}')
+      AUTHORIZATION_STATUS="authorized"
+      return 0
+      ;;
+    '77:{"authorized":false,"status":"denied"}')
+      AUTHORIZATION_STATUS="denied"
+      return 77
+      ;;
+    '77:{"authorized":false,"status":"restricted"}')
+      AUTHORIZATION_STATUS="restricted"
+      return 77
+      ;;
+    '77:{"authorized":false,"status":"not_determined"}')
+      AUTHORIZATION_STATUS="not_determined"
+      return 77
+      ;;
+    '77:{"authorized":false,"status":"unavailable"}')
+      AUTHORIZATION_STATUS="unavailable"
+      return 77
+      ;;
+    *)
+      AUTHORIZATION_STATUS="invalid response"
+      return 1
+      ;;
+  esac
+}
+
+verify_bundle() {
+  local app="$1"
+  local expected_digest="$2"
+  local executable="$app/Contents/MacOS/OpenMurmurCapture"
+  local plist="$app/Contents/Info.plist"
+  local digest_file="$app/Contents/Resources/source.sha256"
+  local resource_digest helper_digest self_check_output auth_exit signed_entitlements audio_entitlement
+
+  VERIFY_ERROR=""
+  SIGNING_CLASS=""
+  AUTHORIZATION_STATUS=""
+
+  if [ ! -d "$app" ] || [ -L "$app" ]; then
+    VERIFY_ERROR="bundle is missing, not a directory, or is a symlink"
+    return 1
+  fi
+  if [ -L "$app/Contents" ] || [ -L "$app/Contents/MacOS" ] || \
+    [ -L "$app/Contents/Resources" ]; then
+    VERIFY_ERROR="bundle contains a linked canonical directory"
+    return 1
+  fi
+  if [ ! -f "$executable" ] || [ ! -x "$executable" ] || [ -L "$executable" ]; then
+    VERIFY_ERROR="bundle executable is missing, not executable, or is a symlink"
+    return 1
+  fi
+  if [ ! -f "$plist" ] || [ -L "$plist" ] || ! /usr/bin/plutil -lint "$plist" >/dev/null; then
+    VERIFY_ERROR="Info.plist is missing, linked, or invalid"
+    return 1
+  fi
+  if [ "$(read_plist_value "$plist" CFBundleIdentifier || true)" != "$EXPECTED_BUNDLE_ID" ]; then
+    VERIFY_ERROR="CFBundleIdentifier is not $EXPECTED_BUNDLE_ID"
+    return 1
+  fi
+  if [ "$(read_plist_value "$plist" CFBundleExecutable || true)" != "OpenMurmurCapture" ]; then
+    VERIFY_ERROR="CFBundleExecutable is not OpenMurmurCapture"
+    return 1
+  fi
+  if [ ! -f "$digest_file" ] || [ -L "$digest_file" ]; then
+    VERIFY_ERROR="signed source digest is missing or linked"
+    return 1
+  fi
+  resource_digest="$(tr -d '\n' < "$digest_file")"
+  if ! valid_digest "$resource_digest" || [ "$(wc -c < "$digest_file" | tr -d ' ')" -ne 65 ]; then
+    VERIFY_ERROR="signed source digest has an invalid format"
+    return 1
+  fi
+  if [ "$resource_digest" != "$expected_digest" ]; then
+    VERIFY_ERROR="source digest drift: installed $resource_digest, current $expected_digest"
+    return 1
+  fi
+  if ! /usr/bin/codesign --verify --strict --verbose=2 "$app" >/dev/null 2>&1; then
+    VERIFY_ERROR="strict code-signature verification failed"
+    return 1
+  fi
+  if ! classify_signature "$app"; then
+    return 1
+  fi
+  if ! signed_entitlements="$(/usr/bin/codesign -d --entitlements :- "$app" 2>/dev/null)" || \
+    ! audio_entitlement="$(printf '%s' "$signed_entitlements" | \
+      /usr/bin/plutil -extract 'com\.apple\.security\.device\.audio-input' raw -o - - \
+        2>/dev/null)" || \
+    [ "$audio_entitlement" != "true" ]; then
+    VERIFY_ERROR="signed audio-input entitlement is missing or false"
+    return 1
+  fi
+  if ! helper_digest="$("$executable" --source-digest 2>/dev/null)" || \
+    [ "$helper_digest" != "$resource_digest" ]; then
+    VERIFY_ERROR="signed helper and resource source digests differ"
+    return 1
+  fi
+  if ! self_check_output="$("$executable" --self-check 2>&1)"; then
+    VERIFY_ERROR="device-free helper self-check failed: ${self_check_output:0:300}"
+    return 1
+  fi
+
+  if probe_authorization_contract "$executable"; then
+    auth_exit=0
+  else
+    auth_exit=$?
+  fi
+  if [ "$auth_exit" -ne 0 ] && [ "$auth_exit" -ne 77 ]; then
+    VERIFY_ERROR="authorization-status violated its fixed read-only contract"
+    return 1
+  fi
+
+  return 0
+}
+
+if ! verify_install_boundary; then
+  die "Unsafe capture app installation boundary: $BOUNDARY_ERROR"
+fi
+
+if ! EXPECTED_SOURCE_DIGEST="$(source_digest)"; then
+  die "Could not compute the native capture source digest."
+fi
+
+if [ "$CHECK_ONLY" = true ]; then
+  if ! verify_bundle "$INSTALLED_APP" "$EXPECTED_SOURCE_DIGEST"; then
+    die "Installed capture app check failed: $VERIFY_ERROR"
+  fi
+  if [ "$AUTHORIZATION_STATUS" != "authorized" ]; then
+    die "Installed capture app is not authorized for the microphone ($AUTHORIZATION_STATUS); no prompt was requested."
+  fi
+  ok "OpenMurmur Capture matches source and has a strict $SIGNING_CLASS signature"
+  ok "Microphone authorization is granted (read-only status probe)"
+  exit 0
+fi
+
+WORK_DIR="$(mktemp -d /private/tmp/openmurmur-capture-install.XXXXXX)"
+BUILD_DIR="$WORK_DIR/build"
+
+bold "Building OpenMurmur Capture"
+OPENMURMUR_CAPTURE_BUILD_DIR="$BUILD_DIR" \
+  OPENMURMUR_CAPTURE_CODESIGN_IDENTITY="$CODESIGN_IDENTITY" \
+  "$BUILD_SCRIPT"
+BUILT_APP="$BUILD_DIR/OpenMurmur Capture.app"
+
+if ! verify_bundle "$BUILT_APP" "$EXPECTED_SOURCE_DIGEST"; then
+  die "Built capture app failed pre-publish verification: $VERIFY_ERROR"
+fi
+BUILT_SIGNING_CLASS="$SIGNING_CLASS"
+
+if [ ! -d "$APPLICATIONS_DIR" ]; then
+  mkdir -m 0755 "$APPLICATIONS_DIR"
+fi
+if ! verify_install_boundary; then
+  die "Unsafe capture app installation boundary before publish: $BOUNDARY_ERROR"
+fi
+PUBLISH_DIR="$(mktemp -d "$APPLICATIONS_DIR/.openmurmur-capture-install.XXXXXX")"
+STAGED_APP="$PUBLISH_DIR/staged.app"
+PREVIOUS_APP="$PUBLISH_DIR/previous.app"
+FAILED_APP="$PUBLISH_DIR/failed.app"
+cp -R "$BUILT_APP" "$STAGED_APP"
+
+if ! verify_bundle "$STAGED_APP" "$EXPECTED_SOURCE_DIGEST"; then
+  die "Adjacent staged capture app failed verification: $VERIFY_ERROR"
+fi
+
+HAD_PREVIOUS=false
+PUBLISH_IN_PROGRESS=true
+if [ -e "$INSTALLED_APP" ] || [ -L "$INSTALLED_APP" ]; then
+  HAD_PREVIOUS=true
+  if ! mv "$INSTALLED_APP" "$PREVIOUS_APP"; then
+    PUBLISH_IN_PROGRESS=false
+    die "Could not preserve the previous capture app before publishing."
+  fi
+fi
+
+rollback_publish() {
+  local restored=true
+  set +e
+
+  if [ -e "$INSTALLED_APP" ] || [ -L "$INSTALLED_APP" ]; then
+    mv "$INSTALLED_APP" "$FAILED_APP" || restored=false
+  fi
+  if [ "$HAD_PREVIOUS" = true ]; then
+    mv "$PREVIOUS_APP" "$INSTALLED_APP" || restored=false
+  fi
+
+  if [ "$restored" != true ]; then
+    PRESERVE_EVIDENCE=true
+    set -e
+    return 1
+  fi
+  PUBLISH_IN_PROGRESS=false
+  set -e
+  return 0
+}
+
+if ! mv "$STAGED_APP" "$INSTALLED_APP"; then
+  if ! rollback_publish; then
+    die "Publishing failed and the previous capture app could not be restored automatically."
+  fi
+  die "Publishing failed; the previous capture app was restored."
+fi
+
+if ! verify_bundle "$INSTALLED_APP" "$EXPECTED_SOURCE_DIGEST"; then
+  PUBLISH_VERIFY_ERROR="$VERIFY_ERROR"
+  if ! rollback_publish; then
+    die "Published capture app failed verification ($PUBLISH_VERIFY_ERROR), and rollback was incomplete."
+  fi
+  die "Published capture app failed verification ($PUBLISH_VERIFY_ERROR); the previous app was restored."
+fi
+
+PUBLISH_IN_PROGRESS=false
+
+ok "Installed $INSTALLED_APP"
+ok "Signature: $BUILT_SIGNING_CLASS"
+if [ "$AUTHORIZATION_STATUS" = "authorized" ]; then
+  ok "Microphone authorization is already granted"
+else
+  warn "Microphone authorization is $AUTHORIZATION_STATUS. The installer did not request it."
+  echo "  Authorize explicitly while logged in:"
+  printf '    open -W %q --args --authorize\n' "$INSTALLED_APP"
+  echo "  Then verify without opening the microphone: ./scripts/install-capture-app --check"
+fi
