@@ -397,6 +397,63 @@ describe('session report', () => {
     assert.ok(report.includes('&lt;script&gt;'));
   });
 
+  it('puts a bounded immutable source excerpt beside model-linked claims', () => {
+    const longSource = `<точный & источник>${'я'.repeat(140)}`;
+    const input = {
+      ...base,
+      summary: {
+        ...EMPTY_SUMMARY,
+        summary: 'Краткий итог',
+        decisions: ['Выпустить MVP.'],
+        people: ['Анна'],
+        claimEvidence: [
+          { field: 'summary' as const, item: 0, segments: [0] },
+          { field: 'decisions' as const, item: 0, segments: [1] },
+          { field: 'people' as const, item: 0, segments: [1] },
+        ],
+      },
+      transcriptSegments: [
+        { startMs: 0, endMs: 1_000, text: longSource },
+        { startMs: 1_000, endMs: 2_000, text: 'Команда решила выпустить MVP.' },
+      ],
+    };
+
+    const html = renderSessionReport(input);
+    const htmlLabels = [...html.matchAll(/<i>\[([^\n]+?)\]<\/i>/g)].map((match) => match[1] ?? '');
+    assert.equal(htmlLabels.length, 3);
+    assert.equal(html.match(/\n↳ <i>/g)?.length, 3);
+    assert.match(
+      htmlLabels[0] ?? '',
+      /ссылка модели: сегм\. 1; фрагмент: «&lt;точный &amp; источник&gt;я+…»/,
+    );
+    assert.doesNotMatch(htmlLabels[0] ?? '', /я{121}/);
+    assert.equal(
+      htmlLabels.filter((label) =>
+        label.includes('ссылка модели: сегм. 2; фрагмент: «Команда решила выпустить MVP.»'),
+      ).length,
+      2,
+    );
+
+    const markdown = renderSessionReportMarkdown(input);
+    assert.equal(markdown.match(/ссылка модели: сегм\\\. 2; фрагмент/g)?.length, 2);
+    assert.match(markdown, /&lt;точный &amp; источник&gt;я+…/);
+
+    const hugeCluster = `a${'\u0301'.repeat(5_000)}`;
+    const hostileUnicodeInput = {
+      ...base,
+      summary: {
+        ...EMPTY_SUMMARY,
+        summary: 'Краткий итог',
+        claimEvidence: [{ field: 'summary' as const, item: 0, segments: [0] }],
+      },
+      transcriptSegments: [{ startMs: 0, endMs: 1_000, text: hugeCluster }],
+    };
+    const preview = renderSessionSummaryPreview(hostileUnicodeInput);
+    assert.ok(preview.length <= TELEGRAM_MESSAGE_LIMIT);
+    assert.match(preview, /фрагмент: «…»/);
+    assert.ok(renderSessionReportMarkdown(hostileUnicodeInput).includes(hugeCluster));
+  });
+
   it('renders a complete Markdown artifact for file delivery', () => {
     const report = renderSessionReportMarkdown({
       ...base,
@@ -467,7 +524,7 @@ describe('session report', () => {
     assert.ok(preview.includes('<blockquote expandable>'));
     assert.ok(preview.includes('&lt;важно&gt;'));
     assert.ok(preview.length < TELEGRAM_MESSAGE_LIMIT);
-    assert.match(preview, /… <i>\[ссылка модели: не указана\]<\/i><\/blockquote>$/);
+    assert.match(preview, /…\n↳ <i>\[ссылка модели: не указана\]<\/i><\/blockquote>$/);
   });
 
   it('bounds a preview containing multi-code-unit graphemes', () => {
@@ -476,7 +533,7 @@ describe('session report', () => {
       summary: { ...EMPTY_SUMMARY, summary: '👨‍👩‍👧‍👦'.repeat(1000) },
     });
     assert.ok(preview.length <= TELEGRAM_MESSAGE_LIMIT);
-    assert.match(preview, /… <i>\[ссылка модели: не указана\]<\/i><\/blockquote>$/);
+    assert.match(preview, /…\n↳ <i>\[ссылка модели: не указана\]<\/i><\/blockquote>$/);
   });
 
   it('keeps transcript-derived Markdown as literal text', () => {

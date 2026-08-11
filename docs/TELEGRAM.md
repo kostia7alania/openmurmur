@@ -213,6 +213,15 @@ Session ID: 01J...
 
 Empty sections are omitted rather than printed as empty headings.
 
+Every non-empty summary claim is labelled either with the segment reference
+selected by the model or with `ссылка модели: не указана`. When a referenced
+immutable transcript segment is available, the label also carries a bounded
+source excerpt on the following line so the owner can check modality and
+wording without searching the full report; only display whitespace is
+normalized. The excerpt is source text, while the association itself is still
+a model claim, not independent verification. The complete numbered source
+segments remain in the report below.
+
 Reports at or below `transcriptInlineLimit` (default 3500) are sent as one HTML
 message: the short summary and the detailed report are separate collapsed
 expandable quotes. A longer report is sent as a compact collapsed summary plus

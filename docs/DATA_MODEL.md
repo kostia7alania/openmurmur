@@ -279,8 +279,11 @@ is discarded. Each summary row is bound to one immutable
 `transcript_revisions.revision_id`. Its optional
 `claimEvidence` entries name a normalized summary field/item and revision-local
 segment indexes. The indexes are bounded both before storage and again before
-delivery; reports name the revision and enumerate those exact source segments.
-They remain model-reported provenance, never a retention or routing fact.
+delivery. Reports put a bounded source excerpt from the referenced immutable
+segment beside each model-linked claim (normalizing only display whitespace),
+name the revision, and still enumerate the complete source segments below. The
+association remains model-reported provenance, never a factual validator,
+retention fact or routing decision.
 
 Digest day bounds use the configured `digest.timezone`, including IANA-zone DST
 transitions. Digest storage and enqueue of `digest:<date>` share one transaction,
