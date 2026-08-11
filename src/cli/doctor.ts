@@ -299,6 +299,14 @@ async function checkDisk(loaded: LoadedConfig): Promise<Check> {
     // Fall back to the working directory when the state root does not exist.
   }
   const freeGb = await diskFreeGb(target);
+  if (freeGb === null) {
+    return {
+      name: 'disk',
+      level: 'warn',
+      detail: 'free-space probe failed',
+      fix: `Check that ${target} exists and is readable, then rerun doctor.`,
+    };
+  }
   return {
     name: 'disk',
     level: freeGb < threshold ? 'warn' : 'ok',

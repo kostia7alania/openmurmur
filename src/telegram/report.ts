@@ -318,7 +318,7 @@ export interface StatusReportInput {
   readonly outboxPending: number;
   readonly failedOutbox: number;
   readonly lastDeliveryMinutesAgo: number | null;
-  readonly diskFreeGb: number;
+  readonly diskFreeGb: number | null;
   readonly asrStatus: string;
   readonly llmStatus: string;
   readonly version: string;
@@ -351,7 +351,7 @@ export function renderStatus(input: StatusReportInput): string {
     `Очередь Telegram: ${input.outboxPending}`,
     `Недоставленные сообщения: ${input.failedOutbox}`,
     `Последняя доставка: ${ago(input.lastDeliveryMinutesAgo, 'мин')}`,
-    `Свободный диск: ${input.diskFreeGb.toFixed(0)} ГБ`,
+    `Свободный диск: ${input.diskFreeGb === null ? 'не удалось проверить' : `${input.diskFreeGb.toFixed(0)} ГБ`}`,
     `ASR: ${escapeHtml(input.asrStatus)}`,
     `LLM: ${escapeHtml(input.llmStatus)}`,
     `Версия: ${escapeHtml(input.version)}`,

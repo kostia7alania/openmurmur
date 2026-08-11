@@ -36,7 +36,7 @@ import { AlertEvaluator, type AlertId, renderAlert } from '../health/alerts.ts';
 import {
   diskFreeGb,
   evaluateHealth,
-  recordHealthEvent,
+  recordHealthReport,
   renderHealthLines,
   sqliteWritable,
 } from '../health/monitor.ts';
@@ -1174,9 +1174,7 @@ export class Daemon {
     const config = this.#options.loaded.config;
     const report = evaluateHealth(inputs, config.health);
 
-    for (const check of report.checks) {
-      if (check.status !== 'healthy') recordHealthEvent(this.#db.handle, check);
-    }
+    recordHealthReport(this.#db.handle, report.checks);
 
     const conditions: {
       id: AlertId;
@@ -1210,8 +1208,11 @@ export class Daemon {
       },
       {
         id: 'disk_low',
-        active: inputs.diskFreeGb < config.health.diskFreeWarnGb,
-        detail: `свободно ${inputs.diskFreeGb.toFixed(0)} GB`,
+        active: inputs.diskFreeGb === null || inputs.diskFreeGb < config.health.diskFreeWarnGb,
+        detail:
+          inputs.diskFreeGb === null
+            ? 'не удалось проверить свободное место'
+            : `свободно ${inputs.diskFreeGb.toFixed(0)} GB`,
       },
       {
         id: 'asr_backlog',

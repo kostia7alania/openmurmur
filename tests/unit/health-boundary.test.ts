@@ -173,11 +173,14 @@ describe('offline Russian health boundary', () => {
         recorder: 'healthy',
         capture_pipeline: 'healthy',
         asr_worker: 'healthy',
+        dead_jobs: 'healthy',
         llm: 'healthy',
+        dead_outbox: 'healthy',
         asr_backlog: 'healthy',
         telegram_outbox: 'healthy',
         disk: 'healthy',
         sqlite: 'healthy',
+        digest: 'healthy',
       },
     );
   });

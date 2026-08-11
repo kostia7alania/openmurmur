@@ -1,6 +1,7 @@
 import { statfs } from 'node:fs/promises';
 import type { DatabaseSync } from 'node:sqlite';
 import type { HealthConfig } from '../config/schema.ts';
+import { transaction } from '../database/db.ts';
 
 export type HealthStatus = 'healthy' | 'degraded' | 'failed' | 'recovering';
 
@@ -37,7 +38,7 @@ export interface HealthInputs {
   readonly deadJobs: number;
   readonly outboxAgeMinutes: number;
   readonly deadOutbox: number;
-  readonly diskFreeGb: number;
+  readonly diskFreeGb: number | null;
   readonly sqliteWritable: boolean;
   readonly hoursSinceLastDigest: number | null;
 }
@@ -98,13 +99,7 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
     detail: inputs.workerDetail,
   });
 
-  if (inputs.deadJobs > 0) {
-    checks.push({
-      component: 'dead_jobs',
-      status: 'failed',
-      detail: `${inputs.deadJobs} job(s) exhausted retries`,
-    });
-  }
+  checks.push(deadJobsHealth(inputs.deadJobs));
 
   // A missing LLM degrades the report to "transcript only"; it never blocks
   // recording or audio delivery, so it is degraded rather than failed.
@@ -114,13 +109,7 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
     detail: inputs.ollamaDetail,
   });
 
-  if (inputs.deadOutbox > 0) {
-    checks.push({
-      component: 'dead_outbox',
-      status: 'degraded',
-      detail: `${inputs.deadOutbox} message(s) exhausted retries`,
-    });
-  }
+  checks.push(deadOutboxHealth(inputs.deadOutbox));
 
   checks.push({
     component: 'asr_backlog',
@@ -140,11 +129,19 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
         : 'clear',
   });
 
-  checks.push({
-    component: 'disk',
-    status: inputs.diskFreeGb < config.diskFreeWarnGb ? 'degraded' : 'healthy',
-    detail: `${inputs.diskFreeGb.toFixed(0)} GB free`,
-  });
+  checks.push(
+    inputs.diskFreeGb === null
+      ? {
+          component: 'disk',
+          status: 'failed',
+          detail: 'disk space probe failed',
+        }
+      : {
+          component: 'disk',
+          status: inputs.diskFreeGb < config.diskFreeWarnGb ? 'degraded' : 'healthy',
+          detail: `${inputs.diskFreeGb.toFixed(0)} GB free`,
+        },
+  );
 
   checks.push({
     component: 'sqlite',
@@ -152,12 +149,8 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
     detail: inputs.sqliteWritable ? 'writable' : 'database is not writable',
   });
 
-  if (inputs.hoursSinceLastDigest !== null && inputs.hoursSinceLastDigest > 26) {
-    checks.push({
-      component: 'digest',
-      status: 'degraded',
-      detail: `last digest ${Math.round(inputs.hoursSinceLastDigest)}h ago`,
-    });
+  if (inputs.hoursSinceLastDigest !== null) {
+    checks.push(digestHealth(inputs.hoursSinceLastDigest));
   }
 
   const overall = checks.reduce<HealthStatus>(
@@ -165,6 +158,33 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
     'healthy',
   );
   return { overall, checks };
+}
+
+function deadJobsHealth(count: number): HealthCheck {
+  return {
+    component: 'dead_jobs',
+    status: count > 0 ? 'failed' : 'healthy',
+    detail: count > 0 ? `${count} job(s) exhausted retries` : 'clear',
+  };
+}
+
+function deadOutboxHealth(count: number): HealthCheck {
+  return {
+    component: 'dead_outbox',
+    status: count > 0 ? 'degraded' : 'healthy',
+    detail: count > 0 ? `${count} message(s) exhausted retries` : 'clear',
+  };
+}
+
+function digestHealth(hoursSinceLastDigest: number): HealthCheck {
+  return {
+    component: 'digest',
+    status: hoursSinceLastDigest > 26 ? 'degraded' : 'healthy',
+    detail:
+      hoursSinceLastDigest > 26
+        ? `last digest ${Math.round(hoursSinceLastDigest)}h ago`
+        : 'on schedule',
+  };
 }
 
 /** The short `/health` reply: one line per non-healthy component. */
@@ -240,7 +260,7 @@ function healthDetail(check: HealthCheck): string {
     case 'telegram_outbox':
       return count === null ? 'очередь растёт' : `старейшему сообщению ${count} мин`;
     case 'disk':
-      return count === null ? 'мало свободного места' : `свободно ${count} ГБ`;
+      return count === null ? 'не удалось проверить свободное место' : `свободно ${count} ГБ`;
     case 'sqlite':
       return 'база данных недоступна для записи';
     case 'digest':
@@ -266,27 +286,96 @@ function russianCount(count: number, one: string, few: string, many: string): st
   return last >= 2 && last <= 4 ? few : many;
 }
 
-export async function diskFreeGb(path: string): Promise<number> {
+type StatfsProbe = (path: string) => ReturnType<typeof statfs>;
+
+export async function diskFreeGb(
+  path: string,
+  probe: StatfsProbe = statfs,
+): Promise<number | null> {
   try {
-    const stats = await statfs(path);
+    const stats = await probe(path);
     return (Number(stats.bavail) * Number(stats.bsize)) / 1024 ** 3;
   } catch {
-    return Number.POSITIVE_INFINITY;
+    return null;
   }
 }
 
 export function sqliteWritable(db: DatabaseSync): boolean {
+  const savepoint = 'openmurmur_health_write_probe';
   try {
-    db.exec('PRAGMA user_version');
-    db.prepare('SELECT 1').get();
+    db.exec(`SAVEPOINT ${savepoint}`);
+    db.prepare(
+      `INSERT INTO health_events (component, status, detail, created_at)
+       VALUES ('sqlite', 'healthy', 'rollback-only write probe', ?)`,
+    ).run(new Date().toISOString());
+    db.exec(`ROLLBACK TO ${savepoint}`);
+    db.exec(`RELEASE ${savepoint}`);
     return true;
   } catch {
+    try {
+      db.exec(`ROLLBACK TO ${savepoint}`);
+      db.exec(`RELEASE ${savepoint}`);
+    } catch {
+      // The probe may have failed before the savepoint was established.
+    }
     return false;
   }
 }
 
-export function recordHealthEvent(db: DatabaseSync, check: HealthCheck): void {
-  db.prepare(
-    'INSERT INTO health_events (component, status, detail, created_at) VALUES (?, ?, ?, ?)',
-  ).run(check.component, check.status, check.detail, new Date().toISOString());
+const HEALTH_SAMPLE_INTERVAL_MS = 60 * 60 * 1000;
+const HEALTH_EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_HEALTH_EVENTS = 5_000;
+
+interface StoredHealthEvent {
+  readonly status: HealthStatus;
+  readonly created_at: string;
+}
+
+/** Persist state edges and one hourly problem sample, then enforce hard bounds. */
+export function recordHealthReport(
+  db: DatabaseSync,
+  checks: readonly HealthCheck[],
+  now = new Date(),
+): void {
+  const nowIso = now.toISOString();
+  const sampleBefore = now.getTime() - HEALTH_SAMPLE_INTERVAL_MS;
+
+  transaction(db, () => {
+    const latest = db.prepare(
+      `SELECT status, created_at
+       FROM health_events
+       WHERE component = ?
+       ORDER BY event_id DESC
+       LIMIT 1`,
+    );
+    const insert = db.prepare(
+      'INSERT INTO health_events (component, status, detail, created_at) VALUES (?, ?, ?, ?)',
+    );
+
+    for (const check of checks) {
+      const previous = latest.get(check.component) as unknown as StoredHealthEvent | undefined;
+      const isEdge = previous !== undefined && previous.status !== check.status;
+      const isProblemSample =
+        check.status !== 'healthy' &&
+        (previous === undefined || Date.parse(previous.created_at) <= sampleBefore);
+      if ((previous === undefined && check.status !== 'healthy') || isEdge || isProblemSample) {
+        insert.run(check.component, check.status, check.detail, nowIso);
+      }
+    }
+
+    db.prepare('DELETE FROM health_events WHERE created_at < ?').run(
+      new Date(now.getTime() - HEALTH_EVENT_RETENTION_MS).toISOString(),
+    );
+    const boundary = db
+      .prepare(
+        `SELECT event_id
+         FROM health_events
+         ORDER BY event_id DESC
+         LIMIT 1 OFFSET ?`,
+      )
+      .get(MAX_HEALTH_EVENTS - 1) as unknown as { event_id: number } | undefined;
+    if (boundary !== undefined) {
+      db.prepare('DELETE FROM health_events WHERE event_id < ?').run(boundary.event_id);
+    }
+  });
 }

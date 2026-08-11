@@ -250,7 +250,10 @@ of duplicate messages.
 
 ### `health_events`, `summaries`, `digests`, `schema_migrations`
 
-Append-only records, one live JSON summary payload per immutable transcript
+`health_events` stores status edges plus at most one hourly sample while a
+problem persists. Events older than 30 days are removed and a hard 5,000-row
+cap bounds even pathological flapping; healthy baseline polls create no rows.
+The other tables hold one live JSON summary payload per immutable transcript
 revision, one digest per local date (`UNIQUE`, upserted), and the
 applied-migration ledger. Migration 012 archives ambiguous legacy duplicates in
 `summary_revision_conflicts` before enforcing revision uniqueness; no payload
