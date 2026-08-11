@@ -11,7 +11,7 @@ import {
 import { managedDirectories, resolvePaths } from '../../src/config/paths.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
-import { nullLogger } from '../../src/logging/logger.ts';
+import { createLogger, nullLogger } from '../../src/logging/logger.ts';
 
 let dir: string;
 let db: Database;
@@ -57,6 +57,22 @@ function seedOrphan(name: string, bytes = 4096): string {
   const path = join(paths().tempDir, name);
   writeFileSync(path, Buffer.alloc(bytes));
   return path;
+}
+
+function seedAudioOutbox(
+  id: string,
+  state: 'pending' | 'sending' | 'sent' | 'dead',
+  payload: Record<string, unknown>,
+): void {
+  const now = nowIso();
+  db.handle
+    .prepare(
+      `INSERT INTO telegram_outbox
+         (outbox_id, delivery_part_id, kind, ordinal, payload, state,
+          run_after, created_at, updated_at)
+       VALUES (?, ?, 'audio', 0, ?, ?, ?, ?, ?)`,
+    )
+    .run(id, `audio:${id}`, JSON.stringify(payload), state, now, now, now);
 }
 
 describe('crash recovery', () => {
@@ -105,32 +121,152 @@ describe('crash recovery', () => {
     );
   });
 
-  it('removes stale split artifacts but keeps one still owned by the outbox', async () => {
+  it('keeps live outbox-owned splits and removes unowned or terminal ones', async () => {
     const stale = seedOrphan('session.p000.split000.flac', 100);
-    const owned = seedOrphan('session.p000.split001.flac', 100);
+    const pending = seedOrphan('session.p000.split001.flac', 100);
+    const sending = seedOrphan('session.p000.split002.flac', 100);
+    const dead = seedOrphan('session.p000.split003.flac', 100);
+    seedAudioOutbox('pending-owner', 'pending', {
+      type: 'document',
+      path: pending,
+      filename: 'session.p000.split001.flac',
+    });
+    seedAudioOutbox('sending-owner', 'sending', {
+      type: 'document',
+      path: sending,
+      filename: 'session.p000.split002.flac',
+      deleteAfterSend: true,
+    });
+    seedAudioOutbox('dead-owner', 'dead', {
+      type: 'document',
+      path: dead,
+      filename: 'session.p000.split003.flac',
+      deleteAfterSend: true,
+    });
+
+    const report = await recoverAfterCrash(db.handle, paths(), nullLogger, { remove: true });
+    assert.deepEqual(report.orphans.map((orphan) => orphan.path).sort(), [dead, stale].sort());
+    assert.equal(report.removed, 2);
+    assert.equal(existsSync(stale), false);
+    assert.equal(existsSync(dead), false);
+    assert.equal(existsSync(pending), true);
+    assert.equal(existsSync(sending), true);
+  });
+
+  it('finds gapped split names without touching their source FLAC', async () => {
+    const source = join(paths().audioDir, 'session.p000.flac');
+    writeFileSync(source, Buffer.alloc(200));
+    const stale = [
+      seedOrphan('session.p000.split000.flac', 10),
+      seedOrphan('session.p000.split002.flac', 20),
+      seedOrphan('session.p000.split999.flac', 30),
+      seedOrphan('session.p000.split1000.flac', 40),
+    ];
+
+    const report = await recoverAfterCrash(db.handle, paths(), nullLogger, { remove: true });
+
+    assert.equal(report.removed, 4);
+    for (const path of stale) assert.equal(existsSync(path), false);
+    assert.equal(existsSync(source), true, 'startup cleanup never removes the archived source');
+  });
+
+  it('reports a stale split without mutating files in report-only mode', async () => {
+    const source = join(paths().audioDir, 'report-only.p000.flac');
+    writeFileSync(source, Buffer.alloc(200));
+    const stale = seedOrphan('report-only.p000.split007.flac', 100);
+
+    const report = await recoverAfterCrash(db.handle, paths(), nullLogger, {
+      remove: false,
+      repair: false,
+    });
+
+    assert.deepEqual(
+      report.orphans.map((orphan) => orphan.path),
+      [stale],
+    );
+    assert.equal(report.removed, 0);
+    assert.equal(existsSync(stale), true);
+    assert.equal(existsSync(source), true);
+  });
+
+  it('preserves every split but still recovers .part files when ownership is ambiguous', async () => {
+    const split = seedOrphan('ambiguous.p000.split005.flac', 100);
+    const partial = seedOrphan('01J-AMBIGUOUS.p000.flac.part', 200);
     const now = nowIso();
     db.handle
       .prepare(
         `INSERT INTO telegram_outbox
-           (outbox_id, delivery_part_id, kind, ordinal, payload, run_after, created_at, updated_at)
-         VALUES ('owned', 'audio:p:split1', 'audio', 0, ?, ?, ?, ?)`,
+           (outbox_id, delivery_part_id, kind, ordinal, payload,
+            run_after, created_at, updated_at)
+         VALUES ('broken-owner', 'audio:broken:split5', 'audio', 0, '{', ?, ?, ?)`,
       )
-      .run(
-        JSON.stringify({
-          type: 'document',
-          path: owned,
-          filename: 'session.p000.split001.flac',
-          deleteAfterSend: true,
-        }),
-        now,
-        now,
-        now,
-      );
+      .run(now, now, now);
+    const records: Record<string, unknown>[] = [];
+    const logger = createLogger({
+      level: 'debug',
+      sink: (record) => records.push(record),
+    });
 
-    const report = await recoverAfterCrash(db.handle, paths(), nullLogger, { remove: true });
+    const report = await recoverAfterCrash(db.handle, paths(), logger, { remove: true });
+
     assert.equal(report.removed, 1);
+    assert.equal(existsSync(partial), false, 'unrelated interrupted writes still recover');
+    assert.equal(existsSync(split), true, 'ambiguous ownership is not deletion proof');
+    assert.ok(
+      records.some(
+        (record) =>
+          record['level'] === 'error' &&
+          String(record['msg']).includes('preserving every split artifact') &&
+          String(record['action']).includes('Repair or retire'),
+      ),
+      'the local log explains how to unblock conservative split preservation',
+    );
+  });
+
+  it('rechecks ownership immediately before deleting a stale split', async () => {
+    const split = seedOrphan('raced.p000.split006.flac', 100);
+    let ownershipReads = 0;
+    const guardedDb = new Proxy(db.handle, {
+      get(target, property) {
+        if (property === 'prepare') {
+          return (sql: string) => {
+            if (sql.includes('SELECT outbox_id, payload FROM telegram_outbox')) {
+              ownershipReads += 1;
+              if (ownershipReads === 2) {
+                seedAudioOutbox('late-owner', 'pending', {
+                  type: 'document',
+                  path: split,
+                  filename: 'raced.p000.split006.flac',
+                  deleteAfterSend: true,
+                });
+              }
+            }
+            return target.prepare(sql);
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as Database['handle'];
+
+    const report = await recoverAfterCrash(guardedDb, paths(), nullLogger, { remove: true });
+
+    assert.equal(ownershipReads, 2);
+    assert.equal(report.removed, 0);
+    assert.deepEqual(report.orphans, []);
+    assert.equal(existsSync(split), true, 'a newly durable owner wins the final deletion check');
+  });
+
+  it('reconciles stale splits idempotently across repeated startup recovery', async () => {
+    const stale = seedOrphan('repeat.p000.split042.flac', 100);
+
+    const first = await recoverAfterCrash(db.handle, paths(), nullLogger, { remove: true });
+    const second = await recoverAfterCrash(db.handle, paths(), nullLogger, { remove: true });
+
+    assert.equal(first.removed, 1);
     assert.equal(existsSync(stale), false);
-    assert.equal(existsSync(owned), true);
+    assert.deepEqual(second.orphans, []);
+    assert.equal(second.removed, 0);
   });
 
   it('fails a session that was interrupted before any audio landed', async () => {

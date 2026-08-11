@@ -1,5 +1,5 @@
 import { readdir, rm, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { Paths } from '../config/paths.ts';
 import { transaction } from '../database/db.ts';
@@ -102,48 +102,102 @@ export function sessionIdFromPartFilename(filename: string): string | null {
   return match?.[1] ?? null;
 }
 
+const SPLIT_ARTIFACT_PATTERN = /\.split\d{3,}\.flac$/;
+
+interface TemporaryAudioOwnershipProof {
+  readonly certain: boolean;
+  readonly paths: ReadonlySet<string>;
+}
+
+function ownedTemporaryAudioPaths(db: DatabaseSync, logger: Logger): TemporaryAudioOwnershipProof {
+  let rows: { outbox_id: string; payload: string }[];
+  try {
+    rows = db
+      .prepare(
+        "SELECT outbox_id, payload FROM telegram_outbox WHERE state IN ('pending','sending') AND kind = 'audio'",
+      )
+      .all() as { outbox_id: string; payload: string }[];
+  } catch (error) {
+    logger.error('active audio outbox ownership is unreadable; preserving every split artifact', {
+      error: (error as Error).message,
+      action: 'Repair the outbox database error before rerunning split recovery.',
+    });
+    return { certain: false, paths: new Set() };
+  }
+
+  const owned = new Set<string>();
+  const ambiguousOutboxIds: string[] = [];
+
+  for (const row of rows) {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(row.payload);
+    } catch {
+      ambiguousOutboxIds.push(row.outbox_id);
+      continue;
+    }
+    if (typeof payload !== 'object' || payload === null) {
+      ambiguousOutboxIds.push(row.outbox_id);
+      continue;
+    }
+    const record = payload as Record<string, unknown>;
+    if (
+      record['type'] !== 'document' ||
+      typeof record['path'] !== 'string' ||
+      record['path'].length === 0
+    ) {
+      ambiguousOutboxIds.push(row.outbox_id);
+      continue;
+    }
+
+    // deleteAfterSend controls terminal cleanup, not whether an in-flight
+    // delivery still needs the file it names.
+    owned.add(resolve(record['path']));
+  }
+
+  if (ambiguousOutboxIds.length > 0) {
+    logger.error('active audio outbox ownership is ambiguous; preserving every split artifact', {
+      outboxIds: ambiguousOutboxIds,
+      action: 'Repair or retire the listed outbox rows before rerunning split recovery.',
+    });
+    return { certain: false, paths: owned };
+  }
+  return { certain: true, paths: owned };
+}
+
 export async function findOrphanedParts(
   db: DatabaseSync,
   paths: Paths,
+  logger: Logger,
 ): Promise<readonly OrphanedPart[]> {
   let entries: string[];
   try {
     entries = await readdir(paths.tempDir);
-  } catch {
-    return [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new Error(`could not inspect recovery temp directory ${paths.tempDir}`, { cause: error });
   }
 
   const orphans: OrphanedPart[] = [];
-  const ownedSplitPaths = new Set(
-    (
-      db
-        .prepare(
-          "SELECT payload FROM telegram_outbox WHERE state IN ('pending','sending') AND kind = 'audio'",
-        )
-        .all() as { payload: string }[]
-    ).flatMap((row) => {
-      try {
-        const payload = JSON.parse(row.payload) as { path?: unknown; deleteAfterSend?: unknown };
-        return payload.deleteAfterSend === true && typeof payload.path === 'string'
-          ? [payload.path]
-          : [];
-      } catch {
-        return [];
-      }
-    }),
-  );
+  const hasSplitArtifacts = entries.some((entry) => SPLIT_ARTIFACT_PATTERN.test(entry));
+  const ownedSplitPaths = hasSplitArtifacts
+    ? ownedTemporaryAudioPaths(db, logger)
+    : { certain: true, paths: new Set<string>() };
   for (const entry of entries) {
     const path = join(paths.tempDir, entry);
     const partialWrite = entry.endsWith('.part');
-    const splitArtifact = /\.split\d{3}\.flac$/.test(entry);
+    const splitArtifact = SPLIT_ARTIFACT_PATTERN.test(entry);
     if (!partialWrite && !splitArtifact) continue;
-    if (splitArtifact && ownedSplitPaths.has(path)) continue;
+    if (splitArtifact && (!ownedSplitPaths.certain || ownedSplitPaths.paths.has(resolve(path)))) {
+      continue;
+    }
 
     let info: Awaited<ReturnType<typeof stat>>;
     try {
       info = await stat(path);
-    } catch {
-      continue;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw new Error(`could not inspect recovery artifact ${path}`, { cause: error });
     }
     if (!info.isFile()) continue;
 
@@ -274,37 +328,44 @@ export async function recoverAfterCrash(
 ): Promise<RecoveryReport> {
   const repair = options.repair ?? true;
   const recoveredPublishedParts = await reconcilePublishedParts(db, logger, repair);
-  const orphans = await findOrphanedParts(db, paths);
+  const orphans = await findOrphanedParts(db, paths, logger);
   const stalledSessions = reconcileStalledSessions(db, logger, repair);
 
   let removed = 0;
   let freedBytes = 0;
+  const preservedPaths = new Set<string>();
 
   if (options.remove) {
     for (const orphan of orphans) {
+      if (SPLIT_ARTIFACT_PATTERN.test(orphan.path)) {
+        const ownership = ownedTemporaryAudioPaths(db, logger);
+        if (!ownership.certain || ownership.paths.has(resolve(orphan.path))) {
+          preservedPaths.add(orphan.path);
+          continue;
+        }
+      }
       try {
-        await rm(orphan.path, { force: true });
+        await rm(orphan.path);
         removed += 1;
         freedBytes += orphan.bytes;
       } catch (error) {
-        logger.warn('could not remove an orphaned temp file', {
-          path: orphan.path,
-          error: (error as Error).message,
-        });
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw new Error(`could not remove orphaned temp file ${orphan.path}`, { cause: error });
       }
     }
   }
 
-  if (orphans.length > 0) {
+  const confirmedOrphans = orphans.filter((orphan) => !preservedPaths.has(orphan.path));
+  if (confirmedOrphans.length > 0) {
     logger.warn('cleaned up after an unclean shutdown', {
-      orphanedParts: orphans.length,
+      orphanedParts: confirmedOrphans.length,
       removed,
       freedBytes,
     });
   }
 
   return {
-    orphans,
+    orphans: confirmedOrphans,
     recoveredPublishedParts,
     removed,
     freedBytes,
