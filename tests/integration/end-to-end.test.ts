@@ -218,7 +218,12 @@ class BlockingVad implements Vad {
   }
 }
 
-function recorderFor(script: readonly ScriptedSegment[], overrides = {}, ffmpegPath = FFMPEG) {
+function recorderFor(
+  script: readonly ScriptedSegment[],
+  overrides = {},
+  ffmpegPath = FFMPEG,
+  onSessionStarted?: (sessionId: string, count: number) => void,
+) {
   const config = {
     ...DEFAULT_CONFIG,
     sessionizer: { ...DEFAULT_CONFIG.sessionizer, ...overrides },
@@ -242,7 +247,10 @@ function recorderFor(script: readonly ScriptedSegment[], overrides = {}, ffmpegP
     onFirstFrame: () => {
       firstFrameSeen = true;
     },
-    onSessionStarted: (sessionId) => startedSessions.push(sessionId),
+    onSessionStarted: (sessionId) => {
+      startedSessions.push(sessionId);
+      onSessionStarted?.(sessionId, startedSessions.length);
+    },
     onSessionFinalized: (sessionId) => finalizedSessions.push(sessionId),
     onSessionRejected: (sessionId) => rejectedSessions.push(sessionId),
   });
@@ -670,6 +678,146 @@ describe('end to end: capture through delivery, without a microphone', () => {
 
     const rows = db.handle.prepare('SELECT session_id FROM audio_sessions').all();
     assert.equal(rows.length, 2, 'a 62-second gap separates two sessions');
+  });
+
+  it('bounds gated encoder closes without blocking later capture', async (t) => {
+    if (!hasFfmpeg) return t.skip('ffmpeg not available');
+
+    const release = join(dir, 'release-encoder-close');
+    const wrapper = join(dir, 'ffmpeg-with-gated-close');
+    const shellLiteral = (value: string) => `'${value.replaceAll("'", "'\\\"'\\\"'")}'`;
+    writeFileSync(
+      wrapper,
+      [
+        '#!/bin/sh',
+        `${shellLiteral(FFMPEG)} "$@"`,
+        'code=$?',
+        `while [ ! -e ${shellLiteral(release)} ]; do`,
+        '  sleep 1',
+        'done',
+        'exit "$code"',
+        '',
+      ].join('\n'),
+      { mode: 0o700 },
+    );
+
+    let observeThirdSession: (() => void) | undefined;
+    const thirdSessionStarted = new Promise<void>((resolve) => {
+      observeThirdSession = resolve;
+    });
+    const { recorder, startedSessions, finalizedSessions, rejectedSessions } = recorderFor(
+      [
+        { kind: 'speech', seconds: 4 },
+        { kind: 'silence', seconds: 62 },
+        { kind: 'speech', seconds: 4 },
+        { kind: 'silence', seconds: 62 },
+        { kind: 'speech', seconds: 1 },
+        { kind: 'silence', seconds: 62 },
+      ],
+      {},
+      wrapper,
+      (_sessionId, count) => {
+        if (count === 3) observeThirdSession?.();
+      },
+    );
+
+    const run = recorder.run();
+    let timeout: NodeJS.Timeout | undefined;
+    const advancedBeforeRelease = await Promise.race([
+      thirdSessionStarted.then(() => true),
+      new Promise<false>((resolve) => {
+        timeout = setTimeout(() => resolve(false), 3_000);
+      }),
+    ]);
+    if (timeout !== undefined) clearTimeout(timeout);
+
+    const capacityDeadline = Date.now() + 3_000;
+    let thirdState: string | undefined;
+    while (advancedBeforeRelease && Date.now() < capacityDeadline) {
+      const thirdSessionId = startedSessions[2] ?? '';
+      thirdState = (
+        db.handle
+          .prepare('SELECT state FROM audio_sessions WHERE session_id = ?')
+          .get(thirdSessionId) as { state: string } | undefined
+      )?.state;
+      if (thirdState === 'FAILED') break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    const firstSessionId = startedSessions[0] ?? '';
+    const beforeRelease = db.handle
+      .prepare('SELECT state FROM audio_sessions WHERE session_id = ?')
+      .get(firstSessionId) as { state: string } | undefined;
+    const firstJournal = db.handle
+      .prepare(
+        `SELECT count(*) AS count
+           FROM audio_finalization_journal
+          WHERE session_id = ? AND session_duration_ms IS NOT NULL`,
+      )
+      .get(firstSessionId) as { count: number };
+    const firstJobs = db.handle
+      .prepare(
+        `SELECT count(*) AS count FROM jobs
+          WHERE idempotency_key IN (?, ?)`,
+      )
+      .get(`deliver-audio:${firstSessionId}`, `asr:${firstSessionId}`) as { count: number };
+
+    writeFileSync(release, 'release\n');
+    await run;
+
+    assert.equal(
+      advancedBeforeRelease,
+      true,
+      'capture must reach a third session before either gated close is released',
+    );
+    assert.equal(beforeRelease?.state, 'FINALIZING');
+    assert.equal(firstJournal.count, 1, 'the detached close must retain exact durable timing');
+    assert.equal(firstJobs.count, 0, 'no processing job may precede storage finalization');
+    assert.equal(thirdState, 'FAILED', 'capacity exhaustion must fail the unrecorded session');
+
+    const sessions = db.handle
+      .prepare(
+        'SELECT session_id, state, rejection_reason, part_count FROM audio_sessions ORDER BY rowid',
+      )
+      .all() as {
+      session_id: string;
+      state: string;
+      rejection_reason: string | null;
+      part_count: number;
+    }[];
+    assert.deepEqual(
+      sessions.map((session) => session.state),
+      ['PROCESSING', 'PROCESSING', 'FAILED'],
+    );
+    assert.deepEqual(
+      {
+        rejectionReason: sessions[2]?.rejection_reason,
+        partCount: sessions[2]?.part_count,
+      },
+      { rejectionReason: 'audio_finalize_failed', partCount: 0 },
+    );
+    assert.deepEqual(rejectedSessions, [], 'storage failure must not emit a normal rejection');
+    const failedSessionId = sessions[2]?.session_id ?? '';
+    const outbox = new Outbox(db.handle);
+    assert.equal(outbox.stateOf(`session-status:rejected:${failedSessionId}`), null);
+    assert.equal(outbox.stateOf(`session-status:failed:${failedSessionId}`), 'pending');
+    assert.deepEqual(
+      finalizedSessions.toSorted(),
+      sessions
+        .slice(0, 2)
+        .map((session) => session.session_id)
+        .toSorted(),
+    );
+    for (const session of sessions.slice(0, 2)) {
+      const parts = new PartRepository(db.handle).listForSession(session.session_id);
+      assert.equal(parts.length, 1);
+      assert.equal(parts[0]?.finalized, 1);
+    }
+    assert.equal(
+      new PartRepository(db.handle).listForSession(sessions[2]?.session_id ?? '').length,
+      0,
+    );
+    assert.equal(new JobQueue(db.handle).pendingCount(), 4);
   });
 
   it('rotates into multiple parts that share one session id', async (t) => {

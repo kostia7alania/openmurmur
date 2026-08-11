@@ -89,6 +89,24 @@ export class SessionRepository {
     throw new Error(`cannot advance session ${sessionId} from ${row.state} to DELIVERING`);
   }
 
+  advanceToFinalizing(sessionId: string): void {
+    const updated = this.#db
+      .prepare(
+        `UPDATE audio_sessions
+            SET state = 'FINALIZING', updated_at = ?
+          WHERE session_id = ? AND state = 'ACTIVE'`,
+      )
+      .run(nowIso(), sessionId);
+    if (updated.changes === 1) return;
+
+    const row = this.#db
+      .prepare('SELECT state FROM audio_sessions WHERE session_id = ?')
+      .get(sessionId) as { state: string } | undefined;
+    if (row?.state === 'FINALIZING') return;
+    if (row === undefined) throw new Error(`unknown session ${sessionId}`);
+    throw new Error(`cannot advance session ${sessionId} from ${row.state} to FINALIZING`);
+  }
+
   finalize(
     sessionId: string,
     endedAtIso: string,
@@ -104,6 +122,30 @@ export class SessionRepository {
           WHERE session_id = ?`,
       )
       .run(endedAtIso, durationMs, speechMs, partCount, nowIso(), sessionId);
+  }
+
+  finalizeFromFinalizing(
+    sessionId: string,
+    endedAtIso: string,
+    durationMs: number,
+    speechMs: number,
+    partCount: number,
+  ): void {
+    const updated = this.#db
+      .prepare(
+        `UPDATE audio_sessions
+            SET state = 'PROCESSING', ended_at = ?, duration_ms = ?, speech_ms = ?,
+                timing_exact = 1, part_count = ?, updated_at = ?
+          WHERE session_id = ? AND state = 'FINALIZING'`,
+      )
+      .run(endedAtIso, durationMs, speechMs, partCount, nowIso(), sessionId);
+    if (updated.changes === 1) return;
+
+    const row = this.#db
+      .prepare('SELECT state FROM audio_sessions WHERE session_id = ?')
+      .get(sessionId) as { state: string } | undefined;
+    if (row === undefined) throw new Error(`unknown session ${sessionId}`);
+    throw new Error(`cannot finalize session ${sessionId} from ${row.state}`);
   }
 
   reject(sessionId: string, reason: string, speechMs: number, partCount: number): void {

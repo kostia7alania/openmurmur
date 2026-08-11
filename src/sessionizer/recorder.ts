@@ -19,6 +19,8 @@ import { Sessionizer } from './machine.ts';
 import type { SessionIntent } from './types.ts';
 import type { Vad } from './vad.ts';
 
+const STORAGE_FINALIZER_CAPACITY = 2;
+
 /**
  * Binds the pure sessionizer to real I/O.
  *
@@ -55,6 +57,24 @@ interface OpenPart {
   readonly startedMonotonicMs: number;
 }
 
+type SessionOutcomeIntent = Extract<
+  SessionIntent,
+  { kind: 'session_finalized' | 'session_rejected' }
+>;
+
+interface PendingSessionOutcome {
+  readonly intent: SessionOutcomeIntent;
+  readonly storageDiscarded: boolean;
+}
+
+interface SessionStorageProof {
+  readonly finalizedPartCount: number;
+  readonly publishedPartPendingDatabase: boolean;
+  readonly hasFinalizationBoundary: boolean;
+  readonly storageDiscarded: boolean;
+  readonly proven: boolean;
+}
+
 export class Recorder {
   readonly #options: RecorderOptions;
   readonly #machine: Sessionizer;
@@ -70,6 +90,10 @@ export class Recorder {
   readonly #preRoll: CaptureFrame[] = [];
   #openPart: OpenPart | null = null;
   #discardingSessionId: string | null = null;
+  #reservedFinalizers = 0;
+  readonly #storageFinalizers = new Set<Promise<void>>();
+  readonly #storageFinalizersBySession = new Map<string, Set<Promise<void>>>();
+  readonly #pendingSessionOutcomes = new Map<string, PendingSessionOutcome>();
   #sawFirstFrame = false;
   #running = false;
   #lastMonotonicMs = 0;
@@ -112,15 +136,19 @@ export class Recorder {
       }
     } finally {
       this.#running = false;
-      await this.#withMutation(async () => {
-        // A stopped capture must still leave a valid file behind.
-        for (const intent of this.#machine.forceFinalize()) {
-          await this.#applyIntent(intent, null);
-        }
-        if (this.#openPart !== null) {
-          await this.#closeOpenPart(Date.now(), this.#lastMonotonicMs);
-        }
-      });
+      try {
+        await this.#withMutation(async () => {
+          // A stopped capture must still leave a valid file behind.
+          for (const intent of this.#machine.forceFinalize()) {
+            await this.#applyIntent(intent, null);
+          }
+          if (this.#openPart !== null) {
+            await this.#closeOpenPart(Date.now(), this.#lastMonotonicMs);
+          }
+        });
+      } finally {
+        await this.#drainStorageFinalizers();
+      }
     }
   }
 
@@ -263,143 +291,235 @@ export class Recorder {
         break;
 
       case 'session_finalized': {
-        if (this.#discardingSessionId === intent.sessionId) {
-          this.#discardingSessionId = null;
-        }
-        const finalizedParts = this.#parts
-          .listForSession(intent.sessionId)
-          .filter((part) => part.finalized === 1);
-        const publishedPartPendingDatabase = this.#finalizations.hasUnfinalizedPart(
-          intent.sessionId,
-        );
-        if (finalizedParts.length === 0 || publishedPartPendingDatabase) {
-          transaction(this.#options.db, () => {
-            this.#options.db
-              .prepare(
-                `UPDATE audio_sessions
-                    SET state = 'FAILED', rejection_reason = 'audio_finalize_failed',
-                        ended_at = ?, duration_ms = ?, speech_ms = ?, part_count = ?,
-                        timing_exact = 1, updated_at = ?
-                  WHERE session_id = ?`,
-              )
-              .run(
-                new Date(intent.endedWallMs).toISOString(),
-                intent.durationMs,
-                intent.speechMs,
-                finalizedParts.length,
-                new Date().toISOString(),
-                intent.sessionId,
-              );
-            this.#finalizations.consumeSessionIfPartFinalized(intent.sessionId, {
-              endedAtIso: new Date(intent.endedWallMs).toISOString(),
-              durationMs: intent.durationMs,
-              speechMs: intent.speechMs,
-            });
-            this.#enqueueLifecycleStatus(
-              intent.sessionId,
-              'failed',
-              '🔴 Сессию не удалось сохранить: финализация аудио завершилась ошибкой. Аудио не загружаю.',
-            );
-          });
-          this.#options.logger.error('session held because audio finalization is incomplete', {
-            sessionId: intent.sessionId,
-            attemptedParts: intent.partCount,
-            finalizedParts: finalizedParts.length,
-            publishedPartPendingDatabase,
-          });
-          break;
-        }
-
-        const partial = finalizedParts.length < intent.partCount;
-        transaction(this.#options.db, () => {
-          this.#sessions.finalize(
-            intent.sessionId,
-            new Date(intent.endedWallMs).toISOString(),
-            intent.durationMs,
-            intent.speechMs,
-            finalizedParts.length,
-          );
-          this.#finalizations.consumeSessionIfPartFinalized(intent.sessionId, {
-            endedAtIso: new Date(intent.endedWallMs).toISOString(),
-            durationMs: intent.durationMs,
-            speechMs: intent.speechMs,
-          });
-          // Audio delivery is a separate job so Telegram can upload while ASR
-          // works, without putting filesystem or network I/O on this hot path.
-          this.#jobs.enqueue({
-            kind: 'deliver_audio',
-            idempotencyKey: `deliver-audio:${intent.sessionId}`,
-            payload: { sessionId: intent.sessionId },
-          });
-          this.#jobs.enqueue({
-            kind: 'asr',
-            idempotencyKey: `asr:${intent.sessionId}`,
-            payload: {
-              sessionId: intent.sessionId,
-              forcedLanguage: this.#options.resolveAsrLanguage?.() ?? null,
-            },
-          });
-          this.#enqueueLifecycleStatus(
-            intent.sessionId,
-            'finalized',
-            partial
-              ? '⚠️ Сессия завершена не полностью — загружаю сохранившиеся части аудио и расшифровываю локально…'
-              : '⏳ Сессия завершена — загружаю аудио и параллельно расшифровываю локально…',
-          );
-        });
-        this.#options.logger.info('session finalized', {
-          sessionId: intent.sessionId,
-          speechMs: intent.speechMs,
-          parts: finalizedParts.length,
-          partial,
-        });
-        this.#notify(() => this.#options.onSessionFinalized?.(intent.sessionId));
+        this.#deferOrSettleSessionOutcome(intent);
         break;
       }
 
       case 'session_rejected':
-        if (this.#discardingSessionId === intent.sessionId) {
-          this.#discardingSessionId = null;
-        }
-        transaction(this.#options.db, () => {
-          if (intent.endedWallMs !== undefined && intent.durationMs !== undefined) {
-            const exact = {
-              endedAtIso: new Date(intent.endedWallMs).toISOString(),
-              durationMs: intent.durationMs,
-              speechMs: intent.speechMs,
-            };
-            this.#sessions.rejectExact(
-              intent.sessionId,
-              intent.reason,
-              exact.endedAtIso,
-              exact.durationMs,
-              exact.speechMs,
-              intent.partCount,
-            );
-            this.#finalizations.consumeSessionIfPartFinalized(intent.sessionId, exact);
-          } else {
-            this.#sessions.reject(
-              intent.sessionId,
-              intent.reason,
-              intent.speechMs,
-              intent.partCount,
-            );
-          }
-          this.#enqueueLifecycleStatus(
-            intent.sessionId,
-            'rejected',
-            'ℹ️ Сессия завершена, но фрагмент слишком короткий — аудио не отправляю.',
-          );
-        });
-        this.#options.logger.info('session rejected', {
-          sessionId: intent.sessionId,
-          reason: intent.reason,
-          speechMs: intent.speechMs,
-        });
-        this.#notify(() => this.#options.onSessionRejected?.(intent.sessionId, intent.reason));
+        this.#deferOrSettleSessionOutcome(intent);
         break;
     }
     void frame;
+  }
+
+  #deferOrSettleSessionOutcome(intent: SessionOutcomeIntent): void {
+    const storageDiscarded = this.#discardingSessionId === intent.sessionId;
+    if (storageDiscarded) {
+      this.#discardingSessionId = null;
+    }
+    if ((this.#storageFinalizersBySession.get(intent.sessionId)?.size ?? 0) > 0) {
+      this.#pendingSessionOutcomes.set(intent.sessionId, { intent, storageDiscarded });
+      return;
+    }
+    this.#settleSessionOutcome(intent, storageDiscarded);
+  }
+
+  #settleDeferredSessionOutcome(sessionId: string): void {
+    if ((this.#storageFinalizersBySession.get(sessionId)?.size ?? 0) > 0) return;
+    const pending = this.#pendingSessionOutcomes.get(sessionId);
+    if (pending === undefined) return;
+    this.#settleSessionOutcome(pending.intent, pending.storageDiscarded);
+    this.#pendingSessionOutcomes.delete(sessionId);
+  }
+
+  #settleSessionOutcome(intent: SessionOutcomeIntent, storageDiscarded: boolean): void {
+    if (intent.kind === 'session_finalized') {
+      this.#settleFinalizedSession(intent, storageDiscarded);
+      return;
+    }
+    this.#settleRejectedSession(intent, storageDiscarded);
+  }
+
+  #settleFinalizedSession(
+    intent: Extract<SessionIntent, { kind: 'session_finalized' }>,
+    storageDiscarded: boolean,
+  ): void {
+    const storage = this.#proveSessionStorage(intent.sessionId, storageDiscarded);
+    if (!storage.proven) {
+      this.#failSessionStorage(
+        {
+          sessionId: intent.sessionId,
+          endedWallMs: intent.endedWallMs,
+          durationMs: intent.durationMs,
+          speechMs: intent.speechMs,
+          partCount: intent.partCount,
+        },
+        storage,
+      );
+      return;
+    }
+
+    const partial = storage.finalizedPartCount < intent.partCount;
+    transaction(this.#options.db, () => {
+      this.#sessions.finalizeFromFinalizing(
+        intent.sessionId,
+        new Date(intent.endedWallMs).toISOString(),
+        intent.durationMs,
+        intent.speechMs,
+        storage.finalizedPartCount,
+      );
+      this.#finalizations.consumeSessionIfPartFinalized(intent.sessionId, {
+        endedAtIso: new Date(intent.endedWallMs).toISOString(),
+        durationMs: intent.durationMs,
+        speechMs: intent.speechMs,
+      });
+      // Audio delivery is a separate job so Telegram can upload while ASR
+      // works, without putting filesystem or network I/O on this hot path.
+      this.#jobs.enqueue({
+        kind: 'deliver_audio',
+        idempotencyKey: `deliver-audio:${intent.sessionId}`,
+        payload: { sessionId: intent.sessionId },
+      });
+      this.#jobs.enqueue({
+        kind: 'asr',
+        idempotencyKey: `asr:${intent.sessionId}`,
+        payload: {
+          sessionId: intent.sessionId,
+          forcedLanguage: this.#options.resolveAsrLanguage?.() ?? null,
+        },
+      });
+      this.#enqueueLifecycleStatus(
+        intent.sessionId,
+        'finalized',
+        partial
+          ? '⚠️ Сессия завершена не полностью — загружаю сохранившиеся части аудио и расшифровываю локально…'
+          : '⏳ Сессия завершена — загружаю аудио и параллельно расшифровываю локально…',
+      );
+    });
+    this.#options.logger.info('session finalized', {
+      sessionId: intent.sessionId,
+      speechMs: intent.speechMs,
+      parts: storage.finalizedPartCount,
+      partial,
+    });
+    this.#notify(() => this.#options.onSessionFinalized?.(intent.sessionId));
+  }
+
+  #settleRejectedSession(
+    intent: Extract<SessionIntent, { kind: 'session_rejected' }>,
+    storageDiscarded: boolean,
+  ): void {
+    const storage = this.#proveSessionStorage(intent.sessionId, storageDiscarded);
+    if (!storage.proven) {
+      if (intent.endedWallMs === undefined || intent.durationMs === undefined) {
+        throw new Error(`rejected session ${intent.sessionId} lacks exact finalization timing`);
+      }
+      this.#failSessionStorage(
+        {
+          sessionId: intent.sessionId,
+          endedWallMs: intent.endedWallMs,
+          durationMs: intent.durationMs,
+          speechMs: intent.speechMs,
+          partCount: intent.partCount,
+        },
+        storage,
+      );
+      return;
+    }
+
+    transaction(this.#options.db, () => {
+      if (intent.endedWallMs !== undefined && intent.durationMs !== undefined) {
+        const exact = {
+          endedAtIso: new Date(intent.endedWallMs).toISOString(),
+          durationMs: intent.durationMs,
+          speechMs: intent.speechMs,
+        };
+        this.#sessions.rejectExact(
+          intent.sessionId,
+          intent.reason,
+          exact.endedAtIso,
+          exact.durationMs,
+          exact.speechMs,
+          storage.finalizedPartCount,
+        );
+        this.#finalizations.consumeSessionIfPartFinalized(intent.sessionId, exact);
+      } else {
+        this.#sessions.reject(
+          intent.sessionId,
+          intent.reason,
+          intent.speechMs,
+          storage.finalizedPartCount,
+        );
+      }
+      this.#enqueueLifecycleStatus(
+        intent.sessionId,
+        'rejected',
+        'ℹ️ Сессия завершена, но фрагмент слишком короткий — аудио не отправляю.',
+      );
+    });
+    this.#options.logger.info('session rejected', {
+      sessionId: intent.sessionId,
+      reason: intent.reason,
+      speechMs: intent.speechMs,
+    });
+    this.#notify(() => this.#options.onSessionRejected?.(intent.sessionId, intent.reason));
+  }
+
+  #proveSessionStorage(sessionId: string, storageDiscarded: boolean): SessionStorageProof {
+    const finalizedPartCount = this.#parts
+      .listForSession(sessionId)
+      .filter((part) => part.finalized === 1).length;
+    const publishedPartPendingDatabase = this.#finalizations.hasUnfinalizedPart(sessionId);
+    const hasFinalizationBoundary = this.#sessions.get(sessionId)?.state === 'FINALIZING';
+    return {
+      finalizedPartCount,
+      publishedPartPendingDatabase,
+      hasFinalizationBoundary,
+      storageDiscarded,
+      proven:
+        !storageDiscarded &&
+        finalizedPartCount > 0 &&
+        !publishedPartPendingDatabase &&
+        hasFinalizationBoundary,
+    };
+  }
+
+  #failSessionStorage(
+    intent: {
+      readonly sessionId: string;
+      readonly endedWallMs: number;
+      readonly durationMs: number;
+      readonly speechMs: number;
+      readonly partCount: number;
+    },
+    storage: SessionStorageProof,
+  ): void {
+    transaction(this.#options.db, () => {
+      this.#options.db
+        .prepare(
+          `UPDATE audio_sessions
+              SET state = 'FAILED', rejection_reason = 'audio_finalize_failed',
+                  ended_at = ?, duration_ms = ?, speech_ms = ?, part_count = ?,
+                  timing_exact = 1, updated_at = ?
+            WHERE session_id = ?`,
+        )
+        .run(
+          new Date(intent.endedWallMs).toISOString(),
+          intent.durationMs,
+          intent.speechMs,
+          storage.finalizedPartCount,
+          new Date().toISOString(),
+          intent.sessionId,
+        );
+      this.#finalizations.consumeSessionIfPartFinalized(intent.sessionId, {
+        endedAtIso: new Date(intent.endedWallMs).toISOString(),
+        durationMs: intent.durationMs,
+        speechMs: intent.speechMs,
+      });
+      this.#enqueueLifecycleStatus(
+        intent.sessionId,
+        'failed',
+        '🔴 Сессию не удалось сохранить: финализация аудио завершилась ошибкой. Аудио не загружаю.',
+      );
+    });
+    this.#options.logger.error('session held because audio finalization is incomplete', {
+      sessionId: intent.sessionId,
+      attemptedParts: intent.partCount,
+      finalizedParts: storage.finalizedPartCount,
+      publishedPartPendingDatabase: storage.publishedPartPendingDatabase,
+      hasFinalizationBoundary: storage.hasFinalizationBoundary,
+      storageDiscarded: storage.storageDiscarded,
+    });
   }
 
   #enqueueLifecycleStatus(
@@ -442,6 +562,18 @@ export class Recorder {
   }
 
   async #openNewPart(intent: Extract<SessionIntent, { kind: 'open_part' }>): Promise<void> {
+    if (this.#discardingSessionId === intent.sessionId) return;
+    if (this.#reservedFinalizers >= STORAGE_FINALIZER_CAPACITY) {
+      this.#discardingSessionId = intent.sessionId;
+      this.#preRoll.length = 0;
+      this.#options.logger.error('audio storage finalizer capacity exhausted', {
+        sessionId: intent.sessionId,
+        partIndex: intent.partIndex,
+        capacity: STORAGE_FINALIZER_CAPACITY,
+      });
+      return;
+    }
+
     const { dateDir, finalPath, tempPath } = partPaths(
       this.#options.paths.audioDir,
       this.#options.paths.tempDir,
@@ -460,6 +592,7 @@ export class Recorder {
       finalPath,
     });
     writer.open();
+    this.#reservedFinalizers += 1;
 
     let partId: string;
     try {
@@ -470,9 +603,9 @@ export class Recorder {
         new Date(intent.startedWallMs).toISOString(),
       );
     } catch (error) {
-      // The encoder exists but no durable row owns it. Reap it before reading
-      // more frames, and do not let audio from this failed session become the
-      // pre-roll of a later one.
+      // The encoder exists but no durable row owns it. Its reserved finalizer
+      // reaps it off the capture lane, and the rest of this session is dropped
+      // so a later part cannot create a gapped archive manifest.
       this.#discardingSessionId = intent.sessionId;
       this.#preRoll.length = 0;
       this.#options.logger.error('failed to register audio part', {
@@ -480,15 +613,17 @@ export class Recorder {
         partIndex: intent.partIndex,
         error: (error as Error).message,
       });
-      try {
-        await writer.abort();
-      } catch (cleanupError) {
-        this.#options.logger.error('failed to clean up unregistered audio part', {
-          sessionId: intent.sessionId,
-          partIndex: intent.partIndex,
-          error: (cleanupError as Error).message,
-        });
-      }
+      this.#trackStorageFinalizer(intent.sessionId, async () => {
+        try {
+          await writer.abort();
+        } catch (cleanupError) {
+          this.#options.logger.error('failed to clean up unregistered audio part', {
+            sessionId: intent.sessionId,
+            partIndex: intent.partIndex,
+            error: (cleanupError as Error).message,
+          });
+        }
+      });
       return;
     }
 
@@ -524,7 +659,6 @@ export class Recorder {
   ): Promise<void> {
     const open = this.#openPart;
     if (open === null) return;
-    this.#openPart = null;
 
     // Duration comes from the monotonic span of the part, so an NTP step
     // mid-recording cannot report a negative or wildly long part.
@@ -532,30 +666,51 @@ export class Recorder {
     const partEndedAtIso = new Date(endedWallMs).toISOString();
 
     try {
-      this.#finalizations.record({
-        partId: open.partId,
-        sessionId: open.sessionId,
-        partEndedAtIso,
-        partDurationMs: durationMs,
-        ...(finalSession === undefined
-          ? {}
-          : {
-              finalSession: {
-                endedAtIso: new Date(finalSession.endedWallMs).toISOString(),
-                durationMs: finalSession.durationMs,
-                speechMs: finalSession.speechMs,
-              },
-            }),
+      transaction(this.#options.db, () => {
+        this.#finalizations.record({
+          partId: open.partId,
+          sessionId: open.sessionId,
+          partEndedAtIso,
+          partDurationMs: durationMs,
+          ...(finalSession === undefined
+            ? {}
+            : {
+                finalSession: {
+                  endedAtIso: new Date(finalSession.endedWallMs).toISOString(),
+                  durationMs: finalSession.durationMs,
+                  speechMs: finalSession.speechMs,
+                },
+              }),
+        });
+        if (finalSession !== undefined) this.#sessions.advanceToFinalizing(open.sessionId);
       });
     } catch (error) {
       this.#options.logger.error('failed to journal exact audio timing', {
         partId: open.partId,
         error: (error as Error).message,
       });
-      await open.writer.abort();
+      this.#openPart = null;
+      this.#trackStorageFinalizer(open.sessionId, async () => {
+        try {
+          await open.writer.abort();
+        } catch (cleanupError) {
+          this.#options.logger.error('failed to clean up unjournaled audio part', {
+            partId: open.partId,
+            error: (cleanupError as Error).message,
+          });
+        }
+      });
       return;
     }
 
+    // The exact journal, and FINALIZING for the last part, are durable before
+    // ownership leaves the capture lane. The reserved slot then bounds all
+    // encoder-close/fsync/hash work while the next frame can be consumed.
+    this.#openPart = null;
+    this.#trackStorageFinalizer(open.sessionId, () => this.#finalizeDetachedPart(open));
+  }
+
+  async #finalizeDetachedPart(open: OpenPart): Promise<void> {
     let finalized: Awaited<ReturnType<PartWriter['close']>>;
     try {
       finalized = await open.writer.close();
@@ -567,7 +722,14 @@ export class Recorder {
         partId: open.partId,
         error: (error as Error).message,
       });
-      await open.writer.abort();
+      try {
+        await open.writer.abort();
+      } catch (cleanupError) {
+        this.#options.logger.error('failed to clean up unpublished audio part', {
+          partId: open.partId,
+          error: (cleanupError as Error).message,
+        });
+      }
       return;
     }
 
@@ -585,7 +747,63 @@ export class Recorder {
         partId: open.partId,
         error: (error as Error).message,
       });
-      await open.writer.abort();
+      try {
+        await open.writer.abort();
+      } catch (cleanupError) {
+        this.#options.logger.error('failed to clean up published audio temp file', {
+          partId: open.partId,
+          error: (cleanupError as Error).message,
+        });
+      }
     }
+  }
+
+  #trackStorageFinalizer(sessionId: string, operation: () => Promise<void>): void {
+    if (this.#storageFinalizers.size >= STORAGE_FINALIZER_CAPACITY) {
+      throw new Error('storage finalizer reservation invariant violated');
+    }
+    const task = operation().catch((error) => {
+      this.#options.logger.error('storage finalizer failed unexpectedly', {
+        sessionId,
+        error: (error as Error).message,
+      });
+    });
+    this.#storageFinalizers.add(task);
+    let sessionTasks = this.#storageFinalizersBySession.get(sessionId);
+    if (sessionTasks === undefined) {
+      sessionTasks = new Set();
+      this.#storageFinalizersBySession.set(sessionId, sessionTasks);
+    }
+    sessionTasks.add(task);
+    void task.then(() => this.#storageFinalizerFinished(sessionId, task));
+  }
+
+  #storageFinalizerFinished(sessionId: string, task: Promise<void>): void {
+    this.#storageFinalizers.delete(task);
+    const sessionTasks = this.#storageFinalizersBySession.get(sessionId);
+    sessionTasks?.delete(task);
+    if (sessionTasks?.size === 0) this.#storageFinalizersBySession.delete(sessionId);
+    this.#reservedFinalizers -= 1;
+
+    void this.#withMutation(async () => {
+      this.#settleDeferredSessionOutcome(sessionId);
+    }).catch((error) => {
+      this.#options.logger.error('failed to settle finalized session', {
+        sessionId,
+        error: (error as Error).message,
+      });
+    });
+  }
+
+  async #drainStorageFinalizers(): Promise<void> {
+    while (this.#storageFinalizers.size > 0) {
+      await Promise.all(this.#storageFinalizers);
+    }
+    await this.#mutationTail;
+    await this.#withMutation(async () => {
+      for (const sessionId of this.#pendingSessionOutcomes.keys()) {
+        this.#settleDeferredSessionOutcome(sessionId);
+      }
+    });
   }
 }
