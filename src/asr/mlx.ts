@@ -23,6 +23,12 @@ export interface MlxAsrOptions {
   readonly logger: Logger;
 }
 
+type ModelLoadState =
+  | { readonly status: 'idle' }
+  | { readonly status: 'loading' }
+  | { readonly status: 'loaded'; readonly model: string; readonly loadMs: number }
+  | { readonly status: 'load_failed'; readonly reason: string };
+
 /**
  * Persistent Python MLX worker.
  *
@@ -36,7 +42,9 @@ export class MlxAsr implements AsrBackend {
 
   readonly #options: MlxAsrOptions;
   readonly #worker: WorkerProcess;
-  #loaded = false;
+  #loadState: ModelLoadState = { status: 'idle' };
+  #loadPromise: Promise<void> | null = null;
+  #workerGeneration = 0;
   #workerFailed = false;
 
   constructor(options: MlxAsrOptions) {
@@ -48,7 +56,9 @@ export class MlxAsr implements AsrBackend {
       logger: options.logger,
       label: 'ASR',
       onExit: () => {
-        this.#loaded = false;
+        this.#workerGeneration += 1;
+        this.#loadState = { status: 'idle' };
+        this.#loadPromise = null;
         this.#workerFailed = true;
       },
     });
@@ -59,7 +69,19 @@ export class MlxAsr implements AsrBackend {
       return { ok: false, reason: 'ASR worker exited; the queued job will restart it' };
     }
     if (!this.#worker.running) return { ok: true, detail: 'idle; starts on demand' };
-    return { ok: true, detail: this.#loaded ? 'model loaded' : 'worker starting' };
+    switch (this.#loadState.status) {
+      case 'idle':
+        return { ok: true, detail: 'worker running; model not loaded' };
+      case 'loading':
+        return { ok: true, detail: 'model loading' };
+      case 'loaded':
+        return {
+          ok: true,
+          detail: `model loaded: ${this.#loadState.model} (${this.#loadState.loadMs} ms)`,
+        };
+      case 'load_failed':
+        return { ok: false, reason: this.#loadState.reason };
+    }
   }
 
   async ready(): Promise<{ ok: true } | { ok: false; reason: string }> {
@@ -158,22 +180,66 @@ export class MlxAsr implements AsrBackend {
 
   async close(): Promise<void> {
     await this.#worker.close(randomUUID());
-    this.#loaded = false;
+    this.#loadState = { status: 'idle' };
+    this.#loadPromise = null;
   }
 
   async #ensureLoaded(): Promise<void> {
-    if (this.#loaded) return;
-    const response = await this.#worker.send(
-      {
-        id: randomUUID(),
-        op: 'load',
-        model: this.#options.model,
-        quantization: this.#options.quantization,
-      },
-      // First load may download several GB of weights.
-      Math.max(this.#options.requestTimeoutMs, 30 * 60 * 1000),
-    );
-    if (!response.ok) throw new Error(`could not load ${this.#options.model}: ${response.error}`);
-    this.#loaded = true;
+    if (this.#loadState.status === 'loaded') return;
+    if (this.#loadPromise !== null) return this.#loadPromise;
+
+    const generation = this.#workerGeneration;
+    const load = this.#loadModel(generation);
+    this.#loadPromise = load;
+    try {
+      await load;
+    } finally {
+      if (this.#loadPromise === load) this.#loadPromise = null;
+    }
+  }
+
+  async #loadModel(generation: number): Promise<void> {
+    this.#loadState = { status: 'loading' };
+    try {
+      const response = await this.#worker.send(
+        {
+          id: randomUUID(),
+          op: 'load',
+          model: this.#options.model,
+          quantization: this.#options.quantization,
+        },
+        // First load may download several GB of weights.
+        Math.max(this.#options.requestTimeoutMs, 30 * 60 * 1000),
+      );
+      if (!response.ok) {
+        throw new Error(`could not load ${this.#options.model}: ${response.error}`);
+      }
+      if (response.op !== 'load') {
+        throw new Error(`ASR worker replied to "load" with "${response.op}"`);
+      }
+      if (response.model !== this.#options.model) {
+        throw new Error(
+          `ASR worker loaded "${response.model}" instead of "${this.#options.model}"`,
+        );
+      }
+      if (!Number.isFinite(response.load_ms) || response.load_ms < 0) {
+        throw new Error('ASR worker returned an invalid model load duration');
+      }
+      if (generation !== this.#workerGeneration || !this.#worker.running) {
+        throw new Error('ASR worker generation changed while the model was loading');
+      }
+
+      this.#loadState = {
+        status: 'loaded',
+        model: response.model,
+        loadMs: response.load_ms,
+      };
+      this.#workerFailed = false;
+    } catch (error) {
+      if (generation === this.#workerGeneration && this.#worker.running) {
+        this.#loadState = { status: 'load_failed', reason: (error as Error).message };
+      }
+      throw error;
+    }
   }
 }
