@@ -109,6 +109,45 @@ describe('Telegram Keychain credential pair', () => {
     });
   });
 
+  it('keeps a read-only peek coherent with a concurrent legacy migration', async () => {
+    const memory = memoryBackend({
+      'telegram-bot-token': 'legacy-token',
+      'telegram-chat-id': '73',
+    });
+    let releasePeekToken!: () => void;
+    let peekReachedToken!: () => void;
+    const peekTokenReleased = new Promise<void>((resolve) => {
+      releasePeekToken = resolve;
+    });
+    const peekAtToken = new Promise<void>((resolve) => {
+      peekReachedToken = resolve;
+    });
+    let tokenReads = 0;
+    const keychain = createTelegramKeychain({
+      ...memory.backend,
+      async get(account) {
+        if (account === 'telegram-bot-token') {
+          tokenReads += 1;
+          if (tokenReads === 1) {
+            peekReachedToken();
+            await peekTokenReleased;
+          }
+        }
+        return memory.values.get(account) ?? null;
+      },
+    });
+
+    const peeked = keychain.peek();
+    await peekAtToken;
+    assert.deepEqual(await keychain.load(), { token: 'legacy-token', chatId: 73 });
+    releasePeekToken();
+
+    assert.deepEqual(await peeked, { token: 'legacy-token', chatId: 73 });
+    assert.equal(memory.values.has('telegram-secrets-v1'), true);
+    assert.equal(memory.values.has('telegram-bot-token'), false);
+    assert.equal(memory.values.has('telegram-chat-id'), false);
+  });
+
   it('fails closed on an incomplete legacy pair', async () => {
     const memory = memoryBackend({ 'telegram-bot-token': 'orphan-token' });
     const keychain = createTelegramKeychain(memory.backend);

@@ -316,6 +316,15 @@ async function readStoredTelegramSecrets(
 
   const token = await backend.get(ACCOUNT_TOKEN);
   const chatIdRaw = await backend.get(ACCOUNT_CHAT_ID);
+  if (token === null || chatIdRaw === null) {
+    // A concurrent load publishes the combined item before removing either
+    // legacy field. Re-read that authoritative item so the read-only setup
+    // preflight cannot mistake an in-flight migration for "not configured".
+    const migrated = await backend.get(ACCOUNT_SECRETS);
+    if (migrated !== null) {
+      return { secrets: decodeTelegramSecrets(migrated), legacy: false };
+    }
+  }
   if (token === null && chatIdRaw === null) return { secrets: null, legacy: false };
   if (token === null || chatIdRaw === null) {
     throw new KeychainError(
