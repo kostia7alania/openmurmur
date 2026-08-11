@@ -432,6 +432,15 @@ of these is true:
 - the transcript was never delivered
 - a job still references the session
 
+On 2026-08-12 a disposable state root exercised the production
+`retention dry-run` and `retention apply` commands against four finalized old
+recordings. The ordinary and post-ASR-rejected files whose complete audio ACK
+was older than 48 hours were deleted and marked exactly once; equally old files
+with one-hour-old ACKs remained byte-for-byte intact and unmarked. A repeated
+dry-run was empty, and SQLite integrity and foreign keys remained clean. The
+rehearsal seeded durable ACK facts, so it proves the retention clock and real
+filesystem apply, not Telegram transport or ACK latency.
+
 The LLM has no involvement in deletion decisions. Eligibility is pure SQL over
 recorded facts. The daemon evaluates and applies this same proof-based plan once
 an hour. Daily digest scheduling uses `digest.timezone` (`local` or a valid IANA
