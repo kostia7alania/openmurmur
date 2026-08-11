@@ -99,8 +99,8 @@ if launchctl print system/com.apple.screensharing >/dev/null 2>&1; then
   ok "screen sharing" "enabled"
 else
   warn "screen sharing" "not enabled"
-  note "Needed once, to grant microphone access — the dialog cannot be shown"
-  note "to an SSH session and there is no command that grants it."
+  note "Needed once to run 'pnpm openmurmur capture authorize' for the native"
+  note "helper — the dialog cannot be shown to an SSH session."
   human "Enable Screen Sharing: System Settings → General → Sharing"
 fi
 
@@ -149,7 +149,8 @@ if launchctl print "gui/$(id -u)/io.openmurmur.daemon" >/dev/null 2>&1; then
   ok "launch agent" "installed and loaded"
 else
   warn "launch agent" "not installed"
-  note "Install it AFTER granting microphone access: ./scripts/install-launch-agents"
+  note "Install it only after native capture is configured and"
+  note "./scripts/install-capture-app --check passes: ./scripts/install-launch-agents"
 fi
 
 # --- disk ----------------------------------------------------------------

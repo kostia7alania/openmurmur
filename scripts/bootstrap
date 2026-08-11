@@ -139,6 +139,6 @@ cat <<'STEPS'
   pnpm openmurmur doctor           # verify everything
   pnpm openmurmur setup            # create directories and config
   pnpm openmurmur setup telegram   # connect your bot
-  pnpm openmurmur capture test     # grant microphone access, check levels
+  pnpm openmurmur capture test     # prove foreground PCM and check levels
   pnpm openmurmur start            # run the daemon
 STEPS
