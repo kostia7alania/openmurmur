@@ -80,6 +80,114 @@ describe('migrations', () => {
     assert.ok(applied.every((row) => row.name.endsWith('.sql')));
   });
 
+  it('backfills delivery time only from an exact, fully sent legacy audio manifest', () => {
+    const legacy = new DatabaseSync(join(dir, 'legacy.db'));
+    try {
+      legacy.exec(`
+        CREATE TABLE schema_migrations (
+          name TEXT PRIMARY KEY,
+          applied_at TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE audio_parts (
+          part_id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          delivered INTEGER NOT NULL,
+          deleted_at TEXT
+        ) STRICT;
+        CREATE TABLE telegram_outbox (
+          delivery_part_id TEXT PRIMARY KEY,
+          session_id TEXT,
+          kind TEXT NOT NULL,
+          state TEXT NOT NULL,
+          last_error TEXT,
+          updated_at TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE alert_state (
+          alert_id TEXT PRIMARY KEY,
+          active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+          last_sent_at TEXT,
+          last_changed_at TEXT,
+          occurrences INTEGER NOT NULL DEFAULT 0
+        ) STRICT;
+      `);
+      const applied = legacy.prepare(
+        'INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)',
+      );
+      for (const name of [
+        '001_initial.sql',
+        '002_speaker_diarization.sql',
+        '003_output_provenance.sql',
+        '004_telegram_bot_scope.sql',
+        '005_asr_preferences.sql',
+      ]) {
+        applied.run(name, '2026-08-01T00:00:00.000Z');
+      }
+
+      const addPart = legacy.prepare(
+        'INSERT INTO audio_parts (part_id, session_id, delivered) VALUES (?, ?, ?)',
+      );
+      for (const [partId, sessionId, delivered] of [
+        ['direct', 's-direct', 1],
+        ['split', 's-split', 1],
+        ['absent', 's-absent', 1],
+        ['pending', 's-pending', 1],
+        ['ambiguous', 's-ambiguous', 1],
+        ['gapped', 's-gapped', 1],
+        ['noncanonical', 's-noncanonical', 1],
+        ['wrong-session', 's-right', 1],
+        ['unconfirmed-domain', 's-domain', 0],
+      ] as const) {
+        addPart.run(partId, sessionId, delivered);
+      }
+
+      const addOutbox = legacy.prepare(
+        `INSERT INTO telegram_outbox
+           (delivery_part_id, session_id, kind, state, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      );
+      const early = '2026-08-01T10:00:00.000Z';
+      const late = '2026-08-01T10:05:00.000Z';
+      addOutbox.run('audio:direct', 's-direct', 'audio', 'sent', early);
+      addOutbox.run('audio:split:split0', 's-split', 'audio', 'sent', early);
+      addOutbox.run('audio:split:split1', 's-split', 'audio', 'sent', late);
+      addOutbox.run('audio:pending:split0', 's-pending', 'audio', 'sent', early);
+      addOutbox.run('audio:pending:split1', 's-pending', 'audio', 'pending', late);
+      addOutbox.run('audio:ambiguous', 's-ambiguous', 'audio', 'sent', early);
+      addOutbox.run('audio:ambiguous:split0', 's-ambiguous', 'audio', 'sent', late);
+      addOutbox.run('audio:gapped:split0', 's-gapped', 'audio', 'sent', early);
+      addOutbox.run('audio:gapped:split2', 's-gapped', 'audio', 'sent', late);
+      addOutbox.run('audio:noncanonical:split00', 's-noncanonical', 'audio', 'sent', early);
+      addOutbox.run('audio:wrong-session', 's-other', 'audio', 'sent', early);
+      addOutbox.run('audio:unconfirmed-domain', 's-domain', 'audio', 'sent', early);
+
+      assert.deepEqual(migrate(legacy), [
+        '006_alert_fingerprints.sql',
+        '007_audio_delivery_time.sql',
+        '008_daemon_heartbeat.sql',
+      ]);
+      const rows = legacy
+        .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')
+        .all() as { part_id: string; delivered_at: string | null }[];
+      const deliveryTime = new Map(rows.map((row) => [row.part_id, row.delivered_at]));
+
+      assert.equal(deliveryTime.get('direct'), early);
+      assert.equal(deliveryTime.get('split'), late, 'split retention starts at its last ACK');
+      for (const partId of [
+        'absent',
+        'pending',
+        'ambiguous',
+        'gapped',
+        'noncanonical',
+        'wrong-session',
+        'unconfirmed-domain',
+      ]) {
+        assert.equal(deliveryTime.get(partId), null, `${partId} must remain fail-closed`);
+      }
+    } finally {
+      legacy.close();
+    }
+  });
+
   it('turns on WAL and foreign keys', () => {
     const journal = db.handle.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
     const fk = db.handle.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number };

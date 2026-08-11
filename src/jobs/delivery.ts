@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { rm, stat } from 'node:fs/promises';
+import { readdir, rm, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import {
@@ -574,17 +574,22 @@ export async function splitFlacLossless(
 }
 
 async function listSplitArtifacts(tempDir: string, stem: string): Promise<string[]> {
-  const produced: string[] = [];
-  for (let index = 0; index < 1000; index += 1) {
-    const candidate = join(tempDir, `${stem}.split${String(index).padStart(3, '0')}.flac`);
-    try {
-      await stat(candidate);
-      produced.push(candidate);
-    } catch {
-      break;
-    }
+  let entries: string[];
+  try {
+    entries = await readdir(tempDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
   }
-  return produced;
+
+  const prefix = `${stem}.split`;
+  return entries
+    .filter((entry) => {
+      if (!entry.startsWith(prefix) || !entry.endsWith('.flac')) return false;
+      return /^\d{3}$/.test(entry.slice(prefix.length, -'.flac'.length));
+    })
+    .sort()
+    .map((entry) => join(tempDir, entry));
 }
 
 async function removeSplitArtifacts(tempDir: string, stem: string): Promise<void> {

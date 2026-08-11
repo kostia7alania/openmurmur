@@ -35,6 +35,7 @@ interface SessionOptions {
   rejectionReason?: string | null;
   finalized?: number;
   delivered?: number;
+  deliveredAt?: string | null;
   sha256?: string | null;
   withTranscript?: boolean;
   transcriptSent?: boolean;
@@ -54,6 +55,8 @@ function seedDeliveredSession(id: string, options: SessionOptions = {}): string 
     outboxPending = false,
     pendingJob = false,
   } = options;
+  const deliveredAt =
+    options.deliveredAt === undefined ? (delivered === 1 ? OLD : null) : options.deliveredAt;
 
   const path = join(dir, `${id}.flac`);
   writeFileSync(path, Buffer.alloc(1024));
@@ -70,10 +73,10 @@ function seedDeliveredSession(id: string, options: SessionOptions = {}): string 
   db.handle
     .prepare(
       `INSERT INTO audio_parts (part_id, session_id, part_index, path, started_at, ended_at,
-                                bytes, sha256, finalized, delivered, created_at)
-       VALUES (?, ?, 0, ?, ?, ?, 1024, ?, ?, ?, ?)`,
+                                bytes, sha256, finalized, delivered, delivered_at, created_at)
+       VALUES (?, ?, 0, ?, ?, ?, 1024, ?, ?, ?, ?, ?)`,
     )
-    .run(`${id}-p0`, id, path, OLD, OLD, sha256, finalized, delivered, OLD);
+    .run(`${id}-p0`, id, path, OLD, OLD, sha256, finalized, delivered, deliveredAt, OLD);
 
   if (withTranscript) {
     db.handle
@@ -128,11 +131,30 @@ describe('retention: what may be deleted', () => {
     assert.equal(plan.totalBytes, 1024);
   });
 
-  it('keeps audio that is not yet old enough', () => {
-    seedDeliveredSession('s1');
-    // Evaluate as if it were the moment the session ended.
-    const plan = planRetention(db.handle, RETENTION, Date.parse(OLD));
+  it('starts the retention window at confirmed delivery, not session end', () => {
+    const now = Date.parse('2026-08-11T12:00:00.000Z');
+    seedDeliveredSession('s1', {
+      // The recording itself is years old, but Telegram only just acknowledged it.
+      deliveredAt: new Date(now - 60 * 60_000).toISOString(),
+    });
+    const plan = planRetention(db.handle, RETENTION, now);
     assert.equal(plan.candidates.length, 0);
+    assert.match(plan.blocked[0]?.reason ?? '', /window after confirmed audio delivery/);
+  });
+
+  it('makes delivered audio eligible after the configured delivery window', () => {
+    const now = Date.parse('2026-08-11T12:00:00.000Z');
+    seedDeliveredSession('s1', {
+      deliveredAt: new Date(now - (RETENTION.sessionAudioHours + 1) * 60 * 60_000).toISOString(),
+    });
+    assert.equal(planRetention(db.handle, RETENTION, now).candidates.length, 1);
+  });
+
+  it('keeps legacy delivered audio when its exact delivery time is missing', () => {
+    seedDeliveredSession('legacy', { deliveredAt: null });
+    const plan = planRetention(db.handle, RETENTION);
+    assert.equal(plan.candidates.length, 0);
+    assert.match(plan.blocked[0]?.reason ?? '', /delivery time is not proven/);
   });
 
   it('deletes rejected-noise audio on its own shorter schedule', () => {
@@ -147,6 +169,29 @@ describe('retention: what may be deleted', () => {
     const plan = planRetention(db.handle, RETENTION);
     assert.equal(plan.candidates.length, 1);
     assert.equal(plan.candidates[0]?.kind, 'rejected_session_audio');
+  });
+
+  it('keeps never-delivered insufficient speech on the short session-end clock', () => {
+    const now = Date.parse('2026-08-11T12:00:00.000Z');
+    seedDeliveredSession('noise', {
+      state: 'REJECTED',
+      rejectionReason: 'insufficient_speech',
+      delivered: 0,
+      withTranscript: false,
+      transcriptSent: false,
+    });
+    db.handle
+      .prepare('UPDATE audio_sessions SET ended_at = ? WHERE session_id = ?')
+      .run(new Date(now - 60 * 60_000).toISOString(), 'noise');
+    assert.equal(planRetention(db.handle, RETENTION, now).candidates.length, 0);
+
+    db.handle
+      .prepare('UPDATE audio_sessions SET ended_at = ? WHERE session_id = ?')
+      .run(
+        new Date(now - (RETENTION.rejectedSessionHours + 1) * 60 * 60_000).toISOString(),
+        'noise',
+      );
+    assert.equal(planRetention(db.handle, RETENTION, now).candidates.length, 1);
   });
 
   it('keeps ASR-rejected audio until its audio-first delivery is confirmed', () => {
@@ -177,8 +222,46 @@ describe('retention: what may be deleted', () => {
     assert.equal(planRetention(db.handle, RETENTION).candidates.length, 0);
 
     db.handle.prepare("UPDATE telegram_outbox SET state = 'sent'").run();
-    db.handle.prepare('UPDATE audio_parts SET delivered = 1').run();
+    db.handle.prepare('UPDATE audio_parts SET delivered = 1, delivered_at = ?').run(OLD);
     assert.equal(planRetention(db.handle, RETENTION).candidates.length, 1);
+  });
+
+  it('gives delivered ASR-rejected audio the ordinary window from its ACK', () => {
+    const now = Date.parse('2026-08-11T12:00:00.000Z');
+    seedDeliveredSession('asr-recent', {
+      state: 'REJECTED',
+      rejectionReason: 'asr_empty',
+      deliveredAt: new Date(now - (RETENTION.rejectedSessionHours + 1) * 60 * 60_000).toISOString(),
+      withTranscript: false,
+      transcriptSent: false,
+    });
+    db.handle
+      .prepare(
+        `INSERT INTO telegram_outbox
+           (outbox_id, delivery_part_id, session_id, kind, ordinal, payload,
+            state, run_after, created_at, updated_at)
+         VALUES ('audio-sent', 'audio:asr-recent-p0', 'asr-recent', 'audio', 0, '{}',
+                 'sent', ?, ?, ?)`,
+      )
+      .run(OLD, OLD, OLD);
+    db.handle
+      .prepare(
+        `INSERT INTO jobs
+           (job_id, kind, idempotency_key, payload, state, run_after, created_at, updated_at)
+         VALUES ('audio-job', 'deliver_audio', 'deliver-audio:asr-recent', '{}', 'done', ?, ?, ?)`,
+      )
+      .run(OLD, OLD, OLD);
+
+    assert.equal(
+      planRetention(db.handle, RETENTION, now).candidates.length,
+      0,
+      'the short rejected-session clock must not delete audio that was delivered recently',
+    );
+
+    db.handle
+      .prepare('UPDATE audio_parts SET delivered_at = ?')
+      .run(new Date(now - (RETENTION.sessionAudioHours + 1) * 60 * 60_000).toISOString());
+    assert.equal(planRetention(db.handle, RETENTION, now).candidates.length, 1);
   });
 
   it('keeps ASR-rejected audio when the delivery job or sent row is missing', () => {

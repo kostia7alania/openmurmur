@@ -35,6 +35,7 @@ export interface PartRow {
   sha256: string | null;
   finalized: number;
   delivered: number;
+  delivered_at: string | null;
   deleted_at: string | null;
 }
 
@@ -159,8 +160,20 @@ export class PartRepository {
       .run(endedAtIso, durationMs, bytes, sha256, partId);
   }
 
-  markDelivered(partId: string): void {
-    this.#db.prepare('UPDATE audio_parts SET delivered = 1 WHERE part_id = ?').run(partId);
+  markDelivered(partId: string, deliveredAtIso: string): void {
+    // A replay may prove a later final acknowledgement, but must never move the
+    // retention clock backwards and make a file eligible sooner.
+    this.#db
+      .prepare(
+        `UPDATE audio_parts
+            SET delivered = 1,
+                delivered_at = CASE
+                  WHEN delivered_at IS NULL OR delivered_at < ? THEN ?
+                  ELSE delivered_at
+                END
+          WHERE part_id = ?`,
+      )
+      .run(deliveredAtIso, deliveredAtIso, partId);
   }
 
   markDeleted(partId: string): void {
@@ -288,6 +301,51 @@ export class IncomingFileRepository {
           WHERE file_uid = ?`,
       )
       .run(path, actualBytes, nowIso(), fileUid);
+  }
+
+  reserveNormalizedPath(fileUid: string, path: string): void {
+    this.#db
+      .prepare(
+        `UPDATE incoming_telegram_files
+            SET normalized_path = COALESCE(normalized_path, ?), updated_at = ?
+          WHERE file_uid = ?`,
+      )
+      .run(path, nowIso(), fileUid);
+  }
+
+  markNormalized(fileUid: string, path: string, probedFormat: string, durationMs: number): void {
+    this.#db
+      .prepare(
+        `UPDATE incoming_telegram_files
+            SET state = 'validated', normalized_path = ?, probed_format = ?, duration_ms = ?,
+                updated_at = ?
+          WHERE file_uid = ?`,
+      )
+      .run(path, probedFormat, durationMs, nowIso(), fileUid);
+  }
+
+  markTranscribed(fileUid: string): void {
+    this.#db
+      .prepare(
+        `UPDATE incoming_telegram_files
+            SET state = 'transcribed', updated_at = ?
+          WHERE file_uid = ? AND state <> 'delivered'`,
+      )
+      .run(nowIso(), fileUid);
+  }
+
+  markFailedIfUntranscribed(fileUid: string): void {
+    this.#db
+      .prepare(
+        `UPDATE incoming_telegram_files
+            SET state = 'failed', updated_at = ?
+          WHERE file_uid = ?
+            AND state NOT IN ('transcribed', 'delivered', 'rejected')
+            AND NOT EXISTS (
+                  SELECT 1 FROM transcript_revisions WHERE incoming_file_id = ?
+                )`,
+      )
+      .run(nowIso(), fileUid, fileUid);
   }
 
   #find(column: 'file_uid' | 'telegram_unique_id', value: string): IncomingFileRow | undefined {
@@ -495,6 +553,22 @@ export class TranscriptRepository {
       speaker: r.speaker,
     }));
   }
+}
+
+export function appendIncomingTranscript(
+  db: DatabaseSync,
+  input: TranscriptInput & { readonly incomingFileId: string },
+  afterStored?: () => void,
+): string {
+  if (input.sessionId !== undefined) {
+    throw new Error('incoming transcript cannot also belong to a recorded session');
+  }
+  return new TranscriptRepository(db).append(input, () => {
+    // State and revision are one recovery boundary: a restart must either run
+    // ASR again or observe both durable facts, never a transcript by itself.
+    new IncomingFileRepository(db).markTranscribed(input.incomingFileId);
+    afterStored?.();
+  });
 }
 
 /**

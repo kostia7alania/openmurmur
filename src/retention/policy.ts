@@ -58,7 +58,8 @@ export function planRetention(
   //   - the session finished processing (state = DONE)
   //   - this part was closed, fsynced and renamed (finalized = 1)
   //   - its checksum was computed (sha256 IS NOT NULL)
-  //   - Telegram confirmed this exact part (delivered = 1)
+  //   - Telegram confirmed this exact part and recorded when (delivered_at)
+  //   - the configured window elapsed after that acknowledgement
   //   - the transcript exists and was itself delivered
   //   - no job still references the session
   const eligible = db
@@ -70,9 +71,10 @@ export function planRetention(
           AND p.finalized = 1
           AND p.sha256 IS NOT NULL
           AND p.delivered = 1
+          AND p.delivered_at IS NOT NULL
+          AND p.delivered_at <= ?
           AND s.state = 'DONE'
           AND s.ended_at IS NOT NULL
-          AND s.ended_at <= ?
           AND EXISTS (
                 SELECT 1 FROM transcript_revisions r
                  WHERE r.session_id = s.session_id AND r.is_current = 1
@@ -104,7 +106,7 @@ export function planRetention(
       id: row.part_id,
       path: row.path,
       bytes: row.bytes,
-      reason: `delivered and older than ${config.sessionAudioHours}h`,
+      reason: `delivery confirmed more than ${config.sessionAudioHours}h ago`,
     });
   }
 
@@ -112,7 +114,9 @@ export function planRetention(
   // user wondering where their disk went gets an answer instead of silence.
   const held = db
     .prepare(
-      `SELECT p.part_id, p.path, s.state, p.finalized, p.delivered, p.sha256
+      `SELECT p.part_id, p.path, s.state, p.finalized, p.delivered, p.delivered_at, p.sha256,
+              CASE WHEN p.delivered_at IS NOT NULL AND p.delivered_at <= ? THEN 1 ELSE 0 END
+                AS delivery_window_elapsed
          FROM audio_parts p
          JOIN audio_sessions s ON s.session_id = p.session_id
         WHERE p.deleted_at IS NULL
@@ -120,12 +124,17 @@ export function planRetention(
           AND s.ended_at <= ?
           AND s.state != 'REJECTED'`,
     )
-    .all(hoursAgoIso(config.sessionAudioHours, now)) as {
+    .all(
+      hoursAgoIso(config.sessionAudioHours, now),
+      hoursAgoIso(config.sessionAudioHours, now),
+    ) as {
     part_id: string;
     path: string;
     state: string;
     finalized: number;
     delivered: number;
+    delivered_at: string | null;
+    delivery_window_elapsed: number;
     sha256: string | null;
   }[];
 
@@ -136,24 +145,29 @@ export function planRetention(
   }
 
   // --- Rejected sessions --------------------------------------------------
-  // The duration gate rejects before delivery is scheduled. ASR rejection is
-  // different: audio delivery was promised and must be proven before deletion.
+  // The duration gate rejects before delivery is scheduled, so its short clock
+  // starts at session end. ASR rejection is different: its audio was delivered
+  // first and therefore keeps the ordinary delivered-audio window from the ACK.
   const rejected = db
     .prepare(
-      `SELECT p.part_id, p.path, COALESCE(p.bytes, 0) AS bytes
+      `SELECT p.part_id, p.path, COALESCE(p.bytes, 0) AS bytes, s.rejection_reason
          FROM audio_parts p
          JOIN audio_sessions s ON s.session_id = p.session_id
         WHERE p.deleted_at IS NULL
           AND s.state = 'REJECTED'
           AND p.finalized = 1
           AND p.sha256 IS NOT NULL
-          AND s.ended_at IS NOT NULL
-          AND s.ended_at <= ?
           AND (
-                s.rejection_reason = 'insufficient_speech'
+                (
+                  s.rejection_reason = 'insufficient_speech'
+                  AND s.ended_at IS NOT NULL
+                  AND s.ended_at <= ?
+                )
                 OR (
                      s.rejection_reason IN ('asr_empty','insufficient_words')
                      AND p.delivered = 1
+                     AND p.delivered_at IS NOT NULL
+                     AND p.delivered_at <= ?
                      AND EXISTS (
                            SELECT 1 FROM telegram_outbox sent_audio
                             WHERE sent_audio.session_id = s.session_id
@@ -185,10 +199,14 @@ export function planRetention(
                    AND j.idempotency_key LIKE '%' || s.session_id
               )`,
     )
-    .all(hoursAgoIso(config.rejectedSessionHours, now)) as {
+    .all(
+      hoursAgoIso(config.rejectedSessionHours, now),
+      hoursAgoIso(config.sessionAudioHours, now),
+    ) as {
     part_id: string;
     path: string;
     bytes: number;
+    rejection_reason: string;
   }[];
 
   for (const row of rejected) {
@@ -197,7 +215,10 @@ export function planRetention(
       id: row.part_id,
       path: row.path,
       bytes: row.bytes,
-      reason: `rejected audio, older than ${config.rejectedSessionHours}h`,
+      reason:
+        row.rejection_reason === 'insufficient_speech'
+          ? `rejected before delivery and older than ${config.rejectedSessionHours}h`
+          : `delivered rejected audio and older than ${config.sessionAudioHours}h after delivery`,
     });
   }
 
@@ -270,6 +291,8 @@ function describeBlock(row: {
   state: string;
   finalized: number;
   delivered: number;
+  delivered_at: string | null;
+  delivery_window_elapsed: number;
   sha256: string | null;
 }): string {
   if (row.finalized !== 1) return 'audio part was never finalized';
@@ -277,7 +300,11 @@ function describeBlock(row: {
   if (row.state === 'PROCESSING') return 'ASR has not finished';
   if (row.state === 'DELIVERING') return 'Telegram delivery not confirmed';
   if (row.delivered !== 1) return 'this audio part was not confirmed delivered';
+  if (row.delivered_at === null) return 'exact audio delivery time is not proven';
   if (row.state !== 'DONE') return `session is in state ${row.state}`;
+  if (row.delivery_window_elapsed !== 1) {
+    return 'retention window after confirmed audio delivery has not elapsed';
+  }
   return 'transcript delivery not confirmed';
 }
 

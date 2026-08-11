@@ -541,18 +541,91 @@ export function reconcileSessionDelivery(
 
 /** Marks the audio parts confirmed by a successful `audio` outbox send. */
 export function markAudioDelivered(db: DatabaseSync, partId: string): void {
-  const directId = `audio:${partId}`;
-  const splitPrefix = `${directId}:split`;
-  const rows = db
+  const manifest = db
     .prepare(
-      `SELECT count(*) AS total,
-              SUM(CASE WHEN state = 'sent' THEN 1 ELSE 0 END) AS sent
-         FROM telegram_outbox
-        WHERE kind = 'audio'
-          AND (delivery_part_id = ? OR substr(delivery_part_id, 1, ?) = ?)`,
+      `WITH target AS (
+         SELECT session_id,
+                'audio:' || part_id AS direct_id,
+                'audio:' || part_id || ':split' AS split_prefix
+           FROM audio_parts
+          WHERE part_id = ?
+       ), relevant AS (
+         SELECT o.delivery_part_id, o.session_id, o.kind, o.state, o.updated_at,
+                t.session_id AS expected_session_id,
+                t.direct_id,
+                substr(o.delivery_part_id, length(t.split_prefix) + 1) AS split_suffix
+           FROM telegram_outbox o
+           JOIN target t
+             ON o.delivery_part_id = t.direct_id
+             OR substr(o.delivery_part_id, 1, length(t.split_prefix)) = t.split_prefix
+       )
+       SELECT count(*) AS total,
+              sum(
+                CASE
+                  WHEN kind = 'audio' AND session_id = expected_session_id AND state = 'sent'
+                  THEN 1 ELSE 0
+                END
+              ) AS confirmed,
+              sum(CASE WHEN delivery_part_id = direct_id THEN 1 ELSE 0 END) AS direct_rows,
+              sum(
+                CASE
+                  WHEN length(split_suffix) > 0
+                   AND split_suffix NOT GLOB '*[^0-9]*'
+                   AND CAST(CAST(split_suffix AS INTEGER) AS TEXT) = split_suffix
+                  THEN 1 ELSE 0
+                END
+              ) AS split_rows,
+              min(
+                CASE
+                  WHEN length(split_suffix) > 0
+                   AND split_suffix NOT GLOB '*[^0-9]*'
+                   AND CAST(CAST(split_suffix AS INTEGER) AS TEXT) = split_suffix
+                  THEN CAST(split_suffix AS INTEGER)
+                END
+              ) AS first_split,
+              max(
+                CASE
+                  WHEN length(split_suffix) > 0
+                   AND split_suffix NOT GLOB '*[^0-9]*'
+                   AND CAST(CAST(split_suffix AS INTEGER) AS TEXT) = split_suffix
+                  THEN CAST(split_suffix AS INTEGER)
+                END
+              ) AS last_split,
+              count(
+                DISTINCT CASE
+                  WHEN length(split_suffix) > 0
+                   AND split_suffix NOT GLOB '*[^0-9]*'
+                   AND CAST(CAST(split_suffix AS INTEGER) AS TEXT) = split_suffix
+                  THEN CAST(split_suffix AS INTEGER)
+                END
+              ) AS distinct_splits,
+              max(updated_at) AS delivered_at
+         FROM relevant`,
     )
-    .get(directId, splitPrefix.length, splitPrefix) as { total: number; sent: number | null };
-  if (rows.total > 0 && rows.sent === rows.total) {
-    new PartRepository(db).markDelivered(partId);
+    .get(partId) as {
+    total: number;
+    confirmed: number | null;
+    direct_rows: number | null;
+    split_rows: number | null;
+    first_split: number | null;
+    last_split: number | null;
+    distinct_splits: number;
+    delivered_at: string | null;
+  };
+
+  const directManifest = manifest.total === 1 && manifest.direct_rows === 1;
+  const splitManifest =
+    manifest.total > 0 &&
+    manifest.direct_rows === 0 &&
+    manifest.split_rows === manifest.total &&
+    manifest.first_split === 0 &&
+    manifest.last_split === manifest.total - 1 &&
+    manifest.distinct_splits === manifest.total;
+  if (
+    manifest.confirmed === manifest.total &&
+    manifest.delivered_at !== null &&
+    (directManifest || splitManifest)
+  ) {
+    new PartRepository(db).markDelivered(partId, manifest.delivered_at);
   }
 }

@@ -658,6 +658,118 @@ describe('delivery enqueue', () => {
 });
 
 describe('session completion and retention handoff', () => {
+  it('rolls back the sent audio row when its part delivery fact fails', () => {
+    seedFinalizedSession('atomic-audio');
+    const part = db.handle
+      .prepare('SELECT part_id, path FROM audio_parts WHERE session_id = ?')
+      .get('atomic-audio') as { part_id: string; path: string };
+    const outbox = new Outbox(db.handle);
+    outbox.enqueue({
+      deliveryPartId: `audio:${part.part_id}`,
+      kind: 'audio',
+      sessionId: 'atomic-audio',
+      ordinal: 0,
+      payload: {
+        type: 'document',
+        path: part.path,
+        filename: 'atomic-audio.p000.flac',
+        partId: part.part_id,
+      },
+    });
+    const claimed = outbox.claimNext();
+    assert.ok(claimed);
+
+    assert.throws(
+      () =>
+        outbox.markSent(claimed.outbox_id, 101, () => {
+          markAudioDelivered(db.handle, part.part_id);
+          throw new Error('injected failure after audio domain update');
+        }),
+      /injected failure after audio domain update/,
+    );
+    const afterFault = db.handle
+      .prepare(
+        `SELECT o.state, p.delivered, p.delivered_at
+           FROM telegram_outbox o
+           JOIN audio_parts p ON p.part_id = ?
+          WHERE o.outbox_id = ?`,
+      )
+      .get(part.part_id, claimed.outbox_id) as {
+      state: string;
+      delivered: number;
+      delivered_at: string | null;
+    };
+    assert.deepEqual(
+      { ...afterFault },
+      { state: 'sending', delivered: 0, delivered_at: null },
+      'the Telegram acknowledgement and audio delivery proof are one commit',
+    );
+
+    outbox.markSent(claimed.outbox_id, 101, () => {
+      markAudioDelivered(db.handle, part.part_id);
+    });
+    const retried = db.handle
+      .prepare(
+        `SELECT o.state, p.delivered, p.delivered_at
+           FROM telegram_outbox o
+           JOIN audio_parts p ON p.part_id = ?
+          WHERE o.outbox_id = ?`,
+      )
+      .get(part.part_id, claimed.outbox_id) as {
+      state: string;
+      delivered: number;
+      delivered_at: string | null;
+    };
+    assert.equal(retried.state, 'sent');
+    assert.equal(retried.delivered, 1);
+    assert.notEqual(retried.delivered_at, null);
+  });
+
+  it('rolls back final transcript and report acknowledgements with the DONE transition', () => {
+    for (const finalKind of ['transcript', 'report'] as const) {
+      const sessionId = `atomic-${finalKind}`;
+      seedFinalizedSession(sessionId);
+      new SessionRepository(db.handle).setState(sessionId, 'DELIVERING');
+      const outbox = new Outbox(db.handle);
+      for (const kind of ['audio', 'transcript', 'report'] as const) {
+        outbox.enqueue({
+          deliveryPartId: `${kind}:${sessionId}`,
+          kind,
+          sessionId,
+          ordinal: 0,
+          payload: { type: 'text', text: kind },
+        });
+      }
+      db.handle
+        .prepare(
+          `UPDATE telegram_outbox
+              SET state = CASE WHEN kind = ? THEN 'sending' ELSE 'sent' END
+            WHERE session_id = ?`,
+        )
+        .run(finalKind, sessionId);
+      const finalRow = db.handle
+        .prepare('SELECT outbox_id FROM telegram_outbox WHERE session_id = ? AND kind = ?')
+        .get(sessionId, finalKind) as { outbox_id: string };
+
+      assert.throws(
+        () =>
+          outbox.markSent(finalRow.outbox_id, 202, () => {
+            reconcileSessionDelivery(db.handle, sessionId, nullLogger);
+            throw new Error(`injected failure after ${finalKind} domain update`);
+          }),
+        new RegExp(`injected failure after ${finalKind} domain update`),
+      );
+      assert.equal(outbox.stateOf(`${finalKind}:${sessionId}`), 'sending');
+      assert.equal(new SessionRepository(db.handle).get(sessionId)?.state, 'DELIVERING');
+
+      outbox.markSent(finalRow.outbox_id, 202, () => {
+        reconcileSessionDelivery(db.handle, sessionId, nullLogger);
+      });
+      assert.equal(outbox.stateOf(`${finalKind}:${sessionId}`), 'sent');
+      assert.equal(new SessionRepository(db.handle).get(sessionId)?.state, 'DONE');
+    }
+  });
+
   it('marks a split source delivered only after its last chunk is sent', () => {
     seedFinalizedSession('s1');
     const part = db.handle
@@ -680,30 +792,28 @@ describe('session completion and retention handoff', () => {
     }
 
     db.handle
-      .prepare("UPDATE telegram_outbox SET state = 'sent' WHERE delivery_part_id = ?")
-      .run(`audio:${part.part_id}:split0`);
+      .prepare(
+        "UPDATE telegram_outbox SET state = 'sent', updated_at = ? WHERE delivery_part_id = ?",
+      )
+      .run('2026-08-11T10:00:00.000Z', `audio:${part.part_id}:split0`);
     markAudioDelivered(db.handle, part.part_id);
-    assert.equal(
-      (
-        db.handle
-          .prepare('SELECT delivered FROM audio_parts WHERE part_id = ?')
-          .get(part.part_id) as { delivered: number }
-      ).delivered,
-      0,
-    );
+    const partiallySent = db.handle
+      .prepare('SELECT delivered, delivered_at FROM audio_parts WHERE part_id = ?')
+      .get(part.part_id) as { delivered: number; delivered_at: string | null };
+    assert.equal(partiallySent.delivered, 0);
+    assert.equal(partiallySent.delivered_at, null);
 
     db.handle
-      .prepare("UPDATE telegram_outbox SET state = 'sent' WHERE delivery_part_id = ?")
-      .run(`audio:${part.part_id}:split1`);
+      .prepare(
+        "UPDATE telegram_outbox SET state = 'sent', updated_at = ? WHERE delivery_part_id = ?",
+      )
+      .run('2026-08-11T10:05:00.000Z', `audio:${part.part_id}:split1`);
     markAudioDelivered(db.handle, part.part_id);
-    assert.equal(
-      (
-        db.handle
-          .prepare('SELECT delivered FROM audio_parts WHERE part_id = ?')
-          .get(part.part_id) as { delivered: number }
-      ).delivered,
-      1,
-    );
+    const fullySent = db.handle
+      .prepare('SELECT delivered, delivered_at FROM audio_parts WHERE part_id = ?')
+      .get(part.part_id) as { delivered: number; delivered_at: string | null };
+    assert.equal(fullySent.delivered, 1);
+    assert.equal(fullySent.delivered_at, '2026-08-11T10:05:00.000Z');
   });
 
   it('marks a direct source delivered after its single row is sent', () => {
@@ -723,14 +833,50 @@ describe('session completion and retention handoff', () => {
         partId: part.part_id,
       },
     });
-    db.handle.prepare("UPDATE telegram_outbox SET state = 'sent'").run();
+    db.handle
+      .prepare("UPDATE telegram_outbox SET state = 'sent', updated_at = ?")
+      .run('2026-08-11T10:00:00.000Z');
 
     markAudioDelivered(db.handle, part.part_id);
 
     const row = db.handle
-      .prepare('SELECT delivered FROM audio_parts WHERE part_id = ?')
-      .get(part.part_id) as { delivered: number };
+      .prepare('SELECT delivered, delivered_at FROM audio_parts WHERE part_id = ?')
+      .get(part.part_id) as { delivered: number; delivered_at: string | null };
     assert.equal(row.delivered, 1);
+    assert.equal(row.delivered_at, '2026-08-11T10:00:00.000Z');
+  });
+
+  it('refuses an ambiguous direct-plus-split delivery manifest', () => {
+    seedFinalizedSession('s1');
+    const part = db.handle
+      .prepare('SELECT part_id, path FROM audio_parts WHERE session_id = ?')
+      .get('s1') as { part_id: string; path: string };
+    const outbox = new Outbox(db.handle);
+    for (const deliveryPartId of [`audio:${part.part_id}`, `audio:${part.part_id}:split0`]) {
+      outbox.enqueue({
+        deliveryPartId,
+        kind: 'audio',
+        sessionId: 's1',
+        ordinal: 0,
+        payload: {
+          type: 'document',
+          path: part.path,
+          filename: 's1.p000.flac',
+          partId: part.part_id,
+        },
+      });
+    }
+    db.handle
+      .prepare("UPDATE telegram_outbox SET state = 'sent', updated_at = ?")
+      .run('2026-08-11T10:00:00.000Z');
+
+    markAudioDelivered(db.handle, part.part_id);
+
+    const row = db.handle
+      .prepare('SELECT delivered, delivered_at FROM audio_parts WHERE part_id = ?')
+      .get(part.part_id) as { delivered: number; delivered_at: string | null };
+    assert.equal(row.delivered, 0);
+    assert.equal(row.delivered_at, null);
   });
 
   it('marks a session DONE only when every message is sent', async () => {
@@ -801,15 +947,22 @@ describe('session completion and retention handoff', () => {
 
     // The worker loop finishes the chain it queued.
     db.handle.prepare("UPDATE jobs SET state = 'done'").run();
-    db.handle.prepare("UPDATE telegram_outbox SET state = 'sent'").run();
-    db.handle.prepare('UPDATE audio_parts SET delivered = 1').run();
+    db.handle
+      .prepare("UPDATE telegram_outbox SET state = 'sent', updated_at = ?")
+      .run(new Date().toISOString());
+    const part = db.handle
+      .prepare('SELECT part_id FROM audio_parts WHERE session_id = ?')
+      .get('s1') as { part_id: string };
+    markAudioDelivered(db.handle, part.part_id);
     reconcileSessionDelivery(db.handle, 's1', nullLogger);
 
     // Still inside the 48-hour window.
     assert.equal(planRetention(db.handle, CONFIG.retention).candidates.length, 0);
 
-    // Now age it past the window.
+    // Ending the session long ago is insufficient; age the proven ACK itself.
     db.handle.prepare("UPDATE audio_sessions SET ended_at = '2020-01-01T00:00:00.000Z'").run();
+    assert.equal(planRetention(db.handle, CONFIG.retention).candidates.length, 0);
+    db.handle.prepare("UPDATE audio_parts SET delivered_at = '2020-01-01T00:00:00.000Z'").run();
     const plan = planRetention(db.handle, CONFIG.retention);
     assert.equal(plan.candidates.length, 1, 'only now is the audio safe to delete');
   });

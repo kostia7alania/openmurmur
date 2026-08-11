@@ -193,6 +193,128 @@ describe('crash recovery', () => {
     assert.equal(new JobQueue(db.handle).pendingCount('asr'), 1);
   });
 
+  it('recovers published audio after DB finalization failed and retries atomically', async () => {
+    const at = nowIso();
+    const archived = join(paths().audioDir, 'db-finalize.p000.flac');
+    writeFileSync(archived, Buffer.from('published before the database fault'));
+    db.handle
+      .prepare(
+        `INSERT INTO audio_sessions
+           (session_id, state, started_at, ended_at, duration_ms, speech_ms,
+            rejection_reason, created_at, updated_at)
+         VALUES ('db-finalize', 'FAILED', ?, ?, 42000, 30000,
+                 'audio_finalize_failed', ?, ?)`,
+      )
+      .run(at, at, at, at);
+    db.handle
+      .prepare(
+        `INSERT INTO audio_parts
+           (part_id, session_id, part_index, path, started_at, finalized, created_at)
+         VALUES ('db-finalize-p0', 'db-finalize', 0, ?, ?, 0, ?)`,
+      )
+      .run(archived, at, at);
+
+    db.handle.exec(`
+      CREATE TRIGGER inject_initial_job_failure
+      BEFORE INSERT ON jobs
+      WHEN NEW.kind = 'asr'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected initial job failure');
+      END;
+    `);
+    await assert.rejects(
+      recoverAfterCrash(db.handle, paths(), nullLogger),
+      /injected initial job failure/,
+    );
+
+    const afterFault = db.handle
+      .prepare('SELECT state, rejection_reason FROM audio_sessions WHERE session_id = ?')
+      .get('db-finalize') as { state: string; rejection_reason: string };
+    assert.equal(afterFault.state, 'FAILED', 'the session transition rolls back with its jobs');
+    assert.equal(afterFault.rejection_reason, 'audio_finalize_failed');
+    assert.equal(
+      new JobQueue(db.handle).pendingCount(),
+      0,
+      'deliver_audio cannot commit alone before the injected ASR failure',
+    );
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT finalized FROM audio_parts WHERE part_id = ?')
+          .get('db-finalize-p0') as { finalized: number }
+      ).finalized,
+      1,
+      'the separately idempotent archive proof survives for the next startup',
+    );
+
+    db.handle.exec('DROP TRIGGER inject_initial_job_failure');
+    db.handle.exec(`
+      CREATE TRIGGER inject_recovery_status_failure
+      BEFORE INSERT ON telegram_outbox
+      WHEN NEW.delivery_part_id = 'session-status:finalized:db-finalize'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected recovery status failure');
+      END;
+    `);
+    await assert.rejects(
+      recoverAfterCrash(db.handle, paths(), nullLogger),
+      /injected recovery status failure/,
+    );
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT state FROM audio_sessions WHERE session_id = ?')
+          .get('db-finalize') as { state: string }
+      ).state,
+      'FAILED',
+      'the session cannot commit even after both jobs if the final durable write fails',
+    );
+    assert.equal(new JobQueue(db.handle).pendingCount(), 0, 'both initial jobs roll back together');
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT count(*) AS count FROM telegram_outbox WHERE session_id = ?')
+          .get('db-finalize') as { count: number }
+      ).count,
+      0,
+    );
+
+    db.handle.exec('DROP TRIGGER inject_recovery_status_failure');
+    const retried = await recoverAfterCrash(db.handle, paths(), nullLogger);
+    assert.deepEqual(retried.stalledSessions, ['db-finalize']);
+    const recovered = db.handle
+      .prepare(
+        `SELECT state, rejection_reason, duration_ms, speech_ms, part_count
+           FROM audio_sessions WHERE session_id = ?`,
+      )
+      .get('db-finalize') as {
+      state: string;
+      rejection_reason: string | null;
+      duration_ms: number;
+      speech_ms: number;
+      part_count: number;
+    };
+    assert.deepEqual(
+      { ...recovered },
+      {
+        state: 'PROCESSING',
+        rejection_reason: null,
+        duration_ms: 42000,
+        speech_ms: 30000,
+        part_count: 1,
+      },
+    );
+    assert.equal(new JobQueue(db.handle).pendingCount('deliver_audio'), 1);
+    assert.equal(new JobQueue(db.handle).pendingCount('asr'), 1);
+
+    await recoverAfterCrash(db.handle, paths(), nullLogger);
+    assert.equal(
+      new JobQueue(db.handle).pendingCount(),
+      2,
+      'stable recovery creates no duplicates',
+    );
+  });
+
   it('is idempotent, so running it twice queues nothing extra', async () => {
     seedLiveSession('B', 1);
     await recoverAfterCrash(db.handle, paths(), nullLogger);

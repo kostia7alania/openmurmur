@@ -171,9 +171,11 @@ export async function findOrphanedParts(
  * Marks sessions a crash left mid-flight.
  *
  * A session still in ACTIVE or FINALIZING at startup cannot be resumed: the
- * audio stream it was consuming is gone. If it produced no finalized part it
- * is FAILED; if some parts did land, it is handed to the normal pipeline so
- * the user still gets whatever was captured.
+ * audio stream it was consuming is gone. A session provisionally marked
+ * audio_finalize_failed is also recoverable when archive reconciliation has
+ * since proved that a published part survived. If no part landed the session
+ * is FAILED; otherwise it is handed to the normal pipeline so the user still
+ * gets whatever was captured.
  */
 export function reconcileStalledSessions(
   db: DatabaseSync,
@@ -186,7 +188,16 @@ export function reconcileStalledSessions(
               (SELECT count(*) FROM audio_parts p
                 WHERE p.session_id = s.session_id AND p.finalized = 1) AS finalized_parts
          FROM audio_sessions s
-        WHERE s.state IN ('ACTIVE','FINALIZING')`,
+        WHERE s.state IN ('ACTIVE','FINALIZING')
+           OR (
+                s.state = 'FAILED'
+                AND s.rejection_reason = 'audio_finalize_failed'
+                AND EXISTS (
+                      SELECT 1 FROM audio_parts recovered
+                       WHERE recovered.session_id = s.session_id
+                         AND recovered.finalized = 1
+                    )
+              )`,
     )
     .all() as { session_id: string; finalized_parts: number }[];
 
@@ -203,7 +214,7 @@ export function reconcileStalledSessions(
         db.prepare(
           `UPDATE audio_sessions
               SET state = 'PROCESSING', ended_at = COALESCE(ended_at, ?),
-                  part_count = ?, updated_at = ?
+                  part_count = ?, rejection_reason = NULL, updated_at = ?
             WHERE session_id = ?`,
         ).run(nowIso, row.finalized_parts, nowIso, row.session_id);
         const jobs = new JobQueue(db);
