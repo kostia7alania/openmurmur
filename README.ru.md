@@ -36,11 +36,22 @@ SSH: [docs/SERVER.md](docs/SERVER.md).
 git clone https://github.com/kostia7alania/openmurmur.git
 cd openmurmur
 ./scripts/bootstrap
+uv sync --project python/openmurmur_audio --extra mlx
 pnpm openmurmur doctor
 pnpm openmurmur setup
 pnpm openmurmur setup telegram
+pnpm openmurmur capture test
 pnpm openmurmur start
 ```
+
+Команда `uv sync ... --extra mlx` обязательна: `bootstrap` ставит только
+CI-safe набор, без которого Silero и Qwen не запустятся.
+
+Оставьте последнюю команду работать в foreground. Когда в логе появится
+`first audio frame received`, говорите дольше 3 секунд, затем помолчите 60
+секунд. В Telegram должны прийти исходный FLAC, затем транскрипт и отчёт.
+
+В другом терминале статус можно проверить через `pnpm openmurmur status`.
 
 Два шага macOS нельзя автоматизировать безопасно: разрешение микрофона и ввод
 токена Telegram. Секрет хранится только в Keychain.

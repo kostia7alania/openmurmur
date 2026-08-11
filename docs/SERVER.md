@@ -75,10 +75,12 @@ pnpm openmurmur doctor --json
 The JSON form is the one to parse. Every entry has `name`, `level`
 (`ok`/`warn`/`fail`/`info`) and `detail`. Proceed when no entry is `fail`.
 
-One warning is expected and does not block anything:
+Two warnings are expected before setup and do not block anything:
 
 - `state_directory ... missing` — until step 2. `sqlite` should be green with
   the pinned Node from `.nvmrc`.
+- `telegram_setup ... not found` — until step 4. This is a metadata-only
+  Keychain readiness check; it does not read the token or contact Telegram.
 
 ## Step 2 — State directory
 

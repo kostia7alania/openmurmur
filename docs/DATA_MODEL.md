@@ -58,11 +58,15 @@ One row per physical FLAC file.
 | `sha256` | Computed after the atomic rename. |
 | `finalized` | 1 once closed, fsynced and renamed. **Retention requires this.** |
 | `delivered` | 1 once Telegram confirmed *this exact part*. **Retention requires this.** |
+| `delivered_at` | UTC time of the last acknowledgement in this part's exact direct or split manifest. NULL means the time is not proven and blocks retention. |
 | `deleted_at` | Set only after the file is really gone from disk. |
 
-The three flags `finalized`, `sha256 IS NOT NULL` and `delivered` are checked
-independently by retention rather than being inferred from session state,
-because each represents a distinct way to lose a user's recording.
+The facts `finalized`, `sha256 IS NOT NULL`, `delivered` and `delivered_at` are
+checked independently by retention rather than being inferred from session
+state, because each represents a distinct way to lose a user's recording.
+`delivered_at` is written only for one unambiguous manifest: either a single
+direct upload or a contiguous `split0..splitN` set whose every row is `sent` and
+belongs to the same session. Legacy absence or ambiguity stays NULL.
 
 Atomic rename necessarily precedes the SQLite update. If the process dies in
 that gap, startup scans non-finalized part rows whose archive path now exists,
@@ -236,18 +240,20 @@ by tests.
    at `path` (unless `deleted_at` is set).
 2. `sha256` is non-null exactly when the file was hashed after its rename.
 3. `delivered = 1` means Telegram acknowledged *that specific part*.
-4. Exactly one `transcript_revisions` row per owner has `is_current = 1`.
-5. A transcript revision belongs to a session **or** an incoming file, never
+4. `delivered_at` is the last acknowledgement in its proven direct/split audio
+   manifest and never moves backwards.
+5. Exactly one `transcript_revisions` row per owner has `is_current = 1`.
+6. A transcript revision belongs to a session **or** an incoming file, never
    both and never neither (`CHECK`).
-6. `jobs.idempotency_key` is unique, so a unit of work exists at most once.
-7. `telegram_outbox.delivery_part_id` is unique, so a logical delivery unit is
+7. `jobs.idempotency_key` is unique, so a unit of work exists at most once.
+8. `telegram_outbox.delivery_part_id` is unique, so a logical delivery unit is
    enqueued at most once. Telegram acceptance remains at-least-once across the
    network/SQLite acknowledgement window.
-8. `(telegram_updates.bot_scope, update_id)` is unique; handled updates are
+9. `(telegram_updates.bot_scope, update_id)` is unique; handled updates are
    ignored and unhandled updates are safely re-driven through bot-scoped
    idempotent work keys.
-9. `deleted_at` is set only after `rm` succeeded.
-10. All timestamps are UTC.
+10. `deleted_at` is set only after `rm` succeeded.
+11. All timestamps are UTC.
 
 ## Retention eligibility
 
@@ -258,8 +264,9 @@ The single most important query in the system. Audio is deletable only when
 p.finalized = 1                     -- the file was closed, fsynced, renamed
 AND p.sha256 IS NOT NULL            -- and hashed
 AND p.delivered = 1                 -- Telegram confirmed this exact part
+AND p.delivered_at <= :cutoff       -- the window elapsed after its last ACK
 AND s.state = 'DONE'                -- the whole session completed
-AND s.ended_at <= :cutoff           -- and is older than the retention window
+AND s.ended_at IS NOT NULL           -- its recording facts are complete
 AND EXISTS (current transcript revision)
 AND EXISTS (transcript outbox row in state 'sent')
 AND NOT EXISTS (outbox row still pending/sending for this session)
@@ -267,6 +274,11 @@ AND NOT EXISTS (job still pending/leased for this session)
 ```
 
 If any fact is missing, the file stays and `retention dry-run` reports **why**.
+
+An `insufficient_speech` rejection happens before upload, so its shorter cleanup
+window starts at `audio_sessions.ended_at`. `asr_empty` and
+`insufficient_words` happen after audio-first delivery; those parts use the
+ordinary delivered-audio window from `delivered_at` instead.
 
 The LLM has no involvement. Eligibility is pure SQL over recorded facts.
 
@@ -282,8 +294,8 @@ Inside that daemon, one writer at a time. Write transactions use
 with `SQLITE_BUSY` instead of deadlocking after doing work. No transaction
 performs I/O, so all of them are short.
 
-Readers (health checks, `/status`, `openmurmur status`) use WAL snapshots and
-never block the recorder.
+Readers (health checks, `/status`, `pnpm openmurmur status`) use WAL snapshots
+and never block the recorder.
 
 ## Migrations
 

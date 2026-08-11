@@ -61,10 +61,11 @@ tool, and no configuration changes that.
 
 | Data | Default retention eligibility threshold |
 | --- | --- |
-| Session audio | 48 hours after confirmed delivery |
+| Session audio | 48 hours after the last confirmed upload for that exact part |
 | Transcripts | Indefinitely |
 | Summaries | Indefinitely |
-| Rejected-session audio | 6 hours |
+| Rejected before delivery (`insufficient_speech`) | 6 hours after session end |
+| Rejected after audio delivery | 48 hours after the last confirmed upload for that exact part |
 | Incoming Telegram audio | 24 hours after confirmed transcript delivery |
 | Quarantined/failed files | 7 days |
 | Logs | Until you delete them |
@@ -74,13 +75,16 @@ not permission to delete without proof. The running daemon evaluates the same
 proof-based retention plan hourly.
 
 Audio is deleted only when the database can prove it is safe: finalized,
-checksummed, delivered, transcript delivered, no pending work. `openmurmur
-retention dry-run` shows exactly what would go and why anything is being kept.
+checksummed, delivered at a known time, transcript delivered, no pending work.
+The delivery clock is the final Telegram acknowledgement for one exact direct or
+split manifest, never the earlier session end. Legacy or ambiguous delivery
+records have no proven clock and remain on disk. `pnpm openmurmur retention
+dry-run` shows exactly what would go and why anything is being kept.
 
 ## Deleting everything
 
 ```bash
-openmurmur stop
+pnpm openmurmur stop
 ```
 
 ```bash

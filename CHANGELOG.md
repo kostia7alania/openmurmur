@@ -25,6 +25,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Slow VAD, encoding or fsync no longer pushes back into FFmpeg's microphone
+  pipe.** Capture drains into a bounded 30-second PCM queue, preserves source
+  timestamp cadence, exposes processing lag separately from microphone silence,
+  and fails visibly on overload or child-process failure. Sleep and stop also
+  invalidate buffered pre-boundary audio, and a stuck FFmpeg receives a bounded
+  SIGKILL fallback.
+- Retention for delivered audio now starts at the final Telegram
+  acknowledgement for that exact direct or split upload, not at the earlier
+  session end. Ambiguous legacy manifests remain on disk with no guessed
+  deletion clock; ASR-rejected but already delivered audio gets the ordinary
+  delivery window instead of the short pre-delivery rejection window.
+- **launchd upgrades are now drift-aware and transactional.** The installer
+  validates the exact Node/SQLite runtime before writes, persists the canonical
+  state root, offers a read-only `--check`, validates rendered plists, and rolls
+  both services back together if publication, registration or bounded
+  audio-frame readiness fails.
+- Clean-machine bootstrap no longer assumes Corepack (which the pinned Node
+  build does not provide): it provisions and re-verifies exactly pnpm 10.19.0
+  through npm before installing dependencies.
+- Node, embedded SQLite and pnpm requirements now come from one validated
+  runtime contract shared by bootstrap, doctor, the database boundary, CI
+  drift tests and the launchd installer.
+- ASR worker timeout, crash and shutdown paths are generation-scoped and
+  bounded: stale child events cannot retire a replacement, shutdown cannot
+  respawn work, and a child that ignores SIGTERM receives a SIGKILL fallback.
+- Local status now distinguishes pending from dead work and trusts recorder
+  state only while a matching, live daemon heartbeat is fresh. Doctor reports
+  Telegram Keychain setup from metadata without reading the token value.
+- Daemon PID records now include the OS process birth marker; `status` and
+  `stop` fail closed when a live PID belongs to a different process generation.
+- Startup recovers a published audio part whose database finalization failed
+  and atomically restores its delivery, ASR and durable status work.
+- Telegram health, incoming-media rejection, exhausted-job and capture-failure
+  messages now use stable Russian copy while technical exceptions remain only
+  in the redacted local log.
+- Telegram setup now publishes the credential-scoped update cursor before the
+  atomic Keychain pair. A configured bot with no matching cursor fails closed
+  instead of replaying history from offset zero.
+- Removed the unimplemented `telegram.summarizeIncoming` setting; old config
+  files receive an explicit migration error instead of a false promise that
+  incoming audio will be summarized.
+- The CI private-key scan now applies its exclusions correctly and no longer
+  matches its own regular-expression source line.
+- Setup and install guidance now uses the checkout-local `pnpm openmurmur`
+  command and takes a new operator through a complete first recorded session,
+  including the MLX environment, microphone check and expected Telegram order.
 - **A mixed-language transcript reported only one language.** A real
   Thai-English conversation — 108 Thai characters, 195 Latin — was stored and
   indexed as `["th"]`. The transcription was right; the label was not, and the

@@ -114,14 +114,16 @@ confirmed before Keychain persistence.
 
 **Risk:** OpenMurmur deletes audio the user still needed.
 
-**Mitigations:** retention requires positive proof of six independent facts
-(finalized, hashed, part delivered, session DONE, transcript exists, transcript
-delivered) plus the absence of pending work. `dry-run` prints exactly what
-`apply` will do, and *why* each retained file is being kept. The LLM has no
-involvement. Deletion is recorded only after `rm` succeeds.
+**Mitigations:** retention requires positive proof that the part is finalized
+and hashed, its exact upload manifest was acknowledged at a known time, the
+configured window elapsed after that acknowledgement, the session is DONE, and
+the transcript exists and was delivered, plus the absence of pending work.
+`dry-run` prints exactly what `apply` will do, and *why* each retained file is
+being kept. The LLM has no involvement. Deletion is recorded only after `rm`
+succeeds.
 
-**Status:** eight "must never delete" cases are covered by tests, each breaking
-exactly one condition.
+**Status:** the dedicated "must never delete" matrix breaks each required proof
+in isolation and confirms that the file remains held.
 
 ### T6 — Silent recording failure
 

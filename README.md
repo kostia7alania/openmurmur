@@ -83,6 +83,13 @@ cd openmurmur
 ```
 
 ```bash
+uv sync --project python/openmurmur_audio --extra mlx
+```
+
+`bootstrap` deliberately installs only the CI-safe Python subset. The MLX extra
+above is required for both Silero speech detection and Qwen transcription.
+
+```bash
 pnpm openmurmur doctor
 ```
 
@@ -102,17 +109,24 @@ pnpm openmurmur capture test
 pnpm openmurmur start
 ```
 
+Keep that terminal open. After the log says `first audio frame received`, speak
+for more than 3 seconds, then stop and wait for 60 seconds of silence. Telegram
+should receive the source FLAC first, then the transcript, then the report.
+
+In another terminal:
+
 ```bash
 pnpm openmurmur status
 ```
 
-Budget 10–15 minutes to your first Telegram status message, not counting model
-downloads.
+Budget 10–15 minutes to your first complete session in Telegram, not counting
+model downloads.
 
 ### Creating the bot
 
-Before `setup telegram`, message [@BotFather](https://t.me/BotFather) on
-Telegram, send `/newbot`, and keep the token it gives you. `setup telegram`
+Before `pnpm openmurmur setup telegram`, message
+[@BotFather](https://t.me/BotFather) on
+Telegram, send `/newbot`, and keep the token it gives you. The setup flow
 will ask for it with hidden input and store it in the macOS Keychain. It is
 never written to the config file, argv, an env var, a launchd plist, or a log.
 Setup drains the old update backlog and binds only to a new `/start` from an
@@ -164,7 +178,7 @@ IDLE ──speech 500ms──▶ SPEECH_CANDIDATE ──sustained──▶ ACTIV
 - Sessions with under 3 seconds of speech are rejected before delivery. If ASR
   later finds fewer than 5 words, the already queued source audio is preserved,
   but the empty transcript and report are suppressed so the chat stays usable.
-- Transcripts stay searchable: `openmurmur search "встреч"` matches "Встреча",
+- Transcripts stay searchable: `pnpm openmurmur search "встреч"` matches "Встреча",
   because the index is trigram rather than whitespace-tokenized — which is also
   what makes Thai searchable at all.
 - Recording never waits for post-session ASR, summarization or Telegram. A new
@@ -180,8 +194,8 @@ dot and no persistent notification. macOS already handles this and doing it
 twice is worse than doing it once:
 
 - macOS prompts for microphone permission the first time capture starts. Run
-  `openmurmur capture test` from a terminal so the prompt appears while you are
-  at the keyboard.
+  `pnpm openmurmur capture test` from a terminal so the prompt appears while
+  you are at the keyboard.
 - macOS shows an **orange dot** near Control Center whenever the microphone is
   open. (Orange = microphone. Green = camera. OpenMurmur never uses the camera.)
 - OpenMurmur does not attempt to hide, replace or suppress that indicator.
@@ -215,7 +229,7 @@ iTerm, or the launchd agent. Consequences worth knowing:
 - A launchd agent may not be able to show a prompt at all. Grant permission
   interactively once, then install the agent.
 - macOS updates and some system changes can reset TCC. Re-run
-  `openmurmur capture test` after a major update.
+  `pnpm openmurmur capture test` after a major update.
 - An unsigned binary's TCC grant is keyed to its path and content. Rebuilding or
   moving it can invalidate the grant. A signed helper is on the P1 roadmap.
 
@@ -315,23 +329,23 @@ able to stop your recorder or delete your data.
 ## CLI
 
 ```bash
-openmurmur doctor              # check every dependency (read-only)
-openmurmur setup               # create dirs, config, database (shows a plan first)
-openmurmur setup telegram      # connect a bot (hidden token prompt)
-openmurmur capture test        # record 5s and report levels
-openmurmur recover             # report what an unclean shutdown left behind
-openmurmur start               # run the daemon
-openmurmur stop                # stop a running daemon
-openmurmur status              # local status, no network
-openmurmur jobs failed         # show exhausted jobs and their causes
-openmurmur jobs retry JOB_ID   # retry one job after fixing its cause
-openmurmur telegram test       # send a test message
-openmurmur telegram poll       # poll once and show routing decisions
-openmurmur search TEXT         # search every stored transcript
-openmurmur transcribe FILE     # transcribe one file locally
-openmurmur digest 2026-07-29   # build, queue and print a daily digest
-openmurmur retention dry-run   # show what would be deleted, and why not
-openmurmur retention apply     # delete only what dry-run proved eligible
+pnpm openmurmur doctor              # check every dependency (read-only)
+pnpm openmurmur setup               # create dirs, config, database (shows a plan first)
+pnpm openmurmur setup telegram      # connect a bot (hidden token prompt)
+pnpm openmurmur capture test        # record 5s and report levels
+pnpm openmurmur recover             # report what an unclean shutdown left behind
+pnpm openmurmur start               # run the daemon
+pnpm openmurmur stop                # stop a running daemon
+pnpm openmurmur status              # local status, no network
+pnpm openmurmur jobs failed         # show exhausted jobs and their causes
+pnpm openmurmur jobs retry JOB_ID   # retry one job after fixing its cause
+pnpm openmurmur telegram test       # send a test message
+pnpm openmurmur telegram poll       # poll once and show routing decisions
+pnpm openmurmur search TEXT         # search every stored transcript
+pnpm openmurmur transcribe FILE     # transcribe one file locally
+pnpm openmurmur digest 2026-07-29   # build, queue and print a daily digest
+pnpm openmurmur retention dry-run   # show what would be deleted, and why not
+pnpm openmurmur retention apply     # delete only what dry-run proved eligible
 ```
 
 ## Running in the background
@@ -415,16 +429,22 @@ Neither needs a microphone, a model, or a network.
 
 Honesty matters more than a green badge, so:
 
-**Verified on this revision by the offline TypeScript and Python test suites:**
+**Verified on this revision by 459 offline TypeScript tests (90 suites) and 36
+Python tests:**
 sessionizer state machine with a fake clock, pre-roll,
-60-second close, 15-minute rotation, atomic FLAC and Markdown publication,
-lossless splitting, ffprobe validation of real media, staged audio-first
-delivery, lifecycle-status ordering, transcript revisions, job leases and crash
-recovery, outbox idempotency, 429 handling, Telegram endpoint confinement,
-HTML escaping, Unicode splitting, path traversal, chat allowlisting, update
-deduplication, secret redaction, prompt-injection fencing, proof-based retention,
-health deduplication and migrations. Model-facing automated tests use fake
-adapters and do not download weights.
+60-second close, 15-minute rotation, bounded capture ingress and sleep epochs,
+atomic FLAC and Markdown publication, lossless splitting, ffprobe validation of
+real media, staged audio-first delivery, delivery-clock retention proofs,
+lifecycle-status ordering, transcript revisions, job leases, worker timeout
+recycling and crash recovery, actionable failed-job diagnostics and retry,
+outbox idempotency, 429 handling, Telegram endpoint confinement, metadata-only
+Keychain readiness, fail-closed local status heartbeats, daemon PID birth
+identity, launchd drift/readiness/rollback checks, crash recovery after a
+published-part database fault, stable Russian failure boundaries, HTML
+escaping, Unicode splitting, path traversal, chat allowlisting, update
+deduplication, secret redaction, prompt-injection fencing, health deduplication
+and migrations.
+Model-facing automated tests use fake adapters and do not download weights.
 
 [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records earlier same-machine
 smoke runs of the pinned MLX/Qwen, Silero and Ollama dependencies. Those runs

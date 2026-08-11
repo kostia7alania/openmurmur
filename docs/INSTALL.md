@@ -136,10 +136,13 @@ git clone https://github.com/kostia7alania/openmurmur.git ~/openmurmur && cd ~/o
 ./scripts/bootstrap
 ```
 
-`bootstrap` installs pnpm (via corepack), `uv`, the Node dependencies and the
+`bootstrap` installs the pinned pnpm via npm, `uv`, the Node dependencies and the
 CI-safe Python subset. It is idempotent — re-run it whenever something looks
 wrong. It deliberately installs **no models**, preserves an already-installed
 local model stack, and never touches the Keychain.
+
+This source checkout does not install a global `openmurmur` binary. Run the
+commands below from the repository as `pnpm openmurmur ...`.
 
 ## 7. The local model stack
 
@@ -172,14 +175,17 @@ Read the output. It is the difference between "it should work" and "it does":
 ✅ speech_detection   Silero VAD answered in 1291 ms
 ✅ ollama             qwen3.6:27b available at http://127.0.0.1:11434
 ⚠️  state_directory    ... (missing or not writable)
+⚠️  telegram_setup    no Telegram credential items found in the macOS Keychain
 ```
 
 `speech_detection` really starts the worker and scores a frame, so a green tick
 there means Silero loads on your machine, not that the config says it should.
 
-`state_directory` is expected to warn before step 9. `sqlite` should be green
-with the pinned Node from `.nvmrc`; if it is not, run `nvm install && nvm use`
-and check [ADR 0004](adr/0004-sqlite-driver.md).
+`state_directory` and `telegram_setup` are expected to warn before steps 9 and
+10. The Telegram check reads item metadata only: it never reads the token or
+contacts Telegram. `sqlite` should be green with the pinned Node from `.nvmrc`;
+if it is not, run `nvm install && nvm use` and check
+[ADR 0004](adr/0004-sqlite-driver.md).
 
 ## 9. Create the state directory
 
@@ -239,9 +245,10 @@ Foreground first, so you can see what it does:
 pnpm openmurmur start
 ```
 
-Speak. Within a second or two the log says `session started`; stop talking and
-60 seconds later the session closes, is transcribed, summarized and delivered.
-`Ctrl-C` stops it and finalizes whatever was recording.
+Wait until the log says `first audio frame received`, then speak for more than
+3 seconds. Stop talking and wait for 60 seconds of silence. Telegram should
+receive the source FLAC first, then the transcript, then the report. `Ctrl-C`
+stops the daemon and finalizes whatever was recording.
 
 The first transcription is slow — it downloads Qwen3-ASR-1.7B (~2 GB) and loads
 it. After that the model stays resident and a session is transcribed in a
@@ -252,8 +259,28 @@ fraction of its duration.
 Only after the microphone permission is granted (step 10):
 
 ```bash
+./scripts/install-launch-agents --check
+```
+
+The first check is read-only and exits non-zero when the installed runtime,
+state root, plist content or launchd registration differs from this checkout.
+A fresh machine reports the agents and labels as missing, which is expected.
+Then install them:
+
+```bash
 ./scripts/install-launch-agents
 ```
+
+If you keep state outside the default directory, pass the same canonical root
+to both commands with `--root DIR`. The installer persists it in the daemon and
+digest arguments; the background service does not depend on an interactive
+shell's `OPENMURMUR_HOME`.
+
+Installation commits only after launchd reports both labels registered and the
+daemon's local `status --json` shows a fresh heartbeat, a running recorder and
+at least one real audio frame. The probe is bounded to 20 seconds and reads no
+Keychain value or network service. If readiness never becomes true, both plist
+files and the previously loaded service set are restored where possible.
 
 ```bash
 pnpm openmurmur status

@@ -276,11 +276,14 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Scope:** Eligibility proof, blocked-file reporting, `apply` executing exactly
   the printed plan.
 - **Non-goals:** Any LLM involvement.
-- **Acceptance:** Undelivered audio is never listed; every retained file has a
-  stated reason.
+- **Acceptance:** Undelivered audio is never listed; delivered audio ages from
+  the last proven Telegram acknowledgement for its exact direct/split manifest,
+  never from session end; missing or ambiguous legacy proof keeps the file;
+  every retained file has a stated reason.
 - **Dependencies:** P0-15 · **Risk:** high (irreversible) · **Estimate:** M
 - **Tests:** A dedicated "must never delete" matrix covers every required proof,
-  alongside dry-run/apply agreement.
+  delayed delivery versus old session end, direct and split acknowledgement
+  clocks, fail-closed legacy backfill, and dry-run/apply agreement.
 
 ### P0-23 ✅ Health transitions
 
@@ -315,7 +318,8 @@ dependencies, risk, estimate (S/M/L), release, tests.
 ### P0-25 ✅ Quick start
 
 - **Epic:** Documentation
-- **User value:** First Telegram message within 10–15 minutes.
+- **User value:** First complete FLAC → transcript → report session within
+  10–15 minutes, excluding model downloads and the 60-second silence close.
 - **Scope:** README with requirements, model sizes, disk usage, TCC, the orange
   indicator, sleep behaviour, the Telegram boundary and limits, and the legal
   warning.
@@ -335,7 +339,8 @@ The 2026-08-09 repair pass implemented the yellow items below with offline
 tests. They remain yellow where their full fault-injection matrix or a live
 microphone/model/Telegram/launchd check is still outstanding. AR-06 and AR-11
 are green because their bounded guarantees are covered entirely by the offline
-suite. AR-07 and AR-14 remain untouched.
+suite. At that cut AR-07 and AR-14 were untouched; AR-07's later 2026-08-11
+offline slice is recorded on the item itself below.
 
 ### Current UX slice
 
@@ -504,9 +509,11 @@ suite. AR-07 and AR-14 remain untouched.
   content plus Markdown/HTML/UTF-16 boundary cases.
 - **Current evidence:** Transcript/report/digest Markdown chrome, provenance,
   status labels, command descriptions and the curated `README.ru.md` are
-  implemented and covered by offline render/transport tests. Health and media
-  rejection copy still need the same stable Russian error boundary, so this
-  item is not complete.
+  implemented and covered by offline render/transport tests. Health, incoming
+  media rejection, exhausted incoming jobs and capture failures now use stable
+  Russian user copy while raw adapter/process errors stay in the redacted local
+  log. Live Bot API rendering and the complete multilingual golden matrix still
+  keep this item yellow.
 
 #### UX-09 🟡 Diagnose and safely retry exhausted jobs
 
@@ -549,6 +556,12 @@ suite. AR-07 and AR-14 remain untouched.
   test, graceful shutdown and close/start race tests proving the shutdown latch,
   timeout fencing with a fresh child, and a repeated-job resource-leak
   regression test.
+- **2026-08-11 evidence:** `WorkerProcess` now owns generation-scoped child,
+  request and output state; timeout, non-zero exit and intentional close use a
+  bounded TERM/KILL join; restart waits for cleanup; and late events from the
+  retired child cannot clear its replacement. Offline timeout/restart,
+  shutdown-latch and stale-handler regressions pass. This remains yellow until
+  repeated real-model jobs and process/resource cleanup are exercised live.
 
 #### AR-02 🟡 Make state transitions crash-consistent
 
@@ -567,11 +580,19 @@ suite. AR-07 and AR-14 remain untouched.
   boundaries; restart repeatedly until the stable result is reached; assertions
   for no lost jobs, orphaned archives, duplicate domain transitions, or skipped
   Telegram updates.
+- **2026-08-11 evidence:** When archive publication succeeds but its database
+  finalization fails, startup now proves the surviving part and atomically
+  restores the provisional `audio_finalize_failed` session to `PROCESSING`
+  with audio delivery, ASR and durable status work. Faults at the ASR-job and
+  status writes roll the whole transition back; repeated startup converges
+  without duplicates. Separate callback fault injection also proves that an
+  outbox `sent` row commits atomically with audio delivery time and the final
+  transcript/report `DONE` transition; retry converges after rollback.
 - **Remaining evidence gap:** Recovery proves and republishes a FLAC renamed
   before its database update, but cannot reconstruct the exact monotonic
-  `duration_ms` / `speech_ms` lost in that crash window. Keep AR-02 yellow until
-  those facts are journaled before publication or the limitation has an
-  explicit data-model contract and fault-injection test.
+  `duration_ms` / `speech_ms` lost in a hard-crash window. Sent-delivery to
+  domain-state and Telegram-update to durable-outcome fault matrices also
+  remain. Keep AR-02 yellow until those boundaries have equivalent evidence.
 
 #### AR-03 🟡 Make incoming Telegram retry and deduplication recoverable
 
@@ -603,6 +624,12 @@ suite. AR-07 and AR-14 remain untouched.
 - **Tests:** Concurrent-start race, stale/reused PID, capture startup failure,
   capture EOF, first and second signal during slow finalization, and launchd
   exit-status contract tests.
+- **2026-08-11 evidence:** PID publication already uses an exclusive create;
+  the record now also stores the OS process birth marker. `status` and `stop`
+  require that marker and the daemon command to match, so a reused PID or a
+  legacy record without exact identity cannot be signalled. Unexpected capture
+  EOF already exits as failure. Repeated real signals during slow finalization
+  and a live launchd restart remain before this item can turn green.
 
 #### AR-05 🟡 Bind Telegram only to a fresh explicit `/start`
 
@@ -621,15 +648,16 @@ suite. AR-07 and AR-14 remain untouched.
   messages, multiple users, a fresh `/start`, cancellation, restart before
   Keychain persistence, atomic pair-write failure, and rollback after the
   matching SQLite offset or confirmation fails.
-- **Remaining evidence gap:** Keychain and SQLite cannot share a crash-atomic
-  transaction. A hard process death between publishing a new credential pair
-  and its offset can leave a complete new pair with the previous bot's cursor;
-  keep AR-05 yellow until startup detects and reconciles credential identity.
-  The 2026-08-09 repair also fixed a real macOS integration defect: a piped
-  `security ... -w` stored an empty password. Setup now drives the two-prompt
-  Keychain flow through a private PTY, while the credential itself remains on
-  stdin and outside argv/env/files. The PTY path was exercised against a
-  disposable Keychain item; a fresh real-bot setup is still required.
+- **2026-08-11 evidence:** Setup now publishes the SHA-256 credential-scoped
+  cursor before atomically replacing the combined Keychain pair. A death before
+  the Keychain write leaves only inactive non-secret metadata; a death after it
+  leaves a matching cursor. Startup refuses to poll a concrete credential scope
+  with no cursor, and ordinary rollback restores same-scope cursors or removes
+  unused new-scope state. The private PTY keeps the credential off argv, env and
+  files. With the same bot token and a changed chat, a death between cursor and
+  Keychain publication may skip updates for the old chat, but cannot replay
+  history or bind an unconfirmed chat. Keep AR-05 yellow until a fresh real-bot
+  setup and disposable Keychain run repeat this evidence on macOS.
 
 #### AR-06 ✅ Enforce local-only LLM endpoints
 
@@ -645,7 +673,7 @@ suite. AR-07 and AR-14 remain untouched.
   notation, credentials, malformed URL, and redirect negatives; assertion that
   rejected configuration makes no request.
 
-#### AR-07 ⬜ Remove processing and timestamp distortion from the recorder hot path
+#### AR-07 🟡 Remove processing and timestamp distortion from the recorder hot path
 
 - **Severity:** P0 · **Epic:** Capture/sessionizer · **Estimate:** L
 - **Risk:** Per-frame VAD and writer awaits can block capture for seconds, while
@@ -660,6 +688,16 @@ suite. AR-07 and AR-14 remain untouched.
 - **Tests:** Delayed/wedged VAD, pipe backpressure, slow part close, queue
   saturation, encoder early exit, and monotonic timing tests using a fake clock
   rather than sleeps.
+- **Implemented offline (2026-08-11):** FFmpeg stdout now has an independent,
+  bounded 30-second PCM pump; ingress age and processing lag are reported
+  separately; timestamps preserve sample cadence; overload and non-zero child
+  exit fail visibly without draining stale audio; stop has a bounded SIGKILL
+  fallback; recorder mutations and sleep boundaries are serialized with stream
+  epochs. Unit and fake-child integration coverage includes overflow/retry,
+  non-zero exit, ignored SIGTERM, buffered stop, discontinuity and a VAD-blocked
+  stop. Still yellow until real AVFoundation chunk cadence and lid sleep/wake are
+  exercised; the 250 ms discontinuity threshold may need calibration from that
+  evidence.
 
 #### AR-15 ⬜ Designate one input owner per Telegram bot token
 
@@ -735,8 +773,11 @@ suite. AR-07 and AR-14 remain untouched.
   and alert cooldown/deduplication.
 - **Current evidence:** Pending/dead counts are separate in local and Telegram
   status; exhausted jobs expose bounded local diagnostics and fingerprinted
-  alerts with explicit retry. Full live Keychain/worker/digest recovery evidence
-  is still outstanding, so the item remains yellow.
+  alerts with explicit retry. Recorder/session state is exposed only from a
+  fresh heartbeat whose PID and start identity match the live daemon, and
+  doctor checks Telegram setup metadata without reading the token. Full live
+  Keychain/worker/digest recovery evidence is still outstanding, so the item
+  remains yellow.
 
 #### AR-11 ✅ Remove the duplicated session-opening frame
 
@@ -771,11 +812,9 @@ suite. AR-07 and AR-14 remain untouched.
 #### AR-13 🟡 Remove dead configuration and synchronize CI/docs with runtime
 
 - **Severity:** P1 · **Epic:** Maintenance · **Estimate:** M
-- **Risk:** `maxConcurrentIncomingJobs`, `summarizeIncoming`, `digest.timezone`,
-  and `vadFrameMs` are documented/configurable but not honored; incoming-audio
-  docs promise behaviour not implemented; CI and doctor validate Node versions
-  below the declared 26.7.0 floor; verified/unverified claims conflict across
-  README, dependency docs, and the original backlog.
+- **Risk:** `maxConcurrentIncomingJobs` remains public but is not honored;
+  incoming-audio and runtime evidence can drift across config, CI, doctor and
+  documentation.
 - **Acceptance:** Every public config field is either implemented and tested or
   removed through an explicit migration; incoming attachment/summary behaviour
   matches code; CI, `.nvmrc`, `package.json`, bootstrap, and doctor validate the
@@ -787,6 +826,16 @@ suite. AR-07 and AR-14 remain untouched.
 - **Tests:** Config field usage/round-trip checks, unknown/deprecated key tests,
   incoming UX tests, CI version assertion, doctor fixtures at the exact version
   boundary, documentation link/checklist review, and full repository checks.
+- **2026-08-11 evidence:** `runtime-requirements.json` is now the validated
+  source for Node, embedded SQLite and pnpm requirements used by bootstrap,
+  launchd installation, doctor and the database boundary. Drift tests enforce
+  alignment with `.nvmrc`, `package.json` and CI. `digest.timezone` is exercised
+  through scheduling/day-boundary/render tests, while the unimplemented
+  `telegram.summarizeIncoming` option was removed with an explicit migration
+  error and transcript-only docs. `sessionizer.vadFrameMs` was also removed with
+  an explicit fixed-32-ms protocol migration error. `maxConcurrentIncomingJobs`
+  and the consolidated live-evidence table remain before this item can turn
+  green.
 
 #### AR-14 ⬜ Review jurisdiction-specific recording guidance
 

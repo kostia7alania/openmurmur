@@ -62,9 +62,9 @@ verifies: an actionable `model_load_failed` or `vad_unavailable` naming the
 `uv sync --extra mlx` command.
 
 **The extra is not optional in practice.** Without it there is no speech
-detection and no transcription — `openmurmur doctor` reports `speech_detection`
-as a failure, because it starts the worker and scores a frame rather than
-reading the config back.
+detection and no transcription — `pnpm openmurmur doctor` reports
+`speech_detection` as a failure, because it starts the worker and scores a frame
+rather than reading the config back.
 
 Silero's **segment-assembly logic** is separately covered by pure Python tests,
 which take a list of probabilities and need no model.

@@ -45,7 +45,7 @@ SQLite database holds durable work, and one Telegram chat receives delivery.
 
 ## Processes
 
-### 1. The daemon (`openmurmur start`)
+### 1. The daemon (`pnpm openmurmur start` from the repository checkout)
 
 A single Node process running cooperating loops. They are independent on
 purpose: a wedged post-session model, an offline Telegram or a full outbox slows
@@ -62,10 +62,15 @@ its own loop and does not stop capture.
 | Digest scheduler | 5 min | Evaluates the configured local/IANA timezone window and transactionally stores and enqueues one daily digest. |
 | Retention scheduler | 1 h | Applies only the candidates proven eligible by the retention query. |
 
-The recorder is the only loop that must never fall behind. No model inference or
-network request runs during session finalization: it records the state and
-enqueues durable jobs, then returns to capture. Lifecycle notifications likewise
-enqueue local outbox rows and never wait for Telegram.
+The FFmpeg stdout pump is the only loop that must never fall behind. It drains
+PCM into a bounded 30-second frame queue and timestamps frames from source
+cadence, independently of VAD, encoding, fsync and hashing. If processing falls
+past that explicit bound, capture stops and reports an error instead of silently
+dropping audio. Source gaps advance a stream epoch, so buffered audio from before
+sleep cannot open a session after wake. No model inference or network request
+runs during session finalization: it records the state and enqueues durable jobs.
+Lifecycle notifications likewise enqueue local outbox rows and never wait for
+Telegram.
 
 ### 2. Model backend ownership
 

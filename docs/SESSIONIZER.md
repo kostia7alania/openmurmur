@@ -51,8 +51,9 @@ microphone is hearing speech right now.
 If the worker stops answering, the recorder keeps running on the energy gate
 rather than stopping: a degraded journal beats no journal. This is never silent
 — the daemon sends 🟡 to Telegram naming the reason, retries Silero once a
-minute, and sends 🟢 when it recovers. `openmurmur doctor` reports the detector
-by actually starting it and scoring a frame, not by reading the config back.
+minute, and sends 🟢 when it recovers. `pnpm openmurmur doctor` reports the
+detector by actually starting it and scoring a frame, not by reading the config
+back.
 
 Setting `sessionizer.vadBackend` to `"energy"` makes the gate permanent. It is
 never selected automatically, because it changes what "a speech session" means.
@@ -176,11 +177,12 @@ Two gates, applied at different times, keep the chat usable.
 Both are configurable. Both record the reason in `audio_sessions.rejection_reason`.
 
 A speech-duration rejection **still gets its audio part closed properly**, but
-does not enqueue it for Telegram. The word-count gate is later: audio delivery
-is already independent of ASR, so that gate suppresses only the empty transcript
-and report and cannot retract audio already queued or sent. Rejected audio stays
-valid on disk and is kept for `rejectedSessionHours` (default 6) before it can
-become retention-eligible.
+does not enqueue it for Telegram. It uses `rejectedSessionHours` (default 6)
+from session end. The word-count gate is later: audio delivery is already
+independent of ASR, so that gate suppresses only the empty transcript and report
+and cannot retract audio already queued or sent. That delivered audio uses the
+ordinary `sessionAudioHours` window from its last proven Telegram
+acknowledgement.
 
 Word counting handles Thai, which is written without spaces: a plain
 space-delimited count would reject every Thai session. See `countWords` in
@@ -211,11 +213,14 @@ moving its monotonic time.
     "maxPartSeconds": 900,        // physical file rotation
     "minSpeechSeconds": 3,        // reject below this much speech
     "minTranscriptWords": 5,      // ...unless ASR found this many words
-    "vadThreshold": 0.5,          // Silero probability above which a frame is speech
-    "vadFrameMs": 32              // 512 samples at 16 kHz; Silero requires this
+    "vadThreshold": 0.5           // Silero probability above which a frame is speech
   }
 }
 ```
+
+VAD frame duration is not configurable: capture and the Silero protocol both
+require 512 samples at 16 kHz, exactly 32 ms. The former `vadFrameMs` option was
+never honored and must be removed from existing config files.
 
 `maxPartSeconds` must exceed `silenceTimeoutSeconds`; the config validator
 rejects a configuration where a session could rotate before it could close.

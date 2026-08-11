@@ -5,8 +5,10 @@ it yourself. This document describes exactly what crosses that boundary.
 
 ## Setup
 
+From the repository checkout:
+
 ```bash
-openmurmur setup telegram
+pnpm openmurmur setup telegram
 ```
 
 1. Create a bot: message [@BotFather](https://t.me/BotFather), send `/newbot`.
@@ -19,10 +21,25 @@ openmurmur setup telegram
    binding.
 6. The CLI shows the sender account, user id and chat id and requires an explicit
    `y`/`yes` confirmation.
-7. Only after confirmation do token and chat ID go into one atomically replaced,
-   versioned **macOS Keychain** item (service `io.openmurmur`).
-8. The `getUpdates` offset is persisted so the `/start` is not replayed.
+7. The matching `getUpdates` offset is persisted under a non-secret SHA-256
+   credential fingerprint so the `/start` cannot be replayed.
+8. Only after that cursor is durable do token and chat ID go into one atomically
+   replaced, versioned **macOS Keychain** item (service `io.openmurmur`).
 9. A test message confirms the whole path.
+
+SQLite and Keychain cannot share one transaction, so publication order is the
+privacy boundary: a hard death before step 8 leaves only inactive, non-secret
+cursor metadata; a hard death after step 8 leaves the complete pair with its
+matching cursor. Startup refuses to poll a concrete credential fingerprint when
+that cursor is absent. This fail-closed state is repaired only by running
+`pnpm openmurmur setup telegram` again, which establishes a new explicit
+`/start` boundary; it never guesses by polling from zero.
+
+One fail-closed trade-off remains when rebinding the same bot token to a
+different chat: a hard death after step 7 but before step 8 can advance that
+bot-wide cursor while the old chat remains configured, so queued updates may be
+skipped. It cannot replay historical updates or bind an unconfirmed chat; rerun
+setup to complete the rebind.
 
 ### Where the token is never allowed
 
@@ -84,6 +101,10 @@ The 20 MB incoming limit is a hard constraint of the official Cloud Bot API.
 OpenMurmur will not work around it with an unsafe external downloader. A local
 Telegram Bot API server is the supported escape hatch: point `telegram.apiBaseUrl`
 at `http://127.0.0.1:<port>` and raise `telegram.maxIncomingBytes`.
+
+Incoming audio produces a transcript, not a summary. The former
+`telegram.summarizeIncoming` option was removed because it was never honored;
+remove it from existing config files before starting the daemon.
 
 ## Delivery stages and queue order
 
@@ -235,7 +256,7 @@ across messages.
 | Command | Effect |
 | --- | --- |
 | `/status` | Daemon host name, recorder state, last frame age, current session, ASR backlog, outbox depth, last delivery, free disk, model status, version. |
-| `/health` | `OK`, or one `WARN:`/`ERROR:` line per unhealthy component. |
+| `/health` | `✅ Всё в порядке`, or one Russian `ВНИМАНИЕ:`/`ОШИБКА:` line per unhealthy component. Raw adapter and process errors stay in the local log. |
 | `/settings` | Shows this daemon host and selects Auto, Thai, Russian, English, or Chinese for future ASR jobs. |
 | `/help` | Available commands. |
 | `/start` | Same as `/help`. |
@@ -302,6 +323,12 @@ supported extension or an `audio/*` MIME type. Formats: `.ogg` `.opus` `.mp3`
 11. Transcribe with the local ASR.
 12. Send the transcript (with a `.md` attachment when long).
 13. Delete after the retention window.
+
+Safe validation failures produce stable Russian messages with the configured
+size or duration limit. ffmpeg, ffprobe, filesystem and Telegram API errors are
+kept in the redacted local log and never copied into chat. If processing still
+fails after all retries, one durable Russian failure notice is sent with the
+file provenance.
 
 ### Path traversal
 
