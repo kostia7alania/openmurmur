@@ -538,6 +538,29 @@ describe('capture backend argument construction', () => {
     await assert.rejects(retry.next(), /ffmpeg exited with code 7/);
   });
 
+  it('classifies an unexpected code-zero EOF as immediate capture failure', async () => {
+    const capture = new FfmpegCapture({
+      sampleRate: 1,
+      channels: 1,
+      device: 'default',
+      frameSamples: 1,
+      ffmpegPath: fakePcmSource(10, { linger: false, exitCode: 0 }),
+      clock: systemClock,
+    });
+    const iterator = capture.start();
+    assert.equal((await iterator.next()).done, false);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await assert.rejects(
+      iterator.next(),
+      /capture ended unexpectedly with code 0; continuous recording stopped/,
+    );
+
+    const retry = capture.start();
+    assert.equal((await retry.next()).done, false);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await assert.rejects(retry.next(), /capture ended unexpectedly with code 0/);
+  });
+
   it('can stop while frames are buffered without leaving the child behind', async () => {
     const capture = new FfmpegCapture({
       sampleRate: 1,

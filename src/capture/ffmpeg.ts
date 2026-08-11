@@ -87,8 +87,18 @@ export class FfmpegCapture implements CaptureBackend {
     const exited = new Promise<CaptureError | null>((resolve) => {
       child.on('error', (error) => resolve(new CaptureError('spawn', error.message)));
       child.on('close', (code) => {
-        if (this.#stopping || code === 0) resolve(null);
-        else resolve(classifyFfmpegFailure(stderr || `ffmpeg exited with code ${code}`));
+        if (this.#stopping) {
+          resolve(null);
+        } else if (code === 0) {
+          resolve(
+            new CaptureError(
+              'exit',
+              'ffmpeg capture ended unexpectedly with code 0; continuous recording stopped',
+            ),
+          );
+        } else {
+          resolve(classifyFfmpegFailure(stderr || `ffmpeg exited with code ${code}`));
+        }
       });
     });
     this.#exitPromise = exited;

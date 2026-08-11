@@ -636,8 +636,10 @@ offline slice is recorded on the item itself below.
   the record now also stores the OS process birth marker. `status` and `stop`
   require that marker and the daemon command to match, so a reused PID or a
   legacy record without exact identity cannot be signalled. Unexpected capture
-  EOF already exits as failure. Repeated real signals during slow finalization
-  and a live launchd restart remain before this item can turn green.
+  EOF now aborts buffered PCM and exits as failure even when FFmpeg returns code
+  zero; the focused regression also proves the capture child can be restarted.
+  Repeated real signals during slow finalization and a live launchd restart
+  remain before this item can turn green.
 
 #### AR-05 🟡 Bind Telegram only to a fresh explicit `/start`
 
