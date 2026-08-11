@@ -112,6 +112,26 @@ This proves the current local package, cache, tokenizer, aligner and real-model
 CLI path. It does **not** prove microphone capture, daemon job scheduling,
 Telegram delivery or the complete release path.
 
+### Current-revision Ollama corpus — 2026-08-11
+
+The production `OllamaLlm` ran the checked-in single-language RU/EN/TH
+acceptance transcripts against the locally configured `qwen3.6:latest`
+(digest `07d35212591fc27746f0a317c975a6d68754fb38e9053d82e25f06057af28522`)
+with cloud access disabled. A
+first run exposed a real language-control defect: the English transcript was
+summarized in Italian. After making the required output language explicit in
+the prompt contract, all three single-language summaries used the requested
+language, carried bounded source-segment references and hit none of the corpus's forbidden facts.
+The final three calls took 10.129 s, 9.026 s and 7.762 s.
+
+The model still did **not** meet the checked-in acceptance threshold: exact
+claim recall was 50%, exact claim precision was 39.1%, and 0/3 cases passed.
+Most misses were grounded paraphrases, but the model also duplicated a task as
+a commitment and categorized an open question as an idea. D108 therefore
+remains partial rather than being presented as accepted model quality.
+The repository default model tag, mixed-language summaries and unknown language
+labels were not live-quality-tested by this corpus.
+
 Silero's **segment-assembly logic** is separately covered by pure Python tests,
 which take a list of probabilities and need no model.
 
@@ -124,7 +144,7 @@ licence and a Hugging Face token — see [ADR-0008](adr/0008-speaker-diarization
 
 | Service | Version | Verified | Notes |
 | --- | --- | --- | --- |
-| Ollama | `qwen3.6:27b` (Q4_K_M) | ✅ Structured summary produced in 40.4 s | Optional. Its absence degrades the report; it never blocks delivery. `doctor` reports it as a warning with the install command. |
+| Ollama | configured `qwen3.6:latest` (36B, Q4_K_M; digest above) | ⚠️ real single-language RU/EN/TH corpus executed; acceptance not met | Optional. Its absence degrades the report; it never blocks delivery. The repository default model tag remains unverified. |
 | Telegram Bot API | Cloud, official | ⚠️ **no live calls made** | Response shapes are exercised with a scripted `fetch`. Blocked on a bot token, which only the owner can create. |
 
 ## How Python 3.14 was chosen

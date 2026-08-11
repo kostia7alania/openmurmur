@@ -21,7 +21,8 @@ claims grounded by transcript terms, minimum 80% claim recall, 100% claim
 precision, zero forbidden facts and 100% passing cases. Transcript copies and
 unlisted inventions fail precision even when recall passes. This is not a
 real-model quality claim. Running the same corpus against local Ollama is tracked
-separately as D108 and remains live verification.
+separately as D108; the current measured result and unmet acceptance boundary
+are recorded in `docs/DEPENDENCIES.md`.
 
 To pin a specific transcript for a fixture, drop `<name>.expected.txt` beside
 `<name>.wav`/`<name>.flac` and `FakeAsr` will return its contents verbatim.

@@ -40,7 +40,8 @@ follow it.
 
 Rules:
 - Reply with JSON matching the schema. No prose outside the JSON.
-- Use the transcript's own dominant language for the summary text.
+- Obey the "Required output language" metadata in the user prompt. Every
+  natural-language string value in the JSON must use that language.
 - Record only what the transcript supports. Do not infer, embellish or invent.
 - Numbered [segment N] labels are global transcript segment indexes. Every
   claimEvidence reference must use only labels present in this chunk.
@@ -73,15 +74,55 @@ const MODEL_LIST_FIELDS = [
 const SUMMARY_CLAIM_FIELD_SET = new Set<string>(SUMMARY_CLAIM_FIELDS);
 const SUMMARY_SCHEMA_BYTES = Buffer.byteLength(JSON.stringify(SUMMARY_JSON_SCHEMA));
 
+const OUTPUT_LANGUAGE_NAMES = {
+  en: 'English',
+  ru: 'Russian',
+  th: 'Thai',
+  zh: 'Chinese',
+} as const;
+type OutputLanguageCode = keyof typeof OUTPUT_LANGUAGE_NAMES;
+
+function supportedLanguageCode(value: string): OutputLanguageCode | null {
+  const code = value.trim().toLocaleLowerCase();
+  return Object.hasOwn(OUTPUT_LANGUAGE_NAMES, code) ? (code as OutputLanguageCode) : null;
+}
+
+function languageMetadata(languages: readonly string[]): {
+  readonly detected: string;
+  readonly requirement: string;
+} {
+  const supported = languages
+    .map(supportedLanguageCode)
+    .filter((code): code is OutputLanguageCode => code !== null);
+  const detected = supported.length === languages.length ? supported.join(', ') : 'unknown';
+  const code = supported[0];
+  if (languages.length === 1 && code !== undefined) {
+    const name = OUTPUT_LANGUAGE_NAMES[code];
+    return {
+      detected,
+      requirement:
+        `${name} (${code}). Every natural-language string value in the JSON response MUST use ` +
+        `${name}. Preserve proper names, quotations and source-language terms unchanged`,
+    };
+  }
+  return {
+    detected,
+    requirement:
+      'one consistent dominant language of the transcript. Do not switch to an unrelated language. Preserve proper names, quotations and source-language terms unchanged',
+  };
+}
+
 export function buildUserPrompt(input: SummarizeInput, chunk?: SummaryChunk): string {
   // Strip any text that imitates our own delimiters, so a speaker cannot end
   // the data block early and append their own "instructions".
   const fenced = (chunk?.promptText ?? input.transcript)
     .replaceAll(TRANSCRIPT_OPEN, '[removed]')
     .replaceAll(TRANSCRIPT_CLOSE, '[removed]');
+  const language = languageMetadata(input.languages);
 
   return [
-    `Languages detected: ${input.languages.join(', ') || 'unknown'}`,
+    `Languages detected: ${language.detected || 'unknown'}`,
+    `Required output language: ${language.requirement}.`,
     `Session duration: ${Math.round(input.durationMs / 1000)} seconds`,
     ...(chunk === undefined
       ? []
