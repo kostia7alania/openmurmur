@@ -112,6 +112,24 @@ This proves the current local package, cache, tokenizer, aligner and real-model
 CLI path. It does **not** prove microphone capture, daemon job scheduling,
 Telegram delivery or the complete release path.
 
+### Current Qwen readiness and worker-reuse smoke — 2026-08-11
+
+With the same offline package and cache, the production `MlxAsr.ready()` path
+transitioned from explicit `recovering` to exact loaded readiness in 823 ms;
+the model load acknowledgement reported 635 ms. Health inspection itself did
+not start the worker. A separate process-fault run completed one real
+transcription, killed the owned Python worker, observed the explicit failed
+health state, and then completed four more real transcriptions through one
+replacement worker generation. Those four calls took 2.506 s, 1.392 s,
+1.388 s and 1.424 s. After the first replacement call, the measured worker-tree
+RSS stayed near 867 MiB with 432 KiB growth across the remaining warm calls.
+Every observed worker process was gone after `close()`.
+
+This proves bounded real-model readiness, replacement-worker recovery and a
+bounded warm RSS profile for the production backend. It does **not** prove that
+a daemon `JobQueue` lease/failure/retry transaction converges after the worker
+dies; that remains the separate D091 live gate.
+
 ### Current-revision Ollama corpus — 2026-08-11
 
 The production `OllamaLlm` ran the checked-in single-language RU/EN/TH
