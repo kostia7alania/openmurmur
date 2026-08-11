@@ -1,16 +1,21 @@
 #!/usr/bin/env node
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { access, rm } from 'node:fs/promises';
 import { hostname } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { parseArgs } from 'node:util';
 import { isAsrLanguageCode, modelLanguageName } from '../asr/preferences.ts';
-import { FfmpegCapture } from '../capture/ffmpeg.ts';
+import {
+  createCaptureBackend,
+  defaultNativeCaptureExecutable,
+  nativeCaptureExecutableIsUsable,
+} from '../capture/native.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
 import { recoverAfterCrash, renderRecoveryReport } from '../capture/recovery.ts';
 import { ensureDirectories, loadConfig } from '../config/load.ts';
-import { ConfigError } from '../config/schema.ts';
+import { type AudioConfig, ConfigError } from '../config/schema.ts';
 import { openDatabase, transaction } from '../database/db.ts';
 import { TranscriptRepository } from '../database/repository.ts';
 import { renderSearchResults, searchTranscripts } from '../database/search.ts';
@@ -81,6 +86,7 @@ Setup and diagnostics
   doctor                 Check every dependency. Read-only: changes nothing.
   setup                  Create directories, config and database (shows a plan first).
   setup telegram         Connect a Telegram bot. Token is entered hidden.
+  capture authorize      Explicitly open the native helper's GUI permission flow.
   capture test           Record a few seconds and report input levels.
   recover                Report recordings an unclean shutdown left behind.
 
@@ -181,11 +187,7 @@ async function main(argv: readonly string[]): Promise<number> {
       return setupCommand(loaded, positionals[1], values['yes'] === true);
 
     case 'capture':
-      return captureCommand(
-        positionals[1],
-        loaded.config.audio.ffmpegPath,
-        loaded.config.audio.captureDevice,
-      );
+      return captureCommand(positionals[1], loaded.config.audio);
 
     case 'start': {
       await ensureDirectories(loaded.paths);
@@ -432,14 +434,64 @@ async function exists(path: string): Promise<boolean> {
 
 function captureCommand(
   subcommand: string | undefined,
-  ffmpegPath: string,
-  captureDevice: string,
+  audio: AudioConfig,
 ): Promise<number> | number {
-  if (subcommand !== 'test') {
-    process.stderr.write('Unknown subcommand. Did you mean `capture test`?\n');
+  switch (subcommand) {
+    case 'authorize':
+      return captureAuthorize();
+    case 'test':
+      return captureTest(audio);
+    default:
+      process.stderr.write('Usage: pnpm openmurmur capture <authorize|test>\n');
+      return 1;
+  }
+}
+
+async function captureAuthorize(): Promise<number> {
+  const executable = defaultNativeCaptureExecutable();
+  if (!nativeCaptureExecutableIsUsable(executable)) {
+    process.stderr.write(
+      'The verified native capture helper is not installed at its supported path.\n' +
+        'Run ./scripts/install-capture-app, then retry this command.\n',
+    );
     return 1;
   }
-  return captureTest(ffmpegPath, captureDevice);
+
+  const app = dirname(dirname(dirname(executable)));
+  process.stdout.write(
+    'Opening the native capture helper. macOS may ask for microphone access now.\n',
+  );
+  const exitCode = await new Promise<number>((resolve) => {
+    let settled = false;
+    const finish = (code: number) => {
+      if (settled) return;
+      settled = true;
+      resolve(code);
+    };
+    const child = spawn('/usr/bin/open', ['-W', app, '--args', '--authorize'], {
+      stdio: 'inherit',
+    });
+    child.once('error', (error) => {
+      process.stderr.write(`Could not open the authorization flow: ${error.message}\n`);
+      finish(1);
+    });
+    child.once('close', (code, signal) => {
+      if (settled) return;
+      if (code === 0) finish(0);
+      else {
+        process.stderr.write(
+          `The authorization flow did not finish normally (${signal ?? `exit ${code}`}).\n`,
+        );
+        finish(1);
+      }
+    });
+  });
+  if (exitCode === 0) {
+    process.stdout.write(
+      'Authorization flow closed. Set audio.captureBackend to "native", then prove real PCM with: pnpm openmurmur capture test\n',
+    );
+  }
+  return exitCode;
 }
 
 async function startDaemon(
@@ -517,95 +569,54 @@ async function confirm(prompt: string): Promise<boolean> {
   }
 }
 
-/** How long to wait for the first frame before assuming a pending TCC prompt. */
-const FIRST_FRAME_TIMEOUT_MS = 10_000;
-
-/** Best-effort name of the app that owns the microphone grant. */
-function terminalHint(): string {
-  return process.env['TERM_PROGRAM'] ?? 'your terminal';
-}
-
-/**
- * Opens the microphone for a few seconds and reports levels. This is the
- * command that triggers the macOS TCC prompt on a fresh install, which is why
- * the README tells users to run it before `start`.
- */
-async function captureTest(ffmpegPath: string, device: string): Promise<number> {
-  const capture = new FfmpegCapture({
-    sampleRate: 16_000,
-    channels: 1,
-    device,
+/** Opens the configured backend and accepts only real PCM frames as success. */
+async function captureTest(audio: AudioConfig): Promise<number> {
+  const capture = createCaptureBackend({
+    backend: audio.captureBackend,
+    sampleRate: audio.sampleRate,
+    channels: audio.channels,
+    device: audio.captureDevice,
     frameSamples: 512,
-    ffmpegPath,
+    ffmpegPath: audio.ffmpegPath,
     clock: systemClock,
   });
   const vad = new EnergyVad();
 
-  process.stdout.write('Recording for 5 seconds. Say something.\n');
+  process.stdout.write(`Testing configured capture backend: ${audio.captureBackend}.\n`);
+  process.stdout.write('Recording 5 seconds of real PCM. Say something.\n');
   process.stdout.write('macOS shows an orange dot near Control Center while the mic is open.\n\n');
 
-  const deadline = Date.now() + 5000;
+  let deadline: number | null = null;
   let frames = 0;
-  let timedOut = false;
+  let capturedDurationMs = 0;
   let speechFrames = 0;
   let peakDbfs = Number.NEGATIVE_INFINITY;
 
   try {
-    // Watchdog for the first frame. Until the user answers the macOS
-    // permission dialog, ffmpeg neither exits nor produces audio, so without
-    // this the command hangs forever and then reports a useless exit code.
-    const watchdog = setTimeout(() => {
-      if (frames > 0) return;
-      process.stderr.write(
-        [
-          '',
-          '⏳ No audio yet after 10 seconds.',
-          '',
-          'macOS is almost certainly showing a microphone permission dialog.',
-          'Click "Allow", then run this command again.',
-          '',
-          'If you see no dialog, grant access manually:',
-          '  System Settings -> Privacy & Security -> Microphone',
-          `  and enable it for the app running this command (${terminalHint()}).`,
-          '',
-          'The permission belongs to the app that launches OpenMurmur, so',
-          'switching terminals means being asked again.',
-          '',
-        ].join('\n'),
-      );
-      timedOut = true;
-      void capture.stop();
-    }, FIRST_FRAME_TIMEOUT_MS);
-
-    try {
-      for await (const frame of capture.start()) {
-        frames += 1;
-        if (frames === 1) clearTimeout(watchdog);
-        const dbfs = rmsDbfs(frame.pcm);
-        if (Number.isFinite(dbfs)) peakDbfs = Math.max(peakDbfs, dbfs);
-        if (vad.probability(frame.pcm) >= 0.5) speechFrames += 1;
-        if (Date.now() >= deadline) break;
-      }
-    } finally {
-      clearTimeout(watchdog);
+    for await (const frame of capture.start()) {
+      frames += 1;
+      capturedDurationMs += frame.durationMs;
+      deadline ??= Date.now() + 5000;
+      const dbfs = rmsDbfs(frame.pcm);
+      if (Number.isFinite(dbfs)) peakDbfs = Math.max(peakDbfs, dbfs);
+      if (vad.probability(frame.pcm) >= 0.5) speechFrames += 1;
+      if (Date.now() >= deadline) break;
     }
   } catch (error) {
-    // A capture we stopped ourselves reports a spurious exit; the watchdog has
-    // already printed the useful explanation.
-    if (!timedOut) process.stderr.write(`\n❌ ${(error as Error).message}\n`);
+    process.stderr.write(`\n❌ ${(error as Error).message}\n`);
     return 1;
   } finally {
     await capture.stop();
   }
 
   if (frames === 0) {
-    if (!timedOut) {
-      process.stderr.write('❌ No audio frames arrived. The microphone did not open.\n');
-    }
+    process.stderr.write('❌ No PCM frames arrived. The configured backend did not open.\n');
     return 1;
   }
 
-  process.stdout.write(`✅ ${frames} frames captured (${(frames * 32) / 1000}s of audio)\n`);
+  process.stdout.write(
+    `✅ ${frames} PCM frames captured (${(capturedDurationMs / 1000).toFixed(2)}s of audio)\n`,
+  );
   process.stdout.write(`   Peak level: ${peakDbfs.toFixed(1)} dBFS\n`);
   process.stdout.write(`   Frames above the speech gate: ${speechFrames}\n`);
   if (peakDbfs < -60) {

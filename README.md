@@ -105,6 +105,11 @@ pnpm openmurmur setup telegram
 pnpm openmurmur capture test
 ```
 
+This tests the configured backend and succeeds only after real PCM frames arrive.
+The default remains `ffmpeg`, which is the simplest foreground path. Before a
+launchd install, use the signed native-helper flow under
+[Running in the background](#running-in-the-background).
+
 ```bash
 pnpm openmurmur start
 ```
@@ -137,7 +142,7 @@ versioned Keychain item.
 ## What actually happens
 
 ```
-microphone ─▶ FFmpeg ─▶ Silero VAD ─▶ sessionizer ─▶ FLAC parts (atomic)
+microphone ─▶ configured capture backend ─▶ Silero VAD ─▶ sessionizer ─▶ FLAC parts (atomic)
                                                           │
                                       ┌───────────────────┴──────────────────┐
                                       ▼                                      ▼
@@ -193,9 +198,13 @@ OpenMurmur adds **no** consent window, no menu bar item, no overlay, no coloured
 dot and no persistent notification. macOS already handles this and doing it
 twice is worse than doing it once:
 
-- macOS prompts for microphone permission the first time capture starts. Run
-  `pnpm openmurmur capture test` from a terminal so the prompt appears while
-  you are at the keyboard.
+- `pnpm openmurmur capture authorize` is the only command that deliberately
+  opens a GUI microphone-permission flow. It verifies the installed native app
+  without opening the microphone, then launches its explicit `--authorize`
+  mode. It is never run by setup, start, doctor, capture test or an installer.
+- The default FFmpeg backend can still trigger a Terminal/iTerm permission
+  prompt when tested interactively. That grant proves the foreground command;
+  it is not a reliable permission identity for a launchd daemon.
 - macOS shows an **orange dot** near Control Center whenever the microphone is
   open. (Orange = microphone. Green = camera. OpenMurmur never uses the camera.)
 - OpenMurmur does not attempt to hide, replace or suppress that indicator.
@@ -222,16 +231,21 @@ Telegram request.
 
 ### TCC caveats
 
-The microphone grant belongs to the app that *launches* the process — Terminal,
-iTerm, or the launchd agent. Consequences worth knowing:
+TCC grants belong to a code identity, not to this repository or config file.
+The two supported operating modes therefore have different boundaries:
 
-- Switching terminals means a new prompt.
-- A launchd agent may not be able to show a prompt at all. Grant permission
-  interactively once, then install the agent.
-- macOS updates and some system changes can reset TCC. Re-run
-  `pnpm openmurmur capture test` after a major update.
-- An unsigned binary's TCC grant is keyed to its path and content. Rebuilding or
-  moving it can invalidate the grant. A signed helper is on the P1 roadmap.
+- **Foreground default:** `audio.captureBackend="ffmpeg"`. Run `capture test`
+  interactively; Terminal or iTerm owns any prompt. This is not the supported
+  background permission path.
+- **launchd:** install the native app at its one permanent path, explicitly run
+  `capture authorize` in a GUI login session, configure
+  `audio.captureBackend="native"`, then run `capture test`. Native `--stream`
+  never requests permission; it exits instead.
+- The local installer uses ad-hoc signing by default. That proves the exact
+  bundle, entitlement and source digest, but a rebuild can change its TCC
+  identity. A distributable stable release requires the same Developer ID,
+  bundle ID and designated requirement across updates plus notarization; no
+  notarized release is claimed here.
 
 ## Sleep and the lid
 
@@ -332,6 +346,7 @@ able to stop your recorder or delete your data.
 pnpm openmurmur doctor              # check every dependency (read-only)
 pnpm openmurmur setup               # create dirs, config, database (shows a plan first)
 pnpm openmurmur setup telegram      # connect a bot (hidden token prompt)
+pnpm openmurmur capture authorize   # explicitly open native GUI permission flow
 pnpm openmurmur capture test        # record 5s and report levels
 pnpm openmurmur recover             # report what an unclean shutdown left behind
 pnpm openmurmur start               # run the daemon
@@ -354,11 +369,27 @@ pnpm openmurmur retention apply     # delete only what dry-run proved eligible
 launchd templates are in [`launchd/`](launchd/):
 
 ```bash
+./scripts/install-capture-app
+```
+
+Set `audio.captureBackend` to `"native"` in
+`~/Library/Application Support/OpenMurmur/openmurmur.json`, then authorize and
+prove that the configured backend emits real PCM:
+
+```bash
+pnpm openmurmur capture authorize
+pnpm openmurmur capture test
+./scripts/install-capture-app --check
+```
+
+Only then install the agents:
+
+```bash
 ./scripts/install-launch-agents
 ```
 
-Grant microphone permission interactively **before** installing the agent —
-launchd cannot always surface the TCC prompt.
+The launchd process never tries to surface a TCC prompt. A Terminal FFmpeg grant
+is only a foreground proof and is not substituted for the native helper grant.
 
 Only one daemon may own an OpenMurmur data root. Startup claims its PID record
 exclusively; `status` and `stop` verify the live process identity before trusting

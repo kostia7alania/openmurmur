@@ -198,19 +198,58 @@ It prints a plan and does nothing until you confirm. Everything lives in
 
 ## 10. Microphone permission
 
-**Do this from a terminal, while you are at the keyboard.**
+The default `audio.captureBackend` is `"ffmpeg"`. It is the simplest foreground
+path and remains useful for development:
 
 ```bash
 pnpm openmurmur capture test
 ```
 
-macOS shows the microphone prompt. Grant it, and watch the input levels it
-prints while you speak.
+This command succeeds only after real PCM frames arrive. On first use macOS may
+ask Terminal or iTerm for microphone access. That grant proves this foreground
+command only; do not assume a launchd process can reuse it.
 
-The grant belongs to the app that *launches* the process — Terminal, iTerm, or
-later the launchd agent — not to OpenMurmur. Switching terminals means a new
-prompt. A launchd agent may not be able to show a prompt at all, which is why
-this step comes before step 12.
+For reliable background capture, install the native app while logged into the
+GUI session:
+
+```bash
+./scripts/install-capture-app
+```
+
+Set this field in
+`~/Library/Application Support/OpenMurmur/openmurmur.json`:
+
+```json
+{
+  "audio": {
+    "captureBackend": "native"
+  }
+}
+```
+
+Then run the one command that deliberately opens the GUI permission flow:
+
+```bash
+pnpm openmurmur capture authorize
+```
+
+It first verifies the app at its permanent path, strict code signature, audio
+entitlement and signed source digest without opening the microphone. Only then
+does it launch `--authorize`. No setup, doctor, installer, test or daemon command
+runs this automatically. Native `--stream` never prompts.
+
+Prove that the configured native backend produces real PCM, then check the
+installed identity and read-only authorization status:
+
+```bash
+pnpm openmurmur capture test
+./scripts/install-capture-app --check
+```
+
+The default installer signature is ad-hoc: it proves the local bundle but a
+rebuild can change the TCC identity. A stable distributable release needs a
+consistent Developer ID identity and notarization. This checkout does not claim
+that a notarized release has been verified.
 
 While the microphone is open macOS shows an **orange dot** near Control Center.
 OpenMurmur adds no indicator of its own and does not try to hide that one.
@@ -256,7 +295,7 @@ fraction of its duration.
 
 ### Then in the background
 
-Only after the microphone permission is granted (step 10):
+Only after the **native** backend passes both checks in step 10:
 
 ```bash
 ./scripts/install-launch-agents --check
@@ -297,12 +336,13 @@ tail -f ~/Library/Application\ Support/OpenMurmur/logs/daemon.err.log
 | Symptom | Cause and fix |
 | --- | --- |
 | `speech_detection` fails in `doctor` | Step 7 was skipped: `uv sync --project python/openmurmur_audio --extra mlx` |
-| `macOS denied microphone access` | Step 10, from a terminal. System Settings → Privacy & Security → Microphone must list the terminal you launch from. |
+| Native helper reports that microphone authorization is required | From a GUI login session, run step 10's `pnpm openmurmur capture authorize`; it is the only intentional prompt path. |
+| FFmpeg works in Terminal but launchd has no frames | A Terminal FFmpeg grant is foreground-only proof. Install, configure and authorize the native helper in step 10. |
 | Nothing recorded, no error | Genuinely no speech: Silero rejects a fan, traffic and music by design, and a session under 3 seconds of speech is dropped as noise. `pnpm openmurmur status` shows the rejected count. |
 | `ollama` warns in `doctor` | Run `brew services start ollama`, then pull the configured model. Audio and transcripts are still delivered; only summaries stop. |
 | Node version errors | `node -v` must be 26+. See step 4. |
 | Telegram silent | `pnpm openmurmur telegram test`. Undelivered messages queue in the outbox and are retried; nothing is lost while it is offline. |
-| It stopped recording after a macOS update | Major updates can reset TCC. Re-run step 10. |
+| It stopped recording after a macOS update | Major updates can reset TCC. Re-run the explicit native authorization and PCM checks in step 10. |
 
 ## Removing it
 

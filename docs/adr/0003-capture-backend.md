@@ -1,47 +1,72 @@
-# ADR-0003: FFmpeg + AVFoundation for capture
+# ADR-0003: FFmpeg foreground default and native launchd capture
 
-**Status:** Accepted · **Date:** 2026-07-29 · **Supersedes:** nothing ·
-**Superseded by:** planned, P1-01
+**Status:** Amended · **Date:** 2026-08-11 · **Supersedes:** the 2026-07-29
+FFmpeg-only decision
 
 ## Context
 
-The daemon needs continuous microphone capture on macOS. Options:
+The daemon needs continuous microphone capture on macOS. FFmpeg with the
+`avfoundation` input is portable across source checkouts and is already needed
+for FLAC encoding and incoming-file validation. It is therefore the lowest-cost
+foreground default.
 
-1. FFmpeg with the `avfoundation` input device.
-2. A native Swift helper using `AVAudioEngine`.
-3. A Node native addon wrapping CoreAudio.
+That does not create a reliable background TCC identity. A microphone prompt
+shown for Terminal or iTerm proves an interactive FFmpeg run, not that a
+LaunchAgent's hardened Node process can open the device. launchd cannot safely
+surface a prompt of its own.
 
-The decisive constraint: **a native helper that behaves well under macOS TCC
-should be code-signed**, which requires an Apple Developer Program membership
-($99/year). Requiring that to run an open-source project from source would
-exclude most potential users and contributors on day one.
+The native `OpenMurmur Capture.app` helper now supplies the missing boundary. It
+has one bundle ID, one installed path, the hardened-runtime audio-input
+entitlement and explicit modes:
+
+- `--authorize` is the only mode allowed to request microphone permission;
+- `--stream` never prompts and emits only 16 kHz mono s16le PCM;
+- `--authorization-status`, `--source-digest` and `--self-check` are read-only
+  or device-free probes.
 
 ## Decision
 
-Ship FFmpeg + AVFoundation as the MVP backend, behind a `CaptureBackend`
-interface. Document the native helper as P1-01 and keep the interface narrow
-enough that adding it touches nothing else.
+Keep `audio.captureBackend="ffmpeg"` as the default for foreground use. Select
+the configured backend through the same `CaptureBackend` interface for the
+daemon and `capture test`.
+
+Use `audio.captureBackend="native"` for reliable launchd capture. The operator
+installs the app at `~/Applications/OpenMurmur Capture.app`, explicitly runs
+`pnpm openmurmur capture authorize` in a GUI login session, and then runs
+`capture test`. No setup, installer, doctor, test, daemon or stream operation
+invokes authorization automatically.
+
+The runtime accepts only the canonical installed bundle after strict signature,
+bundle ID, entitlement and signed source-digest verification. The first real PCM
+frame remains the only recording-readiness proof.
+
+## Signing boundary
+
+The source installer defaults to ad-hoc hardened-runtime signing. That is useful
+local evidence: it seals the helper, entitlement and source digest. It is not a
+promise that TCC authorization survives a rebuild.
+
+A distributable stable release requires a Developer ID Application identity,
+the same Team ID/bundle ID/designated requirement across updates, and
+notarization. The repository can build with a supplied Developer ID identity but
+does not claim that a notarized release has been produced or live-verified.
 
 ## Consequences
 
-**Positive.** Works immediately with `brew install ffmpeg`. No certificate, no
-native build, no `node-gyp`. FFmpeg already handles resampling and format
-conversion, and is needed anyway for FLAC encoding and incoming-file validation.
-The `CaptureBackend` interface means a native helper is additive.
+**Positive:**
 
-**Negative — stated plainly:**
+- source contributors retain a zero-runtime-dependency FFmpeg default;
+- launchd no longer relies on a Terminal or Node permission identity;
+- native permission denial has a stable exit code instead of stderr guessing;
+- both backends feed the same bounded PCM and first-frame contracts.
 
-- **Imprecise TCC errors.** macOS reports a permission denial as a device-open
-  failure, so `classifyFfmpegFailure` matches on the message text. Getting that
-  wrong costs a less helpful error string, never correctness.
-- **No route-change notifications.** Unplugging a USB microphone is seen as a
-  stream ending, not as a device change. The health check catches it within
-  15 seconds and alerts.
-- **An extra process** with a pipe between it and the daemon.
-- **Frame timestamps are assigned on receipt**, not at the hardware, so they
-  carry pipe scheduling jitter. Irrelevant at 32 ms granularity for session
-  boundaries; it would matter for word-level alignment, which is why alignment
-  comes from the ASR model instead.
+**Negative:**
+
+- background setup has an explicit app install, config and GUI authorization
+  step;
+- an ad-hoc rebuild can require authorization again;
+- the native helper currently supports only the default input device;
+- FFmpeg still has imprecise TCC errors and no route-change notifications.
 
 ## Interface
 
@@ -54,14 +79,18 @@ interface CaptureBackend {
 }
 ```
 
-`start()` yielding its first frame is the daemon's proof that the microphone is
-genuinely open — it is what gates the `🟢 Запись включена` message.
+`start()` yielding its first frame gates `🟢 Запись включена`. A successful
+process spawn, signature check or authorization status is never reported as
+active recording.
 
-## Alternatives
+## Rejected alternatives
 
-**Swift helper now.** Better errors and device handling, but requires a
-certificate to distribute well and adds a Swift toolchain to the build. Deferred
-to P1-01, not rejected.
+**Treat a Terminal FFmpeg grant as launchd authorization.** Rejected because it
+does not prove the background process identity can open the microphone.
 
-**Native Node addon.** All the certificate problems plus `node-gyp`, and it
-would put audio-thread code in the daemon's process. Rejected.
+**Authorize from setup, installer or daemon startup.** Rejected because a TCC
+prompt must be an explicit user-visible action and background processes may not
+be able to show it.
+
+**Native Node addon.** Rejected: it adds `node-gyp`, puts audio-thread code in
+the daemon process and still needs a signed TCC identity.

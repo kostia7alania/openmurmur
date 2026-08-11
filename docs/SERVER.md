@@ -138,18 +138,37 @@ Sharing**), then connect from another Mac with ⌘K in Finder:
 vnc://server.local
 ```
 
-**Inside that screen-shared session**, open Terminal.app and run:
+**Inside that screen-shared session**, open Terminal.app and install the signed
+native helper at its permanent path:
 
 ```bash
-cd ~/openmurmur && pnpm openmurmur capture test
+cd ~/openmurmur && ./scripts/install-capture-app
 ```
 
-The dialog appears on the virtual display. A human clicks Allow. From then on
-**Terminal.app** holds the grant, and anything it launches inherits it —
-including a LaunchAgent installed from that same session.
+Set `audio.captureBackend` to `"native"` in
+`~/Library/Application Support/OpenMurmur/openmurmur.json`. Then explicitly
+open the native app's GUI permission mode:
 
-Verify: re-run the same command. Input levels rather than a permission error
-means it stuck.
+```bash
+pnpm openmurmur capture authorize
+```
+
+The dialog appears on the virtual display. A human clicks Allow. This is the
+only command that intentionally requests microphone permission; setup,
+installers, doctor, capture test and the daemon never run it automatically.
+
+The native app's `--stream` mode refuses to prompt. Prove the configured backend
+with actual PCM and then inspect its signed/read-only state:
+
+```bash
+pnpm openmurmur capture test
+./scripts/install-capture-app --check
+```
+
+The local ad-hoc signature proves this exact bundle but can acquire a new TCC
+identity after a rebuild. A stable distributable update requires a consistent
+Developer ID identity and notarization; this repository does not claim a
+notarized release.
 
 Do not attempt this over SSH. The failure is not a timeout or a retryable
 error; the prompt is never shown.
@@ -200,11 +219,11 @@ distinguishes these cases in its logs for exactly this reason.
 
 ## Step 7 — Start on boot
 
-Only after step 5. The LaunchAgent cannot show a permission prompt, so it must
-inherit a grant that already exists.
+Only after step 5. The LaunchAgent cannot show a permission prompt; it uses the
+already-authorized native helper identity. A foreground Terminal/FFmpeg grant
+is not a reliable background substitute.
 
-Run this **from the Screen Sharing session**, not over SSH, so the agent
-inherits Terminal.app's microphone grant:
+Run this from the checkout:
 
 ```bash
 cd ~/openmurmur && ./scripts/install-launch-agents
@@ -317,18 +336,18 @@ ssh you@server 'cd ~/openmurmur && ./scripts/server-preflight'
 
 | Symptom | Cause |
 | --- | --- |
-| `macOS denied microphone access`, no dialog ever appears | Run over SSH. Step 5 — it must be a GUI session. |
+| Native helper says authorization is required, no dialog appears | `capture authorize` was run over SSH. Repeat step 5 in a GUI Screen Sharing session. |
+| FFmpeg works in Terminal but the LaunchAgent has no frames | Foreground Terminal permission is not the launchd identity. Configure and authorize the native helper in step 5. |
 | Telegram "not configured" although it was set up | Locked Keychain. Step 6, check the exit code. |
 | Works until reboot, then nothing | No automatic login, so no GUI session for the agent. Step 3. |
 | `🔴 Запись остановлена` at every start | No usable audio input device. Check `./scripts/server-preflight`. |
 | Recording stops at night | Sleep. Step 4, confirm with `pmset -g assertions`. |
 | Stopped working after a macOS update | Updates can reset TCC. Repeat step 5. |
-| Grant lapsed after moving the repo or updating Node | For an unsigned binary macOS keys the grant to the executable's path and contents. Repeat step 5. |
+| Grant lapsed after rebuilding the ad-hoc native app | Ad-hoc signing proves local integrity, not a stable release identity. Repeat step 5; Developer ID plus notarization is the release-grade path. |
 
-That last row is the sharp edge worth knowing about in advance: a Node upgrade
-can silently invalidate microphone access. `pnpm openmurmur doctor` after any
-system or Node update is the cheap check. A signed helper would fix it properly
-and is on the roadmap ([BACKLOG.md](BACKLOG.md)).
+The native helper decouples launchd microphone permission from Node and the
+checkout path. Its fixed bundle ID/path still does not turn an ad-hoc rebuild
+into a notarized, identity-stable release.
 
 ## Memory, on a 64 GB machine
 
