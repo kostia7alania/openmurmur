@@ -91,6 +91,232 @@ describe('transcript search', () => {
     assert.equal(search('GITHUB').length, 1);
   });
 
+  it('uses Unicode full case folding for multi-character and compatibility folds', () => {
+    const transcripts = new TranscriptRepository(db.handle);
+    const cases: readonly [string, string][] = [
+      ['s1', 'Die STRAẞE ist frei.'],
+      ['s2', 'Die Straße ist frei.'],
+      ['s3', 'Die STRASSE ist frei.'],
+      ['s4', 'Das ist ſafe.'],
+      ['s5', 'Das ist SAFE.'],
+    ];
+    for (const [sessionId, text] of cases) {
+      transcripts.append({
+        sessionId,
+        engine: 'e',
+        model: 'unicode-full-fold',
+        languages: ['de'],
+        text,
+        segments: [
+          {
+            startMs: 0,
+            endMs: 5000,
+            timestampSource: 'vad',
+            language: 'de',
+            text,
+          },
+        ],
+      });
+    }
+
+    assert.deepEqual(
+      new Set(search('STRASSE').map((hit) => hit.sessionId)),
+      new Set(['s1', 's2', 's3']),
+    );
+    assert.deepEqual(
+      new Set(search('straße').map((hit) => hit.sessionId)),
+      new Set(['s1', 's2', 's3']),
+    );
+    assert.deepEqual(new Set(search('SAFE').map((hit) => hit.sessionId)), new Set(['s4', 's5']));
+    assert.deepEqual(new Set(search('ſafe').map((hit) => hit.sessionId)), new Set(['s4', 's5']));
+    assert.match(
+      search('STRASSE').find((hit) => hit.sessionId === 's1')?.snippet ?? '',
+      /\[STRAẞE\]/,
+    );
+  });
+
+  it('preserves the Unicode Cherokee uppercase fold in both directions', () => {
+    const transcripts = new TranscriptRepository(db.handle);
+    const cases: readonly [string, string][] = [
+      ['s1', 'ᎠᎠᎠ'],
+      ['s2', 'ꭰꭰꭰ'],
+    ];
+    for (const [sessionId, text] of cases) {
+      transcripts.append({
+        sessionId,
+        engine: 'e',
+        model: 'unicode-cherokee-fold',
+        languages: ['chr'],
+        text,
+        segments: [
+          {
+            startMs: 0,
+            endMs: 5000,
+            timestampSource: 'vad',
+            language: 'chr',
+            text,
+          },
+        ],
+      });
+    }
+
+    assert.deepEqual(new Set(search('ꭰꭰꭰ').map((hit) => hit.sessionId)), new Set(['s1', 's2']));
+    assert.deepEqual(new Set(search('ᎠᎠᎠ').map((hit) => hit.sessionId)), new Set(['s1', 's2']));
+    assert.match(search('ꭰꭰꭰ').find((hit) => hit.sessionId === 's1')?.snippet ?? '', /\[ᎠᎠᎠ\]/);
+  });
+
+  it('matches Cyrillic case and canonically equivalent NFC/NFD text', () => {
+    const transcripts = new TranscriptRepository(db.handle);
+    transcripts.append({
+      sessionId: 's1',
+      engine: 'e',
+      model: 'unicode-case',
+      languages: ['ru'],
+      text: 'ПРИВЕТ ИЗ МОСКВЫ.',
+      segments: [
+        {
+          startMs: 0,
+          endMs: 5000,
+          timestampSource: 'vad',
+          language: 'ru',
+          text: 'ПРИВЕТ ИЗ МОСКВЫ.',
+        },
+      ],
+    });
+    transcripts.append({
+      sessionId: 's2',
+      engine: 'e',
+      model: 'unicode-nfd',
+      languages: ['ru'],
+      text: 'ВСЕ\u0308 РЕШЕНО И ЗАПИСАНО.',
+      segments: [
+        {
+          startMs: 0,
+          endMs: 5000,
+          timestampSource: 'vad',
+          language: 'ru',
+          text: 'ВСЕ\u0308 РЕШЕНО И ЗАПИСАНО.',
+        },
+      ],
+    });
+
+    assert.equal(search('привет')[0]?.sessionId, 's1');
+    assert.match(search('привет')[0]?.snippet ?? '', /\[ПРИВЕТ\]/);
+    const rawFtsCase = db.handle
+      .prepare('SELECT count(*) AS c FROM transcript_fts WHERE transcript_fts MATCH ?')
+      .get(escapeFtsQuery('привет')) as { c: number };
+    assert.equal(rawFtsCase.c, 1, 'SQLite trigram folds Cyrillic case');
+    const rawFtsNfc = db.handle
+      .prepare('SELECT count(*) AS c FROM transcript_fts WHERE transcript_fts MATCH ?')
+      .get(escapeFtsQuery('всё')) as { c: number };
+    assert.equal(rawFtsNfc.c, 0, 'SQLite trigram does not normalize stored NFD text to NFC');
+    const normalizedHit = search('всё')[0];
+    assert.equal(normalizedHit?.sessionId, 's2');
+    assert.match(normalizedHit?.snippet ?? '', /\[ВСЕ\u0308\]/);
+
+    transcripts.append({
+      sessionId: 's3',
+      engine: 'e',
+      model: 'unicode-nfc',
+      languages: ['ru'],
+      text: 'ВСЁ РЕШЕНО В NFC.',
+      segments: [
+        {
+          startMs: 0,
+          endMs: 5000,
+          timestampSource: 'vad',
+          language: 'ru',
+          text: 'ВСЁ РЕШЕНО В NFC.',
+        },
+      ],
+    });
+    assert.equal(search('все\u0308')[0]?.sessionId, 's3');
+  });
+
+  it('searches durable current text when a revision has no segments', () => {
+    new TranscriptRepository(db.handle).append({
+      sessionId: 's1',
+      engine: 'e',
+      model: 'revision-only',
+      languages: ['ru'],
+      text: 'Текущая ревизия без сегментов содержит важное решение.',
+      segments: [],
+    });
+
+    const hits = search('важное решение');
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0]?.sessionId, 's1');
+    assert.equal(hits[0]?.startMs, null);
+    assert.match(hits[0]?.snippet ?? '', /\[важное решение\]/i);
+  });
+
+  it('falls back to durable revision text when segments omit the matching phrase', () => {
+    new TranscriptRepository(db.handle).append({
+      sessionId: 's1',
+      engine: 'e',
+      model: 'segment-drift',
+      languages: ['ru'],
+      text: 'Полная ревизия сохраняет скрытое решение между сегментами.',
+      segments: [
+        {
+          startMs: 0,
+          endMs: 5000,
+          timestampSource: 'vad',
+          language: 'ru',
+          text: 'Сегмент не содержит нужной фразы.',
+        },
+      ],
+    });
+
+    const hits = search('скрытое решение');
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0]?.sessionId, 's1');
+    assert.equal(hits[0]?.startMs, null);
+    assert.match(hits[0]?.snippet ?? '', /\[скрытое решение\]/i);
+  });
+
+  it('finds an older Unicode match behind more than 2000 newer nonmatches', () => {
+    const insertSession = db.handle.prepare(
+      `INSERT INTO audio_sessions
+         (session_id, state, started_at, ended_at, duration_ms, speech_ms, part_count,
+          created_at, updated_at)
+       VALUES (?, 'DONE', ?, ?, 1000, 1000, 0, ?, ?)`,
+    );
+    const insertRevision = db.handle.prepare(
+      `INSERT INTO transcript_revisions
+         (revision_id, session_id, revision_number, engine, model, languages, text,
+          word_count, is_current, created_at)
+       VALUES (?, ?, 1, 'fixture', 'revision-only', '["ru"]', ?, 3, 1, ?)`,
+    );
+    db.handle.exec('BEGIN');
+    try {
+      const olderAt = '2020-01-01T00:00:00.000Z';
+      insertSession.run('older-unicode-match', olderAt, olderAt, olderAt, olderAt);
+      insertRevision.run(
+        'older-unicode-match-revision',
+        'older-unicode-match',
+        'ДАВНЕЕ РЕДКОЕ РЕШЕНИЕ.',
+        olderAt,
+      );
+      const newerBase = Date.parse('2021-01-01T00:00:00.000Z');
+      for (let index = 0; index < 2_001; index += 1) {
+        const sessionId = `newer-search-nonmatch-${index}`;
+        const at = new Date(newerBase + index * 1000).toISOString();
+        insertSession.run(sessionId, at, at, at, at);
+        insertRevision.run(`${sessionId}-revision`, sessionId, 'НЕРЕЛЕВАНТНАЯ ЗАПИСЬ.', at);
+      }
+      db.handle.exec('COMMIT');
+    } catch (error) {
+      db.handle.exec('ROLLBACK');
+      throw error;
+    }
+
+    assert.deepEqual(
+      search('редкое решение', { limit: 1 }).map((hit) => hit.sessionId),
+      ['older-unicode-match'],
+    );
+  });
+
   it('returns nothing for a phrase that does not occur', () => {
     assert.deepEqual(search('совершенно отсутствующая фраза'), []);
   });
@@ -119,6 +345,8 @@ describe('transcript search', () => {
   it('honours the limit and clamps it to something sane', () => {
     assert.equal(search('телеграм', { limit: 1 }).length, 1);
     assert.ok(search('телеграм', { limit: 99_999 }).length <= 200);
+    assert.throws(() => search('телеграм', { limit: Number.NaN }), /limit must be an integer/);
+    assert.throws(() => search('телеграм', { limit: 1.5 }), /limit must be an integer/);
   });
 
   it('searches only the current revision', () => {
@@ -163,6 +391,10 @@ describe('search query escaping', () => {
     assert.doesNotThrow(() => escapeFtsQuery('abc'));
   });
 
+  it('rejects an oversized query before scanning transcripts', () => {
+    assert.throws(() => search('я'.repeat(513)), /maximum is 512 characters/);
+  });
+
   it('does not let a crafted query break out of the MATCH expression', () => {
     assert.doesNotThrow(() => search('" OR transcript_fts MATCH "'));
     assert.deepEqual(search('" OR transcript_fts MATCH "'), []);
@@ -178,5 +410,26 @@ describe('search output', () => {
     const rendered = renderSearchResults(search('телеграм'), 'телеграм');
     assert.match(rendered, /2026-07-28 14:02/);
     assert.match(rendered, /s1/);
+  });
+
+  it('removes terminal controls and bidi overrides from user-visible output', () => {
+    const rendered = renderSearchResults(
+      [
+        {
+          sessionId: 'safe\u001b[31m\u202Eid',
+          incomingFileId: null,
+          startedAt: '2026-08-11T20:00:00.000Z',
+          language: 'ru',
+          snippet: 'line one\nline two\u202E',
+          text: 'line one line two',
+          startMs: 0,
+        },
+      ],
+      'query\u001b[2J\u202E',
+    );
+
+    assert.equal(rendered.includes('\u001b'), false);
+    assert.equal(rendered.includes('\u202e'), false);
+    assert.match(rendered, /line one line two/);
   });
 });
