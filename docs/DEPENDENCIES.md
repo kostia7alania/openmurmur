@@ -245,6 +245,29 @@ does not claim a Telegram request or ACK, retention eligibility/deletion,
 Recorder or microphone enqueue, oversized splitting, backlog fairness or
 launchd behavior.
 
+### Fresh-process scheduled digest — 2026-08-12
+
+The exact production command rendered into the digest LaunchAgent — Node 26.7
+running `src/cli/main.ts digest scheduled --root <root>` — was executed twice
+as separate processes against one private disposable state root. No daemon,
+launchctl, Telegram client, Keychain, microphone or network service participated.
+The host calendar date was 2026-08-12 while the configured
+`America/Los_Angeles` date was still 2026-08-11; the enabled schedule was due at
+00:00 in that zone.
+
+The first process selected 2026-08-11 and rolled one pre-seeded `DONE` session
+into exactly one stored digest plus one pending `digest:2026-08-11` outbox row.
+The snapshot retained the processing host, the one session, 420,000 ms of speech
+and its stored summary/decision/task/question. The second fresh process exited
+successfully with no output and left both rows' IDs, timestamps, serialized
+payload bytes and SHA-256 values unchanged. No daemon ownership, PID mirror or
+leased job appeared; SQLite quick/integrity checks were `ok` with zero
+foreign-key violations.
+
+This closes D071 at the independent production scheduler-command, timezone,
+atomic enqueue and replay boundary. It does not prove a real launchd wake,
+login/reboot scheduling or Telegram delivery; those remain D070, D098 and D122.
+
 ### Current-revision Ollama corpus — 2026-08-11
 
 The production `OllamaLlm` ran the checked-in single-language RU/EN/TH
