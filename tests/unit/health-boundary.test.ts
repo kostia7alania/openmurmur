@@ -62,6 +62,15 @@ const COMPONENT_GOLDENS: Readonly<Record<HealthComponent, readonly HealthGolden[
   ],
   asr_worker: [
     {
+      inputs: {
+        workerReady: false,
+        workerRecovering: true,
+        workerDetail: 'ASR model is loading',
+      },
+      status: 'recovering',
+      text: 'ВНИМАНИЕ: распознавание — локальная модель запускается',
+    },
+    {
       inputs: { workerReady: false, workerDetail: 'spawn failed: /private/model.bin' },
       status: 'failed',
       text: 'ОШИБКА: распознавание — локальный ASR недоступен',

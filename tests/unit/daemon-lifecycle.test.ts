@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import {
+  asrWorkerAlertActive,
   claimDaemonPid,
   claimIncomingRequest,
   commandLooksLikeOpenMurmurDaemon,
@@ -476,6 +477,12 @@ describe('incoming Telegram retry identity', () => {
 });
 
 describe('daemon terminal state reconciliation', () => {
+  it('does not clear a worker failure while the replacement model is still loading', () => {
+    assert.equal(asrWorkerAlertActive(false, false), true);
+    assert.equal(asrWorkerAlertActive(false, true), null);
+    assert.equal(asrWorkerAlertActive(true, false), false);
+  });
+
   it('retires prior-run notices and preserves current and durable session statuses', () => {
     const outbox = new Outbox(db.handle);
     for (const deliveryPartId of [

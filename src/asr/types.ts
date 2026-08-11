@@ -75,7 +75,7 @@ export interface AsrBackend {
   /** Non-intrusive snapshot: must not start/load/ping a worker. */
   health():
     | { readonly ok: true; readonly detail: string }
-    | { readonly ok: false; readonly reason: string };
+    | { readonly ok: false; readonly reason: string; readonly recovering?: true };
   ready(): Promise<{ ok: true } | { ok: false; reason: string }>;
   transcribe(request: AsrRequest): Promise<AsrResult>;
   /**

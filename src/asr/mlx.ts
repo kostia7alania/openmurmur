@@ -46,6 +46,7 @@ export class MlxAsr implements AsrBackend {
   #loadPromise: Promise<void> | null = null;
   #workerGeneration = 0;
   #workerFailed = false;
+  #readinessFailure: string | null = null;
 
   constructor(options: MlxAsrOptions) {
     this.#options = options;
@@ -60,20 +61,30 @@ export class MlxAsr implements AsrBackend {
         this.#loadState = { status: 'idle' };
         this.#loadPromise = null;
         this.#workerFailed = true;
+        this.#readinessFailure = 'ASR worker exited; the queued job will restart it';
       },
     });
   }
 
-  health(): { ok: true; detail: string } | { ok: false; reason: string } {
+  health(): { ok: true; detail: string } | { ok: false; reason: string; recovering?: true } {
+    if (this.#readinessFailure !== null) {
+      return { ok: false, reason: this.#readinessFailure };
+    }
     if (this.#workerFailed && !this.#worker.running) {
       return { ok: false, reason: 'ASR worker exited; the queued job will restart it' };
     }
-    if (!this.#worker.running) return { ok: true, detail: 'idle; starts on demand' };
+    if (!this.#worker.running) {
+      return { ok: false, reason: 'ASR worker is idle; readiness probe pending', recovering: true };
+    }
     switch (this.#loadState.status) {
       case 'idle':
-        return { ok: true, detail: 'worker running; model not loaded' };
+        return {
+          ok: false,
+          reason: 'ASR worker is running; model not loaded',
+          recovering: true,
+        };
       case 'loading':
-        return { ok: true, detail: 'model loading' };
+        return { ok: false, reason: 'ASR model is loading', recovering: true };
       case 'loaded':
         return {
           ok: true,
@@ -88,12 +99,21 @@ export class MlxAsr implements AsrBackend {
     try {
       await this.#worker.ensureStarted();
       const pong = await this.#worker.send({ id: randomUUID(), op: 'ping' }, 30_000);
-      if (!pong.ok) return { ok: false, reason: pong.error };
+      if (!pong.ok) {
+        const reason = `ASR worker readiness failed: ${pong.error}`;
+        this.#readinessFailure = reason;
+        this.#loadState = { status: 'load_failed', reason };
+        return { ok: false, reason };
+      }
       await this.#ensureLoaded();
       this.#workerFailed = false;
+      this.#readinessFailure = null;
       return { ok: true };
     } catch (error) {
-      return { ok: false, reason: (error as Error).message };
+      const reason = (error as Error).message;
+      this.#readinessFailure = reason;
+      if (this.#worker.running) this.#loadState = { status: 'load_failed', reason };
+      return { ok: false, reason };
     }
   }
 
@@ -235,9 +255,12 @@ export class MlxAsr implements AsrBackend {
         loadMs: response.load_ms,
       };
       this.#workerFailed = false;
+      this.#readinessFailure = null;
     } catch (error) {
       if (generation === this.#workerGeneration && this.#worker.running) {
-        this.#loadState = { status: 'load_failed', reason: (error as Error).message };
+        const reason = (error as Error).message;
+        this.#loadState = { status: 'load_failed', reason };
+        this.#readinessFailure = reason;
       }
       throw error;
     }

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, type TestContext } from 'node:test';
@@ -26,14 +26,18 @@ process.stdin.on('data', (chunk) => {
     if (line.trim() === '') continue;
     const request = JSON.parse(line);
     if (request.op === 'ping') {
-      send({ id: request.id, ok: true, op: 'ping', worker_version: 'fake' });
+      send(mode === 'fail-ping'
+        ? { id: request.id, ok: false, code: 'worker_not_ready', error: 'initialization failed' }
+        : { id: request.id, ok: true, op: 'ping', worker_version: 'fake' });
       continue;
     }
     if (request.op === 'load') {
       loadAttempts += 1;
       fs.writeFileSync(path.join(dir, 'load.started'), String(loadAttempts));
-      if (mode === 'fail-once' && loadAttempts === 1) {
+      if ((mode === 'fail-once' || mode === 'fail-once-slow-retry') && loadAttempts === 1) {
         send({ id: request.id, ok: false, code: 'model_load_failed', error: 'weights missing; run uv sync --extra mlx' });
+      } else if (mode === 'fail-once-slow-retry') {
+        setTimeout(() => send({ id: request.id, ok: true, op: 'load', model: request.model, load_ms: 25 }), 100);
       } else if (mode === 'wrong-op') {
         send({ id: request.id, ok: true, op: 'ping', worker_version: 'fake' });
       } else if (mode === 'wrong-model') {
@@ -105,18 +109,35 @@ async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
   }
 }
 
+async function waitForFileValue(path: string, expected: string, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path) || readFileSync(path, 'utf8') !== expected) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}=${expected}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 describe('MLX ASR model load health', () => {
   it('reports idle, loading and exact loaded state without probing from health()', async (t) => {
     const { asr, dir } = backend(t, 'slow-load');
 
-    assert.deepEqual(asr.health(), { ok: true, detail: 'idle; starts on demand' });
+    assert.deepEqual(asr.health(), {
+      ok: false,
+      reason: 'ASR worker is idle; readiness probe pending',
+      recovering: true,
+    });
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal(existsSync(join(dir, 'started')), false, 'health must not spawn the worker');
 
-    const readiness = asr.ready();
+    const readiness = Promise.all([asr.ready(), asr.ready()]);
     await waitForFile(join(dir, 'load.started'));
-    assert.deepEqual(asr.health(), { ok: true, detail: 'model loading' });
-    assert.deepEqual(await readiness, { ok: true });
+    assert.deepEqual(asr.health(), {
+      ok: false,
+      reason: 'ASR model is loading',
+      recovering: true,
+    });
+    assert.deepEqual(await readiness, [{ ok: true }, { ok: true }]);
+    assert.equal(readFileSync(join(dir, 'load.started'), 'utf8'), '1');
     assert.deepEqual(asr.health(), {
       ok: true,
       detail: 'model loaded: expected/model (25 ms)',
@@ -143,6 +164,37 @@ describe('MLX ASR model load health', () => {
     assert.deepEqual(asr.health(), {
       ok: true,
       detail: 'model loaded: expected/model (7 ms)',
+    });
+  });
+
+  it('keeps the prior failure active until a replacement load succeeds exactly', async (t) => {
+    const { asr, dir } = backend(t, 'fail-once-slow-retry');
+    const failed = await asr.ready();
+    assert.equal(failed.ok, false);
+
+    const recovery = asr.ready();
+    await waitForFileValue(join(dir, 'load.started'), '2');
+    assert.deepEqual(asr.health(), {
+      ok: false,
+      reason: 'could not load expected/model: weights missing; run uv sync --extra mlx',
+    });
+    assert.deepEqual(await recovery, { ok: true });
+    assert.deepEqual(asr.health(), {
+      ok: true,
+      detail: 'model loaded: expected/model (25 ms)',
+    });
+  });
+
+  it('persists an explicit ping rejection as failed readiness', async (t) => {
+    const { asr } = backend(t, 'fail-ping');
+
+    assert.deepEqual(await asr.ready(), {
+      ok: false,
+      reason: 'ASR worker readiness failed: initialization failed',
+    });
+    assert.deepEqual(asr.health(), {
+      ok: false,
+      reason: 'ASR worker readiness failed: initialization failed',
     });
   });
 

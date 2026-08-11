@@ -166,7 +166,9 @@ export class Daemon {
   #stopPromise: Promise<void> | null = null;
   #nextSecretsRetryAt = 0;
   #telegramUnavailable = false;
-  #nextReadinessProbeAt = 0;
+  #nextLlmReadinessProbeAt = 0;
+  #nextAsrReadinessProbeAt = 0;
+  #asrReadinessProbe: Promise<void> | null = null;
   #llmReadiness: { ready: boolean; detail: string } = {
     ready: false,
     detail: 'not probed yet',
@@ -317,6 +319,7 @@ export class Daemon {
       this.#loop('sleep', () => this.#tickSleep(), 2000);
       this.#loop('digest', () => this.#tickDigest(), DIGEST_TICK_INTERVAL_MS);
       this.#loop('retention', () => this.#tickRetention(), 60 * 60 * 1000);
+      this.#scheduleAsrReadinessProbe(true);
 
       // Creating the ONNX session takes about a second. Paying that on the first
       // frame would queue a second of audio behind it at start-up.
@@ -1120,6 +1123,7 @@ export class Daemon {
   async #collectHealth() {
     const { config, paths } = this.#options.loaded;
     await this.#probeLlmReadiness();
+    this.#scheduleAsrReadinessProbe();
     const asrHealth = this.#asr.health();
     const parts = new PartRepository(this.#db.handle);
     const lastPart = parts.lastFinalized();
@@ -1133,6 +1137,7 @@ export class Daemon {
       minutesSinceLastClosedPart:
         lastPart?.ended_at == null ? null : (Date.now() - Date.parse(lastPart.ended_at)) / 60_000,
       workerReady: asrHealth.ok,
+      workerRecovering: !asrHealth.ok && asrHealth.recovering === true,
       workerDetail: asrHealth.ok ? asrHealth.detail : asrHealth.reason,
       ollamaReady: this.#llmReadiness.ready,
       ollamaDetail: this.#llmReadiness.detail,
@@ -1180,6 +1185,7 @@ export class Daemon {
     const report = evaluateHealth(inputs, config.health);
 
     recordHealthReport(this.#db.handle, report.checks);
+    const workerAlertActive = asrWorkerAlertActive(inputs.workerReady, inputs.workerRecovering);
 
     const conditions: {
       id: AlertId;
@@ -1197,12 +1203,16 @@ export class Daemon {
             ? 'нет аудио с момента запуска'
             : `нет аудио ${Math.round((inputs.msSinceLastFrame ?? 0) / 1000)} сек`,
       },
-      {
-        id: 'worker_crashed',
-        active: !inputs.workerReady,
-        detail: renderAsrUnavailableDetail(hostname(), inputs.workerDetail),
-        fingerprint: inputs.workerReady ? '' : `asr:${failureCategory(inputs.workerDetail)}`,
-      },
+      ...(workerAlertActive === null
+        ? []
+        : [
+            {
+              id: 'worker_crashed' as const,
+              active: workerAlertActive,
+              detail: renderAsrUnavailableDetail(hostname(), inputs.workerDetail),
+              fingerprint: inputs.workerReady ? '' : `asr:${failureCategory(inputs.workerDetail)}`,
+            },
+          ]),
       {
         id: 'llm_unavailable',
         active: !inputs.ollamaReady,
@@ -1473,8 +1483,8 @@ export class Daemon {
   }
 
   async #probeLlmReadiness(): Promise<void> {
-    if (Date.now() < this.#nextReadinessProbeAt) return;
-    this.#nextReadinessProbeAt = Date.now() + 60_000;
+    if (Date.now() < this.#nextLlmReadinessProbeAt) return;
+    this.#nextLlmReadinessProbeAt = Date.now() + 60_000;
 
     const llm = await this.#llm
       .ready()
@@ -1482,6 +1492,35 @@ export class Daemon {
     this.#llmReadiness = llm.ok
       ? { ready: true, detail: `${this.#llm.name}:${llm.model}` }
       : { ready: false, detail: llm.reason };
+  }
+
+  #scheduleAsrReadinessProbe(force = false): void {
+    if (this.#stopping || this.#asrReadinessProbe !== null) return;
+    if (!force && Date.now() < this.#nextAsrReadinessProbeAt) return;
+    this.#nextAsrReadinessProbeAt = Date.now() + 60_000;
+
+    const probe = this.#asr
+      .ready()
+      .then((readiness) => {
+        if (!readiness.ok) {
+          this.#options.logger.warn('ASR readiness probe failed', {
+            reason: readiness.reason,
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        this.#options.logger.warn('ASR readiness probe failed', {
+          reason: (error as Error).message,
+        });
+      });
+    this.#asrReadinessProbe = probe;
+    this.#trackTask(
+      'ASR readiness probe',
+      () => probe,
+      () => {
+        if (this.#asrReadinessProbe === probe) this.#asrReadinessProbe = null;
+      },
+    );
   }
 
   /** Enqueues a status and immediately requests a serialized outbox drain. */
@@ -1603,6 +1642,13 @@ export function shouldEnqueueHealthAlert(
   // the warning only makes a stale warning arrive after recovery and can grow
   // the very backlog it describes. The recovery edge remains useful.
   return alertId !== 'telegram_delivery' || transition === 'cleared';
+}
+
+/** A retry in progress is neither a new failure nor proof of recovery. */
+export function asrWorkerAlertActive(ready: boolean, recovering?: boolean): boolean | null {
+  if (ready) return false;
+  if (recovering) return null;
+  return true;
 }
 
 export function markExhaustedAsrSession(

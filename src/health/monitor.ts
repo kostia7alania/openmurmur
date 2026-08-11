@@ -30,6 +30,7 @@ export interface HealthInputs {
   readonly processingLagMs: number | null;
   readonly minutesSinceLastClosedPart: number | null;
   readonly workerReady: boolean;
+  readonly workerRecovering?: boolean;
   readonly workerDetail: string;
   readonly ollamaReady: boolean;
   readonly ollamaDetail: string;
@@ -95,7 +96,7 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
 
   checks.push({
     component: 'asr_worker',
-    status: inputs.workerReady ? 'healthy' : 'failed',
+    status: inputs.workerReady ? 'healthy' : inputs.workerRecovering ? 'recovering' : 'failed',
     detail: inputs.workerDetail,
   });
 
@@ -234,6 +235,7 @@ function healthDetail(check: HealthCheck): string {
         ? 'обработка не успевает за записью'
         : `обработка отстаёт на ${count} сек`;
     case 'asr_worker':
+      if (check.status === 'recovering') return 'локальная модель запускается';
       return 'локальный ASR недоступен';
     case 'dead_jobs':
       return count === null
