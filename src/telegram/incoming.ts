@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
-import { rm, stat } from 'node:fs/promises';
-import { extname, join, resolve, sep } from 'node:path';
+import { constants } from 'node:fs';
+import { type FileHandle, open, rename, rm, stat } from 'node:fs/promises';
+import { dirname, extname, join, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { fsyncDirectory, fsyncFile } from '../capture/writer.ts';
 import type { TelegramAudioLike, TelegramClient, TelegramMessage } from './client.ts';
 import { formatBytes, formatDuration } from './format.ts';
 
@@ -133,6 +134,13 @@ export function quarantinePathFor(
   return { fileUid, path };
 }
 
+/** One bounded crash artefact per durable UID; a retry truncates and reuses it. */
+export function quarantineTemporaryPathFor(quarantineDir: string, fileUid: string): string {
+  const temporary = join(quarantineDir, `.${fileUid}.download.part`);
+  assertContained(quarantineDir, temporary);
+  return temporary;
+}
+
 /** Defence in depth: proves a resolved path really is inside its directory. */
 export function assertContained(directory: string, candidate: string): void {
   const root = resolve(directory);
@@ -204,6 +212,7 @@ export async function downloadToQuarantine(
 
   const target = quarantinePathFor(quarantineDir, attachment.claimedFilename, fileUid);
   const { path } = target;
+  const temporary = quarantineTemporaryPathFor(quarantineDir, target.fileUid);
   const response = await client.downloadFile(file.file_path);
   if (response.body === null) {
     throw new IncomingRejected('corrupt_media', 'Telegram returned an empty body');
@@ -226,22 +235,32 @@ export async function downloadToQuarantine(
     },
   });
 
+  let handle: FileHandle | null = null;
   try {
+    handle = await open(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.chmod(0o600);
     await pipeline(
       Readable.fromWeb(response.body.pipeThrough(capped) as never),
-      createWriteStream(path, { mode: 0o600 }),
+      handle.createWriteStream(),
     );
+    handle = null;
+    const info = await stat(temporary);
+    if (info.size === 0) {
+      throw new IncomingRejected('corrupt_media', 'downloaded file is empty');
+    }
+    await fsyncFile(temporary);
+    await rename(temporary, path);
+    await fsyncDirectory(dirname(path));
+    return { fileUid: target.fileUid, path, actualBytes: info.size };
   } catch (error) {
-    await rm(path, { force: true });
+    await handle?.close().catch(() => {});
+    await rm(temporary, { force: true }).catch(() => {});
     throw error;
   }
-
-  const info = await stat(path);
-  if (info.size === 0) {
-    await rm(path, { force: true });
-    throw new IncomingRejected('corrupt_media', 'downloaded file is empty');
-  }
-  return { fileUid: target.fileUid, path, actualBytes: info.size };
 }
 
 export interface ProbeResult {

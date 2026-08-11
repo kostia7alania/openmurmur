@@ -615,8 +615,14 @@ offline slice is recorded on the item itself below.
   symlinks and corrupt/out-of-root ownership, and never scans the recording
   archive. Focused tests cover report-only mode, both path kinds, NULL and
   non-NULL crash windows, a late owner, root replacement, capture-first startup,
-  idempotency and ambient archive preservation. AR-03 remains yellow until D083
-  completes the end-to-end fault injection matrix.
+  idempotency and ambient archive preservation. The D083 real-SQLite restart
+  matrix now also injects faults across claim/job/ACK, streamed download,
+  normalization, ASR and transcript/outbox publication. Incoming downloads use
+  a private deterministic temp, nonzero check, file fsync, atomic rename and
+  directory fsync; partial bytes never replace the final path, and a hard-crash
+  temp is consumed by retry. Same-file resend converges on one UID, transcript
+  manifest and exact owned artifact set with foreign keys intact. AR-03 remains
+  yellow for the real Bot API/model fault run in D084.
 
 #### AR-04 🟡 Enforce a safe daemon singleton and PID identity
 

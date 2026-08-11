@@ -1898,7 +1898,7 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-async function ensureIncomingWav(
+export async function ensureIncomingWav(
   ffmpegPath: string,
   ffprobePath: string,
   quarantinePath: string,
