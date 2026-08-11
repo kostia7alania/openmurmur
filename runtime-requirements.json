@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "nodeMinimum": "26.7.0",
+  "sqliteMinimum": "3.53.4",
+  "pnpmExact": "10.19.0"
+}

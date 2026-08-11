@@ -2,6 +2,9 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
+import { MINIMUM_SQLITE_VERSION } from '../config/runtime-requirements.ts';
+
+export { MINIMUM_SQLITE_VERSION } from '../config/runtime-requirements.ts';
 
 /**
  * Minimum SQLite runtime we are willing to run against.
@@ -10,8 +13,6 @@ import { fileURLToPath } from 'node:url';
  * runtime because `node:sqlite` is compiled into Node; a Homebrew sqlite3
  * upgrade does not change it. See docs/adr/0004-sqlite-driver.md.
  */
-export const MINIMUM_SQLITE_VERSION = '3.53.4';
-
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), 'migrations');
 
 export interface OpenDatabaseOptions {

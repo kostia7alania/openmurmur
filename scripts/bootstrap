@@ -6,6 +6,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+RUNTIME_CONTRACT="$PWD/runtime-requirements.json"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 warn() { printf '\033[33m! %s\033[0m\n' "$1"; }
@@ -21,35 +22,82 @@ if [ "$(uname -m)" != "arm64" ]; then
 fi
 
 # --- Node ---------------------------------------------------------------
-command -v node >/dev/null 2>&1 || die "Node is not installed. Install Node 26.7.0 or newer: https://nodejs.org"
-node -e '
-const actual = process.versions.node.split(".").map(Number);
-const minimum = [26, 7, 0];
-for (let i = 0; i < minimum.length; i += 1) {
-  if ((actual[i] ?? 0) === minimum[i]) continue;
-  process.exit((actual[i] ?? 0) < minimum[i] ? 1 : 0);
-}
-' || die "Node $(node -v) found; OpenMurmur needs Node 26.7.0 or newer (see .nvmrc)."
-node - <<'NODE' || die "This Node embeds an older node:sqlite runtime; run: nvm install && nvm use"
-const minimum = '3.53.4';
-const actual = process.versions.sqlite ?? '0.0.0';
-const left = actual.split('.').map(Number);
-const right = minimum.split('.').map(Number);
+command -v node >/dev/null 2>&1 || die "Node is not installed. Install the version pinned in .nvmrc: https://nodejs.org"
+NODE_BIN="$(command -v node)"
+if ! RUNTIME_VALUES="$("$NODE_BIN" --input-type=module - "$RUNTIME_CONTRACT" 2>&1 <<'NODE'
+import { readFileSync } from 'node:fs';
 
-for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
-  const x = left[i] ?? 0;
-  const y = right[i] ?? 0;
-  if (x !== y) process.exit(x < y ? 1 : 0);
+const contractPath = process.argv[2];
+const contract = JSON.parse(readFileSync(contractPath, 'utf8'));
+const versionPattern = /^\d+\.\d+\.\d+$/;
+const keys = ['nodeMinimum', 'sqliteMinimum', 'pnpmExact'];
+if (contract.schemaVersion !== 1 || keys.some((key) => !versionPattern.test(contract[key]))) {
+  throw new Error('invalid runtime requirements contract');
 }
+
+function compare(left, right) {
+  const a = left.split('.').map(Number);
+  const b = right.split('.').map(Number);
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const delta = (a[i] ?? 0) - (b[i] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return 0;
+}
+
+const sqlite = process.versions.sqlite ?? '0.0.0';
+const problems = [];
+if (compare(process.versions.node, contract.nodeMinimum) < 0) {
+  problems.push('Node ' + process.versions.node + ' is below ' + contract.nodeMinimum);
+}
+if (compare(sqlite, contract.sqliteMinimum) < 0) {
+  problems.push('node:sqlite ' + sqlite + ' is below ' + contract.sqliteMinimum);
+}
+if (problems.length > 0) {
+  process.stderr.write(problems.join('; '));
+  process.exit(1);
+}
+process.stdout.write(
+  [contract.nodeMinimum, contract.sqliteMinimum, contract.pnpmExact].join('\t'),
+);
 NODE
-ok "Node $(node -v)"
+)"; then
+  die "Runtime requirement check failed: $RUNTIME_VALUES. Run: nvm install && nvm use"
+fi
+IFS=$'\t' read -r MINIMUM_NODE_VERSION MINIMUM_SQLITE_VERSION PNPM_VERSION <<< "$RUNTIME_VALUES"
+ok "Node $("$NODE_BIN" -v)"
 
 # --- pnpm ---------------------------------------------------------------
-if ! command -v pnpm >/dev/null 2>&1; then
-  warn "pnpm not found; installing via corepack"
-  corepack enable && corepack prepare pnpm@10.19.0 --activate
+PNPM_BIN="$(command -v pnpm 2>/dev/null || true)"
+ACTUAL_PNPM_VERSION=""
+if [ -n "$PNPM_BIN" ]; then
+  ACTUAL_PNPM_VERSION="$("$PNPM_BIN" --version 2>/dev/null || true)"
 fi
-ok "pnpm $(pnpm -v)"
+
+if [ "$ACTUAL_PNPM_VERSION" != "$PNPM_VERSION" ]; then
+  if [ -n "$ACTUAL_PNPM_VERSION" ]; then
+    warn "pnpm $ACTUAL_PNPM_VERSION found; OpenMurmur requires exactly $PNPM_VERSION"
+  else
+    warn "pnpm $PNPM_VERSION is not installed"
+  fi
+
+  NODE_BIN_DIR="$(dirname "$NODE_BIN")"
+  NPM_BIN="$NODE_BIN_DIR/npm"
+  [ -x "$NPM_BIN" ] || die "npm was not found beside the validated Node runtime ($NODE_BIN). Reinstall Node $MINIMUM_NODE_VERSION or newer."
+
+  echo "  Installing the exact package manager declared by package.json:"
+  echo "    $NPM_BIN install --global pnpm@$PNPM_VERSION"
+  "$NPM_BIN" install --global "pnpm@$PNPM_VERSION"
+  hash -r
+
+  PNPM_BIN="$(command -v pnpm 2>/dev/null || true)"
+  [ -n "$PNPM_BIN" ] || die "pnpm $PNPM_VERSION was installed but is not on PATH. Add npm's global bin directory to PATH and re-run bootstrap."
+  ACTUAL_PNPM_VERSION="$("$PNPM_BIN" --version 2>/dev/null || true)"
+fi
+
+[ "$ACTUAL_PNPM_VERSION" = "$PNPM_VERSION" ] || \
+  die "pnpm ${ACTUAL_PNPM_VERSION:-unavailable} found after installation; expected exactly $PNPM_VERSION."
+ok "pnpm $ACTUAL_PNPM_VERSION"
 
 # --- FFmpeg -------------------------------------------------------------
 if ! command -v ffmpeg >/dev/null 2>&1; then
@@ -72,7 +120,7 @@ ok "$(uv --version)"
 
 # --- Dependencies -------------------------------------------------------
 bold "Installing Node dependencies"
-pnpm install --frozen-lockfile
+"$PNPM_BIN" install --frozen-lockfile
 
 bold "Installing the Python audio worker (CI-safe subset)"
 uv sync --project python/openmurmur_audio --inexact
