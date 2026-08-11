@@ -1,0 +1,154 @@
+{
+  "thresholds": {
+    "minimumGroundedFactRecall": 0.8,
+    "minimumClaimPrecision": 1,
+    "maximumForbiddenFactHits": 0,
+    "minimumCasePassRate": 1
+  },
+  "cases": [
+    {
+      "id": "ru-mvp-planning",
+      "languages": ["ru"],
+      "transcript": "Команда решила выпустить MVP в пятницу. Анна подготовит чек-лист к четвергу. Бюджет запуска — 50 000 рублей. Открытый вопрос: нужен ли второй тестовый Mac?",
+      "expectedFacts": [
+        {
+          "field": "summary",
+          "claim": "Команда спланировала выпуск MVP и подготовку к запуску.",
+          "terms": ["MVP"]
+        },
+        {
+          "field": "decisions",
+          "claim": "Выпустить MVP в пятницу.",
+          "terms": ["выпустить MVP", "пятницу"]
+        },
+        {
+          "field": "tasks",
+          "claim": "Анна подготовит чек-лист к четвергу.",
+          "terms": ["Анна", "чек-лист", "четвергу"]
+        },
+        { "field": "people", "claim": "Анна", "terms": ["Анна"] },
+        {
+          "field": "expenses",
+          "claim": "Бюджет запуска — 50 000 рублей.",
+          "terms": ["50 000", "рублей"]
+        },
+        {
+          "field": "questions",
+          "claim": "Нужен ли второй тестовый Mac?",
+          "terms": ["второй тестовый Mac"]
+        }
+      ],
+      "forbiddenFacts": ["отменить запуск", "Иван отвечает за релиз"],
+      "candidateSummary": {
+        "summary": "Команда спланировала выпуск MVP и подготовку к запуску.",
+        "decisions": ["Выпустить MVP в пятницу."],
+        "tasks": ["Анна подготовит чек-лист к четвергу."],
+        "commitments": [],
+        "people": ["Анна"],
+        "places": [],
+        "expenses": ["Бюджет запуска — 50 000 рублей."],
+        "ideas": [],
+        "questions": ["Нужен ли второй тестовый Mac?"],
+        "uncertainties": [],
+        "claimEvidence": [],
+        "evidence": []
+      }
+    },
+    {
+      "id": "en-customer-followup",
+      "languages": ["en"],
+      "transcript": "The team decided to send the beta to Acme on Tuesday. Priya will email the installation guide by Monday. The pilot budget is 1200 dollars. The open question is whether Acme needs offline mode.",
+      "expectedFacts": [
+        {
+          "field": "summary",
+          "claim": "The team planned Acme's beta delivery and follow-up.",
+          "terms": ["Acme", "beta"]
+        },
+        {
+          "field": "decisions",
+          "claim": "Send the beta to Acme on Tuesday.",
+          "terms": ["beta", "Acme", "Tuesday"]
+        },
+        {
+          "field": "tasks",
+          "claim": "Priya will email the installation guide by Monday.",
+          "terms": ["Priya", "installation guide", "Monday"]
+        },
+        { "field": "people", "claim": "Priya", "terms": ["Priya"] },
+        {
+          "field": "expenses",
+          "claim": "The pilot budget is 1200 dollars.",
+          "terms": ["1200 dollars"]
+        },
+        {
+          "field": "questions",
+          "claim": "Does Acme need offline mode?",
+          "terms": ["Acme", "offline mode"]
+        }
+      ],
+      "forbiddenFacts": ["cancel the pilot", "Wednesday"],
+      "candidateSummary": {
+        "summary": "The team planned Acme's beta delivery and follow-up.",
+        "decisions": ["Send the beta to Acme on Tuesday."],
+        "tasks": ["Priya will email the installation guide by Monday."],
+        "commitments": [],
+        "people": ["Priya"],
+        "places": [],
+        "expenses": ["The pilot budget is 1200 dollars."],
+        "ideas": [],
+        "questions": ["Does Acme need offline mode?"],
+        "uncertainties": [],
+        "claimEvidence": [],
+        "evidence": []
+      }
+    },
+    {
+      "id": "th-beta-planning",
+      "languages": ["th"],
+      "transcript": "ทีมตัดสินใจเปิดตัว MVP วันศุกร์ มาลีจะเตรียมรายการตรวจสอบภายในวันพฤหัสบดี งบประมาณ 50,000 บาท คำถามที่ยังเปิดอยู่คือจำเป็นต้องมีเครื่องทดสอบเครื่องที่สองหรือไม่",
+      "expectedFacts": [
+        {
+          "field": "summary",
+          "claim": "ทีมวางแผนเปิดตัว MVP และเตรียมความพร้อม",
+          "terms": ["เปิดตัว MVP", "เตรียม"]
+        },
+        {
+          "field": "decisions",
+          "claim": "เปิดตัว MVP วันศุกร์",
+          "terms": ["เปิดตัว MVP", "วันศุกร์"]
+        },
+        {
+          "field": "tasks",
+          "claim": "มาลีจะเตรียมรายการตรวจสอบภายในวันพฤหัสบดี",
+          "terms": ["มาลี", "รายการตรวจสอบ", "วันพฤหัสบดี"]
+        },
+        { "field": "people", "claim": "มาลี", "terms": ["มาลี"] },
+        {
+          "field": "expenses",
+          "claim": "งบประมาณ 50,000 บาท",
+          "terms": ["50,000 บาท"]
+        },
+        {
+          "field": "questions",
+          "claim": "จำเป็นต้องมีเครื่องทดสอบเครื่องที่สองหรือไม่",
+          "terms": ["เครื่องทดสอบเครื่องที่สอง"]
+        }
+      ],
+      "forbiddenFacts": ["ยกเลิกการเปิดตัว", "งบประมาณ 60,000 บาท"],
+      "candidateSummary": {
+        "summary": "ทีมวางแผนเปิดตัว MVP และเตรียมความพร้อม",
+        "decisions": ["เปิดตัว MVP วันศุกร์"],
+        "tasks": ["มาลีจะเตรียมรายการตรวจสอบภายในวันพฤหัสบดี"],
+        "commitments": [],
+        "people": ["มาลี"],
+        "places": [],
+        "expenses": ["งบประมาณ 50,000 บาท"],
+        "ideas": [],
+        "questions": ["จำเป็นต้องมีเครื่องทดสอบเครื่องที่สองหรือไม่"],
+        "uncertainties": [],
+        "claimEvidence": [],
+        "evidence": []
+      }
+    }
+  ]
+}
