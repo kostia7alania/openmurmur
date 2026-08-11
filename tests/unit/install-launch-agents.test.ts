@@ -5,18 +5,148 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { describe, it } from 'node:test';
+import { after, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const INSTALLER = join(REPO, 'scripts', 'install-launch-agents');
 const PLISTS = ['io.openmurmur.daemon.plist', 'io.openmurmur.digest.plist'] as const;
+let nativeFixtureRoot = '';
+
+function makeHome(prefix: string): string {
+  return realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+}
+
+function nativeCaptureFixture(): string {
+  if (nativeFixtureRoot !== '') {
+    return join(nativeFixtureRoot, 'OpenMurmur Capture.app');
+  }
+
+  nativeFixtureRoot = realpathSync(mkdtempSync(join(tmpdir(), 'om-launchd-native-fixture-')));
+  const digestResult = spawnSync(
+    'bash',
+    [join(REPO, 'native', 'OpenMurmurCapture', 'build.sh'), '--source-digest'],
+    { cwd: REPO, encoding: 'utf8' },
+  );
+  assert.equal(digestResult.status, 0, `${digestResult.stdout}\n${digestResult.stderr}`);
+  const digest = digestResult.stdout.trim();
+  assert.match(digest, /^[0-9a-f]{64}$/);
+
+  const app = join(nativeFixtureRoot, 'OpenMurmur Capture.app');
+  const executable = join(app, 'Contents', 'MacOS', 'OpenMurmurCapture');
+  const resources = join(app, 'Contents', 'Resources');
+  const source = join(nativeFixtureRoot, 'helper.c');
+  const entitlements = join(nativeFixtureRoot, 'Entitlements.plist');
+  mkdirSync(dirname(executable), { recursive: true });
+  mkdirSync(resources, { recursive: true });
+  writeFileSync(
+    source,
+    [
+      '#include <stdio.h>',
+      '#include <stdlib.h>',
+      '#include <string.h>',
+      '#include <unistd.h>',
+      '',
+      'int main(int argc, char **argv) {',
+      '  if (argc != 2) return 64;',
+      '  if (strcmp(argv[1], "--source-digest") == 0) {',
+      `    puts("${digest}");`,
+      '    return 0;',
+      '  }',
+      '  if (strcmp(argv[1], "--self-check") == 0) return 0;',
+      '  if (strcmp(argv[1], "--authorization-status") == 0) {',
+      '    const char *home = getenv("HOME");',
+      '    char denied[4096];',
+      '    if (home != NULL) {',
+      '      snprintf(denied, sizeof(denied), "%s/native-capture-denied", home);',
+      '      if (access(denied, F_OK) == 0) {',
+      '        puts("{\\"authorized\\":false,\\"status\\":\\"denied\\"}");',
+      '        return 77;',
+      '      }',
+      '    }',
+      '    puts("{\\"authorized\\":true,\\"status\\":\\"authorized\\"}");',
+      '    return 0;',
+      '  }',
+      '  return 64;',
+      '}',
+      '',
+    ].join('\n'),
+  );
+  const compile = spawnSync('/usr/bin/xcrun', ['clang', source, '-o', executable], {
+    encoding: 'utf8',
+  });
+  assert.equal(compile.status, 0, `${compile.stdout}\n${compile.stderr}`);
+  chmodSync(executable, 0o700);
+
+  writeFileSync(
+    join(app, 'Contents', 'Info.plist'),
+    [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<plist version="1.0">',
+      '<dict>',
+      '  <key>CFBundleExecutable</key>',
+      '  <string>OpenMurmurCapture</string>',
+      '  <key>CFBundleIdentifier</key>',
+      '  <string>io.openmurmur.capture</string>',
+      '  <key>CFBundlePackageType</key>',
+      '  <string>APPL</string>',
+      '</dict>',
+      '</plist>',
+      '',
+    ].join('\n'),
+  );
+  writeFileSync(join(resources, 'source.sha256'), `${digest}\n`);
+  writeFileSync(
+    entitlements,
+    [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<plist version="1.0">',
+      '<dict>',
+      '  <key>com.apple.security.device.audio-input</key>',
+      '  <true/>',
+      '</dict>',
+      '</plist>',
+      '',
+    ].join('\n'),
+  );
+  const signed = spawnSync(
+    '/usr/bin/codesign',
+    ['--force', '--sign', '-', '--options', 'runtime', '--entitlements', entitlements, app],
+    { encoding: 'utf8' },
+  );
+  assert.equal(signed.status, 0, `${signed.stdout}\n${signed.stderr}`);
+  return app;
+}
+
+function prepareNativeCapture(home: string, stateRoot: string): void {
+  mkdirSync(stateRoot, { recursive: true });
+  writeFileSync(
+    join(stateRoot, 'openmurmur.json'),
+    `${JSON.stringify({ audio: { captureBackend: 'native' } })}\n`,
+  );
+  const applications = join(home, 'Applications');
+  const installed = join(applications, 'OpenMurmur Capture.app');
+  mkdirSync(applications, { recursive: true });
+  rmSync(installed, { recursive: true, force: true });
+  const copied = spawnSync('/bin/cp', ['-R', nativeCaptureFixture(), installed], {
+    encoding: 'utf8',
+  });
+  assert.equal(copied.status, 0, `${copied.stdout}\n${copied.stderr}`);
+}
+
+after(() => {
+  if (nativeFixtureRoot !== '') {
+    rmSync(nativeFixtureRoot, { recursive: true, force: true });
+  }
+});
 
 function escapeXml(value: string): string {
   return value
@@ -28,6 +158,7 @@ function escapeXml(value: string): string {
 }
 
 function renderInstalledPlists(home: string, stateRoot: string): void {
+  prepareNativeCapture(home, stateRoot);
   const agents = join(home, 'Library', 'LaunchAgents');
   mkdirSync(agents, { recursive: true });
   for (const name of PLISTS) {
@@ -164,7 +295,7 @@ function prepareLaunchctlHealthMocks(
 
 describe('launch agent installation check', () => {
   it('rejects the runtime before touching the installation directory', () => {
-    const home = mkdtempSync(join(tmpdir(), 'om-launchd-runtime-'));
+    const home = makeHome('om-launchd-runtime-');
     try {
       const rejectedNode = join(home, 'incompatible-node');
       writeFileSync(
@@ -189,8 +320,78 @@ describe('launch agent installation check', () => {
     }
   });
 
+  it('gates launchd on native configuration and nonprompt capture authorization before writes', () => {
+    const home = makeHome('om-launchd-capture-gate-');
+    const stateRoot = join(home, 'state');
+    const installerTmp = join(home, 'installer-tmp');
+    const mockBin = join(home, 'capture-gate-bin');
+    const launchLog = join(home, 'launchctl.log');
+    const deniedMarker = join(home, 'native-capture-denied');
+    try {
+      mkdirSync(stateRoot);
+      mkdirSync(installerTmp);
+      mkdirSync(mockBin);
+      writeFileSync(
+        join(mockBin, 'launchctl'),
+        ['#!/bin/sh', `printf '%s\n' "$*" >> "${launchLog}"`, '[ "$1" = "print" ]', ''].join('\n'),
+        { mode: 0o700 },
+      );
+      chmodSync(join(mockBin, 'launchctl'), 0o700);
+
+      const run = (args: readonly string[]) =>
+        spawnSync('bash', [INSTALLER, ...args, '--node', process.execPath, '--root', stateRoot], {
+          cwd: REPO,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            HOME: home,
+            PATH: `${mockBin}:${process.env['PATH'] ?? ''}`,
+            TMPDIR: installerTmp,
+          },
+        });
+
+      const defaultFfmpeg = run(['--yes']);
+      assert.equal(defaultFfmpeg.status, 1, `${defaultFfmpeg.stdout}\n${defaultFfmpeg.stderr}`);
+      assert.match(defaultFfmpeg.stderr, /effective backend is ffmpeg/);
+      assert.match(defaultFfmpeg.stderr, /pnpm openmurmur start/);
+      assert.equal(existsSync(join(home, 'Library', 'LaunchAgents')), false);
+      assert.equal(existsSync(launchLog), false);
+      assert.deepEqual(readdirSync(installerTmp), []);
+
+      writeFileSync(
+        join(stateRoot, 'openmurmur.json'),
+        `${JSON.stringify({ audio: { captureBackend: null } })}\n`,
+      );
+      const invalid = run(['--yes']);
+      assert.equal(invalid.status, 1, `${invalid.stdout}\n${invalid.stderr}`);
+      assert.match(invalid.stderr, /audio\.captureBackend must be "ffmpeg" or "native"/);
+      assert.equal(existsSync(launchLog), false);
+      assert.deepEqual(readdirSync(installerTmp), []);
+
+      prepareNativeCapture(home, stateRoot);
+      writeFileSync(deniedMarker, 'denied\n');
+      const unauthorized = run(['--yes']);
+      assert.equal(unauthorized.status, 1, `${unauthorized.stdout}\n${unauthorized.stderr}`);
+      assert.match(unauthorized.stderr, /Native capture app preflight failed/);
+      assert.match(unauthorized.stderr, /not authorized for the microphone/);
+      assert.equal(existsSync(join(home, 'Library', 'LaunchAgents')), false);
+      assert.equal(existsSync(launchLog), false);
+      assert.deepEqual(readdirSync(installerTmp), []);
+
+      rmSync(deniedMarker);
+      renderInstalledPlists(home, stateRoot);
+      const ready = run(['--check']);
+      assert.equal(ready.status, 0, `${ready.stdout}\n${ready.stderr}`);
+      assert.match(ready.stdout, /native capture app is signed, current and authorized/);
+      assert.match(ready.stdout, /installed launch agents match this checkout/);
+      assert.equal(readFileSync(launchLog, 'utf8').trim().split('\n').length, 2);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('accepts rendered agents only when runtime, root and templates all match', () => {
-    const home = mkdtempSync(join(tmpdir(), 'om-launchd-current-'));
+    const home = makeHome('om-launchd-current-');
     const stateRoot = join(home, 'state with spaces & privacy');
     try {
       renderInstalledPlists(home, stateRoot);
@@ -206,7 +407,7 @@ describe('launch agent installation check', () => {
   });
 
   it('reports runtime, state-root and template drift without rewriting the plists', () => {
-    const home = mkdtempSync(join(tmpdir(), 'om-launchd-drift-'));
+    const home = makeHome('om-launchd-drift-');
     const stateRoot = join(home, 'state');
     try {
       renderInstalledPlists(home, stateRoot);
@@ -235,7 +436,7 @@ describe('launch agent installation check', () => {
   });
 
   it('reports an unregistered service separately from matching plist files', () => {
-    const home = mkdtempSync(join(tmpdir(), 'om-launchd-unregistered-'));
+    const home = makeHome('om-launchd-unregistered-');
     const stateRoot = join(home, 'state');
     try {
       renderInstalledPlists(home, stateRoot);
@@ -259,7 +460,7 @@ describe('launch agent installation check', () => {
   });
 
   it('restores both previous plists when a mocked bootstrap fails', () => {
-    const home = mkdtempSync(join(tmpdir(), 'om-launchd-rollback-'));
+    const home = makeHome('om-launchd-rollback-');
     const stateRoot = join(home, 'state');
     try {
       renderInstalledPlists(home, stateRoot);
@@ -328,7 +529,7 @@ describe('launch agent installation check', () => {
   });
 
   it('rolls back when bootstrap succeeds but launchctl print cannot find a label', () => {
-    const home = mkdtempSync(join(tmpdir(), 'om-launchd-registration-rollback-'));
+    const home = makeHome('om-launchd-registration-rollback-');
     const stateRoot = join(home, 'state');
     try {
       renderInstalledPlists(home, stateRoot);
@@ -407,7 +608,7 @@ describe('launch agent installation check', () => {
   });
 
   it('commits only after the daemon reports exact local readiness', () => {
-    const home = mkdtempSync(join(tmpdir(), 'om-launchd-health-success-'));
+    const home = makeHome('om-launchd-health-success-');
     const stateRoot = join(home, 'state');
     try {
       renderInstalledPlists(home, stateRoot);
@@ -446,7 +647,7 @@ describe('launch agent installation check', () => {
   });
 
   it('waits for delayed launchd removal before bootstrapping replacements', () => {
-    const home = mkdtempSync(join(tmpdir(), 'om-launchd-delayed-bootout-'));
+    const home = makeHome('om-launchd-delayed-bootout-');
     const stateRoot = join(home, 'state');
     try {
       renderInstalledPlists(home, stateRoot);
@@ -496,7 +697,7 @@ describe('launch agent installation check', () => {
   });
 
   it('fully rolls back when registration succeeds but daemon health never becomes ready', () => {
-    const home = mkdtempSync(join(tmpdir(), 'om-launchd-health-rollback-'));
+    const home = makeHome('om-launchd-health-rollback-');
     const stateRoot = join(home, 'state');
     try {
       renderInstalledPlists(home, stateRoot);

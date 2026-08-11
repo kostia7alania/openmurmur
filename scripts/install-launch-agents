@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Installs the launchd agents from the templates in launchd/.
 #
-# Grant microphone access interactively FIRST (`pnpm openmurmur capture test`).
-# launchd cannot always surface the macOS TCC prompt.
+# Background installation is supported only with the stable native capture app.
+# This script never requests microphone authorization or opens the microphone.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -12,13 +12,11 @@ SERVICE_DOMAIN="gui/$(id -u)"
 RUNTIME_CONTRACT="$REPO/runtime-requirements.json"
 
 CHECK_ONLY=false
-ASSUME_YES=false
 REQUESTED_NODE=""
 REQUESTED_ROOT="${OPENMURMUR_HOME:-$HOME/Library/Application Support/OpenMurmur}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 ok()   { printf '\033[32m✓ %s\033[0m\n' "$1"; }
-warn() { printf '\033[33m! %s\033[0m\n' "$1"; }
 fail() { printf '\033[31m✗ %s\033[0m\n' "$1" >&2; }
 die()  { fail "$1"; exit 1; }
 
@@ -27,7 +25,7 @@ usage() {
 Usage: ./scripts/install-launch-agents [--check] [--yes] [--node PATH] [--root DIR]
 
   --check      Read-only: report runtime, state-root, template and registration drift.
-  --yes        Skip the interactive microphone-permission confirmation.
+  --yes        Accepted for noninteractive compatibility; capture preflight is never skipped.
   --node PATH  Use this Node binary. It must satisfy the project runtime floor.
   --root DIR   Persist this canonical state root in every installed agent.
 USAGE
@@ -40,7 +38,6 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --yes)
-      ASSUME_YES=true
       shift
       ;;
     --node)
@@ -166,6 +163,60 @@ import { resolve } from 'node:path';
 process.stdout.write(resolve(process.argv[2]));
 NODE
 )"
+
+CONFIG_FILE="$STATE_ROOT/openmurmur.json"
+if ! CAPTURE_BACKEND="$("$NODE_BIN" --input-type=module - "$CONFIG_FILE" 2>&1 <<'NODE'
+import { readFileSync } from 'node:fs';
+
+const configFile = process.argv[2];
+let text;
+try {
+  text = readFileSync(configFile, 'utf8');
+} catch (error) {
+  if (error && typeof error === 'object' && error.code === 'ENOENT') {
+    process.stdout.write('ffmpeg');
+    process.exit(0);
+  }
+  throw new Error(`cannot read ${configFile}: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+let config;
+try {
+  config = JSON.parse(text);
+} catch (error) {
+  throw new Error(`${configFile} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+}
+if (config === null || typeof config !== 'object' || Array.isArray(config)) {
+  throw new Error(`${configFile} must contain a JSON object`);
+}
+
+const audio = config.audio;
+if (audio === undefined) {
+  process.stdout.write('ffmpeg');
+  process.exit(0);
+}
+if (audio === null || typeof audio !== 'object' || Array.isArray(audio)) {
+  throw new Error(`${configFile}: audio must be an object`);
+}
+
+const backend = Object.hasOwn(audio, 'captureBackend') ? audio.captureBackend : 'ffmpeg';
+if (backend !== 'ffmpeg' && backend !== 'native') {
+  throw new Error(`${configFile}: audio.captureBackend must be "ffmpeg" or "native"`);
+}
+process.stdout.write(backend);
+NODE
+)"; then
+  die "Capture backend configuration is invalid: $CAPTURE_BACKEND"
+fi
+
+if [ "$CAPTURE_BACKEND" != "native" ]; then
+  die "launchd background recording requires audio.captureBackend=\"native\". The effective backend is ffmpeg; run in the foreground instead: pnpm openmurmur start --root \"$STATE_ROOT\""
+fi
+
+if ! "$REPO/scripts/install-capture-app" --check; then
+  die "Native capture app preflight failed. Install and explicitly authorize the stable app, then run ./scripts/install-capture-app --check."
+fi
+ok "native capture app is signed, current and authorized"
 
 TMP_BASE="${TMPDIR:-/tmp}"
 WORK_DIR="$(mktemp -d "$TMP_BASE/openmurmur-launchd.XXXXXX")"
@@ -297,14 +348,6 @@ echo "  repo:  $REPO"
 echo "  node:  $NODE_BIN (v$PROBED_NODE_VERSION, SQLite $PROBED_SQLITE_VERSION)"
 echo "  root:  $STATE_ROOT"
 echo
-
-if [ "$ASSUME_YES" != true ]; then
-  warn "Have you run 'pnpm openmurmur capture test' and granted microphone access?"
-  warn "launchd may not be able to show the permission prompt."
-  printf 'Continue? [y/N] '
-  read -r reply
-  case "$reply" in [yY]*) ;; *) echo "Cancelled."; exit 1 ;; esac
-fi
 
 # Everything above this point is read-only apart from the private render directory.
 install -d -m 0700 "$AGENTS" "$STATE_ROOT" "$STATE_ROOT/logs"
