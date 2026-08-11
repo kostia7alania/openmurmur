@@ -121,6 +121,50 @@ function seedDeliveredSession(id: string, options: SessionOptions = {}): string 
   return path;
 }
 
+function seedIncomingAudio(id: string): string {
+  const path = join(dir, `${id}.ogg`);
+  writeFileSync(path, Buffer.alloc(100));
+  db.handle
+    .prepare(
+      `INSERT INTO incoming_telegram_files
+         (file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id,
+          actual_bytes, state, quarantine_path, created_at, updated_at)
+       VALUES (?, ?, ?, 42, 1, 100, 'transcribed', ?, ?, ?)`,
+    )
+    .run(id, `file-${id}`, `unique-${id}`, path, OLD, OLD);
+  db.handle
+    .prepare(
+      `INSERT INTO transcript_revisions
+         (revision_id, incoming_file_id, revision_number, engine, model, languages,
+          text, word_count, is_current, created_at)
+       VALUES (?, ?, 1, 'e', 'm', '[]', 'text', 1, 1, ?)`,
+    )
+    .run(`${id}-r1`, id, OLD);
+  return path;
+}
+
+function seedSentIncomingManifest(id: string, acknowledgedAt: string): void {
+  db.handle
+    .prepare(
+      `INSERT INTO telegram_outbox
+         (outbox_id, delivery_part_id, kind, ordinal, payload, state,
+          run_after, created_at, updated_at)
+       VALUES (?, ?, 'incoming_transcript', 10, ?, 'sent', ?, ?, ?)`,
+    )
+    .run(
+      `${id}-outbox-1`,
+      `incoming:${id}:1`,
+      JSON.stringify({
+        type: 'text',
+        text: 'transcript',
+        replyMarkup: { inline_keyboard: [] },
+      }),
+      acknowledgedAt,
+      acknowledgedAt,
+      acknowledgedAt,
+    );
+}
+
 describe('retention: what may be deleted', () => {
   it('deletes audio only once every condition holds', () => {
     seedDeliveredSession('s1');
@@ -299,30 +343,55 @@ describe('retention: what may be deleted', () => {
   });
 
   it('keeps incoming audio until every transcript message is confirmed delivered', () => {
-    const path = join(dir, 'incoming.ogg');
-    writeFileSync(path, Buffer.alloc(100));
-    db.handle
-      .prepare(
-        `INSERT INTO incoming_telegram_files
-           (file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id,
-            actual_bytes, state, quarantine_path, created_at, updated_at)
-         VALUES ('incoming', 'f', 'u', 42, 1, 100, 'transcribed', ?, ?, ?)`,
-      )
-      .run(path, OLD, OLD);
-    db.handle
-      .prepare(
-        `INSERT INTO transcript_revisions
-           (revision_id, incoming_file_id, revision_number, engine, model, languages,
-            text, word_count, is_current, created_at)
-         VALUES ('incoming-r1', 'incoming', 1, 'e', 'm', '[]', 'text', 1, 1, ?)`,
-      )
-      .run(OLD);
+    seedIncomingAudio('incoming-unproven');
 
     assert.equal(planRetention(db.handle, RETENTION).candidates.length, 0);
     db.handle
-      .prepare("UPDATE incoming_telegram_files SET state = 'delivered', updated_at = ?")
-      .run(OLD);
-    assert.equal(planRetention(db.handle, RETENTION).candidates.length, 1);
+      .prepare(
+        "UPDATE incoming_telegram_files SET state = 'delivered', updated_at = ? WHERE file_uid = ?",
+      )
+      .run(OLD, 'incoming-unproven');
+    assert.equal(
+      planRetention(db.handle, RETENTION).candidates.length,
+      0,
+      'state and an old processing timestamp are not delivery proof',
+    );
+    const unproven = db.handle
+      .prepare('SELECT delivered_at FROM incoming_telegram_files WHERE file_uid = ?')
+      .get('incoming-unproven') as { delivered_at: string | null };
+    assert.equal(unproven.delivered_at, null);
+
+    const recentAck = new Date().toISOString();
+    seedIncomingAudio('incoming-recent');
+    seedSentIncomingManifest('incoming-recent', recentAck);
+    db.handle
+      .prepare("UPDATE incoming_telegram_files SET state = 'delivered' WHERE file_uid = ?")
+      .run('incoming-recent');
+    const recent = db.handle
+      .prepare('SELECT delivered_at FROM incoming_telegram_files WHERE file_uid = ?')
+      .get('incoming-recent') as { delivered_at: string | null };
+    assert.equal(recent.delivered_at, recentAck, 'the exact sent manifest derives the clock');
+    assert.equal(
+      planRetention(db.handle, RETENTION).candidates.length,
+      0,
+      'the retention window starts at delivery, not receipt or transcription',
+    );
+  });
+
+  it('makes incoming audio eligible from an elapsed trigger-derived delivery clock', () => {
+    seedIncomingAudio('incoming-old');
+    seedSentIncomingManifest('incoming-old', OLD);
+    db.handle
+      .prepare("UPDATE incoming_telegram_files SET state = 'delivered' WHERE file_uid = ?")
+      .run('incoming-old');
+
+    const stored = db.handle
+      .prepare('SELECT delivered_at FROM incoming_telegram_files WHERE file_uid = ?')
+      .get('incoming-old') as { delivered_at: string | null };
+    assert.equal(stored.delivered_at, OLD);
+    const plan = planRetention(db.handle, RETENTION);
+    assert.equal(plan.candidates.length, 1);
+    assert.equal(plan.candidates[0]?.kind, 'incoming_audio');
   });
 });
 

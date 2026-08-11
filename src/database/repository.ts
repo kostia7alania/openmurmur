@@ -215,6 +215,7 @@ export interface IncomingFileRow {
   readonly state: string;
   readonly quarantinePath: string | null;
   readonly normalizedPath: string | null;
+  readonly deliveredAt: string | null;
 }
 
 export interface ClaimIncomingFileInput {
@@ -353,7 +354,7 @@ export class IncomingFileRepository {
       .prepare(
         `SELECT file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id, bot_scope, update_id,
                 telegram_source, attachment_type, claimed_filename, telegram_message_at,
-                original_sent_at, daemon_host, state, quarantine_path, normalized_path
+                original_sent_at, daemon_host, state, quarantine_path, normalized_path, delivered_at
            FROM incoming_telegram_files WHERE ${column} = ?`,
       )
       .get(value) as
@@ -374,6 +375,7 @@ export class IncomingFileRepository {
           state: string;
           quarantine_path: string | null;
           normalized_path: string | null;
+          delivered_at: string | null;
         }
       | undefined;
     if (row === undefined) return undefined;
@@ -394,6 +396,7 @@ export class IncomingFileRepository {
       state: row.state,
       quarantinePath: row.quarantine_path,
       normalizedPath: row.normalized_path,
+      deliveredAt: row.delivered_at,
     };
   }
 }
@@ -440,6 +443,28 @@ export class TranscriptRepository {
         throw new Error('transcript must belong to a session or an incoming file');
       }
       const column = input.sessionId !== undefined ? 'session_id' : 'incoming_file_id';
+
+      if (input.incomingFileId !== undefined) {
+        const incoming = this.#db
+          .prepare('SELECT state FROM incoming_telegram_files WHERE file_uid = ?')
+          .get(input.incomingFileId) as { readonly state: string } | undefined;
+        if (incoming?.state === 'delivered') {
+          throw new Error('cannot supersede a delivered incoming transcript revision');
+        }
+        const prefix = `incoming:${input.incomingFileId}:`;
+        const manifest = this.#db
+          .prepare(
+            `SELECT 1
+               FROM telegram_outbox
+              WHERE kind = 'incoming_transcript'
+                AND substr(delivery_part_id, 1, ?) = ?
+              LIMIT 1`,
+          )
+          .get(prefix.length, prefix);
+        if (manifest !== undefined) {
+          throw new Error('cannot supersede an incoming transcript revision after delivery starts');
+        }
+      }
 
       const prev = this.#db
         .prepare(

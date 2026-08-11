@@ -229,7 +229,8 @@ export function planRetention(
          FROM incoming_telegram_files
         WHERE deleted_at IS NULL
           AND state = 'delivered'
-          AND updated_at <= ?
+          AND delivered_at IS NOT NULL
+          AND delivered_at <= ?
           AND EXISTS (
                 SELECT 1 FROM transcript_revisions r WHERE r.incoming_file_id = file_uid
               )`,
@@ -249,7 +250,7 @@ export function planRetention(
         id: row.file_uid,
         path,
         bytes: row.bytes,
-        reason: `transcribed, older than ${config.incomingAudioHours}h`,
+        reason: `transcript delivered, older than ${config.incomingAudioHours}h after delivery`,
       });
     }
   }

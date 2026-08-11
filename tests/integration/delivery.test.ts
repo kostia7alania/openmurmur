@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { FakeAsr, SilentFakeAsr } from '../../src/asr/fake.ts';
+import { reconcileIncomingDelivery } from '../../src/cli/daemon.ts';
 import { resolvePaths } from '../../src/config/paths.ts';
 import { DEFAULT_CONFIG } from '../../src/config/schema.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
@@ -658,6 +659,126 @@ describe('delivery enqueue', () => {
 });
 
 describe('session completion and retention handoff', () => {
+  it('commits the final incoming ACK and monotonic retention clock atomically', () => {
+    const fileUid = 'incoming-atomic-clock';
+    const oldAck = '2026-08-11T10:00:00.000Z';
+    db.handle
+      .prepare(
+        `INSERT INTO incoming_telegram_files
+           (file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id,
+            state, created_at, updated_at)
+         VALUES (?, 'telegram-file', 'telegram-unique', 42, 1, 'transcribed', ?, ?)`,
+      )
+      .run(fileUid, oldAck, oldAck);
+    db.handle
+      .prepare(
+        `INSERT INTO transcript_revisions
+           (revision_id, incoming_file_id, revision_number, engine, model, languages,
+            text, word_count, is_current, created_at)
+         VALUES ('incoming-clock-r1', ?, 1, 'fake', 'fake', '[]', 'text', 1, 1, ?)`,
+      )
+      .run(fileUid, oldAck);
+
+    const outbox = new Outbox(db.handle);
+    outbox.enqueue({
+      deliveryPartId: `incoming:${fileUid}:1`,
+      kind: 'incoming_transcript',
+      ordinal: 10,
+      payload: { type: 'text', text: 'part 1' },
+    });
+    outbox.enqueue({
+      deliveryPartId: `incoming:${fileUid}:2`,
+      kind: 'incoming_transcript',
+      ordinal: 10,
+      payload: {
+        type: 'text',
+        text: 'part 2',
+        replyMarkup: { inline_keyboard: [] },
+      },
+    });
+    db.handle
+      .prepare(
+        `UPDATE telegram_outbox
+            SET state = 'sent', updated_at = ?
+          WHERE delivery_part_id = ?`,
+      )
+      .run(oldAck, `incoming:${fileUid}:1`);
+    const afterPartialAck = db.handle
+      .prepare('SELECT state, delivered_at FROM incoming_telegram_files WHERE file_uid = ?')
+      .get(fileUid) as { state: string; delivered_at: string | null };
+    assert.deepEqual(
+      { ...afterPartialAck },
+      { state: 'transcribed', delivered_at: null },
+      'a partial manifest cannot start retention',
+    );
+    const finalRow = outbox.claimNext();
+    assert.ok(finalRow);
+    assert.equal(finalRow.delivery_part_id, `incoming:${fileUid}:2`);
+
+    assert.throws(
+      () =>
+        outbox.markSent(finalRow.outbox_id, 501, () => {
+          reconcileIncomingDelivery(db.handle, fileUid);
+          throw new Error('injected failure after incoming delivery proof');
+        }),
+      /injected failure after incoming delivery proof/,
+    );
+    const afterFault = db.handle
+      .prepare(
+        `SELECT i.state, i.delivered_at, o.state AS outbox_state
+           FROM incoming_telegram_files i
+           JOIN telegram_outbox o ON o.outbox_id = ?
+          WHERE i.file_uid = ?`,
+      )
+      .get(finalRow.outbox_id, fileUid) as {
+      state: string;
+      delivered_at: string | null;
+      outbox_state: string;
+    };
+    assert.deepEqual(
+      { ...afterFault },
+      { state: 'transcribed', delivered_at: null, outbox_state: 'sending' },
+    );
+
+    outbox.markSent(finalRow.outbox_id, 501, () => {
+      reconcileIncomingDelivery(db.handle, fileUid);
+    });
+    const delivered = db.handle
+      .prepare(
+        `SELECT i.state, i.delivered_at, o.state AS outbox_state, o.updated_at AS ack_at
+           FROM incoming_telegram_files i
+           JOIN telegram_outbox o ON o.outbox_id = ?
+          WHERE i.file_uid = ?`,
+      )
+      .get(finalRow.outbox_id, fileUid) as {
+      state: string;
+      delivered_at: string | null;
+      outbox_state: string;
+      ack_at: string;
+    };
+    assert.deepEqual(
+      { state: delivered.state, outboxState: delivered.outbox_state },
+      { state: 'delivered', outboxState: 'sent' },
+      'retrying finalization commits both facts exactly once',
+    );
+    assert.equal(
+      delivered.delivered_at,
+      delivered.ack_at,
+      'the final Telegram ACK starts the retention clock',
+    );
+
+    db.handle
+      .prepare("UPDATE telegram_outbox SET updated_at = ? WHERE kind = 'incoming_transcript'")
+      .run('2020-01-01T00:00:00.000Z');
+    db.handle
+      .prepare("UPDATE incoming_telegram_files SET state = 'delivered' WHERE file_uid = ?")
+      .run(fileUid);
+    const afterOlderReplay = db.handle
+      .prepare('SELECT delivered_at FROM incoming_telegram_files WHERE file_uid = ?')
+      .get(fileUid) as { delivered_at: string | null };
+    assert.equal(afterOlderReplay.delivered_at, delivered.delivered_at);
+  });
+
   it('rolls back the sent audio row when its part delivery fact fails', () => {
     seedFinalizedSession('atomic-audio');
     const part = db.handle

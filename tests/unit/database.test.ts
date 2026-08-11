@@ -80,7 +80,7 @@ describe('migrations', () => {
     assert.ok(applied.every((row) => row.name.endsWith('.sql')));
   });
 
-  it('backfills delivery time only from an exact, fully sent legacy audio manifest', () => {
+  it('backfills delivery clocks only from exact, fully sent legacy manifests', () => {
     const legacy = new DatabaseSync(join(dir, 'legacy.db'));
     try {
       legacy.exec(`
@@ -98,9 +98,19 @@ describe('migrations', () => {
           delivery_part_id TEXT PRIMARY KEY,
           session_id TEXT,
           kind TEXT NOT NULL,
+          payload TEXT NOT NULL DEFAULT '{}',
           state TEXT NOT NULL,
           last_error TEXT,
           updated_at TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE incoming_telegram_files (
+          file_uid TEXT PRIMARY KEY,
+          state TEXT NOT NULL,
+          deleted_at TEXT
+        ) STRICT;
+        CREATE TABLE transcript_revisions (
+          incoming_file_id TEXT,
+          is_current INTEGER NOT NULL
         ) STRICT;
         CREATE TABLE alert_state (
           alert_id TEXT PRIMARY KEY,
@@ -160,10 +170,76 @@ describe('migrations', () => {
       addOutbox.run('audio:wrong-session', 's-other', 'audio', 'sent', early);
       addOutbox.run('audio:unconfirmed-domain', 's-domain', 'audio', 'sent', early);
 
+      const addIncoming = legacy.prepare(
+        "INSERT INTO incoming_telegram_files (file_uid, state) VALUES (?, 'delivered')",
+      );
+      const addIncomingRevision = legacy.prepare(
+        'INSERT INTO transcript_revisions (incoming_file_id, is_current) VALUES (?, 1)',
+      );
+      for (const fileUid of [
+        'incoming-valid',
+        'incoming-absent',
+        'incoming-pending',
+        'incoming-missing-tail',
+        'incoming-gapped',
+        'incoming-ambiguous',
+        'incoming-invalid-payload',
+        'incoming-malformed-head',
+        'incoming-non-text',
+        'incoming-no-transcript',
+      ]) {
+        addIncoming.run(fileUid);
+        if (fileUid !== 'incoming-no-transcript') addIncomingRevision.run(fileUid);
+      }
+      const addIncomingOutbox = legacy.prepare(
+        `INSERT INTO telegram_outbox
+           (delivery_part_id, kind, payload, state, updated_at)
+         VALUES (?, 'incoming_transcript', ?, ?, ?)`,
+      );
+      const ordinaryPayload = JSON.stringify({ type: 'text', text: 'part' });
+      const finalPayload = JSON.stringify({
+        type: 'text',
+        text: 'final',
+        replyMarkup: { inline_keyboard: [] },
+      });
+      addIncomingOutbox.run('incoming:incoming-valid:1', ordinaryPayload, 'sent', early);
+      addIncomingOutbox.run('incoming:incoming-valid:2', finalPayload, 'sent', late);
+      addIncomingOutbox.run('incoming:incoming-pending:1', ordinaryPayload, 'sent', early);
+      addIncomingOutbox.run('incoming:incoming-pending:2', finalPayload, 'pending', late);
+      addIncomingOutbox.run('incoming:incoming-missing-tail:1', ordinaryPayload, 'sent', early);
+      addIncomingOutbox.run('incoming:incoming-gapped:1', ordinaryPayload, 'sent', early);
+      addIncomingOutbox.run('incoming:incoming-gapped:3', finalPayload, 'sent', late);
+      addIncomingOutbox.run('incoming:incoming-ambiguous:1', finalPayload, 'sent', early);
+      addIncomingOutbox.run('incoming:incoming-ambiguous:2', finalPayload, 'sent', late);
+      addIncomingOutbox.run('incoming:incoming-invalid-payload:1', 'not-json', 'sent', early);
+      addIncomingOutbox.run(
+        'incoming:incoming-malformed-head:1',
+        JSON.stringify({
+          type: 'text',
+          text: 'head',
+          replyMarkup: { inline_keyboard: 'not-an-array' },
+        }),
+        'sent',
+        early,
+      );
+      addIncomingOutbox.run('incoming:incoming-malformed-head:2', finalPayload, 'sent', late);
+      addIncomingOutbox.run(
+        'incoming:incoming-non-text:1',
+        JSON.stringify({
+          type: 'text',
+          text: 42,
+          replyMarkup: { inline_keyboard: [] },
+        }),
+        'sent',
+        late,
+      );
+      addIncomingOutbox.run('incoming:incoming-no-transcript:1', finalPayload, 'sent', early);
+
       assert.deepEqual(migrate(legacy), [
         '006_alert_fingerprints.sql',
         '007_audio_delivery_time.sql',
         '008_daemon_heartbeat.sql',
+        '009_incoming_delivery_time.sql',
       ]);
       const rows = legacy
         .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')
@@ -182,6 +258,27 @@ describe('migrations', () => {
         'unconfirmed-domain',
       ]) {
         assert.equal(deliveryTime.get(partId), null, `${partId} must remain fail-closed`);
+      }
+
+      const incomingRows = legacy
+        .prepare('SELECT file_uid, delivered_at FROM incoming_telegram_files ORDER BY file_uid')
+        .all() as { file_uid: string; delivered_at: string | null }[];
+      const incomingDeliveryTime = new Map(
+        incomingRows.map((row) => [row.file_uid, row.delivered_at]),
+      );
+      assert.equal(incomingDeliveryTime.get('incoming-valid'), late);
+      for (const fileUid of [
+        'incoming-absent',
+        'incoming-pending',
+        'incoming-missing-tail',
+        'incoming-gapped',
+        'incoming-ambiguous',
+        'incoming-invalid-payload',
+        'incoming-malformed-head',
+        'incoming-non-text',
+        'incoming-no-transcript',
+      ]) {
+        assert.equal(incomingDeliveryTime.get(fileUid), null, `${fileUid} must remain fail-closed`);
       }
     } finally {
       legacy.close();
@@ -516,6 +613,121 @@ describe('immutable transcript revisions', () => {
         }),
       /must belong to/,
     );
+  });
+
+  it('does not supersede the revision whose incoming delivery was proven', () => {
+    const at = '2026-08-11T10:00:00.000Z';
+    db.handle
+      .prepare(
+        `INSERT INTO incoming_telegram_files
+           (file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id,
+            state, created_at, updated_at)
+         VALUES ('incoming-delivered', 'file-id', 'unique-id', 42, 1,
+                 'transcribed', ?, ?)`,
+      )
+      .run(at, at);
+    const transcripts = new TranscriptRepository(db.handle);
+    const originalRevision = transcripts.append({
+      incomingFileId: 'incoming-delivered',
+      engine: 'e',
+      model: 'm',
+      languages: ['ru'],
+      text: 'доставленный вариант',
+      segments: [],
+    });
+    db.handle
+      .prepare("UPDATE incoming_telegram_files SET state = 'delivered' WHERE file_uid = ?")
+      .run('incoming-delivered');
+
+    assert.throws(
+      () =>
+        transcripts.append({
+          incomingFileId: 'incoming-delivered',
+          engine: 'e',
+          model: 'm2',
+          languages: ['ru'],
+          text: 'новый вариант',
+          segments: [],
+        }),
+      /cannot supersede a delivered incoming transcript revision/,
+    );
+    const current = db.handle
+      .prepare(
+        `SELECT revision_id, text
+           FROM transcript_revisions
+          WHERE incoming_file_id = ? AND is_current = 1`,
+      )
+      .get('incoming-delivered') as { revision_id: string; text: string };
+    assert.deepEqual(
+      { ...current },
+      { revision_id: originalRevision, text: 'доставленный вариант' },
+    );
+  });
+
+  it('freezes an incoming revision as soon as its delivery manifest exists', () => {
+    const at = '2026-08-11T10:00:00.000Z';
+    db.handle
+      .prepare(
+        `INSERT INTO incoming_telegram_files
+           (file_uid, telegram_file_id, telegram_unique_id, chat_id, message_id,
+            state, created_at, updated_at)
+         VALUES ('incoming-pending', 'file-pending', 'unique-pending', 42, 2,
+                 'transcribed', ?, ?)`,
+      )
+      .run(at, at);
+    const transcripts = new TranscriptRepository(db.handle);
+    const originalRevision = transcripts.append({
+      incomingFileId: 'incoming-pending',
+      engine: 'e',
+      model: 'm',
+      languages: ['ru'],
+      text: 'вариант в очереди',
+      segments: [],
+    });
+    db.handle
+      .prepare(
+        `INSERT INTO telegram_outbox
+           (outbox_id, delivery_part_id, kind, ordinal, payload, state,
+            run_after, created_at, updated_at)
+         VALUES ('incoming-pending-o1', 'incoming:incoming-pending:1',
+                 'incoming_transcript', 10, '{}', 'pending', ?, ?, ?)`,
+      )
+      .run(at, at, at);
+
+    assert.throws(
+      () =>
+        transcripts.append({
+          incomingFileId: 'incoming-pending',
+          engine: 'e',
+          model: 'm2',
+          languages: ['ru'],
+          text: 'отвязанный вариант',
+          segments: [],
+        }),
+      /cannot supersede an incoming transcript revision after delivery starts/,
+    );
+    assert.throws(
+      () =>
+        db.handle
+          .prepare(
+            `INSERT INTO transcript_revisions
+               (revision_id, incoming_file_id, revision_number, engine, model, languages,
+                text, word_count, is_current, created_at)
+             VALUES ('incoming-pending-r2', 'incoming-pending', 2, 'e', 'm2', '[]',
+                     'обход repository', 2, 1, ?)`,
+          )
+          .run(at),
+      /cannot supersede an incoming transcript revision after delivery starts/,
+      'the database invariant must also reject direct inserts',
+    );
+    const current = db.handle
+      .prepare(
+        `SELECT revision_id, text
+           FROM transcript_revisions
+          WHERE incoming_file_id = ? AND is_current = 1`,
+      )
+      .get('incoming-pending') as { revision_id: string; text: string };
+    assert.deepEqual({ ...current }, { revision_id: originalRevision, text: 'вариант в очереди' });
   });
 });
 
