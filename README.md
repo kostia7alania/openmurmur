@@ -430,6 +430,12 @@ Neither needs a microphone, a model, or a network.
 
 Honesty matters more than a green badge, so:
 
+| Evidence level | Current authoritative evidence | Boundary it does **not** cross |
+| --- | --- | --- |
+| Offline automated | The exact current-revision Node and Python gate is recorded immediately below; every covered guarantee names deterministic repository tests. | No microphone, model weights, Telegram credential, Keychain mutation, launchd login session or sleep/wake cycle is exercised. |
+| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama component runs. | A component smoke run is not the complete daemon pipeline and is not current-revision live release evidence. |
+| Live release | No current-revision end-to-end live run is recorded yet; D120–D122 in [`docs/MVP_123.md`](docs/MVP_123.md) are the required gates. | Until those rows are evidenced, the project does not claim real microphone → models → Telegram, launchd login/reboot or sleep/wake verification. |
+
 **Verified on this revision by 551 offline TypeScript tests (106 suites) and 36
 Python tests:**
 sessionizer state machine with a fake clock, pre-roll,
