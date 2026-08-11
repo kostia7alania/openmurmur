@@ -57,7 +57,6 @@ import { SileroStreamVad } from '../sessionizer/silero.ts';
 import type { Vad } from '../sessionizer/vad.ts';
 import {
   isClientShutdown,
-  isRetryable,
   type TelegramCallbackQuery,
   TelegramClient,
   type TelegramInlineKeyboardMarkup,
@@ -81,12 +80,12 @@ import {
 } from '../telegram/provenance.ts';
 import { HELP_TEXT, renderCaptureFailure, renderStatus } from '../telegram/report.ts';
 import {
+  completeTelegramUpdate,
   markUpdateHandled,
-  nextOffsetFor,
   readOffset,
   recordUpdate,
   routeUpdate,
-  writeOffset,
+  writeOffsetAfterHandledUpdates,
 } from '../telegram/router.ts';
 import {
   asrSettingsKeyboard,
@@ -664,22 +663,31 @@ export class Daemon {
 
     for (const update of updates) {
       const action = routeUpdate(update, chatId);
-      // An unhandled row is replayed after a crash. Every durable side effect
-      // below has an update-based idempotency key, so replay completes missing
-      // work instead of duplicating it.
+      // An unhandled row is replayed after a crash. Each branch commits its
+      // durable outcome with handled; queued work also has an update-scoped key.
       if (!recordUpdate(this.#db.handle, update.update_id, action.kind, botScope)) continue;
 
       switch (action.kind) {
         case 'ignore':
+          completeTelegramUpdate(
+            this.#db.handle,
+            update.update_id,
+            action.kind,
+            botScope,
+            () => {},
+          );
           break;
         case 'command':
-          await this.#handleCommand(action.command, update.update_id);
+          await this.#handleCommand(action.command, update.update_id, botScope);
           break;
         case 'callback':
-          await this.#handleCallback(action.query);
+          await this.#handleCallback(action.query, update.update_id, botScope);
           break;
         case 'unknown_command':
-          this.#enqueueText(
+          this.#completeTextUpdate(
+            action.kind,
+            update.update_id,
+            botScope,
             `Неизвестная команда. ${HELP_TEXT}`,
             scopedUpdateKey('cmd', botScope, update.update_id),
             'HTML',
@@ -696,25 +704,41 @@ export class Daemon {
           );
           continue;
         case 'text':
+          completeTelegramUpdate(
+            this.#db.handle,
+            update.update_id,
+            action.kind,
+            botScope,
+            () => {},
+          );
           break;
       }
-      markUpdateHandled(this.#db.handle, update.update_id, botScope);
     }
-    writeOffset(this.#db.handle, nextOffsetFor(updates, offset), botScope);
+    writeOffsetAfterHandledUpdates(this.#db.handle, updates, offset, botScope);
   }
 
   async #handleCommand(
     command: '/status' | '/health' | '/help' | '/start' | '/settings',
     updateId: number,
+    botScope: string,
   ): Promise<void> {
-    const botScope = this.#botScope ?? 'legacy';
     if (command === '/help' || command === '/start') {
-      this.#enqueueText(HELP_TEXT, scopedUpdateKey('help', botScope, updateId), 'HTML');
+      this.#completeTextUpdate(
+        'command',
+        updateId,
+        botScope,
+        HELP_TEXT,
+        scopedUpdateKey('help', botScope, updateId),
+        'HTML',
+      );
       return;
     }
     if (command === '/settings') {
       const language = this.#asrLanguage;
-      this.#enqueueText(
+      this.#completeTextUpdate(
+        'command',
+        updateId,
+        botScope,
         renderAsrSettings(hostname(), language),
         scopedUpdateKey('settings', botScope, updateId),
         'HTML',
@@ -727,7 +751,10 @@ export class Daemon {
         await this.#collectHealth(),
         this.#options.loaded.config.health,
       );
-      this.#enqueueText(
+      this.#completeTextUpdate(
+        'command',
+        updateId,
+        botScope,
         renderHealthLines(report),
         scopedUpdateKey('health', botScope, updateId),
         undefined,
@@ -740,7 +767,10 @@ export class Daemon {
     const snapshot = this.#recorder.snapshot();
     const lastDelivery = this.#outbox.lastDeliveryAt();
 
-    this.#enqueueText(
+    this.#completeTextUpdate(
+      'command',
+      updateId,
+      botScope,
       renderStatus({
         hostName: hostname(),
         recording: this.#recorder.running && this.#recorderFailure === null,
@@ -775,14 +805,25 @@ export class Daemon {
     );
   }
 
-  async #handleCallback(query: TelegramCallbackQuery): Promise<void> {
+  async #handleCallback(
+    query: TelegramCallbackQuery,
+    updateId: number,
+    botScope: string,
+  ): Promise<void> {
     const selected = parseAsrModeCallback(query.data);
     const message = query.message;
     if (selected === undefined || message === undefined) {
+      const completed = completeTelegramUpdate(
+        this.#db.handle,
+        updateId,
+        'callback',
+        botScope,
+        () => {},
+      );
+      if (!completed) return;
       try {
         await this.#client?.answerCallbackQuery(query.id, 'Эта кнопка больше не поддерживается');
       } catch (error) {
-        if (isRetryable(error)) throw error;
         this.#options.logger.warn('could not acknowledge an obsolete Telegram callback', {
           error: (error as Error).message,
         });
@@ -790,7 +831,16 @@ export class Daemon {
       return;
     }
 
-    new AsrPreferenceRepository(this.#db.handle).set(selected.language);
+    const completed = completeTelegramUpdate(
+      this.#db.handle,
+      updateId,
+      'callback',
+      botScope,
+      () => {
+        new AsrPreferenceRepository(this.#db.handle).set(selected.language);
+      },
+    );
+    if (!completed) return;
     const language = selected.language === null ? null : modelLanguageName(selected.language);
     this.#asrLanguage = language;
     const client = this.#client;
@@ -813,9 +863,8 @@ export class Daemon {
         );
       }
     } catch (error) {
-      if (isRetryable(error)) throw error;
-      // The preference is already durable. An old/deleted message must not
-      // pin getUpdates forever merely because its keyboard can no longer edit.
+      // The preference and handled outcome are already durable. Replaying a
+      // possibly accepted callback/edit would duplicate a remote side effect.
       this.#options.logger.warn('ASR preference saved but its Telegram panel could not update', {
         error: (error as Error).message,
       });
@@ -1300,6 +1349,20 @@ export class Daemon {
       kind: 'status',
       ordinal: 1,
       payload,
+    });
+  }
+
+  #completeTextUpdate(
+    kind: 'command' | 'unknown_command',
+    updateId: number,
+    botScope: string,
+    text: string,
+    key: string,
+    parseMode?: 'HTML',
+    replyMarkup?: TelegramInlineKeyboardMarkup,
+  ): void {
+    completeTelegramUpdate(this.#db.handle, updateId, kind, botScope, () => {
+      this.#enqueueText(text, key, parseMode, replyMarkup);
     });
   }
 

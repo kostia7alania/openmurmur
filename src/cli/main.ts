@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { access, rm } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import type { DatabaseSync } from 'node:sqlite';
 import { parseArgs } from 'node:util';
 import { FfmpegCapture } from '../capture/ffmpeg.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
@@ -32,7 +33,7 @@ import {
   renderHeldLegacyDeliveries,
 } from '../retention/reconcile-delivery.ts';
 import { EnergyVad, rmsDbfs } from '../sessionizer/vad.ts';
-import { TelegramClient } from '../telegram/client.ts';
+import { TelegramClient, type TelegramUpdate } from '../telegram/client.ts';
 import { keychain, telegramBotScope } from '../telegram/keychain.ts';
 import { Outbox, type OutboxPayload } from '../telegram/outbox.ts';
 import {
@@ -40,7 +41,7 @@ import {
   listUnacknowledgedTelegramDeliveries,
   renderUnacknowledgedTelegramDeliveries,
 } from '../telegram/reconcile-delivery.ts';
-import { nextOffsetFor, readOffset, routeUpdate, writeOffset } from '../telegram/router.ts';
+import { readOffset, routeUpdate } from '../telegram/router.ts';
 import { writeTextAtomically } from '../util/atomic-file.ts';
 import { systemClock } from '../util/clock.ts';
 import { createAsrBackend } from './backends.ts';
@@ -989,14 +990,14 @@ async function telegramCommand(
     const db = openDatabase({ file: loaded.paths.databaseFile });
     try {
       const botScope = telegramBotScope(secrets.token);
-      const offset = readOffset(db.handle, botScope);
-      const updates = await client.getUpdates(offset, 5);
-      process.stdout.write(`Fetched ${updates.length} update(s) from offset ${offset}.\n`);
-      for (const update of updates) {
-        const action = routeUpdate(update, secrets.chatId);
-        process.stdout.write(`  #${update.update_id}: ${action.kind}\n`);
+      const inspection = await pollTelegramReadOnly(db.handle, client, botScope, secrets.chatId);
+      process.stdout.write(
+        `Fetched ${inspection.updates.length} update(s) from offset ${inspection.offset} ` +
+          '(read-only; offset unchanged).\n',
+      );
+      for (const update of inspection.updates) {
+        process.stdout.write(`  #${update.updateId}: ${update.kind}\n`);
       }
-      writeOffset(db.handle, nextOffsetFor(updates, offset), botScope);
       return 0;
     } finally {
       db.close();
@@ -1005,6 +1006,30 @@ async function telegramCommand(
 
   process.stderr.write('Usage: pnpm openmurmur telegram <test|poll>\n');
   return 1;
+}
+
+interface TelegramUpdatePoller {
+  getUpdates(offset: number, timeoutSeconds: number): Promise<readonly TelegramUpdate[]>;
+}
+
+export async function pollTelegramReadOnly(
+  db: DatabaseSync,
+  client: TelegramUpdatePoller,
+  botScope: string,
+  chatId: number,
+): Promise<{
+  readonly offset: number;
+  readonly updates: readonly { readonly updateId: number; readonly kind: string }[];
+}> {
+  const offset = readOffset(db, botScope);
+  const updates = await client.getUpdates(offset, 5);
+  return {
+    offset,
+    updates: updates.map((update) => ({
+      updateId: update.update_id,
+      kind: routeUpdate(update, chatId).kind,
+    })),
+  };
 }
 
 async function transcribeFile(
@@ -1093,15 +1118,17 @@ async function retentionCommand(
   }
 }
 
-try {
-  process.exitCode = await main(process.argv.slice(2));
-} catch (error) {
-  if (error instanceof ConfigError) {
-    process.stderr.write(`${error.message}\n`);
-  } else {
-    process.stderr.write(`Error: ${(error as Error).message}\n`);
+if (import.meta.main) {
+  try {
+    process.exitCode = await main(process.argv.slice(2));
+  } catch (error) {
+    if (error instanceof ConfigError) {
+      process.stderr.write(`${error.message}\n`);
+    } else {
+      process.stderr.write(`Error: ${(error as Error).message}\n`);
+    }
+    process.exitCode = 1;
   }
-  process.exitCode = 1;
 }
 
 export { main, TranscriptRepository };

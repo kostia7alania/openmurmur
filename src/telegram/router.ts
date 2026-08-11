@@ -1,4 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { transaction } from '../database/db.ts';
 import type { TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from './client.ts';
 import { extractAttachment } from './incoming.ts';
 
@@ -86,8 +87,13 @@ export function recordUpdate(
   if (result.changes > 0) return true;
 
   const row = db
-    .prepare('SELECT handled FROM telegram_updates WHERE bot_scope = ? AND update_id = ?')
-    .get(botScope, updateId) as { handled: number } | undefined;
+    .prepare('SELECT kind, handled FROM telegram_updates WHERE bot_scope = ? AND update_id = ?')
+    .get(botScope, updateId) as { kind: string; handled: number } | undefined;
+  if (row?.handled === 0 && row.kind !== kind) {
+    throw new Error(
+      `Telegram update ${botScope}/${updateId} changed route from ${row.kind} to ${kind}`,
+    );
+  }
   return row?.handled === 0;
 }
 
@@ -96,6 +102,50 @@ export function markUpdateHandled(db: DatabaseSync, updateId: number, botScope =
     botScope,
     updateId,
   );
+}
+
+/**
+ * Commits one update's durable outcome and handled marker together.
+ *
+ * For commands the outcome is an outbox row, for callbacks it is the selected
+ * preference, and for ignored/unsupported text the recorded kind itself is the
+ * explicit no-side-effect outcome. The callback must remain synchronous so no
+ * network operation can accidentally be held inside the SQLite transaction.
+ */
+export function completeTelegramUpdate(
+  db: DatabaseSync,
+  updateId: number,
+  kind: RoutedAction['kind'],
+  botScope: string,
+  persistOutcome: () => void,
+): boolean {
+  return transaction(db, () => {
+    const row = db
+      .prepare('SELECT kind, handled FROM telegram_updates WHERE bot_scope = ? AND update_id = ?')
+      .get(botScope, updateId) as { kind: string; handled: number } | undefined;
+    if (row === undefined) {
+      throw new Error(`Telegram update ${botScope}/${updateId} was not recorded`);
+    }
+    if (row.kind !== kind) {
+      throw new Error(
+        `Telegram update ${botScope}/${updateId} was recorded as ${row.kind}, not ${kind}`,
+      );
+    }
+    if (row.handled === 1) return false;
+
+    persistOutcome();
+    const result = db
+      .prepare(
+        `UPDATE telegram_updates
+            SET handled = 1
+          WHERE bot_scope = ? AND update_id = ? AND handled = 0`,
+      )
+      .run(botScope, updateId);
+    if (result.changes !== 1) {
+      throw new Error(`Telegram update ${botScope}/${updateId} could not be marked handled`);
+    }
+    return true;
+  });
 }
 
 export class MissingTelegramOffsetError extends Error {
@@ -142,6 +192,47 @@ export function writeOffset(db: DatabaseSync, nextOffset: number, botScope = 'le
        next_offset = excluded.next_offset,
        updated_at = excluded.updated_at`,
   ).run(botScope, nextOffset, new Date().toISOString());
+}
+
+/** Advances a polled batch only after every returned update has a durable outcome. */
+export function writeOffsetAfterHandledUpdates(
+  db: DatabaseSync,
+  updates: readonly TelegramUpdate[],
+  current: number,
+  botScope: string,
+): number {
+  return transaction(db, () => {
+    const nextOffset = nextOffsetFor(updates, current);
+    for (const update of updates) {
+      const row = db
+        .prepare('SELECT handled FROM telegram_updates WHERE bot_scope = ? AND update_id = ?')
+        .get(botScope, update.update_id) as { handled: number } | undefined;
+      if (row?.handled !== 1) {
+        throw new Error(
+          `refusing to advance Telegram offset past unhandled update ${botScope}/${update.update_id}`,
+        );
+      }
+    }
+
+    const skipped = db
+      .prepare(
+        `SELECT update_id
+           FROM telegram_updates
+          WHERE bot_scope = ? AND handled = 0
+            AND update_id >= ? AND update_id < ?
+          ORDER BY update_id
+          LIMIT 1`,
+      )
+      .get(botScope, current, nextOffset) as { update_id: number } | undefined;
+    if (skipped !== undefined) {
+      throw new Error(
+        `refusing to advance Telegram offset past unhandled update ${botScope}/${skipped.update_id}`,
+      );
+    }
+
+    writeOffset(db, nextOffset, botScope);
+    return nextOffset;
+  });
 }
 
 /** Removes setup state that never became the active Keychain credential. */
