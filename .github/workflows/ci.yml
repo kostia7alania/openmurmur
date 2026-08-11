@@ -166,8 +166,9 @@ jobs:
             exit 1
           fi
 
-          if grep -rn --binary-files=text -- '-----BEGIN .*PRIVATE KEY-----' \
-               --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv . ; then
+          if grep -rn --binary-files=text \
+               --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv \
+               -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' . ; then
             echo "::error::A private key was found."
             exit 1
           fi
