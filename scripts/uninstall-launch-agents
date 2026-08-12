@@ -4,13 +4,342 @@ set -euo pipefail
 
 AGENTS="$HOME/Library/LaunchAgents"
 UID_NUM="$(id -u)"
+SERVICE_DOMAIN="gui/$UID_NUM"
+NAMES=(
+  io.openmurmur.daemon.plist
+  io.openmurmur.telegram.plist
+  io.openmurmur.digest.plist
+)
 
-for label in io.openmurmur.daemon io.openmurmur.telegram io.openmurmur.digest; do
-  if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
-    launchctl bootout "gui/$UID_NUM/$label" 2>/dev/null || true
-    printf '\033[32m✓ unloaded %s\033[0m\n' "$label"
+fail() { printf '\033[31m✗ %s\033[0m\n' "$1" >&2; }
+die()  { fail "$1"; exit 1; }
+
+require_physical_directory() {
+  local path="$1"
+  local description="$2"
+  local physical
+
+  [ -d "$path" ] && [ ! -L "$path" ] || die "$description is missing, not a directory, or is a symlink: $path"
+  physical="$(cd "$path" && pwd -P)"
+  [ "$physical" = "$path" ] || die "$description is not its canonical physical path: $path"
+}
+
+directory_identity() {
+  /usr/bin/stat -f '%d:%i' "$1" 2>/dev/null
+}
+
+file_sha256() {
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+file_mode() {
+  /usr/bin/stat -f '%Lp' "$1"
+}
+
+file_identity() {
+  /usr/bin/stat -f '%d:%i' "$1"
+}
+
+require_physical_directory "$HOME" "HOME"
+if [ -e "$HOME/Library" ] || [ -L "$HOME/Library" ]; then
+  require_physical_directory "$HOME/Library" "HOME/Library"
+fi
+
+AGENTS_PRESENT=false
+AGENTS_ID=""
+if [ -e "$AGENTS" ] || [ -L "$AGENTS" ]; then
+  require_physical_directory "$AGENTS" "HOME/Library/LaunchAgents"
+  AGENTS_ID="$(directory_identity "$AGENTS")"
+  [ -n "$AGENTS_ID" ] || die "Could not identify HOME/Library/LaunchAgents."
+  cd "$AGENTS"
+  AGENTS_PRESENT=true
+
+  for name in "${NAMES[@]}"; do
+    if [ -L "$name" ] || { [ -e "$name" ] && [ ! -f "$name" ]; }; then
+      die "Refusing to remove an unsafe launch agent path: $AGENTS/$name"
+    fi
+  done
+fi
+
+SERVICE_UNREGISTER_ATTEMPTS=100
+SERVICE_UNREGISTER_DELAY_SECONDS=0.1
+
+wait_until_unregistered() {
+  local label="$1"
+  local attempt=1
+
+  while launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; do
+    if [ "$attempt" -ge "$SERVICE_UNREGISTER_ATTEMPTS" ]; then return 1; fi
+    attempt=$((attempt + 1))
+    sleep "$SERVICE_UNREGISTER_DELAY_SECONDS" || return 1
+  done
+}
+
+EXISTED=()
+WAS_LOADED=()
+PLIST_SHA256=()
+PLIST_MODE=()
+PLIST_ID=()
+for index in "${!NAMES[@]}"; do
+  name="${NAMES[$index]}"
+  label="${name%.plist}"
+  if [ "$AGENTS_PRESENT" = true ] && [ -f "$name" ]; then
+    EXISTED[$index]=1
+    PLIST_ID[$index]="$(file_identity "$name")"
+    PLIST_SHA256[$index]="$(file_sha256 "$name")"
+    PLIST_MODE[$index]="$(file_mode "$name")"
+    [ "$(file_identity "$name")" = "${PLIST_ID[$index]}" ] || \
+      die "Launch agent changed while its removal snapshot was being read: $AGENTS/$name"
+  else
+    EXISTED[$index]=0
+    PLIST_ID[$index]=""
+    PLIST_SHA256[$index]=""
+    PLIST_MODE[$index]=""
   fi
-  rm -f "$AGENTS/$label.plist"
+  if launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+    WAS_LOADED[$index]=1
+    [ "${EXISTED[$index]}" -eq 1 ] || \
+      die "$label is registered but its plist is missing; no service was changed."
+  else
+    WAS_LOADED[$index]=0
+  fi
+done
+
+WORK_DIR=""
+WORK_DIR_ID=""
+PRESERVE_WORK_DIR=false
+MUTATION_STARTED=false
+COMPLETED=false
+
+if [ "$AGENTS_PRESENT" = true ]; then
+  WORK_DIR="$(mktemp -d "$AGENTS/.openmurmur-uninstall.XXXXXX")"
+  chmod 0700 "$WORK_DIR"
+  require_physical_directory "$WORK_DIR" "uninstall work directory"
+  WORK_DIR_ID="$(directory_identity "$WORK_DIR")"
+  [ -n "$WORK_DIR_ID" ] || die "Could not identify the uninstall work directory."
+  for index in "${!NAMES[@]}"; do
+    name="${NAMES[$index]}"
+    if [ "${EXISTED[$index]}" -eq 1 ]; then
+      if ! cp -p "$name" "$WORK_DIR/$name.snapshot" || \
+        [ "$(file_identity "$name")" != "${PLIST_ID[$index]}" ] || \
+        [ "$(file_sha256 "$WORK_DIR/$name.snapshot")" != "${PLIST_SHA256[$index]}" ] || \
+        [ "$(file_mode "$WORK_DIR/$name.snapshot")" != "${PLIST_MODE[$index]}" ]; then
+        die "Launch agent changed while its exact rollback snapshot was being saved; inspect $WORK_DIR and $AGENTS/$name"
+      fi
+    fi
+  done
+fi
+
+agents_directory_unchanged() {
+  [ "$AGENTS_PRESENT" = true ] && [ "$(directory_identity "$AGENTS")" = "$AGENTS_ID" ]
+}
+
+work_directory_unchanged() {
+  [ -n "$WORK_DIR" ] && [ "$(directory_identity "$WORK_DIR")" = "$WORK_DIR_ID" ]
+}
+
+restore_previous_state() {
+  local index name label current_loaded restored_all=true source conflict
+  set +e
+
+  if [ -n "$WORK_DIR" ]; then
+    if ! agents_directory_unchanged || ! work_directory_unchanged; then
+      fail "Rollback refused a changed LaunchAgents or work-directory identity."
+      restored_all=false
+      PRESERVE_WORK_DIR=true
+    else
+      for index in "${!NAMES[@]}"; do
+        name="${NAMES[$index]}"
+        source=""
+        if [ -f "$WORK_DIR/$name" ] && [ ! -L "$WORK_DIR/$name" ]; then
+          source="$WORK_DIR/$name"
+        elif [ "${EXISTED[$index]}" -eq 1 ] && \
+          [ -f "$WORK_DIR/$name.snapshot" ] && [ ! -L "$WORK_DIR/$name.snapshot" ]; then
+          source="$WORK_DIR/$name.snapshot"
+        fi
+
+        if [ "${EXISTED[$index]}" -eq 1 ]; then
+          if [ -z "$source" ] || \
+            [ "$(file_sha256 "$source")" != "${PLIST_SHA256[$index]}" ] || \
+            [ "$(file_mode "$source")" != "${PLIST_MODE[$index]}" ]; then
+            fail "Rollback has no exact snapshot for $name."
+            restored_all=false
+            continue
+          fi
+          if [ -e "$name" ] || [ -L "$name" ]; then
+            if [ ! -L "$name" ] && [ -f "$name" ] && \
+              [ "$(file_sha256 "$name")" = "${PLIST_SHA256[$index]}" ] && \
+              [ "$(file_mode "$name")" = "${PLIST_MODE[$index]}" ]; then
+              continue
+            fi
+            conflict="$WORK_DIR/$name.conflict"
+            if [ -e "$conflict" ] || [ -L "$conflict" ] || ! mv "$name" "$conflict"; then
+              fail "Rollback could not preserve a conflicting path at $AGENTS/$name."
+              restored_all=false
+              continue
+            fi
+            PRESERVE_WORK_DIR=true
+          fi
+          if ! /bin/ln "$source" "$name"; then
+            restored_all=false
+          elif [ "$source" = "$WORK_DIR/$name" ]; then
+            /bin/rm -f "$source" || restored_all=false
+          fi
+        elif [ -e "$name" ] || [ -L "$name" ]; then
+          conflict="$WORK_DIR/$name.conflict"
+          if [ -e "$conflict" ] || [ -L "$conflict" ] || ! mv "$name" "$conflict"; then
+            fail "Rollback could not preserve a newly appeared path at $AGENTS/$name."
+            restored_all=false
+          else
+            PRESERVE_WORK_DIR=true
+          fi
+        fi
+      done
+    fi
+  fi
+
+  for index in "${!NAMES[@]}"; do
+    name="${NAMES[$index]}"
+    label="${name%.plist}"
+    if launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+      current_loaded=1
+    else
+      current_loaded=0
+    fi
+
+    if [ "${WAS_LOADED[$index]}" -eq 1 ] && [ "$current_loaded" -eq 0 ]; then
+      if ! agents_directory_unchanged || \
+        [ -L "$AGENTS/$name" ] || [ ! -f "$AGENTS/$name" ] || \
+        [ "$(file_sha256 "$AGENTS/$name")" != "${PLIST_SHA256[$index]}" ] || \
+        [ "$(file_mode "$AGENTS/$name")" != "${PLIST_MODE[$index]}" ] || \
+        ! launchctl bootstrap "$SERVICE_DOMAIN" "$AGENTS/$name" >/dev/null 2>&1 || \
+        ! launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+        fail "Rollback could not restore $label."
+        restored_all=false
+      fi
+    elif [ "${WAS_LOADED[$index]}" -eq 0 ] && [ "$current_loaded" -eq 1 ]; then
+      if ! launchctl bootout "$SERVICE_DOMAIN/$label" >/dev/null 2>&1 || \
+        ! wait_until_unregistered "$label"; then
+        fail "Rollback could not return $label to its prior absent state."
+        restored_all=false
+      fi
+    fi
+  done
+
+  for index in "${!NAMES[@]}"; do
+    label="${NAMES[$index]%.plist}"
+    if launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+      current_loaded=1
+    else
+      current_loaded=0
+    fi
+    if [ "$current_loaded" -ne "${WAS_LOADED[$index]}" ]; then restored_all=false; fi
+  done
+
+  if [ "$restored_all" != true ]; then
+    PRESERVE_WORK_DIR=true
+    fail "Automatic uninstall rollback was incomplete; inspect $AGENTS and $WORK_DIR."
+    set -e
+    return 1
+  fi
+  set -e
+  return 0
+}
+
+cleanup_work_dir() {
+  if [ -n "$WORK_DIR" ] && [ "$PRESERVE_WORK_DIR" != true ]; then
+    if agents_directory_unchanged && work_directory_unchanged; then
+      rm -rf "$WORK_DIR"
+    else
+      PRESERVE_WORK_DIR=true
+      fail "Uninstall evidence was preserved because a directory identity changed: $WORK_DIR"
+    fi
+  fi
+}
+
+finish_on_exit() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [ "$MUTATION_STARTED" = true ] && [ "$COMPLETED" != true ]; then
+    if restore_previous_state; then
+      fail "The uninstall did not complete; the previous plist files and registered-service set were restored."
+    else
+      status=1
+    fi
+  fi
+  cleanup_work_dir
+  exit "$status"
+}
+
+trap finish_on_exit EXIT
+trap 'exit 130' HUP INT TERM
+MUTATION_STARTED=true
+
+for index in "${!NAMES[@]}"; do
+  name="${NAMES[$index]}"
+  label="${name%.plist}"
+  if [ "${WAS_LOADED[$index]}" -eq 1 ]; then
+    if ! launchctl bootout "$SERVICE_DOMAIN/$label"; then
+      die "Could not unload $label."
+    fi
+    if ! wait_until_unregistered "$label"; then
+      die "Timed out waiting for $label to leave launchd."
+    fi
+  fi
+done
+
+# A concurrently restored service is safer than deleting the file that launchd
+# still owns. Recheck the complete set before moving any plist out of place.
+for name in "${NAMES[@]}"; do
+  label="${name%.plist}"
+  if launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+    die "$label became registered again before plist removal."
+  fi
+done
+
+if [ "$AGENTS_PRESENT" = true ]; then
+  agents_directory_unchanged || die "HOME/Library/LaunchAgents changed before plist removal."
+  work_directory_unchanged || die "The uninstall work directory changed before plist removal."
+  for index in "${!NAMES[@]}"; do
+    name="${NAMES[$index]}"
+    if [ "${EXISTED[$index]}" -eq 1 ]; then
+      if [ -L "$name" ] || [ ! -f "$name" ] || \
+        [ "$(file_identity "$name")" != "${PLIST_ID[$index]}" ] || \
+        [ "$(file_sha256 "$name")" != "${PLIST_SHA256[$index]}" ] || \
+        [ "$(file_mode "$name")" != "${PLIST_MODE[$index]}" ]; then
+        die "Launch agent identity changed before removal: $AGENTS/$name"
+      fi
+      mv "$name" "$WORK_DIR/$name"
+      if [ -L "$WORK_DIR/$name" ] || [ ! -f "$WORK_DIR/$name" ] || \
+        [ "$(file_identity "$WORK_DIR/$name")" != "${PLIST_ID[$index]}" ] || \
+        [ "$(file_sha256 "$WORK_DIR/$name")" != "${PLIST_SHA256[$index]}" ] || \
+        [ "$(file_mode "$WORK_DIR/$name")" != "${PLIST_MODE[$index]}" ]; then
+        die "Quarantined launch agent identity does not match the snapshot: $name"
+      fi
+    elif [ -e "$name" ] || [ -L "$name" ]; then
+      die "A launch agent path appeared before removal: $AGENTS/$name"
+    fi
+  done
+fi
+
+# Close the re-registration window before committing the recoverable quarantine.
+for name in "${NAMES[@]}"; do
+  label="${name%.plist}"
+  if launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+    die "$label became registered during plist removal."
+  fi
+  if [ -e "$AGENTS/$name" ] || [ -L "$AGENTS/$name" ]; then
+    die "A new launch agent path appeared during removal: $AGENTS/$name"
+  fi
+done
+if [ "$AGENTS_PRESENT" = true ]; then
+  agents_directory_unchanged || die "HOME/Library/LaunchAgents changed during removal."
+  work_directory_unchanged || die "The uninstall work directory changed during removal."
+fi
+
+COMPLETED=true
+for name in "${NAMES[@]}"; do
+  printf '\033[32m✓ unloaded %s\033[0m\n' "${name%.plist}"
 done
 
 echo
