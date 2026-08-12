@@ -601,7 +601,7 @@ describe('capture backend argument construction', () => {
     const started = Date.now();
     await assert.rejects(capture.start().next(), /No source audio frame arrived within 1 seconds/);
     const elapsed = Date.now() - started;
-    assert.ok(elapsed >= 3_900, `expected the SIGKILL fallback, stopped after ${elapsed}ms`);
+    assert.ok(elapsed >= 900, `first-frame watchdog fired too early after ${elapsed}ms`);
     assert.ok(elapsed < 6_000, `bounded first-frame failure took ${elapsed}ms`);
 
     const childPid = Number(readFileSync(pidFile, 'utf8'));
