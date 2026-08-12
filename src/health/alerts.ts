@@ -14,6 +14,7 @@ import { transaction } from '../database/db.ts';
 
 export type AlertId =
   | 'recorder_stale'
+  | 'capture_failed'
   | 'worker_crashed'
   | 'llm_unavailable'
   | 'disk_low'
@@ -176,6 +177,10 @@ export function renderAlert(
     recorder_stale: {
       up: '🟡 Запись временно недоступна',
       down: '🟢 Запись восстановлена',
+    },
+    capture_failed: {
+      up: '🔴 Запись остановлена',
+      down: '🟢 Запись восстановлена после ошибки захвата',
     },
     worker_crashed: {
       up: '🟡 Локальное распознавание остановилось',

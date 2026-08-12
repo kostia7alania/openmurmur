@@ -9,7 +9,6 @@ import {
   claimDaemonPid,
   claimIncomingRequest,
   commandLooksLikeOpenMurmurDaemon,
-  enqueueCaptureFailureNotice,
   enqueueIncomingRequest,
   enqueueRecoveryNotice,
   expectedDigestIsMissing,
@@ -22,6 +21,7 @@ import {
   processIdentityMatches,
   readDaemonPid,
   reconcileIncomingDelivery,
+  recordCaptureAvailabilityAlert,
   recordIncomingDownload,
   recordKeychainAccessAlert,
   releaseDaemonPid,
@@ -29,6 +29,7 @@ import {
   retirePendingAlertDeliveries,
   retireStaleNotices,
   shouldEnqueueHealthAlert,
+  shouldSendRecordingStartedNotice,
 } from '../../src/cli/daemon.ts';
 import {
   assertCurrentDaemonMaintenance,
@@ -1189,46 +1190,119 @@ describe('daemon terminal state reconciliation', () => {
     );
   });
 
-  it('preserves one generation-scoped capture failure across restart and delivers it once', async () => {
-    const generation = '2026-08-12T10:20:30.000Z';
-    const deliveryPartId = `capture-failure:${generation}`;
+  it('collapses failed capture generations into one incident until real-frame recovery', async () => {
     const outbox = new Outbox(db.handle);
+    const firstFailureAt = Date.parse('2026-08-12T10:20:30.000Z');
 
-    assert.equal(enqueueCaptureFailureNotice(outbox, generation, true), true);
+    for (const legacyGeneration of ['old-a', 'old-b']) {
+      outbox.enqueue({
+        deliveryPartId: `capture-failure:${legacyGeneration}`,
+        kind: 'status',
+        ordinal: 1,
+        payload: { type: 'text', text: 'legacy capture failure' },
+      });
+    }
+
+    const restartCutoff = new Date(firstFailureAt - 1000).toISOString();
+    db.handle
+      .prepare(
+        `UPDATE telegram_outbox SET created_at = ?, updated_at = ?
+          WHERE delivery_part_id GLOB 'capture-failure:*'`,
+      )
+      .run(restartCutoff, restartCutoff);
+
+    for (let generation = 0; generation < 3; generation += 1) {
+      const now = firstFailureAt + generation * 31_000;
+      const alerts = new AlertEvaluator(db.handle, { cooldownMinutes: 30, now: () => now });
+      recordCaptureAvailabilityAlert(alerts, outbox, true, generation > 0, now);
+    }
+
+    assert.equal(outbox.recoverSending(), 0);
+    assert.equal(retireStaleNotices(db.handle, new Date(firstFailureAt).toISOString()), 2);
     assert.equal(
-      enqueueCaptureFailureNotice(outbox, generation, true),
-      false,
-      'the same failed capture generation must not create a second chat message',
+      db.handle
+        .prepare(
+          "SELECT COUNT(*) AS count FROM telegram_outbox WHERE delivery_part_id GLOB 'capture-failure:*' AND state = 'failed'",
+        )
+        .get()?.['count'],
+      2,
     );
 
-    const restartCutoff = new Date(Date.now() + 1000).toISOString();
-    assert.equal(outbox.recoverSending(), 0);
-    assert.equal(retireStaleNotices(db.handle, restartCutoff), 0);
-
-    const pending = db.handle
+    const raised = db.handle
       .prepare(
         `SELECT outbox_id, state, attempts, payload, last_error
-           FROM telegram_outbox WHERE delivery_part_id = ?`,
+           FROM telegram_outbox
+          WHERE delivery_part_id GLOB 'alert:capture_failed:raise:*'`,
       )
-      .get(deliveryPartId) as {
+      .all() as {
       outbox_id: string;
       state: string;
       attempts: number;
       payload: string;
       last_error: string | null;
-    };
-    assert.equal(pending.state, 'pending');
-    assert.equal(pending.attempts, 0);
-    assert.equal(pending.last_error, null);
-    assert.deepEqual(JSON.parse(pending.payload), {
+    }[];
+    assert.equal(raised.length, 1, 'continuous launchd failures are one durable incident');
+    assert.equal(raised[0]?.state, 'pending');
+    assert.equal(raised[0]?.attempts, 0);
+    assert.equal(raised[0]?.last_error, null);
+    assert.deepEqual(JSON.parse(raised[0]?.payload ?? ''), {
       type: 'text',
       text:
-        '🔴 Запись остановлена\n\n' +
+        '🔴 Запись не запустилась\n\n' +
         'Не удалось получать аудио с микрофона.\n' +
         `Проверьте доступ к микрофону и запустите \`pnpm openmurmur --root "\${OPENMURMUR_STATE_ROOT:?set exact daemon state root locally}" doctor\` в корне репозитория.\n` +
         'Технические подробности сохранены в локальном журнале.',
     });
-    assert.doesNotMatch(pending.payload, /CaptureError|ffmpeg|\/private\//u);
+    assert.doesNotMatch(raised[0]?.payload ?? '', /CaptureError|ffmpeg|\/private\//u);
+
+    const recoveredAt = firstFailureAt + 120_000;
+    const recoveryAlerts = new AlertEvaluator(db.handle, {
+      cooldownMinutes: 30,
+      now: () => recoveredAt,
+    });
+    assert.equal(
+      recordCaptureAvailabilityAlert(recoveryAlerts, outbox, false, true, recoveredAt).transition,
+      'cleared',
+    );
+    assert.equal(
+      shouldSendRecordingStartedNotice({ send: true, transition: 'cleared' }),
+      false,
+      'the durable capture recovery edge replaces the ordinary first-frame green notice',
+    );
+    assert.equal(
+      shouldSendRecordingStartedNotice({ send: false, transition: 'none' }),
+      true,
+      'a normal first frame still gets the ordinary green notice',
+    );
+    assert.equal(
+      shouldSendRecordingStartedNotice(null),
+      false,
+      'a failed durable clear must not split from an independently committed green notice',
+    );
+    assert.equal(
+      recordCaptureAvailabilityAlert(recoveryAlerts, outbox, false, true, recoveredAt).transition,
+      'none',
+    );
+
+    const secondFailureAt = recoveredAt + 60_000;
+    const nextAlerts = new AlertEvaluator(db.handle, {
+      cooldownMinutes: 30,
+      now: () => secondFailureAt,
+    });
+    assert.equal(
+      recordCaptureAvailabilityAlert(nextAlerts, outbox, true, true, secondFailureAt).transition,
+      'raised',
+    );
+
+    const counts = db.handle
+      .prepare(
+        `SELECT
+           SUM(delivery_part_id GLOB 'alert:capture_failed:raise:*') AS raises,
+           SUM(delivery_part_id GLOB 'alert:capture_failed:clear:*') AS clears
+         FROM telegram_outbox`,
+      )
+      .get() as { raises: number; clears: number };
+    assert.deepEqual({ ...counts }, { raises: 2, clears: 1 });
 
     const requests: string[] = [];
     const client = new TelegramClient({
@@ -1245,29 +1319,76 @@ describe('daemon terminal state reconciliation', () => {
         );
       }) as typeof fetch,
     });
-    const restartedOutbox = new Outbox(db.handle);
     const deps = {
-      outbox: restartedOutbox,
+      outbox: new Outbox(db.handle),
       client,
       chatId: 42,
       logger: nullLogger,
       maxOutgoingBytes: 50 * 1024 * 1024,
     };
 
-    assert.equal(await drainOutbox(deps), 1);
+    assert.equal(await drainOutbox(deps), 3);
     assert.equal(await drainOutbox(deps), 0);
-    assert.equal(requests.length, 1);
+    assert.equal(requests.length, 3);
     const sent = db.handle
       .prepare(
         `SELECT state, attempts, telegram_message_id
            FROM telegram_outbox WHERE outbox_id = ?`,
       )
-      .get(pending.outbox_id) as {
+      .get(raised[0]?.outbox_id) as {
       state: string;
       attempts: number;
       telegram_message_id: number | null;
     };
     assert.deepEqual({ ...sent }, { state: 'sent', attempts: 1, telegram_message_id: 77 });
+  });
+
+  it('keeps a capture incident active when its first-frame clear cannot commit', () => {
+    const now = Date.parse('2026-08-12T10:20:30.000Z');
+    const alerts = new AlertEvaluator(db.handle, { cooldownMinutes: 30, now: () => now });
+    const outbox = new Outbox(db.handle);
+
+    assert.equal(
+      recordCaptureAvailabilityAlert(alerts, outbox, true, false, now).transition,
+      'raised',
+    );
+    db.handle.exec(`
+      CREATE TRIGGER fail_capture_clear
+      BEFORE INSERT ON telegram_outbox
+      WHEN NEW.delivery_part_id GLOB 'alert:capture_failed:clear:*'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected capture clear enqueue failure');
+      END;
+    `);
+    assert.throws(
+      () => recordCaptureAvailabilityAlert(alerts, outbox, false, true, now + 1000),
+      /injected capture clear enqueue failure/,
+    );
+    assert.equal(alerts.isActive('capture_failed'), true, 'failed clear rolls back alert state');
+    assert.equal(shouldSendRecordingStartedNotice(null), false);
+    assert.equal(
+      db.handle
+        .prepare(
+          "SELECT COUNT(*) AS count FROM telegram_outbox WHERE payload LIKE '%Запись включена%'",
+        )
+        .get()?.['count'],
+      0,
+    );
+
+    db.handle.exec('DROP TRIGGER fail_capture_clear');
+    assert.equal(
+      recordCaptureAvailabilityAlert(alerts, outbox, true, true, now + 2000).transition,
+      'none',
+      'a failure before a durable green clear remains the same incident',
+    );
+    assert.equal(
+      db.handle
+        .prepare(
+          "SELECT COUNT(*) AS count FROM telegram_outbox WHERE delivery_part_id GLOB 'alert:capture_failed:raise:*'",
+        )
+        .get()?.['count'],
+      1,
+    );
   });
 
   it('preserves one count-only recovery notice across a second startup and delivers it once', async () => {

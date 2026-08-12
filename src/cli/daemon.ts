@@ -39,7 +39,7 @@ import {
   publishDigestSnapshot,
   readDigestDeliveryPayload,
 } from '../digest/delivery.ts';
-import { AlertEvaluator, type AlertId, renderAlert } from '../health/alerts.ts';
+import { type AlertDecision, AlertEvaluator, type AlertId, renderAlert } from '../health/alerts.ts';
 import {
   diskFreeGb,
   evaluateHealth,
@@ -401,7 +401,7 @@ export class Daemon {
         throw new Error('capture stopped for system sleep; restart required', { cause: error });
       }
       logger.error('capture failed', { error: this.#recorderFailure });
-      enqueueCaptureFailureNotice(this.#outbox, this.#daemonStartedAt, this.#announcedRecording);
+      this.#recordCaptureAvailability(true);
       await this.#tickOutbox().catch(() => {});
       throw new Error(`capture failed: ${this.#recorderFailure}`, { cause: error });
     }
@@ -566,7 +566,26 @@ export class Daemon {
     if (this.#announcedRecording) return;
     this.#announcedRecording = true;
     this.#options.logger.info('first audio frame received');
-    void this.#sendNow('🟢 Запись включена');
+    const captureDecision = this.#recordCaptureAvailability(false);
+    if (shouldSendRecordingStartedNotice(captureDecision)) {
+      void this.#sendNow('🟢 Запись включена');
+    }
+  }
+
+  #recordCaptureAvailability(failed: boolean) {
+    try {
+      return recordCaptureAvailabilityAlert(
+        this.#alerts,
+        this.#outbox,
+        failed,
+        this.#announcedRecording,
+      );
+    } catch (error) {
+      this.#options.logger.warn('could not persist the capture availability edge', {
+        error: (error as Error).message,
+      });
+      return null;
+    }
   }
 
   #loop(name: string, tick: () => Promise<void>, intervalMs: number): void {
@@ -1229,6 +1248,12 @@ export class Daemon {
     recordHealthReport(this.#db.handle, report.checks);
     const workerAlertActive = asrWorkerAlertActive(inputs.workerReady, inputs.workerRecovering);
 
+    // A terminal capture failure exits the process, so only a real frame from
+    // a replacement generation is authoritative recovery for that incident.
+    if (this.#announcedRecording && this.#recorderFailure === null) {
+      this.#recordCaptureAvailability(false);
+    }
+
     const conditions: {
       id: AlertId;
       active: boolean;
@@ -1695,23 +1720,39 @@ export function releaseInterruptedJob(
   return result.changes === 1;
 }
 
-export function enqueueCaptureFailureNotice(
+export function recordCaptureAvailabilityAlert(
+  alerts: AlertEvaluator,
   outbox: Outbox,
-  daemonStartedAt: string | null,
+  failed: boolean,
   recordingWasAnnounced: boolean,
-): boolean {
-  return outbox.enqueue({
-    deliveryPartId: `capture-failure:${daemonStartedAt ?? 'unknown-generation'}`,
-    kind: 'status',
-    ordinal: 1,
-    payload: {
-      type: 'text',
-      text: renderCaptureFailure(
-        recordingWasAnnounced,
-        openMurmurRecoveryCommand(TELEGRAM_RECOVERY_COMMAND_CONTEXT, 'doctor'),
-      ),
+  now = Date.now(),
+) {
+  return alerts.evaluate(
+    'capture_failed',
+    failed,
+    failed ? 'terminal-capture' : undefined,
+    (decision) => {
+      const cleared = decision.transition === 'cleared';
+      const text = cleared
+        ? renderAlert('capture_failed', 'cleared', '', now).text
+        : renderCaptureFailure(
+            recordingWasAnnounced,
+            openMurmurRecoveryCommand(TELEGRAM_RECOVERY_COMMAND_CONTEXT, 'doctor'),
+          );
+      outbox.enqueue({
+        deliveryPartId: `alert:capture_failed:${cleared ? 'clear' : 'raise'}:${now}`,
+        kind: 'alert',
+        ordinal: 5,
+        payload: { type: 'text', text },
+      });
     },
-  });
+  );
+}
+
+export function shouldSendRecordingStartedNotice(decision: AlertDecision | null): boolean {
+  // A failed capture clear must not be followed by an independently committed
+  // generic green notice. The next health tick retries the atomic clear.
+  return decision !== null && decision.transition !== 'cleared';
 }
 
 export function enqueueRecoveryNotice(
@@ -1783,7 +1824,8 @@ export function retireStaleNotices(
     .prepare(
       `UPDATE telegram_outbox
           SET state = 'failed', last_error = ?, updated_at = ?
-        WHERE delivery_part_id GLOB 'notice:*'
+        WHERE (delivery_part_id GLOB 'notice:*'
+               OR delivery_part_id GLOB 'capture-failure:*')
           AND state IN ('pending','sending')
           AND created_at < ?`,
     )
