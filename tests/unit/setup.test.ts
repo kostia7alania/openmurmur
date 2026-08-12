@@ -9,7 +9,9 @@ import { withStoppedDaemonForTelegram } from '../../src/cli/main.ts';
 import {
   commitTelegramSetup,
   drainUpdateBacklog,
+  planSetup,
   renderSetupCompletion,
+  renderSetupPlan,
   renderTelegramSetupCompletion,
   setupTelegram,
   waitForStart,
@@ -58,12 +60,14 @@ function updateWithIdentity(
 }
 
 describe('setup completion output', () => {
-  it('leads a fresh setup through Telegram to one verifiable ambient session', () => {
-    const output = renderSetupCompletion('owner');
+  it('leads a fresh setup through Telegram to one verifiable ambient session on the exact root', () => {
+    const root = "/private/tmp/Open Murmur's state";
+    const rootArgument = `'/private/tmp/Open Murmur'"'"'s state'`;
+    const output = renderSetupCompletion(root, 'owner');
     const expectedInOrder = [
-      'pnpm openmurmur setup telegram owner',
-      'pnpm openmurmur capture test',
-      'pnpm openmurmur start',
+      `pnpm openmurmur --root ${rootArgument} setup telegram owner`,
+      `pnpm openmurmur --root ${rootArgument} capture test`,
+      `pnpm openmurmur --root ${rootArgument} start`,
       'speak for more than 3 seconds',
       'wait for 60 seconds of silence',
       'source FLAC, then transcript, then report',
@@ -75,6 +79,26 @@ describe('setup completion output', () => {
       assert.ok(index > previous, `expected "${text}" after the previous onboarding step`);
       previous = index;
     }
+  });
+
+  it('does not echo a nonprintable state root in copyable follow-up commands', () => {
+    const root = '/private/tmp/openmurmur\nspoofed';
+    const output = [
+      renderSetupPlan(planSetup(resolvePaths(root), false, 'send-only')),
+      renderSetupCompletion(root, 'send-only'),
+    ].join('\n');
+
+    assert.doesNotMatch(output, /spoofed/);
+    assert.match(output, /create directory {2}<path not printed>/);
+    assert.match(output, /write config {6}<path not printed>/);
+    assert.match(output, /create database {3}<path not printed>/);
+    assert.match(output, /state root is not safe to print/);
+    assert.match(
+      output,
+      /pnpm openmurmur --root "\$OPENMURMUR_STATE_ROOT" setup telegram send-only/,
+    );
+    assert.match(output, /pnpm openmurmur --root "\$OPENMURMUR_STATE_ROOT" capture test/);
+    assert.match(output, /pnpm openmurmur --root "\$OPENMURMUR_STATE_ROOT" start/);
   });
 
   it('selects the fresh Telegram role without ever rewriting an existing config', () => {
@@ -97,7 +121,7 @@ describe('setup completion output', () => {
       );
       assert.equal(created.status, 0, created.stderr);
       assert.match(created.stdout, /set Telegram role owner \(telegram\.receiveUpdates=true\)/);
-      assert.match(created.stdout, /pnpm openmurmur setup telegram owner/);
+      assert.ok(created.stdout.includes(`pnpm openmurmur --root '${root}' setup telegram owner`));
 
       const original = readFileSync(configFile, 'utf8');
       const config = JSON.parse(original) as { telegram?: { receiveUpdates?: unknown } };
@@ -193,7 +217,7 @@ describe('setup completion output', () => {
   });
 
   it('continues a completed Telegram setup without promising a global binary', () => {
-    const output = renderTelegramSetupCompletion({
+    const output = renderTelegramSetupCompletion('/private/tmp/openmurmur-live', {
       botDisplay: '@murmur_bot',
       chatId: 42,
       role: 'owner',
@@ -201,8 +225,8 @@ describe('setup completion output', () => {
 
     assert.match(output, /^✅ Connected @murmur_bot, chat 42 \(owner\)$/m);
     assert.doesNotMatch(output, /setup telegram/);
-    assert.match(output, /pnpm openmurmur capture test/);
-    assert.match(output, /pnpm openmurmur start/);
+    assert.match(output, /pnpm openmurmur --root '\/private\/tmp\/openmurmur-live' capture test/);
+    assert.match(output, /pnpm openmurmur --root '\/private\/tmp\/openmurmur-live' start/);
     assert.doesNotMatch(output, /(^|\n)\s*(?:\d+\.\s+)?openmurmur\s/m);
   });
 });
@@ -394,7 +418,7 @@ describe('Telegram setup ownership handshake', () => {
         chatId: 700,
         role: 'send-only',
       });
-      const attendedOutput = `${ownerOutput.join('\n')}\n${ownerPrompt}\n${renderTelegramSetupCompletion(owner)}`;
+      const attendedOutput = `${ownerOutput.join('\n')}\n${ownerPrompt}\n${renderTelegramSetupCompletion(ownerRoot, owner)}`;
       assert.match(attendedOutput, /Bot: .* \(id 1\)/);
       assert.match(attendedOutput, /Account: .* \(user id 700\)/);
       assert.match(attendedOutput, /Chat ID: 700/);
@@ -407,7 +431,7 @@ describe('Telegram setup ownership handshake', () => {
         ownerPrompt,
         ownerOutput.find((line) => line.startsWith('  Bot:')) ?? '',
         ownerOutput.find((line) => line.startsWith('  Account:')) ?? '',
-        renderTelegramSetupCompletion(owner).split('\n')[0] ?? '',
+        renderTelegramSetupCompletion(ownerRoot, owner).split('\n')[0] ?? '',
       ];
       for (const surface of identitySurfaces) {
         for (const character of surface) {

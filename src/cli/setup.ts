@@ -96,39 +96,66 @@ export function planSetup(
 
 export function renderSetupPlan(plan: SetupPlan): string {
   const lines = ['pnpm openmurmur setup will make these changes:', ''];
-  for (const dir of plan.directories) lines.push(`  create directory  ${dir}`);
+  for (const dir of plan.directories) {
+    lines.push(`  create directory  ${setupPathForDisplay(dir)}`);
+  }
   if (plan.willCreateConfig) {
-    lines.push(`  write config      ${plan.configFile}`);
+    lines.push(`  write config      ${setupPathForDisplay(plan.configFile)}`);
     lines.push(
       `  set Telegram role ${plan.telegramRole} (telegram.receiveUpdates=${plan.telegramRole === 'owner'})`,
     );
   } else {
-    lines.push(`  keep config       ${plan.configFile} (already exists, untouched)`);
+    lines.push(
+      `  keep config       ${setupPathForDisplay(plan.configFile)} (already exists, untouched)`,
+    );
     lines.push(`  keep Telegram role ${plan.telegramRole} (from existing config)`);
   }
-  lines.push(`  create database   ${plan.databaseFile}`);
+  lines.push(`  create database   ${setupPathForDisplay(plan.databaseFile)}`);
   lines.push('');
   lines.push('It will NOT download models, contact any network service, or touch the Keychain.');
   return lines.join('\n');
 }
 
+export function shellQuotedStateRoot(root: string): string | null {
+  if (root.length > 512 || !/^[\x20-\x7e]+$/.test(root)) {
+    return null;
+  }
+  return `'${root.replaceAll("'", `'"'"'`)}'`;
+}
+
+function setupPathForDisplay(path: string): string {
+  return shellQuotedStateRoot(path) === null ? '<path not printed>' : path;
+}
+
 /** The clone-based install has no global binary, so every next step is runnable as printed. */
 export function renderSetupNextSteps(
+  root: string,
   telegramConfigured: boolean,
   telegramRole?: TelegramSetupRole,
 ): string {
-  const lines = ['Next, verify the complete foreground path:'];
+  const quotedRoot = shellQuotedStateRoot(root);
+  const rootArgument = quotedRoot ?? '"$OPENMURMUR_STATE_ROOT"';
+  const command = (args: string) => `pnpm openmurmur --root ${rootArgument} ${args}`;
+  const lines = [
+    ...(quotedRoot === null
+      ? [
+          'The state root is not safe to print. Set OPENMURMUR_STATE_ROOT to its exact value',
+          'outside this terminal, then use the placeholder below.',
+        ]
+      : []),
+    'Next, verify the complete foreground path:',
+  ];
   let step = 1;
   if (!telegramConfigured) {
     if (telegramRole === undefined) {
       throw new Error('Telegram role is required before Telegram setup');
     }
-    lines.push(`  ${step}. Connect Telegram: pnpm openmurmur setup telegram ${telegramRole}`);
+    lines.push(`  ${step}. Connect Telegram: ${command(`setup telegram ${telegramRole}`)}`);
     step += 1;
   }
-  lines.push(`  ${step}. Verify the microphone: pnpm openmurmur capture test`);
+  lines.push(`  ${step}. Verify the microphone: ${command('capture test')}`);
   step += 1;
-  lines.push(`  ${step}. Start in the foreground: pnpm openmurmur start`);
+  lines.push(`  ${step}. Start in the foreground: ${command('start')}`);
   step += 1;
   lines.push(`  ${step}. After "first audio frame received", speak for more than 3 seconds.`);
   step += 1;
@@ -214,12 +241,12 @@ async function withTelegramSetupLock<T>(
   }
 }
 
-export function renderSetupCompletion(telegramRole: TelegramSetupRole): string {
-  return `✅ Setup complete.\n\n${renderSetupNextSteps(false, telegramRole)}`;
+export function renderSetupCompletion(root: string, telegramRole: TelegramSetupRole): string {
+  return `✅ Setup complete.\n\n${renderSetupNextSteps(root, false, telegramRole)}`;
 }
 
-export function renderTelegramSetupCompletion(result: TelegramSetupResult): string {
-  return `✅ Connected ${result.botDisplay}, chat ${result.chatId} (${result.role})\n\n${renderSetupNextSteps(true)}`;
+export function renderTelegramSetupCompletion(root: string, result: TelegramSetupResult): string {
+  return `✅ Connected ${result.botDisplay}, chat ${result.chatId} (${result.role})\n\n${renderSetupNextSteps(root, true)}`;
 }
 
 /**

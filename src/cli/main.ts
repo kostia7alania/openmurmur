@@ -82,6 +82,7 @@ import {
   renderSetupPlan,
   renderTelegramSetupCompletion,
   setupTelegram,
+  shellQuotedStateRoot,
   type TelegramSetupRole,
 } from './setup.ts';
 import {
@@ -456,7 +457,7 @@ async function setupCommand(
         positionalTelegramRole,
         (message) => process.stdout.write(`${message}\n`),
       );
-      process.stdout.write(`\n${renderTelegramSetupCompletion(result)}\n`);
+      process.stdout.write(`\n${renderTelegramSetupCompletion(loaded.paths.root, result)}\n`);
       return 0;
     });
   }
@@ -505,7 +506,7 @@ async function setupCommand(
   }
 
   await applySetup(loaded.paths, plan);
-  process.stdout.write(`\n${renderSetupCompletion(telegramRole)}\n`);
+  process.stdout.write(`\n${renderSetupCompletion(loaded.paths.root, telegramRole)}\n`);
   return 0;
 }
 
@@ -1187,13 +1188,6 @@ type StoppedDaemonTelegramCommand =
   | 'setup telegram owner'
   | 'setup telegram send-only'
   | 'telegram poll';
-
-function shellQuotedStateRoot(root: string): string | null {
-  if (root.length > 512 || !/^[\x20-\x7e]+$/.test(root)) {
-    return null;
-  }
-  return `'${root.replaceAll("'", `'"'"'`)}'`;
-}
 
 function stoppedDaemonTelegramRunbook(root: string, command: StoppedDaemonTelegramCommand): string {
   const quotedRoot = shellQuotedStateRoot(root);
