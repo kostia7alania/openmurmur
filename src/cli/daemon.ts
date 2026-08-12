@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +12,7 @@ import type { AsrBackend, AsrSegment } from '../asr/types.ts';
 import { type CaptureBackend, CaptureError } from '../capture/backend.ts';
 import { createCaptureBackend } from '../capture/native.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
-import { recoverAfterCrash } from '../capture/recovery.ts';
+import { type RecoveryReport, recoverAfterCrash } from '../capture/recovery.ts';
 import type { LoadedConfig } from '../config/load.ts';
 import { type Database, openDatabase, transaction } from '../database/db.ts';
 import {
@@ -275,22 +276,21 @@ export class Daemon {
       if (this.#stopping) return;
       const staleNoticeCutoff = new Date().toISOString();
 
-      // Reclaim anything a previous crash left half-done before new work starts.
-      const recovery = await recoverAfterCrash(this.#db.handle, paths, logger);
-      if (
-        recovery.orphans.length > 0 ||
-        recovery.recoveredPublishedParts.length > 0 ||
-        recovery.settledMissingParts.length > 0 ||
-        recovery.stalledSessions.length > 0
-      ) {
-        await this.#sendNow(
-          `🟡 Предыдущий запуск завершился некорректно\n\n` +
-            `Прерванных записей: ${recovery.orphans.length}\n` +
-            `Восстановленных частей: ${recovery.recoveredPublishedParts.length}\n` +
-            `Недоступных неопубликованных частей: ${recovery.settledMissingParts.length}\n` +
-            `Незавершённых сессий: ${recovery.stalledSessions.length}`,
-        );
+      // Persist the user-visible edge before recovery consumes its evidence.
+      // If this process dies during repair, the next generation reuses the same
+      // event fingerprint and finishes both recovery and delivery idempotently.
+      const recoveryPreview = await recoverAfterCrash(this.#db.handle, paths, logger, {
+        remove: false,
+        repair: false,
+      });
+      const recoveryNeeded = recoveryReportHasWork(recoveryPreview);
+      if (recoveryNeeded) {
+        enqueueRecoveryNotice(this.#db.handle, this.#outbox, identity, recoveryPreview);
       }
+
+      // Reclaim anything a previous crash left half-done before new work starts.
+      await recoverAfterCrash(this.#db.handle, paths, logger);
+      if (recoveryNeeded) await this.#tickOutbox().catch(() => {});
       if (this.#stopping) return;
 
       const reclaimedJobs = reclaimedAfterDaemonDeath + this.#jobs.recoverStaleLeases();
@@ -1712,6 +1712,65 @@ export function enqueueCaptureFailureNotice(
       ),
     },
   });
+}
+
+export function enqueueRecoveryNotice(
+  db: Database['handle'],
+  outbox: Outbox,
+  identity: Pick<DaemonPidClaim, 'pid' | 'root' | 'startedAt' | 'processBirth'>,
+  recovery: Pick<
+    RecoveryReport,
+    'orphans' | 'recoveredPublishedParts' | 'settledMissingParts' | 'stalledSessions'
+  >,
+): boolean {
+  const eventHash = createHash('sha256')
+    .update(
+      JSON.stringify({
+        orphans: recovery.orphans
+          .map((orphan) => [orphan.path, orphan.bytes, orphan.modifiedAt, orphan.sessionId])
+          .toSorted((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+        recoveredPublishedParts: recovery.recoveredPublishedParts.toSorted(),
+        settledMissingParts: recovery.settledMissingParts.toSorted(),
+        stalledSessions: recovery.stalledSessions.toSorted(),
+      }),
+    )
+    .digest('hex');
+  if (
+    db
+      .prepare('SELECT 1 FROM telegram_outbox WHERE delivery_part_id GLOB ? LIMIT 1')
+      .get(`recovery:${eventHash}:*`) !== undefined
+  ) {
+    return false;
+  }
+  const generationHash = createHash('sha256').update(daemonJobOwner(identity)).digest('hex');
+  return outbox.enqueue({
+    deliveryPartId: `recovery:${eventHash}:${generationHash}`,
+    kind: 'status',
+    ordinal: 1,
+    payload: {
+      type: 'text',
+      text:
+        `🟡 После некорректного завершения обнаружены данные; выполняю локальное восстановление\n\n` +
+        `Временных артефактов: ${recovery.orphans.length}\n` +
+        `Частей для восстановления: ${recovery.recoveredPublishedParts.length}\n` +
+        `Неопубликованных недоступных частей: ${recovery.settledMissingParts.length}\n` +
+        `Незавершённых сессий: ${recovery.stalledSessions.length}`,
+    },
+  });
+}
+
+function recoveryReportHasWork(
+  recovery: Pick<
+    RecoveryReport,
+    'orphans' | 'recoveredPublishedParts' | 'settledMissingParts' | 'stalledSessions'
+  >,
+): boolean {
+  return (
+    recovery.orphans.length > 0 ||
+    recovery.recoveredPublishedParts.length > 0 ||
+    recovery.settledMissingParts.length > 0 ||
+    recovery.stalledSessions.length > 0
+  );
 }
 
 export function retireStaleNotices(

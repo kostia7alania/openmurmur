@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
+import { recoverAfterCrash } from '../../src/capture/recovery.ts';
 import {
   asrWorkerAlertActive,
   claimDaemonPid,
@@ -10,6 +11,7 @@ import {
   commandLooksLikeOpenMurmurDaemon,
   enqueueCaptureFailureNotice,
   enqueueIncomingRequest,
+  enqueueRecoveryNotice,
   expectedDigestIsMissing,
   findIncomingFile,
   incomingFileUidFromDeliveryPart,
@@ -38,6 +40,7 @@ import {
   renewDaemonMaintenance,
   stopOwnedDaemon,
 } from '../../src/cli/daemon-ownership.ts';
+import { resolvePaths } from '../../src/config/paths.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
 import { appendIncomingTranscript, IncomingFileRepository } from '../../src/database/repository.ts';
 import { AlertEvaluator } from '../../src/health/alerts.ts';
@@ -1162,6 +1165,153 @@ describe('daemon terminal state reconciliation', () => {
       telegram_message_id: number | null;
     };
     assert.deepEqual({ ...sent }, { state: 'sent', attempts: 1, telegram_message_id: 77 });
+  });
+
+  it('preserves one count-only recovery notice across a second startup and delivers it once', async () => {
+    const generation = '2026-08-12T10:20:30.000Z';
+    const sessionId = 'private-session-/private/operator/audio.flac';
+    const firstIdentity = {
+      pid: 101,
+      root: '/private/operator/state',
+      startedAt: generation,
+      processBirth: 'private-process-birth-a',
+    };
+    const replacementIdentity = {
+      pid: 202,
+      root: '/private/operator/state',
+      startedAt: '2026-08-12T10:21:00.000Z',
+      processBirth: 'private-process-birth-b',
+    };
+    db.handle
+      .prepare(
+        `INSERT INTO audio_sessions
+           (session_id, state, started_at, created_at, updated_at)
+         VALUES (?, 'ACTIVE', ?, ?, ?)`,
+      )
+      .run(sessionId, generation, generation, generation);
+
+    const firstPreview = await recoverAfterCrash(db.handle, resolvePaths(dir), nullLogger, {
+      remove: false,
+      repair: false,
+    });
+    assert.deepEqual(firstPreview.stalledSessions, [sessionId]);
+
+    const outbox = new Outbox(db.handle);
+    assert.equal(enqueueRecoveryNotice(db.handle, outbox, firstIdentity, firstPreview), true);
+    assert.equal(
+      (db.handle.prepare('SELECT state FROM audio_sessions').get() as { state: string }).state,
+      'ACTIVE',
+      'the durable notice must precede every recovery mutation',
+    );
+    db.handle.exec(`
+      CREATE TRIGGER fail_recovery_after_notice
+      BEFORE UPDATE OF state ON audio_sessions
+      WHEN OLD.session_id = '${sessionId.replaceAll("'", "''")}'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected recovery failure after notice');
+      END
+    `);
+    await assert.rejects(
+      recoverAfterCrash(db.handle, resolvePaths(dir), nullLogger),
+      /injected recovery failure after notice/,
+    );
+    assert.equal(
+      (db.handle.prepare('SELECT state FROM audio_sessions').get() as { state: string }).state,
+      'ACTIVE',
+    );
+    db.handle.exec('DROP TRIGGER fail_recovery_after_notice');
+
+    const replacementPreview = await recoverAfterCrash(db.handle, resolvePaths(dir), nullLogger, {
+      remove: false,
+      repair: false,
+    });
+    assert.equal(
+      enqueueRecoveryNotice(db.handle, outbox, replacementIdentity, replacementPreview),
+      false,
+      'the replacement generation must reuse the same unresolved recovery event',
+    );
+
+    const repaired = await recoverAfterCrash(db.handle, resolvePaths(dir), nullLogger);
+    assert.deepEqual(repaired.stalledSessions, [sessionId]);
+    const cleanRestart = await recoverAfterCrash(db.handle, resolvePaths(dir), nullLogger);
+    assert.deepEqual(cleanRestart.stalledSessions, []);
+    assert.equal(outbox.recoverSending(), 0);
+    assert.equal(retireStaleNotices(db.handle, new Date(Date.now() + 1000).toISOString()), 0);
+
+    const pending = db.handle
+      .prepare(
+        `SELECT outbox_id, delivery_part_id, state, payload
+           FROM telegram_outbox WHERE delivery_part_id GLOB 'recovery:*'`,
+      )
+      .get() as {
+      outbox_id: string;
+      delivery_part_id: string;
+      state: string;
+      payload: string;
+    };
+    assert.equal(pending.state, 'pending');
+    assert.match(pending.delivery_part_id, /^recovery:[0-9a-f]{64}:[0-9a-f]{64}$/);
+    assert.equal(
+      (
+        db.handle
+          .prepare(
+            "SELECT count(*) AS count FROM telegram_outbox WHERE delivery_part_id GLOB 'recovery:*'",
+          )
+          .get() as { count: number }
+      ).count,
+      1,
+    );
+    assert.doesNotMatch(
+      `${pending.delivery_part_id}\n${pending.payload}`,
+      /private-session|\/private\/operator|audio\.flac|process-birth/u,
+    );
+    assert.deepEqual(JSON.parse(pending.payload), {
+      type: 'text',
+      text:
+        '🟡 После некорректного завершения обнаружены данные; выполняю локальное восстановление\n\n' +
+        'Временных артефактов: 0\n' +
+        'Частей для восстановления: 0\n' +
+        'Неопубликованных недоступных частей: 0\n' +
+        'Незавершённых сессий: 1',
+    });
+
+    const requests: string[] = [];
+    const client = new TelegramClient({
+      token: 'test-token',
+      baseUrl: 'https://api.telegram.org',
+      fetchImpl: (async (input: string | URL | Request) => {
+        requests.push(String(input));
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            result: { message_id: 78, date: 0, chat: { id: 42, type: 'private' } },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }) as typeof fetch,
+    });
+    const restartedOutbox = new Outbox(db.handle);
+    const deps = {
+      outbox: restartedOutbox,
+      client,
+      chatId: 42,
+      logger: nullLogger,
+      maxOutgoingBytes: 50 * 1024 * 1024,
+    };
+
+    assert.equal(await drainOutbox(deps), 1);
+    assert.equal(await drainOutbox(deps), 0);
+    assert.equal(requests.length, 1);
+    assert.deepEqual(
+      {
+        ...db.handle
+          .prepare(
+            'SELECT state, attempts, telegram_message_id FROM telegram_outbox WHERE outbox_id = ?',
+          )
+          .get(pending.outbox_id),
+      },
+      { state: 'sent', attempts: 1, telegram_message_id: 78 },
+    );
   });
 
   it('coalesces pending alerts and never queues a stale delivery-down warning', () => {
