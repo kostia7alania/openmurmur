@@ -445,9 +445,10 @@ restore_config() {
 wait_for_restored_daemon() {
   local phase="$1"
   local attempt=1
+  local max_attempts=60
   local output
   local validation
-  while [ "$attempt" -le 20 ]; do
+  while [ "$attempt" -le "$max_attempts" ]; do
     validation=""
     if output="$("$NODE_BIN" src/cli/main.ts status --root "$STATE_ROOT" --json 2>&1)" && \
       validation="$("$NODE_BIN" --input-type=module - "$output" 2>&1 <<'NODE'
@@ -469,7 +470,7 @@ NODE
     fi
     printf '%s\n' "${validation:-$output}" > "$EVIDENCE_DIR/restored-status.$phase.last-error"
     attempt=$((attempt + 1))
-    [ "$attempt" -le 20 ] && sleep 1
+    [ "$attempt" -le "$max_attempts" ] && sleep 1
   done
   echo "Restored daemon did not return to a fresh real-frame heartbeat; inspect $EVIDENCE_DIR" >&2
   return 1
