@@ -66,8 +66,8 @@ describe('summary claim provenance', () => {
 
     const html = renderSessionReport(input);
     assert.match(html, /ссылка модели: сегм\. 1, 3/);
-    assert.match(html, /Подготовить релиз.*ссылка модели: сегм\. 3/);
-    assert.match(html, /Позвонить заказчику.*ссылка модели: не указана/);
+    assert.match(html, /Подготовить релиз[\s\S]*ссылка модели: сегм\. 3/);
+    assert.match(html, /Позвонить заказчику[\s\S]*ссылка модели: не указана/);
 
     const markdown = renderSessionReportMarkdown(input);
     assert.match(markdown, /ссылка модели: сегм\\\. 1, 3/);

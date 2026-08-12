@@ -104,9 +104,10 @@ function fakePcmSourceIgnoringTerm(frameCount: number, pidFile?: string): string
 
 function fakePcmSourceStuckBeforeOutput(pidFile: string): string {
   const path = join(dir, 'fake-pcm-source-stuck-before-output');
+  const shellPidFile = `'${pidFile.replaceAll("'", `'"'"'`)}'`;
   writeFileSync(
     path,
-    `#!${process.execPath}\nprocess.on('SIGTERM', () => {});\nrequire('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+    `#!/bin/sh\ntrap '' TERM\nprintf '%s' "$$" > ${shellPidFile}\nwhile :; do /bin/sleep 1; done\n`,
     { mode: 0o700 },
   );
   chmodSync(path, 0o700);
