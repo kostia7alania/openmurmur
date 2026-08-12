@@ -296,6 +296,7 @@ describe('migrations', () => {
         '015_telegram_outbox_claim_generation.sql',
         '016_transcript_timestamp_provenance.sql',
         '017_daemon_ownership.sql',
+        '018_telegram_maintenance_outbox_guard.sql',
       ]);
       const rows = legacy
         .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')
@@ -549,6 +550,8 @@ describe('migrations', () => {
     db.handle.exec(`
       DROP INDEX idx_transcript_current_session;
       DROP INDEX idx_transcript_current_incoming;
+      DROP TRIGGER telegram_outbox_block_insert_during_maintenance;
+      DROP TRIGGER telegram_outbox_block_requeue_during_maintenance;
       ALTER TABLE telegram_outbox DROP COLUMN claim_generation;
       DROP TABLE daemon_ownership;
       DELETE FROM schema_migrations
@@ -556,7 +559,8 @@ describe('migrations', () => {
          '014_current_transcript_uniqueness.sql',
          '015_telegram_outbox_claim_generation.sql',
          '016_transcript_timestamp_provenance.sql',
-         '017_daemon_ownership.sql'
+         '017_daemon_ownership.sql',
+         '018_telegram_maintenance_outbox_guard.sql'
        );
     `);
     const at = '2026-08-11T01:00:00.000Z';
@@ -586,6 +590,7 @@ describe('migrations', () => {
       '015_telegram_outbox_claim_generation.sql',
       '016_transcript_timestamp_provenance.sql',
       '017_daemon_ownership.sql',
+      '018_telegram_maintenance_outbox_guard.sql',
     ]);
     const pointers = db.handle
       .prepare(

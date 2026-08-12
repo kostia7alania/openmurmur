@@ -4,7 +4,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { claimDaemonPid, releaseDaemonPid } from '../../src/cli/daemon-ownership.ts';
+import {
+  claimDaemonMaintenance,
+  claimDaemonPid,
+  releaseDaemonMaintenance,
+  releaseDaemonPid,
+} from '../../src/cli/daemon-ownership.ts';
 import { withStoppedDaemonForTelegram } from '../../src/cli/main.ts';
 import {
   commitTelegramSetup,
@@ -25,6 +30,7 @@ import {
   type TelegramSecrets,
   telegramBotScope,
 } from '../../src/telegram/keychain.ts';
+import { Outbox } from '../../src/telegram/outbox.ts';
 import { readOffset, writeOffset } from '../../src/telegram/router.ts';
 
 function update(
@@ -580,6 +586,105 @@ function memorySecrets(initial: TelegramSecrets | null): {
 }
 
 describe('Telegram setup persistence', () => {
+  it('does not move unresolved deliveries across a credential or chat replacement', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openmurmur-setup-rebind-'));
+    const paths = resolvePaths(root);
+    const db = openDatabase({ file: paths.databaseFile });
+    const previous = { token: 'old-token', chatId: 10 } as const;
+    const secrets = memorySecrets(previous);
+    const outbox = new Outbox(db.handle);
+    assert.equal(
+      outbox.enqueue({
+        deliveryPartId: 'status:old-destination',
+        kind: 'status',
+        ordinal: 1,
+        payload: { type: 'text', text: 'private old-destination message' },
+      }),
+      true,
+    );
+    writeOffset(db.handle, 7, telegramBotScope(previous.token));
+    const claim = await claimDaemonMaintenance(db.handle, paths.pidFile, root, {
+      birthMarker: async () => 'test-process-birth',
+    });
+    let confirmed = false;
+    try {
+      await assert.rejects(
+        commitTelegramSetup(
+          db.handle,
+          secrets.store,
+          { token: 'new-token', chatId: 20 },
+          { role: 'owner', nextOffset: 101 },
+          async () => {
+            confirmed = true;
+          },
+        ),
+        /Cannot replace Telegram credentials while unresolved deliveries exist/,
+      );
+      assert.deepEqual(secrets.get(), previous);
+      assert.equal(readOffset(db.handle, telegramBotScope(previous.token)), 7);
+      assert.equal(confirmed, false);
+      assert.equal(secrets.writes.length, 0);
+
+      db.handle
+        .prepare(
+          "UPDATE telegram_outbox SET state = 'failed' WHERE delivery_part_id = 'status:old-destination'",
+        )
+        .run();
+      await commitTelegramSetup(
+        db.handle,
+        secrets.store,
+        { token: 'new-token', chatId: 20 },
+        { role: 'owner', nextOffset: 101 },
+        async () => {
+          confirmed = true;
+        },
+      );
+      assert.deepEqual(secrets.get(), { token: 'new-token', chatId: 20 });
+      assert.equal(confirmed, true, 'a deliberately retired row must not deadlock replacement');
+
+      assert.throws(
+        () =>
+          outbox.enqueue({
+            deliveryPartId: 'status:racing-old-destination',
+            kind: 'status',
+            ordinal: 2,
+            payload: { type: 'text', text: 'must not cross the replacement proof' },
+          }),
+        /Telegram outbox is paused during exclusive Telegram maintenance/,
+      );
+
+      db.handle
+        .prepare(
+          "UPDATE telegram_outbox SET state = 'dead' WHERE delivery_part_id = 'status:old-destination'",
+        )
+        .run();
+      await assert.rejects(
+        commitTelegramSetup(
+          db.handle,
+          secrets.store,
+          { token: 'third-token', chatId: 30 },
+          { role: 'owner', nextOffset: 202 },
+          async () => {},
+        ),
+        /Cannot replace Telegram credentials while unresolved deliveries exist/,
+        'a recoverable dead delivery remains bound to the current destination',
+      );
+      assert.throws(
+        () =>
+          db.handle
+            .prepare(
+              "UPDATE telegram_outbox SET state = 'pending' WHERE delivery_part_id = 'status:old-destination'",
+            )
+            .run(),
+        /Telegram outbox is paused during exclusive Telegram maintenance/,
+      );
+    } finally {
+      await releaseDaemonMaintenance(db.handle, paths.pidFile, claim);
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('publishes the matching scoped offset before the Keychain pair', async () => {
     const db = openDatabase({ file: ':memory:' });
     const next = { token: 'new-token', chatId: 20 } as const;

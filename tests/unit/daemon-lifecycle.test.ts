@@ -12,6 +12,7 @@ import {
   expectedDigestIsMissing,
   findIncomingFile,
   incomingFileUidFromDeliveryPart,
+  incomingRejectionDeliveryPartId,
   markExhaustedAsrSession,
   markExhaustedIncomingFile,
   parseDaemonPid,
@@ -709,12 +710,12 @@ describe('incoming Telegram retry identity', () => {
       message_id: 40,
       date: Date.parse('2025-08-09T12:00:00.000Z') / 1000,
       chat: { id: 42, type: 'private' },
-      voice: { file_id: 'bot-a-file', file_unique_id: 'bot-a-unique' },
+      voice: { file_id: 'bot-a-file', file_unique_id: 'shared-unique' },
     };
     const secondMessage = {
       ...firstMessage,
       message_id: 41,
-      voice: { file_id: 'bot-b-file', file_unique_id: 'bot-b-unique' },
+      voice: { file_id: 'bot-b-file', file_unique_id: 'shared-unique' },
     };
     assert.equal(recordUpdate(db.handle, 800, 'audio', 'bot-a'), true);
     assert.equal(recordUpdate(db.handle, 800, 'audio', 'bot-b'), true);
@@ -733,6 +734,31 @@ describe('incoming Telegram retry identity', () => {
     assert.deepEqual(
       jobs.map((row) => row.idempotency_key),
       ['incoming:bot-a:800', 'incoming:bot-b:800'],
+    );
+
+    const outbox = new Outbox(db.handle);
+    const enqueueRejection = (fileUid: string) =>
+      outbox.enqueue({
+        deliveryPartId: incomingRejectionDeliveryPartId(fileUid),
+        kind: 'status',
+        ordinal: 1,
+        payload: { type: 'text', text: 'bounded rejection' },
+      });
+    assert.equal(enqueueRejection(first.fileUid), true);
+    assert.equal(enqueueRejection(second.fileUid), true);
+    assert.equal(enqueueRejection(first.fileUid), false, 'one scoped rejection stays idempotent');
+    assert.deepEqual(
+      db.handle
+        .prepare(
+          "SELECT delivery_part_id FROM telegram_outbox WHERE delivery_part_id GLOB 'reject:*'",
+        )
+        .all()
+        .map((row) => (row as { delivery_part_id: string }).delivery_part_id)
+        .sort(),
+      [
+        incomingRejectionDeliveryPartId(first.fileUid),
+        incomingRejectionDeliveryPartId(second.fileUid),
+      ].sort(),
     );
   });
 

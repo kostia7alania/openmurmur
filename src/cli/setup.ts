@@ -436,6 +436,21 @@ export async function commitTelegramSetup(
   confirmDelivery: () => Promise<unknown>,
 ): Promise<void> {
   const previousSecrets = await store.load();
+  const replacesDestination =
+    previousSecrets === null ||
+    previousSecrets.token !== secrets.token ||
+    previousSecrets.chatId !== secrets.chatId;
+  if (
+    replacesDestination &&
+    db
+      .prepare("SELECT 1 FROM telegram_outbox WHERE state IN ('pending','sending','dead') LIMIT 1")
+      .get() !== undefined
+  ) {
+    throw new Error(
+      'Cannot replace Telegram credentials while unresolved deliveries exist. ' +
+        'Restore the current credentials, finish or reconcile those deliveries, then retry setup.',
+    );
+  }
   const newBotScope = telegramBotScope(secrets.token);
   const previousBotScope =
     previousSecrets === null ? 'legacy' : telegramBotScope(previousSecrets.token);

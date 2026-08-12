@@ -432,6 +432,7 @@ describe('offline summary reliability', () => {
         '015_telegram_outbox_claim_generation.sql',
         '016_transcript_timestamp_provenance.sql',
         '017_daemon_ownership.sql',
+        '018_telegram_maintenance_outbox_guard.sql',
       ]);
       const live = legacy
         .prepare('SELECT summary_id FROM summaries WHERE revision_id = ?')

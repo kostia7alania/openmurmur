@@ -1108,7 +1108,7 @@ export class Daemon {
               maxIncomingBytes: config.telegram.maxIncomingBytes,
               maxDurationSeconds: config.telegram.maxIncomingDurationSeconds,
             })}\n\n${renderProvenancePlain(incomingTelegramProvenance(failedIncoming))}`.trim(),
-            `reject:${attachment.fileUniqueId}`,
+            incomingRejectionDeliveryPartId(failedIncoming.fileUid),
           );
           this.#db.handle
             .prepare(
@@ -1863,6 +1863,10 @@ export function findIncomingFile(
   botScope = 'legacy',
 ): IncomingFileRow | undefined {
   return new IncomingFileRepository(db).findByTelegramUniqueId(telegramUniqueId, botScope);
+}
+
+export function incomingRejectionDeliveryPartId(fileUid: string): string {
+  return `reject:${fileUid}`;
 }
 
 /**
