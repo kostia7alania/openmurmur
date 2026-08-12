@@ -288,7 +288,7 @@ function compactPreview(text: string, maxGraphemes: number, maxEscapedLength: nu
 
 export interface StatusReportInput {
   readonly hostName: string;
-  readonly recording: boolean;
+  readonly recordingState: 'starting' | 'recording' | 'stopped';
   readonly lastFrameSecondsAgo: number | null;
   readonly processingLagSeconds: number | null;
   readonly sessionState: string;
@@ -313,12 +313,25 @@ export function renderStatus(input: StatusReportInput): string {
     input.sessionElapsedMs === null
       ? input.sessionState
       : `${input.sessionState}, ${formatDuration(input.sessionElapsedMs)}`;
-  const heading = input.recording ? 'OpenMurmur работает' : 'OpenMurmur не записывает';
+  const heading =
+    input.recordingState === 'recording'
+      ? 'OpenMurmur работает'
+      : input.recordingState === 'starting'
+        ? 'OpenMurmur запускает запись'
+        : 'OpenMurmur не записывает';
+  const recording =
+    input.recordingState === 'recording'
+      ? 'включена'
+      : input.recordingState === 'starting'
+        ? 'запуск, ожидаю первый аудиокадр'
+        : 'остановлена';
+  const icon =
+    input.recordingState === 'recording' ? '🟢' : input.recordingState === 'starting' ? '🟡' : '🔴';
 
   return [
-    `${input.recording ? '🟢' : '🔴'} <b>${heading}</b> — <code>${escapeHtml(input.hostName)}</code>`,
+    `${icon} <b>${heading}</b> — <code>${escapeHtml(input.hostName)}</code>`,
     '',
-    `Запись: ${input.recording ? 'включена' : 'остановлена'}`,
+    `Запись: ${recording}`,
     `Последний аудиокадр: ${ago(input.lastFrameSecondsAgo, 'сек')}`,
     `Отставание обработки: ${
       input.processingLagSeconds === null

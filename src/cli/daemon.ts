@@ -843,7 +843,7 @@ export class Daemon {
       botScope,
       renderStatus({
         hostName: hostname(),
-        recording: this.#recorder.running && this.#recorderFailure === null,
+        recordingState: this.#recordingState(),
         lastFrameSecondsAgo:
           this.#capture.msSinceLastFrame() === null
             ? null
@@ -1173,6 +1173,9 @@ export class Daemon {
     const deadJobs = this.#jobs.deadJobs();
 
     return {
+      // Health distinguishes a live capture process that is still waiting for
+      // its first frame (recovering) from a stopped process (failed). Chat
+      // status uses #recordingState so it never turns green before that frame.
       recorderRunning: this.#recorder.running && this.#recorderFailure === null,
       msSinceLastFrame: this.#capture.msSinceLastFrame(),
       processingLagMs: this.#capture.processingLagMs?.() ?? null,
@@ -1316,7 +1319,7 @@ export class Daemon {
     writeDaemonHeartbeat(this.#db.handle, {
       daemonPid: process.pid,
       daemonStartedAt,
-      recorderRunning: this.#recorder.running && this.#recorderFailure === null,
+      recorderRunning: this.#recordingState() === 'recording',
       sessionState: snapshot.state,
       lastSourceFrameAgeMs: this.#capture.msSinceLastFrame(),
       processingLagMs: this.#capture.processingLagMs?.() ?? null,
@@ -1363,6 +1366,21 @@ export class Daemon {
         payload: { type: 'text', text: alert.text },
       });
     });
+  }
+
+  #recordingState(): 'starting' | 'recording' | 'stopped' {
+    if (
+      this.#announcedRecording &&
+      this.#recorder.running &&
+      this.#recorderFailure === null &&
+      !this.#stopping
+    ) {
+      return 'recording';
+    }
+    if (this.#recorderFailure !== null || this.#stopping || this.#announcedRecording) {
+      return 'stopped';
+    }
+    return 'starting';
   }
 
   async #tickDigest(): Promise<void> {

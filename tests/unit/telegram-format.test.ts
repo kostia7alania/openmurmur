@@ -587,9 +587,9 @@ describe('formatting helpers', () => {
 
 describe('status report', () => {
   it('shows the escaped daemon host in the heading', () => {
-    const report = renderStatus({
+    const input = {
       hostName: 'Kostia <Mac> & Studio',
-      recording: true,
+      recordingState: 'recording' as const,
       lastFrameSecondsAgo: 1,
       processingLagSeconds: 0.5,
       sessionState: 'IDLE',
@@ -604,7 +604,8 @@ describe('status report', () => {
       asrStatus: 'ready',
       llmStatus: 'ready',
       version: '0.1.0',
-    });
+    };
+    const report = renderStatus(input);
 
     assert.match(
       report,
@@ -613,5 +614,14 @@ describe('status report', () => {
     assert.ok(!report.includes('<Mac>'));
     assert.match(report, /Ошибочные задачи: 1/);
     assert.match(report, /Недоставленные сообщения: 2/);
+
+    const starting = renderStatus({
+      ...input,
+      recordingState: 'starting',
+      lastFrameSecondsAgo: null,
+    });
+    assert.match(starting, /^🟡 <b>OpenMurmur запускает запись<\/b>/);
+    assert.match(starting, /Запись: запуск, ожидаю первый аудиокадр/);
+    assert.doesNotMatch(starting, /🟢|Запись: включена/);
   });
 });

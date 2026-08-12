@@ -82,7 +82,7 @@ describe('health storage and probe boundaries', () => {
 
     const status = renderStatus({
       hostName: 'local-mac',
-      recording: true,
+      recordingState: 'recording',
       lastFrameSecondsAgo: 1,
       processingLagSeconds: 0,
       sessionState: 'IDLE',
