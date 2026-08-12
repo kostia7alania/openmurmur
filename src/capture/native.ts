@@ -192,6 +192,9 @@ export function nativeCaptureAuthorizationStatus(
 }
 
 function classifyExit(stderr: string, code: number | null): CaptureError {
+  if (code === 75 && stderr === 'capture failed: system sleep\n') {
+    return new CaptureError('sleep', 'native capture stopped for system sleep');
+  }
   const detail = stderr.trim();
   const lower = detail.toLowerCase();
   const message =

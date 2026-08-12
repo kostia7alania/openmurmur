@@ -38,7 +38,12 @@ enum StreamFailure: UInt {
         }
     }
 
-    static func select(from bits: UInt) -> StreamFailure {
+    static func select(from bits: UInt, authoritativeSleep: Bool = false) -> StreamFailure {
+        let sleepCompatibleBits = StreamFailure.deviceChanged.rawValue
+            | StreamFailure.systemSleep.rawValue
+        if authoritativeSleep, bits & ~sleepCompatibleBits == 0 {
+            return .systemSleep
+        }
         let priority: [StreamFailure] = [
             .handoffOverflow,
             .outputWrite,

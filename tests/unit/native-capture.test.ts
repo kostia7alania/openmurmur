@@ -96,6 +96,14 @@ int main(int argc, char **argv) {
   if (count == 2) {
     while (1) pause();
   }
+  if (count == 3) {
+    fputs("capture failed: system sleep\\n", stderr);
+    return 75;
+  }
+  if (count == 4) {
+    fputs("capture failed: system sleep later\\n", stderr);
+    return 75;
+  }
   const unsigned char pcm[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
   fwrite(pcm, 1, sizeof(pcm), stdout);
   fflush(stdout);
@@ -207,6 +215,21 @@ int main(int argc, char **argv) {
     const firstPid = Number(readFileSync(join(root, 'pid-2'), 'utf8'));
     assert.throws(() => process.kill(firstPid, 0), { code: 'ESRCH' });
 
+    const sleepFailure = await capture
+      .start()
+      .next()
+      .catch((error: unknown) => error);
+    assert.ok(sleepFailure instanceof CaptureError);
+    assert.equal(sleepFailure.kind, 'sleep');
+    assert.equal(sleepFailure.message, 'native capture stopped for system sleep');
+
+    const malformedSleep = await capture
+      .start()
+      .next()
+      .catch((error: unknown) => error);
+    assert.ok(malformedSleep instanceof CaptureError);
+    assert.equal(malformedSleep.kind, 'exit');
+
     const restarted = capture.start();
     const first = await restarted.next();
     assert.equal(first.done, false);
@@ -224,6 +247,6 @@ int main(int argc, char **argv) {
     assert.match(failure.message, /\[REDACTED\]/);
     assert.equal(failure.message.includes(botToken), false);
     assert.ok(failure.message.length <= 8_300, `stderr error was ${failure.message.length} bytes`);
-    assert.equal(readFileSync(invocationFile, 'utf8'), '3');
+    assert.equal(readFileSync(invocationFile, 'utf8'), '5');
   });
 });

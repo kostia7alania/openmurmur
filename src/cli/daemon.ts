@@ -8,7 +8,7 @@ import {
   modelLanguageName,
 } from '../asr/preferences.ts';
 import type { AsrBackend, AsrSegment } from '../asr/types.ts';
-import type { CaptureBackend } from '../capture/backend.ts';
+import { type CaptureBackend, CaptureError } from '../capture/backend.ts';
 import { createCaptureBackend } from '../capture/native.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
 import { recoverAfterCrash } from '../capture/recovery.ts';
@@ -46,7 +46,7 @@ import {
   renderHealthLines,
   sqliteWritable,
 } from '../health/monitor.ts';
-import { renderSleepMessage, SleepDetector } from '../health/sleep.ts';
+import { renderSleepMessage } from '../health/sleep.ts';
 import {
   failureCategory,
   renderAsrUnavailableDetail,
@@ -170,7 +170,6 @@ export class Daemon {
   /** Resolves once `run()` has finalized whatever was open. */
   #recorderDone: Promise<void> | null = null;
   #recorderSettled = true;
-  readonly #sleepDetector: SleepDetector;
   #announcedRecording = false;
   readonly #timers: NodeJS.Timeout[] = [];
   readonly #activeTicks = new Set<Promise<void>>();
@@ -223,13 +222,6 @@ export class Daemon {
       frameSamples: 512,
       ffmpegPath: config.audio.ffmpegPath,
       clock: captureClock,
-    });
-
-    this.#sleepDetector = new SleepDetector({
-      clock: {
-        monotonicMs: () => Number(process.hrtime.bigint() / 1_000_000n),
-        wallMs: Date.now,
-      },
     });
 
     this.#vad = createVadBackend(options.loaded, options.logger, {
@@ -351,7 +343,6 @@ export class Daemon {
         logger.info('Telegram update polling disabled; outbound delivery remains enabled');
       }
       this.#loop('health', () => this.#tickHealth(), config.health.pollIntervalMs);
-      this.#loop('sleep', () => this.#tickSleep(), 2000);
       this.#loop('digest', () => this.#tickDigest(), DIGEST_TICK_INTERVAL_MS);
       this.#loop('retention', () => this.#tickRetention(), 60 * 60 * 1000);
       this.#scheduleAsrReadinessProbe(true);
@@ -394,6 +385,14 @@ export class Daemon {
       if (!this.#stopping) throw new Error('capture stream ended unexpectedly');
     } catch (error) {
       this.#recorderFailure = (error as Error).message;
+      if (error instanceof CaptureError && error.kind === 'sleep') {
+        logger.warn('capture stopped because the system is entering sleep');
+        this.#enqueueText(
+          renderSleepMessage(),
+          `sleep:${this.#daemonStartedAt ?? 'unknown-generation'}`,
+        );
+        throw new Error('capture stopped for system sleep; restart required', { cause: error });
+      }
       logger.error('capture failed', { error: this.#recorderFailure });
       await this.#sendNow(renderCaptureFailure(this.#announcedRecording));
       throw new Error(`capture failed: ${this.#recorderFailure}`, { cause: error });
@@ -1202,25 +1201,6 @@ export class Daemon {
         DIGEST_TICK_INTERVAL_MS + config.health.pollIntervalMs,
       ),
     };
-  }
-
-  /**
-   * Detects that the Mac was asleep and closes any session that would
-   * otherwise appear to span the gap.
-   */
-  async #tickSleep(): Promise<void> {
-    const event = this.#sleepDetector.poll();
-    if (event === null) return;
-
-    this.#options.logger.warn('detected a sleep gap', { sleptMs: event.sleptMs });
-    const closed = await this.#recorder.closeOpenSession('machine slept');
-
-    await this.#sendNow(renderSleepMessage(event));
-    if (closed !== null) {
-      this.#options.logger.info('closed a session that spanned the sleep gap', {
-        sessionId: closed,
-      });
-    }
   }
 
   async #tickHealth(): Promise<void> {

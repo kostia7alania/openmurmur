@@ -45,7 +45,8 @@ export interface CaptureBackend {
 }
 
 export class CaptureError extends Error {
-  readonly kind: 'permission' | 'device' | 'spawn' | 'exit';
+  readonly kind: 'permission' | 'device' | 'spawn' | 'exit' | 'sleep';
+
   constructor(kind: CaptureError['kind'], message: string) {
     super(message);
     this.name = 'CaptureError';

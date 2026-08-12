@@ -759,9 +759,13 @@ offline slice is recorded on the item itself below.
   fallback; recorder mutations and sleep boundaries are serialized with stream
   epochs. Unit and fake-child integration coverage includes overflow/retry,
   non-zero exit, ignored SIGTERM, buffered stop, discontinuity and a VAD-blocked
-  stop. Still yellow until real AVFoundation chunk cadence and lid sleep/wake are
-  exercised; the 250 ms discontinuity threshold may need calibration from that
-  evidence.
+  stop. When the native helper receives the authoritative macOS `willSleep`
+  event, it treats that as a terminal typed capture boundary; the daemon finalizes the recorder and
+  reports the interruption without inventing a duration; launchd is configured
+  to start a new generation after wake. The helper does not claim to drain the
+  bounded pre-sleep handoff tail. Still yellow until real AVFoundation chunk
+  cadence and lid sleep/wake are exercised; the 250 ms discontinuity threshold
+  may need calibration from that evidence.
 
 #### AR-15 ⬜ Designate one input owner per Telegram bot token
 

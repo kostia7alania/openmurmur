@@ -30,7 +30,11 @@ terminates explicitly instead of blocking the realtime callback or silently
 dropping samples.
 
 Configuration changes, system sleep, conversion errors and broken stdout all
-terminate with stable nonzero codes. SIGINT and SIGTERM are normal shutdowns.
+terminate with stable nonzero codes. When the helper receives `willSleep`, it
+stops the tap and engine immediately, emits the fixed `capture failed: system sleep`
+diagnostic and exits; it does not claim a sleep duration or resume the old
+stream after wake. A bounded handoff tail that had not reached stdout may be
+absent. SIGINT and SIGTERM are normal shutdowns.
 
 ## Build and self-check
 
@@ -94,6 +98,6 @@ first PCM bytes remain the only proof that capture actually started.
 | 69 | Input device unavailable or engine start failed |
 | 70 | PCM setup or conversion failed |
 | 74 | PCM stdout write failed |
-| 75 | Bounded handoff overflow or system sleep |
+| 75 | Bounded handoff overflow or system sleep (distinguished by exact diagnostic) |
 | 76 | Input-device configuration changed |
 | 77 | Microphone permission is not granted |

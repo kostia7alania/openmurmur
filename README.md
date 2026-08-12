@@ -275,16 +275,19 @@ The two supported operating modes therefore have different boundaries:
 
 ## Sleep and the lid
 
-- **Sleep:** capture stops. macOS suspends the process; no audio is recorded.
-  The daemon detects the gap on wake — sleep advances the wall clock while the
-  monotonic clock stays frozen, which is a fingerprint nothing else produces —
-  closes any open session so it cannot appear to span the gap, and reports
-  `🟡 Запись прерывалась: компьютер спал` with the duration.
+- **Sleep with the native backend:** when the helper receives macOS `willSleep`,
+  it stops capture and exits explicitly. The recorder finalizes any open session,
+  reports `🟡 Запись прерывалась: компьютер начал переход в сон`, and launchd is
+  configured to start a new capture generation after wake. No sleep duration is
+  inferred. A bounded helper handoff tail that had not reached stdout at the
+  sleep boundary may be absent; the product does not claim to drain it.
+- **Foreground FFmpeg:** capture failure and source discontinuity remain
+  fail-closed, but no native macOS sleep notification is available.
 - **Closed lid:** with an external display and power, the Mac may stay awake and
   recording continues. On battery with the lid closed, the Mac sleeps and
   recording stops.
-- **Long sleeps** produce a `🟡` alert on wake if the recorder was stale, and the
-  job queue drains any backlog that accumulated.
+- When launchd starts a new daemon generation after wake, that generation
+  drains durable work left from before sleep.
 
 ## Who spoke
 

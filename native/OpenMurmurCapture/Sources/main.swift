@@ -132,17 +132,59 @@ private func runStream() -> Never {
 
     let failures = DispatchSource.makeUserDataOrSource(queue: .main)
     var isTerminating = false
+    var tapInstalled = false
+    var pendingDeviceTermination: DispatchWorkItem?
+    let terminateStream = { (failure: StreamFailure) -> Never in
+        isTerminating = true
+        pendingDeviceTermination?.cancel()
+        if tapInstalled {
+            input.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        engine.stop()
+        terminate(failure.exitCode, failure.diagnostic)
+    }
     failures.setEventHandler {
         guard !isTerminating else {
             return
         }
-        isTerminating = true
         let failure = StreamFailure.select(from: failures.data)
-        input.removeTap(onBus: 0)
-        engine.stop()
-        terminate(failure.exitCode, failure.diagnostic)
+        if failure == .deviceChanged {
+            guard pendingDeviceTermination == nil else {
+                return
+            }
+            let work = DispatchWorkItem {
+                guard !isTerminating else {
+                    return
+                }
+                terminateStream(.deviceChanged)
+            }
+            pendingDeviceTermination = work
+            // macOS may publish a configuration change immediately before its
+            // authoritative sleep event. Give that main-queue event one bounded
+            // chance to override the otherwise terminal device transition.
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100), execute: work)
+            return
+        }
+        terminateStream(failure)
     }
     failures.resume()
+
+    // Register before starting the worker, tap or engine. Device failures get
+    // a bounded grace period so a sleep notification already queued on this
+    // same main queue can take authoritative precedence.
+    let sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
+        forName: NSWorkspace.willSleepNotification,
+        object: nil,
+        queue: .main
+    ) { _ in
+        guard !isTerminating else {
+            return
+        }
+        terminateStream(
+            StreamFailure.select(from: failures.data, authoritativeSleep: true)
+        )
+    }
 
     let worker = PCMOutputWorker(
         converter: converter,
@@ -156,13 +198,26 @@ private func runStream() -> Never {
             failures.or(data: StreamFailure.handoffOverflow.rawValue)
         }
     }
+    tapInstalled = true
 
     do {
         engine.prepare()
         try engine.start()
     } catch {
-        input.removeTap(onBus: 0)
-        terminate(Exit.unavailable, "capture failed: input device unavailable")
+        if tapInstalled {
+            input.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        let work = DispatchWorkItem {
+            guard !isTerminating else {
+                return
+            }
+            isTerminating = true
+            terminate(Exit.unavailable, "capture failed: input device unavailable")
+        }
+        pendingDeviceTermination = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100), execute: work)
+        dispatchMain()
     }
 
     // Some devices issue an engine-configuration notification as part of the
@@ -170,25 +225,21 @@ private func runStream() -> Never {
     let engineObserver = NotificationCenter.default.addObserver(
         forName: .AVAudioEngineConfigurationChange,
         object: engine,
-        queue: nil
+        queue: .main
     ) { _ in
         failures.or(data: StreamFailure.deviceChanged.rawValue)
     }
-    let sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
-        forName: NSWorkspace.willSleepNotification,
-        object: nil,
-        queue: nil
-    ) { _ in
-        failures.or(data: StreamFailure.systemSleep.rawValue)
-    }
-
     var signalSources: [DispatchSourceSignal] = []
     let stopNormally = {
         guard !isTerminating else {
             return
         }
         isTerminating = true
-        input.removeTap(onBus: 0)
+        pendingDeviceTermination?.cancel()
+        if tapInstalled {
+            input.removeTap(onBus: 0)
+            tapInstalled = false
+        }
         engine.stop()
         Darwin.exit(0)
     }
@@ -205,6 +256,18 @@ private func runStream() -> Never {
 }
 
 private func runSelfCheck() -> Never {
+    guard StreamFailure.select(
+        from: StreamFailure.deviceChanged.rawValue,
+        authoritativeSleep: true
+    ) == .systemSleep,
+        StreamFailure.select(
+            from: StreamFailure.handoffOverflow.rawValue,
+            authoritativeSleep: true
+        ) == .handoffOverflow
+    else {
+        terminate(Exit.software, "self-check failed: sleep failure priority")
+    }
+
     guard let inputFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
         sampleRate: 48_000,
