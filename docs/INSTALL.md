@@ -381,7 +381,11 @@ registration set and full read-only `launchctl print` output in a private
 directory. It then makes `logLevel` invalid temporarily: the installer's native
 and TCC preflight still passes, but the daemon and the same `status` readiness
 probe reject the config before capture opens. The installer must return
-non-zero and restore the prior files and loaded-label set.
+non-zero and restore the prior files and loaded-label set. The block uses the
+exact Node executable recorded in the installed daemon plist, validates it
+against `runtime-requirements.json`, and moves the proved config through a
+private adjacent directory. It never overwrites an unexpected config path;
+conflicting bytes and rollback evidence are retained for inspection.
 
 This deliberately changes launchd state and therefore needs explicit operator
 approval. After the config is restored, the previous daemon is required to
@@ -397,12 +401,258 @@ set -euo pipefail
 STATE_ROOT="$HOME/Library/Application Support/OpenMurmur"
 CONFIG_FILE="$STATE_ROOT/openmurmur.json"
 AGENT_DIR="$HOME/Library/LaunchAgents"
-NODE_BIN="$(command -v node)"
+DAEMON_PLIST="$AGENT_DIR/io.openmurmur.daemon.plist"
+RUNTIME_CONTRACT="$PWD/runtime-requirements.json"
+WORK_DIR=""
+WORK_DIR_ID=""
+STATE_ROOT_ID=""
+HOME_ID=""
+AGENT_DIR_ID=""
+CONFIG_ID=""
+CONFIG_SHA256=""
+CONFIG_MODE=""
+INVALID_ID=""
+INVALID_SHA256=""
+INVALID_MODE=""
+CONFIG_MUTATION_STARTED=false
+CONFIG_RESTORED=true
+PRESERVE_WORK_DIR=false
+CONFLICT_COUNT=0
+
+directory_identity() {
+  /usr/bin/stat -f '%d:%i' "$1"
+}
+
+file_identity() {
+  /usr/bin/stat -f '%d:%i' "$1"
+}
+
+file_sha256() {
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+file_mode() {
+  /usr/bin/stat -f '%Lp' "$1"
+}
+
+require_physical_directory() {
+  local path="$1"
+  local label="$2"
+  local physical
+  [ -d "$path" ] && [ ! -L "$path" ] || {
+    echo "$label must be a physical directory: $path" >&2
+    exit 1
+  }
+  physical="$(cd "$path" && pwd -P)"
+  [ "$physical" = "$path" ] || {
+    echo "$label must not contain symlinked or non-canonical components: $path" >&2
+    exit 1
+  }
+}
+
+require_physical_directory "$HOME" HOME
+require_physical_directory "$HOME/Library" HOME/Library
+require_physical_directory "$AGENT_DIR" HOME/Library/LaunchAgents
+require_physical_directory "$STATE_ROOT" STATE_ROOT
+HOME_ID="$(directory_identity "$HOME")"
+STATE_ROOT_ID="$(directory_identity "$STATE_ROOT")"
+AGENT_DIR_ID="$(directory_identity "$AGENT_DIR")"
+
+[ -f "$DAEMON_PLIST" ] && [ ! -L "$DAEMON_PLIST" ] || {
+  echo "D121 needs a regular installed daemon plist: $DAEMON_PLIST" >&2
+  exit 1
+}
+NODE_BIN="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$DAEMON_PLIST")"
+[ -n "$NODE_BIN" ] && [ "${NODE_BIN#/}" != "$NODE_BIN" ] && [ -x "$NODE_BIN" ] || {
+  echo "Installed daemon ProgramArguments:0 is not an absolute executable" >&2
+  exit 1
+}
+[ -f "$RUNTIME_CONTRACT" ] && [ ! -L "$RUNTIME_CONTRACT" ]
+"$NODE_BIN" --input-type=module - "$RUNTIME_CONTRACT" "$NODE_BIN" <<'NODE'
+import { readFileSync } from 'node:fs';
+
+const contract = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const expectedExecutable = process.argv[3];
+const versionPattern = /^\d+\.\d+\.\d+$/;
+const keys = ['nodeMinimum', 'sqliteMinimum', 'pnpmExact'];
+if (contract.schemaVersion !== 1 || keys.some((key) => !versionPattern.test(contract[key]))) {
+  throw new Error('invalid runtime requirements contract');
+}
+if (process.execPath !== expectedExecutable) {
+  throw new Error(`installed Node resolved to ${process.execPath}, expected ${expectedExecutable}`);
+}
+function compare(left, right) {
+  const a = left.split('.').map(Number);
+  const b = right.split('.').map(Number);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const delta = (a[index] ?? 0) - (b[index] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return 0;
+}
+const sqlite = process.versions.sqlite ?? '0.0.0';
+if (
+  compare(process.versions.node, contract.nodeMinimum) < 0 ||
+  compare(sqlite, contract.sqliteMinimum) < 0
+) {
+  throw new Error(
+    `installed runtime is incompatible: Node ${process.versions.node}, SQLite ${sqlite}`,
+  );
+}
+NODE
+
+boundaries_unchanged() {
+  local agents_physical
+  local home_physical
+  local state_physical
+  [ -d "$HOME" ] && [ ! -L "$HOME" ] && \
+    home_physical="$(cd "$HOME" 2>/dev/null && pwd -P)" && \
+    [ "$home_physical" = "$HOME" ] && \
+    [ "$(directory_identity "$HOME")" = "$HOME_ID" ] && \
+    [ -d "$AGENT_DIR" ] && [ ! -L "$AGENT_DIR" ] && \
+    agents_physical="$(cd "$AGENT_DIR" 2>/dev/null && pwd -P)" && \
+    [ "$agents_physical" = "$AGENT_DIR" ] && \
+    [ "$(directory_identity "$AGENT_DIR")" = "$AGENT_DIR_ID" ] && \
+    [ -d "$STATE_ROOT" ] && [ ! -L "$STATE_ROOT" ] && \
+    state_physical="$(cd "$STATE_ROOT" 2>/dev/null && pwd -P)" && \
+    [ "$state_physical" = "$STATE_ROOT" ] && \
+    [ "$(directory_identity "$STATE_ROOT")" = "$STATE_ROOT_ID" ]
+}
+
+work_directory_unchanged() {
+  local physical
+  [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ] && [ ! -L "$WORK_DIR" ] && \
+    physical="$(cd "$WORK_DIR" 2>/dev/null && pwd -P)" && \
+    [ "$physical" = "$WORK_DIR" ] && \
+    [ "$(directory_identity "$WORK_DIR")" = "$WORK_DIR_ID" ]
+}
+
+config_is_original() {
+  boundaries_unchanged && [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] && \
+    [ "$(file_identity "$CONFIG_FILE")" = "$CONFIG_ID" ] && \
+    [ "$(file_sha256 "$CONFIG_FILE")" = "$CONFIG_SHA256" ] && \
+    [ "$(file_mode "$CONFIG_FILE")" = "$CONFIG_MODE" ]
+}
+
+config_is_invalid() {
+  boundaries_unchanged && [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] && \
+    [ "$(file_identity "$CONFIG_FILE")" = "$INVALID_ID" ] && \
+    [ "$(file_sha256 "$CONFIG_FILE")" = "$INVALID_SHA256" ] && \
+    [ "$(file_mode "$CONFIG_FILE")" = "$INVALID_MODE" ]
+}
+
+preserve_current_config() {
+  local conflict
+  boundaries_unchanged && work_directory_unchanged || return 1
+  if [ ! -e "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ]; then return 0; fi
+  CONFLICT_COUNT=$((CONFLICT_COUNT + 1))
+  conflict="$WORK_DIR/openmurmur.json.conflict.$CONFLICT_COUNT"
+  [ ! -e "$conflict" ] && [ ! -L "$conflict" ] || return 1
+  /bin/mv "$CONFIG_FILE" "$conflict" || return 1
+  PRESERVE_WORK_DIR=true
+}
+
+preserve_work_path_as_conflict() {
+  local source="$1"
+  local conflict
+  boundaries_unchanged && work_directory_unchanged || return 1
+  [ -e "$source" ] || [ -L "$source" ] || return 1
+  CONFLICT_COUNT=$((CONFLICT_COUNT + 1))
+  conflict="$WORK_DIR/openmurmur.json.conflict.$CONFLICT_COUNT"
+  [ ! -e "$conflict" ] && [ ! -L "$conflict" ] || return 1
+  /bin/mv "$source" "$conflict" || return 1
+  PRESERVE_WORK_DIR=true
+}
+
+restore_config() {
+  local live_copy="$WORK_DIR/openmurmur.json.invalid.live"
+  local conflict_found=false
+  if config_is_original; then
+    CONFIG_RESTORED=true
+    return 0
+  fi
+  boundaries_unchanged && work_directory_unchanged || {
+    PRESERVE_WORK_DIR=true
+    return 1
+  }
+  [ -f "$WORK_DIR/openmurmur.json.snapshot" ] && \
+    [ ! -L "$WORK_DIR/openmurmur.json.snapshot" ] && \
+    [ "$(file_identity "$WORK_DIR/openmurmur.json.snapshot")" = "$CONFIG_ID" ] && \
+    [ "$(file_sha256 "$WORK_DIR/openmurmur.json.snapshot")" = "$CONFIG_SHA256" ] && \
+    [ "$(file_mode "$WORK_DIR/openmurmur.json.snapshot")" = "$CONFIG_MODE" ] || {
+      PRESERVE_WORK_DIR=true
+      return 1
+    }
+
+  if config_is_invalid; then
+    [ ! -e "$live_copy" ] && [ ! -L "$live_copy" ] && \
+      /bin/mv "$CONFIG_FILE" "$live_copy" || {
+        PRESERVE_WORK_DIR=true
+        return 1
+      }
+    [ "$(file_identity "$live_copy")" = "$INVALID_ID" ] && \
+      [ "$(file_sha256 "$live_copy")" = "$INVALID_SHA256" ] && \
+      [ "$(file_mode "$live_copy")" = "$INVALID_MODE" ] || {
+      preserve_work_path_as_conflict "$live_copy" || true
+      PRESERVE_WORK_DIR=true
+      return 1
+    }
+  elif [ -e "$CONFIG_FILE" ] || [ -L "$CONFIG_FILE" ]; then
+    preserve_current_config || {
+      PRESERVE_WORK_DIR=true
+      return 1
+    }
+    conflict_found=true
+  fi
+
+  boundaries_unchanged && work_directory_unchanged && \
+    [ ! -e "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] && \
+    /bin/ln "$WORK_DIR/openmurmur.json.snapshot" "$CONFIG_FILE" || {
+      if [ -e "$CONFIG_FILE" ] || [ -L "$CONFIG_FILE" ]; then
+        preserve_current_config || true
+      fi
+      PRESERVE_WORK_DIR=true
+      return 1
+    }
+  config_is_original || {
+    PRESERVE_WORK_DIR=true
+    return 1
+  }
+  CONFIG_RESTORED=true
+  [ "$conflict_found" = false ]
+}
+
+finish_rehearsal() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [ "$CONFIG_MUTATION_STARTED" = true ] && [ "$CONFIG_RESTORED" != true ]; then
+    if ! restore_config; then status=1; fi
+  fi
+  if [ -n "$WORK_DIR" ]; then
+    if [ "$PRESERVE_WORK_DIR" = true ]; then
+      echo "D121 config transaction evidence preserved at $WORK_DIR" >&2
+    elif boundaries_unchanged && work_directory_unchanged; then
+      /bin/rm -rf "$WORK_DIR"
+    else
+      echo "D121 config transaction directory preserved after an identity change: $WORK_DIR" >&2
+      status=1
+    fi
+  fi
+  exit "$status"
+}
+
 EVIDENCE_DIR="$(mktemp -d /private/tmp/openmurmur-d121.XXXXXX)"
 chmod 0700 "$EVIDENCE_DIR"
+WORK_DIR="$(mktemp -d "$STATE_ROOT/.openmurmur-d121.XXXXXX")"
+chmod 0700 "$WORK_DIR"
+WORK_DIR_ID="$(directory_identity "$WORK_DIR")"
+boundaries_unchanged && work_directory_unchanged
+trap finish_rehearsal EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 ./scripts/install-capture-app --check
-[ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ]
 [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ]
 for label in io.openmurmur.daemon io.openmurmur.digest; do
   [ -f "$AGENT_DIR/$label.plist" ] || {
@@ -411,8 +661,20 @@ for label in io.openmurmur.daemon io.openmurmur.digest; do
   }
 done
 
+CONFIG_ID="$(file_identity "$CONFIG_FILE")"
+CONFIG_SHA256="$(file_sha256 "$CONFIG_FILE")"
+CONFIG_MODE="$(file_mode "$CONFIG_FILE")"
+printf 'identity=%s\nsha256=%s\nmode=%s\n' \
+  "$CONFIG_ID" "$CONFIG_SHA256" "$CONFIG_MODE" \
+  > "$EVIDENCE_DIR/openmurmur.json.before.identity"
+/bin/ln "$CONFIG_FILE" "$WORK_DIR/openmurmur.json.snapshot"
 cp -p "$CONFIG_FILE" "$EVIDENCE_DIR/openmurmur.json.before"
 chmod 0600 "$EVIDENCE_DIR/openmurmur.json.before"
+config_is_original
+[ "$(file_identity "$WORK_DIR/openmurmur.json.snapshot")" = "$CONFIG_ID" ]
+[ "$(file_sha256 "$WORK_DIR/openmurmur.json.snapshot")" = "$CONFIG_SHA256" ]
+[ "$(file_mode "$WORK_DIR/openmurmur.json.snapshot")" = "$CONFIG_MODE" ]
+[ "$(file_sha256 "$EVIDENCE_DIR/openmurmur.json.before")" = "$CONFIG_SHA256" ]
 /usr/bin/shasum -a 256 \
   "$AGENT_DIR/io.openmurmur.daemon.plist" \
   "$AGENT_DIR/io.openmurmur.digest.plist" \
@@ -432,14 +694,6 @@ snapshot_launchd() {
     fi
     printf '%s %s\n' "$label" "$registration" >> "$EVIDENCE_DIR/labels.$phase"
   done
-}
-
-restore_config() {
-  local staged="$CONFIG_FILE.d121-restore.$$"
-  [ ! -e "$staged" ] && [ ! -L "$staged" ]
-  cp -p "$EVIDENCE_DIR/openmurmur.json.before" "$staged"
-  chmod 0600 "$staged"
-  mv -f "$staged" "$CONFIG_FILE"
 }
 
 wait_for_restored_daemon() {
@@ -478,25 +732,54 @@ NODE
 
 snapshot_launchd before
 wait_for_restored_daemon before
-trap restore_config EXIT
-trap 'exit 130' HUP INT TERM
 
-"$NODE_BIN" --input-type=module - "$CONFIG_FILE" <<'NODE'
-import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+"$NODE_BIN" --input-type=module - "$CONFIG_FILE" "$WORK_DIR/openmurmur.json.invalid" <<'NODE'
+import { readFileSync, writeFileSync } from 'node:fs';
 
 const configFile = process.argv[2];
+const invalidFile = process.argv[3];
 const config = JSON.parse(readFileSync(configFile, 'utf8'));
 if (config?.audio?.captureBackend !== 'native') {
   throw new Error('D121 rehearsal requires audio.captureBackend="native"');
 }
 config.logLevel = '__d121_readiness_failure__';
-const staged = `${configFile}.d121-${process.pid}`;
-writeFileSync(staged, `${JSON.stringify(config, null, 2)}\n`, {
+writeFileSync(invalidFile, `${JSON.stringify(config, null, 2)}\n`, {
   flag: 'wx',
   mode: 0o600,
 });
-renameSync(staged, configFile);
 NODE
+chmod "$CONFIG_MODE" "$WORK_DIR/openmurmur.json.invalid"
+INVALID_ID="$(file_identity "$WORK_DIR/openmurmur.json.invalid")"
+INVALID_SHA256="$(file_sha256 "$WORK_DIR/openmurmur.json.invalid")"
+INVALID_MODE="$(file_mode "$WORK_DIR/openmurmur.json.invalid")"
+
+CONFIG_MUTATION_STARTED=true
+CONFIG_RESTORED=false
+boundaries_unchanged && work_directory_unchanged && config_is_original
+/bin/mv "$CONFIG_FILE" "$WORK_DIR/openmurmur.json.original"
+  [ "$(file_identity "$WORK_DIR/openmurmur.json.original")" = "$CONFIG_ID" ] && \
+  [ "$(file_sha256 "$WORK_DIR/openmurmur.json.original")" = "$CONFIG_SHA256" ] && \
+  [ "$(file_mode "$WORK_DIR/openmurmur.json.original")" = "$CONFIG_MODE" ] || {
+    PRESERVE_WORK_DIR=true
+    preserve_work_path_as_conflict "$WORK_DIR/openmurmur.json.original" || true
+    restore_config
+    exit 1
+  }
+boundaries_unchanged && work_directory_unchanged && \
+  [ ! -e "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] && \
+  /bin/ln "$WORK_DIR/openmurmur.json.invalid" "$CONFIG_FILE" || {
+    if [ -e "$CONFIG_FILE" ] || [ -L "$CONFIG_FILE" ]; then
+      preserve_current_config || true
+    fi
+    PRESERVE_WORK_DIR=true
+    restore_config
+    exit 1
+  }
+config_is_invalid || {
+  PRESERVE_WORK_DIR=true
+  restore_config
+  exit 1
+}
 
 if "$NODE_BIN" src/cli/main.ts status --root "$STATE_ROOT" --json \
   > "$EVIDENCE_DIR/invalid-status.stdout" \
@@ -512,6 +795,8 @@ set +e
 INSTALL_EXIT=$?
 set -e
 
+restore_config
+cmp "$EVIDENCE_DIR/openmurmur.json.before" "$CONFIG_FILE"
 if [ "$INSTALL_EXIT" -eq 0 ] || \
   ! /usr/bin/grep -Fq "Daemon readiness failed after registration" \
     "$EVIDENCE_DIR/installer.stderr"; then
@@ -519,14 +804,22 @@ if [ "$INSTALL_EXIT" -eq 0 ] || \
   exit 1
 fi
 
-restore_config
-cmp "$EVIDENCE_DIR/openmurmur.json.before" "$CONFIG_FILE"
-trap - EXIT HUP INT TERM
 /usr/bin/shasum -a 256 -c "$EVIDENCE_DIR/plists.before.sha256"
 snapshot_launchd after
 cmp "$EVIDENCE_DIR/labels.before" "$EVIDENCE_DIR/labels.after"
 wait_for_restored_daemon after
-echo "D121 rollback restored exact plist bytes, registration set and live audio readiness."
+trap - EXIT HUP INT TERM
+if [ "$PRESERVE_WORK_DIR" = true ]; then
+  echo "D121 config transaction evidence preserved at $WORK_DIR" >&2
+  exit 1
+elif boundaries_unchanged && work_directory_unchanged; then
+  /bin/rm -rf "$WORK_DIR"
+  WORK_DIR=""
+else
+  echo "D121 config transaction directory preserved after an identity change: $WORK_DIR" >&2
+  exit 1
+fi
+echo "D121 rollback restored the exact config inode/mode, plist bytes, registration set and live audio readiness."
 echo "Evidence: $EVIDENCE_DIR"
 )
 ```
