@@ -156,7 +156,7 @@ export async function applySetup(paths: Paths, plan: SetupPlan): Promise<void> {
 }
 
 export interface TelegramSetupResult {
-  readonly botUsername: string;
+  readonly botDisplay: string;
   readonly chatId: number;
   readonly role: TelegramSetupRole;
 }
@@ -219,7 +219,7 @@ export function renderSetupCompletion(telegramRole: TelegramSetupRole): string {
 }
 
 export function renderTelegramSetupCompletion(result: TelegramSetupResult): string {
-  return `✅ Connected @${result.botUsername}, chat ${result.chatId} (${result.role})\n\n${renderSetupNextSteps(true)}`;
+  return `✅ Connected ${result.botDisplay}, chat ${result.chatId} (${result.role})\n\n${renderSetupNextSteps(true)}`;
 }
 
 /**
@@ -275,8 +275,9 @@ async function setupTelegramLocked(
   log('Verifying the token with getMe...');
   const me = await client.getMe();
   if (!me.is_bot) throw new Error('that token does not belong to a bot');
-  const username = me.username ?? me.first_name;
-  log(`  Bot: @${username} (id ${me.id})`);
+  const botUsername = telegramUsername(me.username);
+  const botDisplay = telegramIdentityDisplay(me.username, me.first_name, 'Telegram bot');
+  log(`  Bot: ${botDisplay} (id ${me.id})`);
 
   let chatId: number;
   let commit: TelegramSetupCommit;
@@ -286,12 +287,16 @@ async function setupTelegramLocked(
     const baselineOffset = await drainUpdateBacklog(client);
 
     log('');
-    log(`Now open Telegram, find @${username}, and send it:  /start`);
+    log(`Now open Telegram, find ${botDisplay}, and send it:  /start`);
     log('Waiting for the message...');
 
-    const accepted = await waitForStart(client, baselineOffset, username);
+    const accepted = await waitForStart(client, baselineOffset, botUsername);
     chatId = accepted.chatId;
-    const account = accepted.username === null ? accepted.firstName : `@${accepted.username}`;
+    const account = telegramIdentityDisplay(
+      accepted.username ?? undefined,
+      accepted.firstName,
+      'Telegram user',
+    );
     log(`  Account: ${account} (user id ${accepted.userId})`);
     log(`  Chat ID: ${chatId}`);
     if (
@@ -342,7 +347,7 @@ async function setupTelegramLocked(
   log('  Stored the token and chat ID in the macOS Keychain (service io.openmurmur).');
   log('  Sent a test message.');
 
-  return { botUsername: username, chatId, role };
+  return { botDisplay, chatId, role };
 }
 
 export async function promptTelegramChatId(): Promise<number> {
@@ -470,7 +475,7 @@ export async function drainUpdateBacklog(client: UpdatePoller, maxBatches = 100)
 export async function waitForStart(
   client: UpdatePoller,
   baselineOffset: number,
-  botUsername: string,
+  botUsername: string | null,
   attempts = 30,
 ): Promise<{
   chatId: number;
@@ -491,7 +496,8 @@ export async function waitForStart(
 
       const command = (message.text ?? '').trim().split(/\s+/)[0]?.toLowerCase();
       const direct = '/start';
-      const addressed = `/start@${botUsername.toLowerCase()}`;
+      const addressed =
+        botUsername === null ? null : `/start@${botUsername.toLocaleLowerCase('en-US')}`;
       if (command === direct || command === addressed) {
         return {
           chatId: message.chat.id,
@@ -507,6 +513,33 @@ export async function waitForStart(
     'No message arrived. Make sure you messaged the right bot, then run ' +
       '`pnpm openmurmur setup telegram owner` again.',
   );
+}
+
+const TELEGRAM_IDENTITY_MAX_CODE_POINTS = 80;
+
+function telegramUsername(value: string | undefined): string | null {
+  return value !== undefined && /^[A-Za-z0-9_]{5,32}$/.test(value) ? value : null;
+}
+
+/** Makes Bot API identity fields safe for logs and interactive confirmation prompts. */
+function telegramIdentityDisplay(
+  username: string | undefined,
+  firstName: string,
+  fallback: string,
+): string {
+  const validUsername = telegramUsername(username);
+  if (validUsername !== null) return `@${validUsername}`;
+
+  let safe = '';
+  for (const character of firstName.normalize('NFC')) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (/\p{Cf}/u.test(character)) continue;
+    safe += codePoint <= 31 || (codePoint >= 127 && codePoint <= 159) ? ' ' : character;
+  }
+  const collapsed = safe.replace(/\s+/gu, ' ').trim() || fallback;
+  const codePoints = [...collapsed];
+  if (codePoints.length <= TELEGRAM_IDENTITY_MAX_CODE_POINTS) return collapsed;
+  return `${codePoints.slice(0, TELEGRAM_IDENTITY_MAX_CODE_POINTS - 1).join('')}…`;
 }
 
 export async function confirmTelegramOwner(prompt: string): Promise<boolean> {

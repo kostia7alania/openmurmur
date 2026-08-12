@@ -40,6 +40,20 @@ function update(
   };
 }
 
+function updateWithIdentity(
+  updateId: number,
+  chatId: number,
+  text: string,
+  firstName: string,
+  username: string,
+): TelegramUpdate {
+  const result = update(updateId, chatId, text);
+  if (result.message?.from === undefined) throw new Error('test update sender is missing');
+  result.message.from.first_name = firstName;
+  result.message.from.username = username;
+  return result;
+}
+
 describe('setup completion output', () => {
   it('leads a fresh setup through Telegram to one verifiable ambient session', () => {
     const output = renderSetupCompletion('owner');
@@ -101,7 +115,7 @@ describe('setup completion output', () => {
 
   it('continues a completed Telegram setup without promising a global binary', () => {
     const output = renderTelegramSetupCompletion({
-      botUsername: 'murmur_bot',
+      botDisplay: '@murmur_bot',
       chatId: 42,
       role: 'owner',
     });
@@ -163,9 +177,30 @@ describe('Telegram setup ownership handshake', () => {
     const ownerRoot = mkdtempSync(join(tmpdir(), 'om-telegram-owner-'));
     const senderRoot = mkdtempSync(join(tmpdir(), 'om-telegram-sender-'));
     const calls: string[] = [];
+    const ownerOutput: string[] = [];
     const setupLockPath = join(ownerRoot, 'telegram-setup.lock');
     let actor: 'owner' | 'send-only' = 'owner';
     let ownerPoll = 0;
+    let ownerPrompt = '';
+    const ownerBot = {
+      id: 1,
+      is_bot: true,
+      first_name: ` Open\tMurmur ${'界'.repeat(120)}\u001b[2J\u202e\u200b\u200c\u200d\u2060\ufeff `,
+      username: 'invalid-bot\u001b[31m',
+    };
+    const senderBot = {
+      id: 2,
+      is_bot: true,
+      first_name: 'send-only',
+      username: 'send_only_bot',
+    };
+    const hostileStart = updateWithIdentity(
+      7,
+      700,
+      '/start',
+      ` Owner\n${'X'.repeat(120)}\u009b31m\u202e `,
+      'bad-name\u2066',
+    );
     const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       const method = url.slice(url.lastIndexOf('/') + 1);
@@ -174,15 +209,10 @@ describe('Telegram setup ownership handshake', () => {
 
       let result: unknown;
       if (method === 'getMe') {
-        result = {
-          id: actor === 'owner' ? 1 : 2,
-          is_bot: true,
-          first_name: actor,
-          username: `${actor.replace('-', '_')}_bot`,
-        };
+        result = actor === 'owner' ? ownerBot : senderBot;
       } else if (method === 'getUpdates') {
         ownerPoll += 1;
-        result = ownerPoll === 1 ? [] : [update(7, 700, '/start')];
+        result = ownerPoll === 1 ? [] : [hostileStart];
       } else {
         const body = JSON.parse(String(init?.body)) as { chat_id: number };
         result = { message_id: 1, date: 0, chat: { id: body.chat_id, type: 'private' } };
@@ -248,10 +278,13 @@ describe('Telegram setup ownership handshake', () => {
         resolvePaths(ownerRoot),
         'https://api.telegram.org',
         'owner',
-        () => {},
+        (message) => ownerOutput.push(message),
         {
           promptToken: async () => 'shared-token',
-          confirmRecipient: async () => true,
+          confirmRecipient: async (prompt) => {
+            ownerPrompt = prompt;
+            return true;
+          },
           secrets: ownerSecrets.store,
           setupLockPath,
           fetchImpl,
@@ -273,12 +306,41 @@ describe('Telegram setup ownership handshake', () => {
         },
       );
 
-      assert.deepEqual(owner, { botUsername: 'owner_bot', chatId: 700, role: 'owner' });
+      assert.equal(owner.chatId, 700);
+      assert.equal(owner.role, 'owner');
+      assert.ok([...owner.botDisplay].length <= 80);
+      assert.ok(!owner.botDisplay.startsWith('@invalid-bot'));
       assert.deepEqual(sender, {
-        botUsername: 'send_only_bot',
+        botDisplay: '@send_only_bot',
         chatId: 700,
         role: 'send-only',
       });
+      const attendedOutput = `${ownerOutput.join('\n')}\n${ownerPrompt}\n${renderTelegramSetupCompletion(owner)}`;
+      assert.match(attendedOutput, /Bot: .* \(id 1\)/);
+      assert.match(attendedOutput, /Account: .* \(user id 700\)/);
+      assert.match(attendedOutput, /Chat ID: 700/);
+      assert.match(ownerPrompt, /chat 700/);
+      assert.doesNotMatch(attendedOutput, /invalid-bot|bad-name/);
+      assert.doesNotMatch(owner.botDisplay, /\s{2,}/u);
+      assert.ok(ownerPrompt.length < 200, 'the attended confirmation prompt must stay bounded');
+      const identitySurfaces = [
+        owner.botDisplay,
+        ownerPrompt,
+        ownerOutput.find((line) => line.startsWith('  Bot:')) ?? '',
+        ownerOutput.find((line) => line.startsWith('  Account:')) ?? '',
+        renderTelegramSetupCompletion(owner).split('\n')[0] ?? '',
+      ];
+      for (const surface of identitySurfaces) {
+        for (const character of surface) {
+          const codePoint = character.codePointAt(0) ?? 0;
+          const formatControl = /\p{Cf}/u.test(character);
+          assert.equal(
+            codePoint <= 31 || (codePoint >= 127 && codePoint <= 159) || formatControl,
+            false,
+            `unsafe identity character U+${codePoint.toString(16)}`,
+          );
+        }
+      }
       assert.deepEqual(calls, [
         'owner:getMe',
         'owner:getUpdates',
