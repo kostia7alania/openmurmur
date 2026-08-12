@@ -14,6 +14,7 @@ import {
   TELEGRAM_MESSAGE_LIMIT,
   timestampSourceLabel,
 } from '../../src/telegram/format.ts';
+import { rejectionMessage } from '../../src/telegram/incoming.ts';
 import {
   renderProvenanceHtml,
   renderProvenanceMarkdown,
@@ -82,20 +83,66 @@ describe('output provenance', () => {
       attachmentType: 'document' as const,
       telegramMessageAt: '2026-08-09T12:00:00.000Z',
       originalSentAt: '2026-08-08T08:00:00.000Z',
-      claimedFilename: `<b>../../secret\u0000</b>${'👨‍👩‍👧‍👦'.repeat(500)}.mp3`,
+      claimedFilename:
+        `Привет😀ไทย<b>../../secret&\u0000\u007f\u0085</b>` +
+        `\u061c\u200b\u200c\u200d\u200e\u200f\u202a\u202e\u2060\u2066\u2069\ufeff` +
+        `${'🌍'.repeat(500)}.mp3`,
       updateId: 99,
       messageId: 10,
       fileUid: 'file-uid',
     };
     const html = renderProvenanceHtml(provenance);
+    const plain = renderProvenancePlain(provenance);
+    const markdown = renderProvenanceMarkdown(provenance);
+    const rejection = `${rejectionMessage('corrupt_media', {
+      maxIncomingBytes: 20 * 1024 * 1024,
+      maxDurationSeconds: 60 * 60,
+    })}\n\n${plain}`;
+    const hasForbiddenDisplayControl = (value: string): boolean =>
+      [...value].some((character) => {
+        const codePoint = character.codePointAt(0) ?? 0;
+        return (
+          /\p{Cf}/u.test(character) ||
+          (codePoint <= 31 && codePoint !== 10) ||
+          (codePoint >= 127 && codePoint <= 159)
+        );
+      });
     assert.match(html, /пересланное аудио из Telegram \(документ\)/);
     assert.match(html, /ID обновления\/сообщения Telegram: <code>99\/10<\/code>/);
     assert.match(html, /UID файла: <code>file-uid<\/code>/);
     assert.ok(!html.includes('<b>../../secret'));
-    assert.ok(!html.includes('\u0000'));
+    assert.match(html, /Привет😀ไทย/);
+    assert.match(plain, /Привет😀ไทย/);
+    assert.match(markdown, /Привет😀ไทย/);
+    for (const rendered of [html, plain, markdown, rejection]) {
+      assert.equal(hasForbiddenDisplayControl(rendered), false);
+    }
+    assert.doesNotMatch(html, /&(?!amp;|lt;|gt;|quot;)/u);
     assert.ok(html.length <= 1024, 'the provenance must fit a Telegram caption by UTF-16 units');
-    assert.match(renderProvenancePlain(provenance), /UID файла: file-uid/);
-    assert.match(renderProvenanceMarkdown(provenance), /- UID файла: `file-uid`/);
+    assert.ok(plain.length <= 1024);
+    assert.ok(markdown.length <= 1024);
+    assert.ok(rejection.length <= TELEGRAM_MESSAGE_LIMIT);
+    assert.match(plain, /UID файла: file-uid/);
+    assert.match(markdown, /- UID файла: `file-uid`/);
+  });
+
+  it('uses a stable fallback for a filename made only of format controls', () => {
+    const provenance = {
+      kind: 'telegram_audio' as const,
+      hostName: 'host',
+      telegramSource: 'direct' as const,
+      attachmentType: 'document' as const,
+      telegramMessageAt: '2026-08-09T12:00:00.000Z',
+      originalSentAt: null,
+      claimedFilename: ' \u200b\u200c\u200d\u2060\ufeff ',
+      updateId: 99,
+      messageId: 10,
+      fileUid: 'file-uid',
+    };
+
+    assert.match(renderProvenanceHtml(provenance), /Исходное имя: <code>неизвестно<\/code>/);
+    assert.match(renderProvenancePlain(provenance), /Исходное имя: неизвестно/);
+    assert.match(renderProvenanceMarkdown(provenance), /Исходное имя: `неизвестно`/);
   });
 
   it('renders missing legacy provenance as unknown instead of inventing current facts', () => {

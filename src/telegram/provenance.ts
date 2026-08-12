@@ -25,6 +25,7 @@ export interface IncomingTelegramProvenance {
 export type OutputProvenance = LiveCaptureProvenance | IncomingTelegramProvenance;
 
 const UNKNOWN = 'неизвестно';
+const FORMAT_CONTROL = /\p{Cf}/u;
 // Captions share Telegram's 1024 UTF-16 limit with their surrounding label.
 // Bounding every variable independently keeps the complete provenance block
 // below that budget even when one grapheme is many code units or HTML expands.
@@ -160,9 +161,11 @@ function displayUntrusted(value: string): string {
   const visible = [...value]
     .map((character) => {
       const codePoint = character.codePointAt(0) ?? 0;
-      return codePoint < 32 || codePoint === 127 ? '�' : character;
+      if (FORMAT_CONTROL.test(character)) return '';
+      return codePoint <= 31 || (codePoint >= 127 && codePoint <= 159) ? '�' : character;
     })
     .join('');
+  if (visible.trim().length === 0) return UNKNOWN;
   let bounded = '';
   let escapedLength = 0;
   for (const { segment } of new Intl.Segmenter(undefined, {
