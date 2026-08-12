@@ -104,6 +104,63 @@ the next operation recovers the claim only after proving that exact process is
 gone. If process birth identity cannot be established, maintenance fails before
 reading credentials or contacting Telegram.
 
+### Attended real-bot and Keychain proof
+
+D046 and D047 stay live until this is run. Use a fresh disposable macOS GUI
+user with its login Keychain unlocked, a disposable bot used by no other
+poller, and a private `0700` state root. Never use a production bot: owner setup
+drains its backlog. Enter the token only at the CLI's hidden prompt, never in a
+command, environment variable, file, log, or evidence bundle.
+
+1. Confirm that service `io.openmurmur` has no `telegram-secrets-v1`,
+   `telegram-bot-token`, or `telegram-chat-id` item for this disposable user.
+   `security find-generic-password` exit `44` means absent; any other error must
+   stop the rehearsal.
+2. Run exact-root owner setup:
+
+   ```bash
+   pnpm openmurmur --root "$STATE_ROOT" setup --telegram-role owner --yes
+   pnpm openmurmur --root "$STATE_ROOT" setup telegram owner
+   ```
+
+   Send a fresh private `/start`, verify the displayed bot/account/chat ids,
+   confirm, and require the final setup message in that same chat. This is the
+   D046 binding proof.
+3. Before the rollback attempt, record only redacted evidence: user id and
+   default-Keychain metadata; config SHA-256; sorted
+   `(bot_scope,next_offset)` rows (omit `updated_at`); empty
+   `daemon_ownership`; absent PID mirror; and the combined credential hash with
+   the password stream connected directly to SHA-256:
+
+   ```bash
+   set -o pipefail
+   /usr/bin/security find-generic-password \
+     -s io.openmurmur -a telegram-secrets-v1 -w | /usr/bin/shasum -a 256
+   ```
+
+   Inspect Keychain metadata without `-w` or `-g`; retain only `acct`, `svce`,
+   `cdat`, and `mdat`. Never store the password output.
+4. Wait at least two seconds after the baseline metadata snapshot. With the
+   exact root still stopped, preserve the disposable config bytes,
+   change only `telegram.receiveUpdates` to `false`, then run
+   `pnpm openmurmur --root "$STATE_ROOT" setup telegram send-only`. Enter the
+   **same** disposable token and the impossible positive chat id
+   `9007199254740991`, confirm, and do not interrupt the command. Accept only a
+   nonzero result with the authoritative Bot API `400` / `chat not found`; a
+   timeout or lost connection is ambiguous, so preserve evidence and stop.
+5. Restore the disposable config bytes and repeat the redacted snapshot. The
+   combined credential SHA-256, config SHA-256, scoped cursor values, empty
+   ownership, and absent PID mirror must match. `cdat`/`mdat` must show that a
+   real Keychain replacement and rollback occurred; cursor `updated_at` may
+   truthfully change. Legacy Keychain accounts must remain absent.
+
+After a successful proof, revoke the disposable bot and remove only this GUI
+user's disposable Keychain items and private state root. This proves one real
+private-chat binding and one ordinary final-send rollback. It does **not**
+prove ambiguous remote acknowledgement, `SIGKILL` windows, locked-Keychain
+recovery, production-token safety, cross-host owner uniqueness, daemon client
+restart, or launchd/reboot Keychain unlock.
+
 ### Where the token is never allowed
 
 | Channel | Why not |
