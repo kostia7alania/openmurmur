@@ -63,7 +63,16 @@ import { readOffset, routeUpdate } from '../telegram/router.ts';
 import { systemClock } from '../util/clock.ts';
 import { createAsrBackend } from './backends.ts';
 import { Daemon } from './daemon.ts';
-import { inspectDaemonControl, releaseDaemonPid, stopOwnedDaemon } from './daemon-ownership.ts';
+import {
+  assertCurrentDaemonMaintenance,
+  claimDaemonMaintenance,
+  DAEMON_MAINTENANCE_RENEW_INTERVAL_MS,
+  inspectDaemonControl,
+  releaseDaemonMaintenance,
+  releaseDaemonPid,
+  renewDaemonMaintenance,
+  stopOwnedDaemon,
+} from './daemon-ownership.ts';
 import { doctorExitCode, formatChecks, runDoctor } from './doctor.ts';
 import { normalizeRecallOptions, recallTranscripts, renderRecallResults } from './recall.ts';
 import {
@@ -438,15 +447,18 @@ async function setupCommand(
       );
       return 1;
     }
-    await ensureDirectories(loaded.paths);
-    const result = await setupTelegram(
-      loaded.paths,
-      loaded.config.telegram.apiBaseUrl,
-      positionalTelegramRole,
-      (message) => process.stdout.write(`${message}\n`),
-    );
-    process.stdout.write(`\n${renderTelegramSetupCompletion(result)}\n`);
-    return 0;
+    const command = `setup telegram ${positionalTelegramRole}` as const;
+    return withStoppedDaemonForTelegram(loaded, command, async () => {
+      await ensureDirectories(loaded.paths);
+      const result = await setupTelegram(
+        loaded.paths,
+        loaded.config.telegram.apiBaseUrl,
+        positionalTelegramRole,
+        (message) => process.stdout.write(`${message}\n`),
+      );
+      process.stdout.write(`\n${renderTelegramSetupCompletion(result)}\n`);
+      return 0;
+    });
   }
 
   if (subcommand !== undefined || positionalTelegramRole !== undefined) {
@@ -765,7 +777,7 @@ async function localStatus(
   try {
     const daemon = await inspectDaemonControl(db.handle, loaded.paths.pidFile, loaded.paths.root);
     const alive = daemon.process?.alive === true && daemon.process.identityMatches;
-    const pid = daemon.record?.pid ?? null;
+    const pid = daemon.source === 'maintenance' ? null : (daemon.record?.pid ?? null);
 
     const counts = readLocalStatusCounts(db.handle);
     const live = readLocalLiveStatus(db.handle, {
@@ -1154,17 +1166,101 @@ async function assertDaemonStoppedForOutboxMutation(
   db: DatabaseSync,
   loaded: Awaited<ReturnType<typeof loadConfig>>,
   action: string,
+  daemonRunningError?: string,
 ): Promise<void> {
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const daemon = await inspectDaemonControl(db, loaded.paths.pidFile, loaded.paths.root);
     if (daemon.source === 'none' || daemon.record === null || daemon.process === null) return;
     if (daemon.process.alive) {
-      throw new Error(`stop the OpenMurmur daemon before ${action} (pid ${daemon.record.pid})`);
+      throw new Error(
+        daemonRunningError ??
+          `stop the OpenMurmur daemon before ${action} (pid ${daemon.record.pid})`,
+      );
     }
     if (daemon.source === 'legacy') return;
     if (await releaseDaemonPid(db, loaded.paths.pidFile, daemon.record)) return;
   }
   throw new Error(`daemon ownership changed while checking whether it was safe to ${action}`);
+}
+
+type StoppedDaemonTelegramCommand =
+  | 'setup telegram owner'
+  | 'setup telegram send-only'
+  | 'telegram poll';
+
+function shellQuotedStateRoot(root: string): string | null {
+  if (root.length > 512 || !/^[\x20-\x7e]+$/.test(root)) {
+    return null;
+  }
+  return `'${root.replaceAll("'", `'"'"'`)}'`;
+}
+
+function stoppedDaemonTelegramRunbook(root: string, command: StoppedDaemonTelegramCommand): string {
+  const quotedRoot = shellQuotedStateRoot(root);
+  const rootArgument = quotedRoot ?? '"$OPENMURMUR_STATE_ROOT"';
+  return [
+    'The OpenMurmur daemon must be stopped before this Telegram control operation.',
+    ...(quotedRoot === null
+      ? [
+          'The state root is not safe to print. Set OPENMURMUR_STATE_ROOT to its exact value',
+          'outside this terminal, then use the placeholder below.',
+        ]
+      : []),
+    'Run from the repository checkout:',
+    `  pnpm openmurmur --root ${rootArgument} stop`,
+    `  pnpm openmurmur --root ${rootArgument} ${command}`,
+    `  pnpm openmurmur --root ${rootArgument} start`,
+  ].join('\n');
+}
+
+/** Keeps credential publication and diagnostic getUpdates exclusive with the exact root owner. */
+export async function withStoppedDaemonForTelegram<T>(
+  loaded: Awaited<ReturnType<typeof loadConfig>>,
+  command: StoppedDaemonTelegramCommand,
+  action: (db: DatabaseSync) => Promise<T>,
+  maintenanceDependencies: Parameters<typeof claimDaemonMaintenance>[3] = {},
+): Promise<T> {
+  const db = openDatabase({ file: loaded.paths.databaseFile });
+  let claim: Awaited<ReturnType<typeof claimDaemonMaintenance>> | null = null;
+  let renewalFailure: Error | null = null;
+  let renewalTimer: NodeJS.Timeout | null = null;
+  try {
+    claim = await claimDaemonMaintenance(db.handle, loaded.paths.pidFile, loaded.paths.root, {
+      ...maintenanceDependencies,
+      daemonRunningError: stoppedDaemonTelegramRunbook(loaded.paths.root, command),
+    });
+    assertCurrentDaemonMaintenance(db.handle, claim);
+    const renew = () => {
+      if (claim === null) return;
+      try {
+        if (!renewDaemonMaintenance(db.handle, claim)) {
+          renewalFailure = new Error('exclusive Telegram maintenance ownership was lost');
+        } else {
+          renewalFailure = null;
+        }
+      } catch (error) {
+        renewalFailure = new Error('could not renew exclusive Telegram maintenance ownership', {
+          cause: error,
+        });
+      }
+    };
+    renewalTimer = setInterval(renew, DAEMON_MAINTENANCE_RENEW_INTERVAL_MS);
+    renewalTimer.unref();
+    const result = await action(db.handle);
+    assertCurrentDaemonMaintenance(db.handle, claim);
+    renew();
+    if (renewalFailure !== null) {
+      // A transient claimed_at refresh failure cannot forfeit a live exact-birth
+      // authority. Re-prove the generation synchronously before returning.
+      assertCurrentDaemonMaintenance(db.handle, claim);
+      renewalFailure = null;
+    }
+    return result;
+  } finally {
+    if (renewalTimer !== null) clearInterval(renewalTimer);
+    if (claim !== null) await releaseDaemonMaintenance(db.handle, loaded.paths.pidFile, claim);
+    db.close();
+  }
 }
 
 function writeRemoteReconciliationReport(
@@ -1283,15 +1379,47 @@ async function telegramCommand(
   loaded: Awaited<ReturnType<typeof loadConfig>>,
   subcommand: string | undefined,
 ): Promise<number> {
-  const secrets = await keychain.load();
-  if (secrets === null) {
-    const role = loaded.config.telegram.receiveUpdates ? 'owner' : 'send-only';
-    process.stderr.write(
-      `Telegram is not configured. Run: pnpm openmurmur setup telegram ${role}\n`,
-    );
-    return 1;
+  if (subcommand === 'poll') {
+    if (!loaded.config.telegram.receiveUpdates) {
+      process.stderr.write(
+        'Telegram polling is disabled on this send-only host. Run this only on the explicit input owner with telegram.receiveUpdates=true.\n',
+      );
+      return 1;
+    }
+    return withStoppedDaemonForTelegram(loaded, 'telegram poll', async (db) => {
+      const secrets = await keychain.load();
+      if (secrets === null) {
+        process.stderr.write(
+          'Telegram is not configured. Run: pnpm openmurmur setup telegram owner\n',
+        );
+        return 1;
+      }
+      const client = new TelegramClient({
+        token: secrets.token,
+        baseUrl: loaded.config.telegram.apiBaseUrl,
+      });
+      const botScope = telegramBotScope(secrets.token);
+      const inspection = await pollTelegramReadOnly(db, client, botScope, secrets.chatId, true);
+      process.stdout.write(
+        `Fetched ${inspection.updates.length} update(s) from offset ${inspection.offset} ` +
+          '(read-only; offset unchanged).\n',
+      );
+      for (const update of inspection.updates) {
+        process.stdout.write(`  #${update.updateId}: ${update.kind}\n`);
+      }
+      return 0;
+    });
   }
+
   if (subcommand === 'test') {
+    const secrets = await keychain.load();
+    if (secrets === null) {
+      const role = loaded.config.telegram.receiveUpdates ? 'owner' : 'send-only';
+      process.stderr.write(
+        `Telegram is not configured. Run: pnpm openmurmur setup telegram ${role}\n`,
+      );
+      return 1;
+    }
     const client = new TelegramClient({
       token: secrets.token,
       baseUrl: loaded.config.telegram.apiBaseUrl,
@@ -1303,40 +1431,6 @@ async function telegramCommand(
     );
     process.stdout.write(`Sent a test message to chat ${secrets.chatId}.\n`);
     return 0;
-  }
-
-  if (subcommand === 'poll') {
-    if (!loaded.config.telegram.receiveUpdates) {
-      process.stderr.write(
-        'Telegram polling is disabled on this send-only host. Run this only on the explicit input owner with telegram.receiveUpdates=true.\n',
-      );
-      return 1;
-    }
-    const client = new TelegramClient({
-      token: secrets.token,
-      baseUrl: loaded.config.telegram.apiBaseUrl,
-    });
-    const db = openDatabase({ file: loaded.paths.databaseFile });
-    try {
-      const botScope = telegramBotScope(secrets.token);
-      const inspection = await pollTelegramReadOnly(
-        db.handle,
-        client,
-        botScope,
-        secrets.chatId,
-        true,
-      );
-      process.stdout.write(
-        `Fetched ${inspection.updates.length} update(s) from offset ${inspection.offset} ` +
-          '(read-only; offset unchanged).\n',
-      );
-      for (const update of inspection.updates) {
-        process.stdout.write(`  #${update.updateId}: ${update.kind}\n`);
-      }
-      return 0;
-    } finally {
-      db.close();
-    }
   }
 
   process.stderr.write('Usage: pnpm openmurmur telegram <test|poll>\n');

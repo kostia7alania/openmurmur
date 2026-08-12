@@ -4,6 +4,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
+import { claimDaemonPid, releaseDaemonPid } from '../../src/cli/daemon-ownership.ts';
+import { withStoppedDaemonForTelegram } from '../../src/cli/main.ts';
 import {
   commitTelegramSetup,
   drainUpdateBacklog,
@@ -13,6 +15,7 @@ import {
   waitForStart,
 } from '../../src/cli/setup.ts';
 import { resolvePaths } from '../../src/config/paths.ts';
+import { DEFAULT_CONFIG } from '../../src/config/schema.ts';
 import { openDatabase } from '../../src/database/db.ts';
 import type { TelegramUpdate } from '../../src/telegram/client.ts';
 import {
@@ -109,6 +112,82 @@ describe('setup completion output', () => {
       assert.match(refused.stderr, /existing config selects Telegram role owner/);
       assert.equal(readFileSync(configFile, 'utf8'), original);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks Telegram setup before the token prompt while the exact root is owned', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'om-setup-live-owner-'));
+    const paths = resolvePaths(root);
+    const created = spawnSync(
+      process.execPath,
+      ['src/cli/main.ts', 'setup', '--telegram-role', 'owner', '--yes', '--root', root],
+      { cwd: process.cwd(), encoding: 'utf8' },
+    );
+    assert.equal(created.status, 0, created.stderr);
+
+    const originalConfig = readFileSync(paths.configFile, 'utf8');
+    const db = openDatabase({ file: paths.databaseFile });
+    writeOffset(db.handle, 41, 'setup-guard');
+    const owner = await claimDaemonPid(db.handle, paths.pidFile, paths.root, {
+      birthMarker: async () => 'telegram-setup-test-birth',
+      inspect: async () => ({
+        alive: true,
+        identityMatches: false,
+        command: 'test process',
+        processBirth: 'telegram-setup-test-birth',
+      }),
+    });
+    const originalMirror = readFileSync(paths.pidFile, 'utf8');
+    const originalOwnership = db.handle
+      .prepare('SELECT * FROM daemon_ownership WHERE ownership_id = 1')
+      .get();
+
+    try {
+      const blocked = spawnSync(
+        process.execPath,
+        ['src/cli/main.ts', 'setup', 'telegram', 'owner', '--root', root],
+        { cwd: process.cwd(), encoding: 'utf8' },
+      );
+      assert.equal(blocked.status, 1);
+      assert.equal(
+        blocked.stderr,
+        [
+          'Error: The OpenMurmur daemon must be stopped before this Telegram control operation.',
+          'Run from the repository checkout:',
+          `  pnpm openmurmur --root '${root}' stop`,
+          `  pnpm openmurmur --root '${root}' setup telegram owner`,
+          `  pnpm openmurmur --root '${root}' start`,
+          '',
+        ].join('\n'),
+      );
+      assert.doesNotMatch(blocked.stderr, /bot token|interactive terminal/i);
+      assert.equal(readFileSync(paths.configFile, 'utf8'), originalConfig);
+      assert.equal(readOffset(db.handle, 'setup-guard'), 41);
+      assert.equal(readFileSync(paths.pidFile, 'utf8'), originalMirror);
+      assert.deepEqual(
+        db.handle.prepare('SELECT * FROM daemon_ownership WHERE ownership_id = 1').get(),
+        originalOwnership,
+      );
+    } finally {
+      await releaseDaemonPid(db.handle, paths.pidFile, owner);
+    }
+
+    try {
+      let reachedSetupBoundary = 0;
+      await withStoppedDaemonForTelegram(
+        { config: DEFAULT_CONFIG, paths, fromFile: false },
+        'setup telegram owner',
+        async () => {
+          reachedSetupBoundary += 1;
+        },
+        { birthMarker: async () => 'setup-maintenance-birth' },
+      );
+      assert.equal(reachedSetupBoundary, 1);
+      assert.equal(readFileSync(paths.configFile, 'utf8'), originalConfig);
+      assert.equal(readOffset(db.handle, 'setup-guard'), 41);
+    } finally {
+      db.close();
       rmSync(root, { recursive: true, force: true });
     }
   });

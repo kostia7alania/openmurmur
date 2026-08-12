@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { type Database, transaction } from '../database/db.ts';
@@ -31,6 +32,16 @@ export interface DaemonOwnershipRecord {
   readonly processBirth: string;
 }
 
+export interface DaemonMaintenanceClaim extends DaemonOwnershipRecord {
+  /** Opaque generation token embedded in the durable ownership authority. */
+  readonly token: string;
+  /** Actual process birth marker used to prove this maintenance holder is still alive. */
+  readonly ownerProcessBirth: string;
+}
+
+const MAINTENANCE_PROCESS_BIRTH_PREFIX = 'openmurmur-maintenance:v1:';
+export const DAEMON_MAINTENANCE_RENEW_INTERVAL_MS = 30 * 1000;
+
 export function daemonJobOwner(owner: DaemonOwnershipRecord): string {
   return `daemon:${owner.pid}:${owner.startedAt}:${owner.processBirth}`;
 }
@@ -45,6 +56,11 @@ export interface DaemonProcessState {
 export type DaemonControlSnapshot =
   | {
       readonly source: 'sqlite';
+      readonly record: DaemonOwnershipRecord;
+      readonly process: DaemonProcessState;
+    }
+  | {
+      readonly source: 'maintenance';
       readonly record: DaemonOwnershipRecord;
       readonly process: DaemonProcessState;
     }
@@ -180,6 +196,13 @@ interface DaemonPidClaimDependencies {
   readonly beforeMirrorPublish?: () => void;
 }
 
+interface DaemonMaintenanceDependencies {
+  readonly birthMarker?: (pid: number) => Promise<string | null>;
+  readonly inspect?: typeof inspectDaemonProcess;
+  readonly now?: () => number;
+  readonly daemonRunningError?: string;
+}
+
 function canonicalUtc(value: string): boolean {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
@@ -193,6 +216,22 @@ export function readDaemonOwnership(
   db: Database['handle'],
   expectedRoot?: string,
 ): DaemonOwnershipRecord | null {
+  const stored = readStoredDaemonOwnership(db, expectedRoot);
+  if (stored === null || parseMaintenanceProcessBirth(stored.record.processBirth) !== null) {
+    return null;
+  }
+  return stored.record;
+}
+
+interface StoredDaemonOwnership {
+  readonly record: DaemonOwnershipRecord;
+  readonly claimedAt: string;
+}
+
+function readStoredDaemonOwnership(
+  db: Database['handle'],
+  expectedRoot?: string,
+): StoredDaemonOwnership | null {
   const row = db
     .prepare(
       `SELECT daemon_pid, daemon_root, daemon_started_at, process_birth, claimed_at
@@ -222,11 +261,65 @@ export function readDaemonOwnership(
     throw daemonOwnershipError('the stored root does not match this database root');
   }
   return {
-    pid: row.daemon_pid,
-    root: row.daemon_root,
-    startedAt: row.daemon_started_at,
-    processBirth: row.process_birth,
+    record: {
+      pid: row.daemon_pid,
+      root: row.daemon_root,
+      startedAt: row.daemon_started_at,
+      processBirth: row.process_birth,
+    },
+    claimedAt: row.claimed_at,
   };
+}
+
+interface MaintenanceProcessBirth {
+  readonly token: string;
+  readonly ownerProcessBirth: string;
+}
+
+function maintenanceProcessBirth(token: string, ownerProcessBirth: string): string {
+  return `${MAINTENANCE_PROCESS_BIRTH_PREFIX}${token}:${Buffer.from(ownerProcessBirth, 'utf8').toString('base64url')}`;
+}
+
+function parseMaintenanceProcessBirth(value: string): MaintenanceProcessBirth | null {
+  if (!value.startsWith(MAINTENANCE_PROCESS_BIRTH_PREFIX)) return null;
+  const encoded = value.slice(MAINTENANCE_PROCESS_BIRTH_PREFIX.length);
+  const separator = encoded.indexOf(':');
+  const token = encoded.slice(0, separator);
+  const birthEncoded = encoded.slice(separator + 1);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(token)) {
+    throw daemonOwnershipError('maintenance token is invalid');
+  }
+  if (separator <= 0 || !/^[A-Za-z0-9_-]+$/.test(birthEncoded)) {
+    throw daemonOwnershipError('maintenance process birth is invalid');
+  }
+  const ownerProcessBirth = Buffer.from(birthEncoded, 'base64url').toString('utf8');
+  if (
+    ownerProcessBirth.trim().length === 0 ||
+    Buffer.from(ownerProcessBirth, 'utf8').toString('base64url') !== birthEncoded
+  ) {
+    throw daemonOwnershipError('maintenance process birth is invalid');
+  }
+  return { token, ownerProcessBirth };
+}
+
+type DaemonOwnershipAuthority =
+  | { readonly kind: 'daemon'; readonly stored: StoredDaemonOwnership }
+  | {
+      readonly kind: 'maintenance';
+      readonly stored: StoredDaemonOwnership;
+      readonly maintenance: MaintenanceProcessBirth;
+    };
+
+function readDaemonOwnershipAuthority(
+  db: Database['handle'],
+  expectedRoot?: string,
+): DaemonOwnershipAuthority | null {
+  const stored = readStoredDaemonOwnership(db, expectedRoot);
+  if (stored === null) return null;
+  const maintenance = parseMaintenanceProcessBirth(stored.record.processBirth);
+  return maintenance === null
+    ? { kind: 'daemon', stored }
+    : { kind: 'maintenance', stored, maintenance };
 }
 
 function sameDaemonPidRecord(
@@ -275,9 +368,11 @@ function insertDaemonOwnership(
   observedMirror: DaemonPidRecord | null,
   identity: DaemonOwnershipRecord,
   reclaimedJobOwner: string | null,
+  blockedJobOwner: string | null = null,
 ): { readonly acquired: boolean; readonly reclaimedJobs: number } {
   return transaction(db, () => {
-    if (readDaemonOwnership(db) !== null) return { acquired: false, reclaimedJobs: 0 };
+    if (readStoredDaemonOwnership(db) !== null) return { acquired: false, reclaimedJobs: 0 };
+    if (blockedJobOwner !== null) assertNoPredecessorLeases(db, blockedJobOwner);
     if (!removeObservedDaemonMirror(pidFile, observedMirror)) {
       return { acquired: false, reclaimedJobs: 0 };
     }
@@ -311,11 +406,14 @@ function replaceDaemonOwnership(
   observedMirror: DaemonPidRecord | null,
   expected: DaemonOwnershipRecord,
   replacement: DaemonOwnershipRecord,
+  reclaimedJobOwner: string | null,
+  blockedJobOwner: string | null = null,
 ): { readonly acquired: boolean; readonly reclaimedJobs: number } {
   return transaction(db, () => {
-    if (!sameDaemonOwnership(readDaemonOwnership(db), expected)) {
+    if (!sameDaemonOwnership(readStoredDaemonOwnership(db)?.record ?? null, expected)) {
       return { acquired: false, reclaimedJobs: 0 };
     }
+    if (blockedJobOwner !== null) assertNoPredecessorLeases(db, blockedJobOwner);
     if (!removeObservedDaemonMirror(pidFile, observedMirror)) {
       return { acquired: false, reclaimedJobs: 0 };
     }
@@ -342,7 +440,10 @@ function replaceDaemonOwnership(
     if (Number(result.changes) !== 1) return { acquired: false, reclaimedJobs: 0 };
     return {
       acquired: true,
-      reclaimedJobs: new JobQueue(db).recoverLeasesAfterProvenDaemonDeath(daemonJobOwner(expected)),
+      reclaimedJobs:
+        reclaimedJobOwner === null
+          ? 0
+          : new JobQueue(db).recoverLeasesAfterProvenDaemonDeath(reclaimedJobOwner),
     };
   });
 }
@@ -353,7 +454,7 @@ function deleteDaemonOwnership(
   expected: DaemonOwnershipRecord,
 ): boolean {
   return transaction(db, () => {
-    if (!sameDaemonOwnership(readDaemonOwnership(db), expected)) return false;
+    if (!sameDaemonOwnership(readStoredDaemonOwnership(db)?.record ?? null, expected)) return false;
     try {
       const mirror = parseDaemonPid(readFileSync(pidFile, 'utf8'));
       if (sameDaemonOwnership(mirror, expected)) rmSync(pidFile, { force: true });
@@ -378,6 +479,43 @@ function daemonAlreadyRunningError(
 ): Error {
   const detail = identityMatches ? 'OpenMurmur is already running' : 'pid is in use';
   return new Error(`${detail} (pid ${owner.pid}); refusing to replace daemon ownership`);
+}
+
+function maintenanceAlreadyRunningError(owner: DaemonOwnershipRecord): Error {
+  return new Error(
+    `another exact-root maintenance operation is still active (pid ${owner.pid}); retry after it finishes`,
+  );
+}
+
+async function inspectMaintenanceAuthority(
+  authority: Extract<DaemonOwnershipAuthority, { readonly kind: 'maintenance' }>,
+  inspect: typeof inspectDaemonProcess,
+): Promise<{ readonly process: DaemonProcessState; readonly recoverable: boolean }> {
+  const inspected = await inspect(
+    authority.stored.record.pid,
+    authority.maintenance.ownerProcessBirth,
+  );
+  if (!inspected.alive) return { process: inspected, recoverable: true };
+  if (
+    inspected.processBirth !== null &&
+    inspected.processBirth !== authority.maintenance.ownerProcessBirth
+  ) {
+    return {
+      process: { ...inspected, alive: false, identityMatches: false },
+      recoverable: true,
+    };
+  }
+  return {
+    process: {
+      ...inspected,
+      alive: true,
+      // A maintenance holder must never be signalable as the daemon.
+      identityMatches: false,
+    },
+    // If ps cannot prove the birth marker, fail closed until kill(0) proves the
+    // process absent. Expiry must never steal authority from a live action.
+    recoverable: false,
+  };
 }
 
 async function assertNoAmbiguousLegacyDaemon(
@@ -420,6 +558,24 @@ async function assertNoAmbiguousLegacyDaemon(
   }
 }
 
+function assertNoPredecessorLeases(db: Database['handle'], predecessorOwner: string): void {
+  const lease = db
+    .prepare(
+      `SELECT job_id
+         FROM jobs
+        WHERE state = 'leased'
+          AND substr(lease_owner, 1, length(?) + 1) = ? || ':'
+        LIMIT 1`,
+    )
+    .get(predecessorOwner, predecessorOwner) as { readonly job_id: string } | undefined;
+  if (lease !== undefined) {
+    throw new Error(
+      'the proven-dead daemon still owns leased work; start OpenMurmur once to recover jobs ' +
+        'before running Telegram maintenance',
+    );
+  }
+}
+
 async function assertNoConflictingLiveDaemon(
   db: Database['handle'],
   pidFile: string,
@@ -455,6 +611,203 @@ async function assertNoConflictingLiveDaemon(
   return mirror;
 }
 
+function throwMaintenanceDaemonRunning(
+  owner: DaemonOwnershipRecord | DaemonPidRecord,
+  state: DaemonProcessState,
+  override?: string,
+): never {
+  throw new Error(override ?? daemonAlreadyRunningError(owner, state.identityMatches).message);
+}
+
+async function assertMaintenancePreflight(
+  db: Database['handle'],
+  pidFile: string,
+  root: string,
+  inspect: typeof inspectDaemonProcess,
+  daemonRunningError?: string,
+): Promise<void> {
+  const authority = readDaemonOwnershipAuthority(db, root);
+  if (authority === null) {
+    const legacy = await readDaemonPidForClaim(pidFile);
+    if (legacy === null) return;
+    const state = await inspect(legacy.pid, legacy.processBirth);
+    if (state.alive) throwMaintenanceDaemonRunning(legacy, state, daemonRunningError);
+    return;
+  }
+  if (authority.kind === 'maintenance') {
+    if (!(await inspectMaintenanceAuthority(authority, inspect)).recoverable) {
+      throw maintenanceAlreadyRunningError(authority.stored.record);
+    }
+    return;
+  }
+  const owner = authority.stored.record;
+  const state = await inspect(owner.pid, owner.processBirth);
+  if (state.alive) throwMaintenanceDaemonRunning(owner, state, daemonRunningError);
+}
+
+async function tryClaimDaemonMaintenance(
+  db: Database['handle'],
+  pidFile: string,
+  root: string,
+  identity: DaemonMaintenanceClaim,
+  inspect: typeof inspectDaemonProcess,
+  daemonRunningError?: string,
+): Promise<boolean> {
+  const authority = readDaemonOwnershipAuthority(db, root);
+  if (authority === null) {
+    const legacy = await readDaemonPidForClaim(pidFile);
+    if (legacy !== null) {
+      const state = await inspect(legacy.pid, legacy.processBirth);
+      if (state.alive) throwMaintenanceDaemonRunning(legacy, state, daemonRunningError);
+    } else {
+      await assertNoAmbiguousLegacyDaemon(db, inspect);
+    }
+    return insertDaemonOwnership(
+      db,
+      pidFile,
+      legacy,
+      identity,
+      null,
+      legacy === null ? null : String(legacy.pid),
+    ).acquired;
+  }
+  if (authority.kind === 'maintenance') {
+    const inspected = await inspectMaintenanceAuthority(authority, inspect);
+    if (!inspected.recoverable) throw maintenanceAlreadyRunningError(authority.stored.record);
+    const observedMirror = await assertNoConflictingLiveDaemon(
+      db,
+      pidFile,
+      authority.stored.record,
+      inspect,
+    );
+    return replaceDaemonOwnership(
+      db,
+      pidFile,
+      observedMirror,
+      authority.stored.record,
+      identity,
+      null,
+    ).acquired;
+  }
+  const owner = authority.stored.record;
+  const state = await inspect(owner.pid, owner.processBirth);
+  if (state.alive) throwMaintenanceDaemonRunning(owner, state, daemonRunningError);
+  const observedMirror = await assertNoConflictingLiveDaemon(db, pidFile, owner, inspect);
+  return replaceDaemonOwnership(
+    db,
+    pidFile,
+    observedMirror,
+    owner,
+    identity,
+    null,
+    daemonJobOwner(owner),
+  ).acquired;
+}
+
+export async function claimDaemonMaintenance(
+  db: Database['handle'],
+  pidFile: string,
+  root: string,
+  dependencies: DaemonMaintenanceDependencies = {},
+): Promise<DaemonMaintenanceClaim> {
+  const birthMarker = dependencies.birthMarker ?? processBirthMarker;
+  const inspect = dependencies.inspect ?? inspectDaemonProcess;
+  const now = dependencies.now ?? Date.now;
+  await assertMaintenancePreflight(db, pidFile, root, inspect, dependencies.daemonRunningError);
+  const ownerProcessBirth = await birthMarker(process.pid);
+  if (ownerProcessBirth === null) {
+    throw new Error('could not establish maintenance process birth identity; refusing maintenance');
+  }
+  const token = randomUUID();
+  const identity = {
+    pid: process.pid,
+    root,
+    startedAt: new Date(now()).toISOString(),
+    processBirth: maintenanceProcessBirth(token, ownerProcessBirth),
+    token,
+    ownerProcessBirth,
+  } satisfies DaemonMaintenanceClaim;
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (
+      await tryClaimDaemonMaintenance(
+        db,
+        pidFile,
+        root,
+        identity,
+        inspect,
+        dependencies.daemonRunningError,
+      )
+    ) {
+      return identity;
+    }
+  }
+  throw new Error('could not claim maintenance ownership after concurrent changes');
+}
+
+export function renewDaemonMaintenance(
+  db: Database['handle'],
+  claim: DaemonMaintenanceClaim,
+  nowMs = Date.now(),
+): boolean {
+  return transaction(db, () => {
+    const result = db
+      .prepare(
+        `UPDATE daemon_ownership
+            SET claimed_at = ?
+          WHERE ownership_id = 1
+            AND daemon_pid = ? AND daemon_root = ?
+            AND daemon_started_at = ? AND process_birth = ?`,
+      )
+      .run(
+        new Date(nowMs).toISOString(),
+        claim.pid,
+        claim.root,
+        claim.startedAt,
+        claim.processBirth,
+      );
+    return Number(result.changes) === 1;
+  });
+}
+
+export function assertCurrentDaemonMaintenance(
+  db: Database['handle'],
+  claim: DaemonMaintenanceClaim,
+): void {
+  if (!sameDaemonOwnership(readStoredDaemonOwnership(db, claim.root)?.record ?? null, claim)) {
+    throw new Error('exclusive Telegram maintenance ownership was lost');
+  }
+}
+
+export async function releaseDaemonMaintenance(
+  db: Database['handle'],
+  pidFile: string,
+  claim: DaemonMaintenanceClaim,
+): Promise<boolean> {
+  return deleteDaemonOwnership(db, pidFile, claim);
+}
+
+async function inspectSqliteDaemonControl(
+  db: Database['handle'],
+  root: string,
+  authority: DaemonOwnershipAuthority,
+  inspect: typeof inspectDaemonProcess,
+): Promise<Extract<DaemonControlSnapshot, { readonly source: 'sqlite' | 'maintenance' }> | null> {
+  const owner = authority.stored.record;
+  const process =
+    authority.kind === 'maintenance'
+      ? (await inspectMaintenanceAuthority(authority, inspect)).process
+      : await inspect(owner.pid, owner.processBirth);
+  if (!sameDaemonOwnership(readStoredDaemonOwnership(db, root)?.record ?? null, owner)) {
+    return null;
+  }
+  return {
+    source: authority.kind === 'maintenance' ? 'maintenance' : 'sqlite',
+    record: owner,
+    process,
+  };
+}
+
 export async function inspectDaemonControl(
   db: Database['handle'],
   pidFile: string,
@@ -463,17 +816,17 @@ export async function inspectDaemonControl(
 ): Promise<DaemonControlSnapshot> {
   const inspect = dependencies.inspect ?? inspectDaemonProcess;
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const owner = readDaemonOwnership(db, root);
-    if (owner !== null) {
-      const process = await inspect(owner.pid, owner.processBirth);
-      if (!sameDaemonOwnership(readDaemonOwnership(db, root), owner)) continue;
-      return { source: 'sqlite', record: owner, process };
+    const authority = readDaemonOwnershipAuthority(db, root);
+    if (authority !== null) {
+      const snapshot = await inspectSqliteDaemonControl(db, root, authority, inspect);
+      if (snapshot === null) continue;
+      return snapshot;
     }
 
     const legacy = await readDaemonPidForClaim(pidFile);
     if (legacy === null) {
       await assertNoAmbiguousLegacyDaemon(db, inspect);
-      if (readDaemonOwnership(db, root) !== null) continue;
+      if (readStoredDaemonOwnership(db, root) !== null) continue;
       if ((await readDaemonPidForClaim(pidFile)) !== null) continue;
       return { source: 'none', record: null, process: null };
     }
@@ -481,7 +834,7 @@ export async function inspectDaemonControl(
       throw new Error('legacy daemon PID mirror belongs to another OpenMurmur root');
     }
     const process = await inspect(legacy.pid, legacy.processBirth);
-    if (readDaemonOwnership(db, root) !== null) continue;
+    if (readStoredDaemonOwnership(db, root) !== null) continue;
     if (
       !sameDaemonOwnership(await readDaemonPidForClaim(pidFile), legacy as DaemonOwnershipRecord)
     ) {
@@ -498,11 +851,14 @@ async function daemonControlStillCurrent(
   root: string,
   snapshot: Exclude<DaemonControlSnapshot, { readonly source: 'none' }>,
 ): Promise<boolean> {
-  if (snapshot.source === 'sqlite') {
-    return sameDaemonOwnership(readDaemonOwnership(db, root), snapshot.record);
+  if (snapshot.source === 'sqlite' || snapshot.source === 'maintenance') {
+    return sameDaemonOwnership(
+      readStoredDaemonOwnership(db, root)?.record ?? null,
+      snapshot.record,
+    );
   }
   return (
-    readDaemonOwnership(db, root) === null &&
+    readStoredDaemonOwnership(db, root) === null &&
     sameDaemonOwnership(
       await readDaemonPidForClaim(pidFile),
       snapshot.record as DaemonOwnershipRecord,
@@ -569,10 +925,10 @@ export async function claimDaemonPid(
     processBirth,
   };
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const owner = readDaemonOwnership(db, root);
+    const authority = readDaemonOwnershipAuthority(db, root);
     let reclaimedJobOwner: string | null = null;
     let acquisition = { acquired: false, reclaimedJobs: 0 };
-    if (owner === null) {
+    if (authority === null) {
       // Upgrade boundary: a daemon from the pre-SQLite ownership protocol may
       // still be live even though the new table is empty.
       const legacy = await readDaemonPidForClaim(pidFile);
@@ -585,14 +941,39 @@ export async function claimDaemonPid(
         await assertNoAmbiguousLegacyDaemon(db, inspect);
       }
       acquisition = insertDaemonOwnership(db, pidFile, legacy, identity, reclaimedJobOwner);
-    } else {
+    } else if (authority.kind === 'daemon') {
+      const owner = authority.stored.record;
       const state = await inspect(owner.pid, owner.processBirth);
       if (state.alive) throw daemonAlreadyRunningError(owner, state.identityMatches);
       const observedMirror = await assertNoConflictingLiveDaemon(db, pidFile, owner, inspect);
-      acquisition = replaceDaemonOwnership(db, pidFile, observedMirror, owner, identity);
+      acquisition = replaceDaemonOwnership(
+        db,
+        pidFile,
+        observedMirror,
+        owner,
+        identity,
+        daemonJobOwner(owner),
+      );
       if (acquisition.acquired) {
         reclaimedJobOwner = daemonJobOwner(owner);
       }
+    } else {
+      const inspected = await inspectMaintenanceAuthority(authority, inspect);
+      if (!inspected.recoverable) throw maintenanceAlreadyRunningError(authority.stored.record);
+      const observedMirror = await assertNoConflictingLiveDaemon(
+        db,
+        pidFile,
+        authority.stored.record,
+        inspect,
+      );
+      acquisition = replaceDaemonOwnership(
+        db,
+        pidFile,
+        observedMirror,
+        authority.stored.record,
+        identity,
+        null,
+      );
     }
     if (!acquisition.acquired) continue;
 
@@ -605,7 +986,7 @@ export async function claimDaemonPid(
     try {
       await writeTextAtomically(pidFile, `${JSON.stringify(identity)}\n`, {
         beforePublish: () => {
-          if (!sameDaemonOwnership(readDaemonOwnership(db, root), identity)) {
+          if (!sameDaemonOwnership(readStoredDaemonOwnership(db, root)?.record ?? null, identity)) {
             throw new Error('daemon ownership changed before PID publication');
           }
           dependencies.beforeMirrorPublish?.();

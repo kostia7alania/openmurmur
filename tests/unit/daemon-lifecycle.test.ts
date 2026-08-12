@@ -26,9 +26,13 @@ import {
   shouldEnqueueHealthAlert,
 } from '../../src/cli/daemon.ts';
 import {
+  assertCurrentDaemonMaintenance,
+  claimDaemonMaintenance,
   daemonJobOwner,
   inspectDaemonControl,
   readDaemonOwnership,
+  releaseDaemonMaintenance,
+  renewDaemonMaintenance,
   stopOwnedDaemon,
 } from '../../src/cli/daemon-ownership.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
@@ -167,6 +171,167 @@ describe('daemon PID ownership', () => {
       { state: 'pending', attempts: 0, lease_owner: null },
     );
     await releaseDaemonPid(db.handle, pidFile, reclaimed);
+  });
+
+  it('serializes daemon startup with renewable maintenance and recovers a dead holder', async () => {
+    const pidFile = join(dir, 'daemon.pid');
+    await assert.rejects(
+      claimDaemonMaintenance(db.handle, pidFile, dir, { birthMarker: async () => null }),
+      /could not establish maintenance process birth identity/,
+    );
+    assert.equal(readDaemonOwnership(db.handle, dir), null);
+
+    const maintenanceBirth = 'maintenance-birth';
+    const maintenance = await claimDaemonMaintenance(db.handle, pidFile, dir, {
+      birthMarker: async () => maintenanceBirth,
+    });
+    assert.equal(existsSync(pidFile), false, 'maintenance must not publish a daemon PID mirror');
+    assert.equal(renewDaemonMaintenance(db.handle, maintenance), true);
+    assertCurrentDaemonMaintenance(db.handle, maintenance);
+    const lostGeneration = { ...maintenance, processBirth: 'not-the-current-generation' };
+    assert.equal(renewDaemonMaintenance(db.handle, lostGeneration), false);
+    assert.throws(
+      () => assertCurrentDaemonMaintenance(db.handle, lostGeneration),
+      /maintenance ownership was lost/,
+    );
+
+    await assert.rejects(
+      claimDaemonPid(db.handle, pidFile, dir, {
+        birthMarker: async () => 'blocked-daemon-birth',
+        inspect: async (_pid, expectedBirth) => ({
+          alive: true,
+          identityMatches: false,
+          command: 'pnpm openmurmur setup telegram owner',
+          processBirth: expectedBirth,
+        }),
+      }),
+      /maintenance operation is still active/,
+    );
+    db.handle
+      .prepare('UPDATE daemon_ownership SET claimed_at = ? WHERE ownership_id = 1')
+      .run('1970-01-01T00:00:00.000Z');
+    const exactLiveInspect = async () => ({
+      alive: true,
+      identityMatches: false,
+      command: null,
+      processBirth: maintenanceBirth,
+    });
+    await assert.rejects(
+      claimDaemonPid(db.handle, pidFile, dir, {
+        birthMarker: async () => 'after-renewal-failure-daemon-birth',
+        inspect: exactLiveInspect,
+      }),
+      /maintenance operation is still active/,
+    );
+    assert.equal(await releaseDaemonMaintenance(db.handle, pidFile, maintenance), true);
+
+    const afterAction = await claimDaemonPid(db.handle, pidFile, dir, {
+      birthMarker: async () => 'after-action-daemon-birth',
+    });
+    assert.equal(afterAction.reclaimedPreviousDaemon, false);
+    await releaseDaemonPid(db.handle, pidFile, afterAction);
+
+    const staleMaintenance = await claimDaemonMaintenance(db.handle, pidFile, dir, {
+      birthMarker: async () => 'dead-maintenance-birth',
+    });
+    const afterProcessDeath = await claimDaemonPid(db.handle, pidFile, dir, {
+      birthMarker: async () => 'after-death-daemon-birth',
+      inspect: async () => ({
+        alive: false,
+        identityMatches: false,
+        command: null,
+        processBirth: null,
+      }),
+    });
+    assert.equal(
+      await releaseDaemonMaintenance(db.handle, pidFile, staleMaintenance),
+      false,
+      'a stale maintenance token must not release its replacement',
+    );
+    assert.equal(afterProcessDeath.reclaimedPreviousDaemon, false);
+    await releaseDaemonPid(db.handle, pidFile, afterProcessDeath);
+  });
+
+  it('never changes predecessor-owned leases while acquiring maintenance', async () => {
+    const pidFile = join(dir, 'daemon.pid');
+    const cases = [
+      {
+        kind: 'legacy',
+        owner: String(process.pid + 1000),
+        predecessor: {
+          pid: process.pid + 1000,
+          root: dir,
+          startedAt: '2026-08-11T00:00:00.000Z',
+          processBirth: 'legacy-dead-birth',
+        },
+      },
+      {
+        kind: 'sqlite',
+        owner: daemonJobOwner({
+          pid: process.pid + 2000,
+          root: dir,
+          startedAt: '2026-08-11T00:01:00.000Z',
+          processBirth: 'sqlite-dead-birth',
+        }),
+        predecessor: {
+          pid: process.pid + 2000,
+          root: dir,
+          startedAt: '2026-08-11T00:01:00.000Z',
+          processBirth: 'sqlite-dead-birth',
+        },
+      },
+    ] as const;
+
+    for (const item of cases) {
+      if (item.kind === 'legacy') {
+        writeFileSync(pidFile, `${JSON.stringify(item.predecessor)}\n`);
+      } else {
+        db.handle
+          .prepare(
+            `INSERT INTO daemon_ownership
+               (ownership_id, daemon_pid, daemon_root, daemon_started_at, process_birth, claimed_at)
+             VALUES (1, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            item.predecessor.pid,
+            item.predecessor.root,
+            item.predecessor.startedAt,
+            item.predecessor.processBirth,
+            item.predecessor.startedAt,
+          );
+      }
+      const jobs = new JobQueue(db.handle, item.owner);
+      const jobId = jobs.enqueue({
+        kind: 'asr',
+        idempotencyKey: `maintenance-predecessor:${item.kind}`,
+        payload: {},
+      });
+      assert.ok(jobId);
+      assert.ok(jobs.claim(['asr'], 10 * 60_000));
+      const before = db.handle.prepare('SELECT * FROM jobs WHERE job_id = ?').get(jobId);
+
+      await assert.rejects(
+        claimDaemonMaintenance(db.handle, pidFile, dir, {
+          birthMarker: async () => 'maintenance-birth',
+          inspect: async () => ({
+            alive: false,
+            identityMatches: false,
+            command: null,
+            processBirth: null,
+          }),
+        }),
+        /start OpenMurmur once to recover jobs/,
+      );
+      assert.deepEqual(db.handle.prepare('SELECT * FROM jobs WHERE job_id = ?').get(jobId), before);
+      assert.deepEqual(
+        item.kind === 'legacy' ? await readDaemonPid(pidFile) : readDaemonOwnership(db.handle, dir),
+        item.predecessor,
+      );
+
+      db.handle.prepare('DELETE FROM jobs WHERE job_id = ?').run(jobId);
+      if (item.kind === 'legacy') rmSync(pidFile, { force: true });
+      else db.handle.prepare('DELETE FROM daemon_ownership').run();
+    }
   });
 
   it('lets only one concurrent claimant replace a proven-dead daemon', async () => {

@@ -70,6 +70,38 @@ publish credentials between the read-only preflight and the owner handshake.
 An interrupted stale lock makes the next setup fail closed with an explicit
 cleanup instruction; it never falls through to Keychain or Telegram.
 
+Credential setup and the diagnostic `telegram poll` are exclusive with the
+daemon that owns the same state root. The CLI refuses them before reading the
+Keychain or contacting Telegram while that daemon is running: otherwise a
+credential change would leave its resident client on the old bot, and a second
+`getUpdates` request could interrupt the production long poll. From the
+repository checkout, stop the daemon, run the exact setup or diagnostic, then
+restart it. Keep the same exact state root on every command (replace the sample
+value once):
+
+```bash
+STATE_ROOT="/absolute/path/to/openmurmur-state"
+pnpm openmurmur --root "$STATE_ROOT" stop
+pnpm openmurmur --root "$STATE_ROOT" setup telegram owner
+pnpm openmurmur --root "$STATE_ROOT" start
+```
+
+On a send-only host, use
+`pnpm openmurmur --root "$STATE_ROOT" setup telegram send-only` as the middle
+command instead.
+
+```bash
+pnpm openmurmur --root "$STATE_ROOT" stop
+pnpm openmurmur --root "$STATE_ROOT" telegram poll
+pnpm openmurmur --root "$STATE_ROOT" start
+```
+
+Setup and poll hold a renewable local maintenance claim for that exact root.
+Daemon startup is blocked until the action releases it; if the CLI is killed,
+the next operation recovers the claim only after proving that exact process is
+gone. If process birth identity cannot be established, maintenance fails before
+reading credentials or contacting Telegram.
+
 ### Where the token is never allowed
 
 | Channel | Why not |
