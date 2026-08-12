@@ -53,6 +53,11 @@ function writeFixtureRepository(root: string): void {
       '  if (argc != 2) return 64;',
       '  log_mode(argv[1]);',
       '  if (strcmp(argv[1], "--authorization-status") == 0) {',
+      '    const char *status = getenv("CAPTURE_AUTHORIZATION_STATUS");',
+      '    if (status != NULL && strcmp(status, "denied") == 0) {',
+      '      puts("{\\"authorized\\":false,\\"status\\":\\"denied\\"}");',
+      '      return 77;',
+      '    }',
       '    puts("{\\"authorized\\":true,\\"status\\":\\"authorized\\"}");',
       '    return 0;',
       '  }',
@@ -211,6 +216,12 @@ it('installs at the stable path, checks drift, and restores or preserves rollbac
     const checked = run(['--check']);
     assert.equal(checked.status, 0, `${checked.stdout}\n${checked.stderr}`);
     assert.match(checked.stdout, /Microphone authorization is granted/);
+
+    const denied = run(['--check'], { CAPTURE_AUTHORIZATION_STATUS: 'denied' });
+    assert.equal(denied.status, 1, `${denied.stdout}\n${denied.stderr}`);
+    assert.match(denied.stdout, /audio\.captureBackend="native"/);
+    assert.match(denied.stdout, /same --root value/);
+    assert.doesNotMatch(denied.stdout, /Final proof is real PCM/);
 
     const weakenedSignature = spawnSync(
       '/usr/bin/codesign',

@@ -555,7 +555,7 @@ function captureCommand(
   const commandContext = recoveryCommandContextForRoot(root);
   switch (subcommand) {
     case 'authorize':
-      return captureAuthorize(commandContext);
+      return captureAuthorize(commandContext, audio.captureBackend);
     case 'test':
       return captureTest(audio);
     default:
@@ -564,7 +564,10 @@ function captureCommand(
   }
 }
 
-async function captureAuthorize(commandContext: RecoveryCommandContext): Promise<number> {
+async function captureAuthorize(
+  commandContext: RecoveryCommandContext,
+  captureBackend: AudioConfig['captureBackend'],
+): Promise<number> {
   const executable = defaultNativeCaptureExecutable();
   if (!nativeCaptureExecutableIsUsable(executable)) {
     process.stderr.write(
@@ -583,7 +586,9 @@ async function captureAuthorize(commandContext: RecoveryCommandContext): Promise
     );
     return 1;
   }
-  if (status !== 'not_determined') return renderNativeAuthorizationResult(status, commandContext);
+  if (status !== 'not_determined') {
+    return renderNativeAuthorizationResult(status, commandContext, captureBackend);
+  }
 
   const app = dirname(dirname(dirname(executable)));
   process.stdout.write(
@@ -626,25 +631,40 @@ async function captureAuthorize(commandContext: RecoveryCommandContext): Promise
       );
       return 1;
     }
-    if (status !== 'not_determined') return renderNativeAuthorizationResult(status, commandContext);
+    if (status !== 'not_determined') {
+      return renderNativeAuthorizationResult(status, commandContext, captureBackend);
+    }
     await new Promise((resolve) => setTimeout(resolve, 250));
   } while (Date.now() < deadline);
 
   process.stderr.write(
     'The GUI flow opened, but no macOS decision was observed within 30 seconds. No permission is claimed.\n' +
-      `Finish the dialog in the GUI session, then prove real PCM with: ${openMurmurRecoveryCommand(commandContext, 'capture test')}\n`,
+      `Finish the dialog in the GUI session. ${renderNativeCaptureProofInstruction(commandContext, captureBackend)}\n`,
   );
   return 1;
+}
+
+function renderNativeCaptureProofInstruction(
+  commandContext: RecoveryCommandContext,
+  captureBackend: AudioConfig['captureBackend'],
+): string {
+  const command = openMurmurRecoveryCommand(commandContext, 'capture test');
+  if (captureBackend === 'native') return `Prove native PCM with: ${command}`;
+  return (
+    'The configured capture backend is "ffmpeg", so capture test would not prove the native helper. ' +
+    `Set audio.captureBackend to "native" for this state root, then run: ${command}`
+  );
 }
 
 function renderNativeAuthorizationResult(
   status: NativeCaptureAuthorizationStatus,
   commandContext: RecoveryCommandContext,
+  captureBackend: AudioConfig['captureBackend'],
 ): number {
   switch (status) {
     case 'authorized':
       process.stdout.write(
-        `Microphone access is granted to OpenMurmur Capture. Prove real PCM with: ${openMurmurRecoveryCommand(commandContext, 'capture test')}\n`,
+        `Microphone access is granted to OpenMurmur Capture. ${renderNativeCaptureProofInstruction(commandContext, captureBackend)}\n`,
       );
       return 0;
     case 'denied':
@@ -1664,4 +1684,4 @@ if (import.meta.main) {
   }
 }
 
-export { main, TranscriptRepository };
+export { main, renderNativeCaptureProofInstruction, TranscriptRepository };

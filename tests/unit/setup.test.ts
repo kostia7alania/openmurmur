@@ -15,7 +15,10 @@ import {
   releaseDaemonMaintenance,
   releaseDaemonPid,
 } from '../../src/cli/daemon-ownership.ts';
-import { withStoppedDaemonForTelegram } from '../../src/cli/main.ts';
+import {
+  renderNativeCaptureProofInstruction,
+  withStoppedDaemonForTelegram,
+} from '../../src/cli/main.ts';
 import {
   commitTelegramSetup,
   drainUpdateBacklog,
@@ -77,6 +80,18 @@ function updateWithIdentity(
 }
 
 describe('setup completion output', () => {
+  it('does not present an FFmpeg capture test as native PCM proof', () => {
+    const context = recoveryCommandContextForRoot('/private/tmp/openmurmur-live');
+    const ffmpeg = renderNativeCaptureProofInstruction(context, 'ffmpeg');
+    const native = renderNativeCaptureProofInstruction(context, 'native');
+
+    assert.match(ffmpeg, /would not prove the native helper/);
+    assert.match(ffmpeg, /Set audio\.captureBackend to "native"/);
+    assert.match(ffmpeg, /--root '\/private\/tmp\/openmurmur-live' capture test/);
+    assert.match(native, /^Prove native PCM with:/);
+    assert.doesNotMatch(native, /would not prove/);
+  });
+
   it('rejects an explicitly empty root before creating state', () => {
     const workingDirectory = mkdtempSync(join(tmpdir(), 'om-empty-root-'));
     const cli = join(process.cwd(), 'src', 'cli', 'main.ts');

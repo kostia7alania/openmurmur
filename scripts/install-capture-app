@@ -223,7 +223,8 @@ print_authorization_recovery() {
       echo "  Reinstall the helper and inspect System Settings -> Privacy & Security -> Microphone."
       ;;
   esac
-  echo "  Final proof is real PCM: pnpm openmurmur capture test"
+  echo '  Native PCM proof requires audio.captureBackend="native" in the selected state root.'
+  echo "  Then run capture test with that same --root value."
 }
 
 verify_bundle() {
