@@ -27,6 +27,32 @@ export function escapeHtml(text: string): string {
     .replaceAll('"', '&quot;');
 }
 
+function splitOversizedGrapheme(
+  grapheme: string,
+  limit: number,
+  size: (value: string) => number,
+): string[] {
+  const chunks: string[] = [];
+  let current = '';
+  let currentSize = 0;
+
+  for (const codePoint of grapheme) {
+    const codePointSize = size(codePoint);
+    if (codePointSize > limit) {
+      throw new Error('limit cannot contain one Unicode code point');
+    }
+    if (currentSize + codePointSize > limit) {
+      chunks.push(current);
+      current = '';
+      currentSize = 0;
+    }
+    current += codePoint;
+    currentSize += codePointSize;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
 /**
  * Splits text into chunks that are safe to send.
  *
@@ -50,10 +76,11 @@ export function splitForTelegram(text: string, limit = TELEGRAM_MESSAGE_LIMIT): 
         chunks.push(current);
         current = '';
       }
-      // A single grapheme longer than the limit cannot be split without
-      // corrupting it; emit it alone and let Telegram reject it loudly.
+      // A maliciously large combining sequence can itself exceed Telegram's
+      // limit. Preserve ordinary graphemes, but keep this exceptional case
+      // deliverable without ever cutting a UTF-16 surrogate pair.
       if (segment.length > limit) {
-        chunks.push(segment);
+        chunks.push(...splitOversizedGrapheme(segment, limit, (value) => value.length));
         continue;
       }
     }
@@ -107,7 +134,7 @@ function splitForEscapedHtml(text: string, limit: number): string[] {
         escapedLength = 0;
       }
       if (segmentLength > limit) {
-        chunks.push(segment);
+        chunks.push(...splitOversizedGrapheme(segment, limit, (value) => escapeHtml(value).length));
         continue;
       }
     }

@@ -158,6 +158,32 @@ describe('message splitting', () => {
     assert.equal(chunks.join(''), text);
   });
 
+  it('bounds an individually oversized grapheme without losing Unicode or HTML entities', () => {
+    const marks = '\u0301'.repeat(5_000);
+    const oversizedEmoji = `😀${marks}`;
+    const chunks = splitForTelegram(oversizedEmoji);
+
+    assert.ok(chunks.length > 1);
+    assert.equal(chunks.join(''), oversizedEmoji);
+    for (const chunk of chunks) {
+      assert.ok(chunk.length <= TELEGRAM_MESSAGE_LIMIT);
+      assert.ok(!/[\uD800-\uDBFF]$/.test(chunk), 'chunk ends with a high surrogate');
+      assert.ok(!/^[\uDC00-\uDFFF]/.test(chunk), 'chunk starts with a low surrogate');
+    }
+
+    const hostileHtml = `&${marks}`;
+    const messages = renderTranscriptMessages('01J8ZQ2N9K7XM3T6VBWD5HRGYA', hostileHtml, 3500);
+    assert.ok(messages.length > 1, 'delivery must select the Markdown artifact path');
+    const bodies = messages.map((message) => {
+      assert.ok(message.text.length <= TELEGRAM_MESSAGE_LIMIT);
+      const body = /<blockquote expandable>([\s\S]*)<\/blockquote>$/.exec(message.text)?.[1];
+      assert.ok(body !== undefined);
+      assert.doesNotMatch(body, /&(?!amp;)/);
+      return body;
+    });
+    assert.equal(bodies.join(''), escapeHtml(hostileHtml));
+  });
+
   it('handles Thai, which has no spaces', () => {
     const text = 'สวัสดีครับ'.repeat(200);
     const chunks = splitForTelegram(text, 100);
