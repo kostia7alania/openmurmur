@@ -1196,6 +1196,40 @@ does not prove D115 post-wake session attribution, calibrate D014 AVFoundation
 cadence or discontinuity, exercise a D116 rotation, prove Telegram remote ACK,
 or complete the models and Telegram golden path in D120.
 
+### Bind live evidence to one release revision (D123)
+
+First complete the D121 rollback rehearsal above, then its valid apply/check.
+Those operations legitimately replace installed plist inodes. Only after D121
+succeeds, create one persistent private evidence directory and freeze that
+installed source/runtime boundary before D120 and D122. `--prepare` refuses a
+dirty or different checkout and atomically creates, but never replaces, its
+manifest. Both modes run only the native helper's signed non-prompting checks;
+they do not call `launchctl`, open the microphone, read Keychain values or use
+the network.
+
+```bash
+[ -d "$HOME" ] && [ ! -L "$HOME" ] && [ "$(cd "$HOME" && pwd -P)" = "$HOME" ] || exit 1
+umask 077
+export RELEASE_EVIDENCE_DIR="$(mktemp -d "$HOME/.openmurmur-release.XXXXXX")"
+chmod 0700 "$RELEASE_EVIDENCE_DIR"
+./scripts/release-signoff --prepare --evidence-dir "$RELEASE_EVIDENCE_DIR"
+```
+
+For a custom state root, add the same canonical `--root DIR` to prepare and
+check. Run the read-only check again after the attended evidence is complete:
+
+```bash
+./scripts/release-signoff --check --evidence-dir "$RELEASE_EVIDENCE_DIR"
+```
+
+The strict manifest binds the full clean commit to the physical installed CLI,
+Node/SQLite runtime, state root, plist bytes and signed authorized capture
+helper. It also declares fixed reference-file paths for D120, D121 and D122 so
+the final human audit has one evidence index; the D121 reference may index the
+earlier rollback/apply evidence. A reference file's presence is not itself
+proof: D123 stays `live` until those three attended artifacts and every README
+verified/unverified claim are reviewed against the same manifest.
+
 ```bash
 pnpm openmurmur status
 ```

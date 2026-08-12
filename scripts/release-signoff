@@ -1,0 +1,462 @@
+#!/bin/bash
+# Binds attended release evidence to one clean source revision and installed runtime.
+# This script is read-only outside the operator-provided evidence directory.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+RUNTIME_CONTRACT="$REPO/runtime-requirements.json"
+MANIFEST_NAME="release-signoff-v1.json"
+
+MODE=""
+EVIDENCE_DIR=""
+REQUESTED_ROOT=""
+STAGE_DIR=""
+STAGE_DIR_ID=""
+
+die() {
+  printf 'release-signoff: %s\n' "$1" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./scripts/release-signoff --prepare --evidence-dir DIR [--root ROOT]
+  ./scripts/release-signoff --check   --evidence-dir DIR [--root ROOT]
+
+  --prepare       Atomically create the provenance manifest. Refuses an existing manifest.
+  --check         Read-only: verify the manifest against the current source and installation.
+  --evidence-dir  Existing private (0700), physical, user-owned evidence directory.
+  --root          Require this exact canonical state root in both installed plists.
+
+Neither mode changes launchd, opens the microphone, reads Keychain values, or uses the network.
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --prepare|--check)
+      [ -z "$MODE" ] || die "choose exactly one of --prepare or --check"
+      MODE="${1#--}"
+      shift
+      ;;
+    --evidence-dir)
+      [ "$#" -ge 2 ] || die "--evidence-dir needs a path"
+      EVIDENCE_DIR="$2"
+      shift 2
+      ;;
+    --root)
+      [ "$#" -ge 2 ] || die "--root needs a path"
+      REQUESTED_ROOT="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+[ -n "$MODE" ] || { usage >&2; die "choose --prepare or --check"; }
+[ -n "$EVIDENCE_DIR" ] || die "--evidence-dir is required"
+[ "$(uname -s)" = Darwin ] || die "release sign-off requires macOS"
+[ -n "${HOME:-}" ] && [ "${HOME#/}" != "$HOME" ] || die "HOME must be absolute"
+
+directory_identity() {
+  /usr/bin/stat -f '%d:%i' "$1" 2>/dev/null
+}
+
+file_identity() {
+  /usr/bin/stat -f '%d:%i' "$1" 2>/dev/null
+}
+
+file_mode() {
+  /usr/bin/stat -f '%Lp' "$1" 2>/dev/null
+}
+
+file_owner() {
+  /usr/bin/stat -f '%u' "$1" 2>/dev/null
+}
+
+file_sha256() {
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+require_physical_directory() {
+  local path="$1"
+  local description="$2"
+  local physical
+
+  [ "${path#/}" != "$path" ] || die "$description must be absolute"
+  [ -d "$path" ] && [ ! -L "$path" ] || die "$description must be a physical directory: $path"
+  physical="$(cd "$path" && pwd -P)"
+  [ "$physical" = "$path" ] || die "$description must be canonical and contain no symlinked component: $path"
+}
+
+require_physical_file() {
+  local path="$1"
+  local description="$2"
+
+  [ "${path#/}" != "$path" ] || die "$description must be absolute"
+  require_physical_directory "$(dirname "$path")" "$description parent"
+  [ -f "$path" ] && [ ! -L "$path" ] || die "$description must be a regular non-symlink file: $path"
+}
+
+require_private_evidence_directory() {
+  require_physical_directory "$EVIDENCE_DIR" "evidence directory"
+  [ "$(file_owner "$EVIDENCE_DIR")" = "$(id -u)" ] || die "evidence directory must be owned by the current user"
+  [ "$(file_mode "$EVIDENCE_DIR")" = 700 ] || die "evidence directory mode must be exactly 0700"
+  case "$EVIDENCE_DIR/" in
+    "$REPO/"*) die "evidence directory must be outside the source worktree" ;;
+  esac
+}
+
+plist_value() {
+  /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null
+}
+
+assert_no_plist_value() {
+  if plist_value "$1" "$2" >/dev/null; then
+    die "$3 has an unexpected $2 value"
+  fi
+}
+
+cleanup_stage() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "$STAGE_DIR" ]; then
+    if [ -d "$STAGE_DIR" ] && [ ! -L "$STAGE_DIR" ] && \
+       [ "$(cd "$STAGE_DIR" 2>/dev/null && pwd -P)" = "$STAGE_DIR" ] && \
+       [ "$(dirname "$STAGE_DIR")" = "$EVIDENCE_DIR" ] && \
+       [ "$(directory_identity "$STAGE_DIR")" = "$STAGE_DIR_ID" ]; then
+      if /bin/rm -rf "$STAGE_DIR"; then
+        fsync_directory "$EVIDENCE_DIR" || status=1
+      else
+        status=1
+      fi
+    else
+      printf 'release-signoff: staging evidence preserved after an identity change: %s\n' "$STAGE_DIR" >&2
+      status=1
+    fi
+  fi
+  exit "$status"
+}
+
+inspect_current_facts() {
+  local git_top
+  local git_status
+  local daemon_label digest_label daemon_working digest_working
+  local daemon_node digest_node daemon_cli digest_cli
+  local daemon_root digest_root
+  local runtime_values
+  local authorization_output authorization_code
+
+  require_physical_directory "$REPO" "source repository"
+  require_physical_directory "$REPO/scripts" "source scripts directory"
+  require_physical_file "$REPO/scripts/release-signoff" "release-signoff entrypoint"
+  require_physical_file "$RUNTIME_CONTRACT" "runtime requirements contract"
+
+  git_top="$(/usr/bin/git -C "$REPO" rev-parse --show-toplevel 2>/dev/null)" || \
+    die "source directory is not a Git worktree"
+  [ "$git_top" = "$REPO" ] || die "source repository is not the physical Git worktree root"
+  git_status="$(/usr/bin/git -C "$REPO" status --porcelain=v1 --untracked-files=all)"
+  [ -z "$git_status" ] || die "source worktree is dirty; commit or remove every tracked and untracked change first"
+  RELEASE_HEAD="$(/usr/bin/git -C "$REPO" rev-parse HEAD)"
+  [[ "$RELEASE_HEAD" =~ ^[0-9a-f]{40}$ ]] || die "Git did not return a full commit identity"
+
+  require_physical_directory "$HOME" "HOME"
+  [ "$(file_owner "$HOME")" = "$(id -u)" ] || die "HOME must be owned by the current user"
+  require_physical_directory "$HOME/Library" "HOME/Library"
+  AGENT_DIR="$HOME/Library/LaunchAgents"
+  require_physical_directory "$AGENT_DIR" "HOME/Library/LaunchAgents"
+  DAEMON_PLIST="$AGENT_DIR/io.openmurmur.daemon.plist"
+  DIGEST_PLIST="$AGENT_DIR/io.openmurmur.digest.plist"
+  require_physical_file "$DAEMON_PLIST" "installed daemon plist"
+  require_physical_file "$DIGEST_PLIST" "installed digest plist"
+  /usr/bin/plutil -lint "$DAEMON_PLIST" >/dev/null || die "installed daemon plist is invalid"
+  /usr/bin/plutil -lint "$DIGEST_PLIST" >/dev/null || die "installed digest plist is invalid"
+
+  daemon_label="$(plist_value "$DAEMON_PLIST" Label)" || die "installed daemon plist has no Label"
+  digest_label="$(plist_value "$DIGEST_PLIST" Label)" || die "installed digest plist has no Label"
+  [ "$daemon_label" = io.openmurmur.daemon ] || die "installed daemon plist has the wrong label"
+  [ "$digest_label" = io.openmurmur.digest ] || die "installed digest plist has the wrong label"
+
+  daemon_node="$(plist_value "$DAEMON_PLIST" ProgramArguments:0)" || die "daemon Node argument is missing"
+  digest_node="$(plist_value "$DIGEST_PLIST" ProgramArguments:0)" || die "digest Node argument is missing"
+  daemon_cli="$(plist_value "$DAEMON_PLIST" ProgramArguments:1)" || die "daemon CLI argument is missing"
+  digest_cli="$(plist_value "$DIGEST_PLIST" ProgramArguments:1)" || die "digest CLI argument is missing"
+  [ "$(plist_value "$DAEMON_PLIST" ProgramArguments:2)" = start ] || die "daemon command is not start"
+  [ "$(plist_value "$DAEMON_PLIST" ProgramArguments:3)" = --root ] || die "daemon root flag is missing"
+  [ "$(plist_value "$DIGEST_PLIST" ProgramArguments:2)" = digest ] || die "digest command is not digest"
+  [ "$(plist_value "$DIGEST_PLIST" ProgramArguments:3)" = scheduled ] || die "digest subcommand is not scheduled"
+  [ "$(plist_value "$DIGEST_PLIST" ProgramArguments:4)" = --root ] || die "digest root flag is missing"
+  daemon_root="$(plist_value "$DAEMON_PLIST" ProgramArguments:4)" || die "daemon state root is missing"
+  digest_root="$(plist_value "$DIGEST_PLIST" ProgramArguments:5)" || die "digest state root is missing"
+  assert_no_plist_value "$DAEMON_PLIST" ProgramArguments:5 "installed daemon plist"
+  assert_no_plist_value "$DIGEST_PLIST" ProgramArguments:6 "installed digest plist"
+  [ "$daemon_node" = "$digest_node" ] || die "installed agents use different Node executables"
+  [ "$daemon_cli" = "$digest_cli" ] || die "installed agents use different CLI entries"
+  [ "$daemon_root" = "$digest_root" ] || die "installed agents use different state roots"
+
+  daemon_working="$(plist_value "$DAEMON_PLIST" WorkingDirectory)" || die "daemon WorkingDirectory is missing"
+  digest_working="$(plist_value "$DIGEST_PLIST" WorkingDirectory)" || die "digest WorkingDirectory is missing"
+  [ "$daemon_working" = "$REPO" ] && [ "$digest_working" = "$REPO" ] || \
+    die "installed agents do not point at the selected source repository"
+
+  NODE_BIN="$daemon_node"
+  CLI_ENTRY="$daemon_cli"
+  STATE_ROOT="$daemon_root"
+  require_physical_file "$NODE_BIN" "installed Node executable"
+  [ -x "$NODE_BIN" ] || die "installed Node is not executable"
+  require_physical_file "$CLI_ENTRY" "installed CLI entry"
+  [ "$CLI_ENTRY" = "$REPO/src/cli/main.ts" ] || die "installed CLI checkout does not match the selected repository"
+  require_physical_directory "$STATE_ROOT" "installed state root"
+  [ "$(file_owner "$STATE_ROOT")" = "$(id -u)" ] || die "installed state root must be owned by the current user"
+  if [ -n "$REQUESTED_ROOT" ]; then
+    require_physical_directory "$REQUESTED_ROOT" "requested state root"
+    [ "$REQUESTED_ROOT" = "$STATE_ROOT" ] || die "--root does not match the installed state root"
+  fi
+
+  if ! runtime_values="$("$NODE_BIN" --input-type=module - "$RUNTIME_CONTRACT" "$NODE_BIN" 2>&1 <<'NODE'
+import { readFileSync } from 'node:fs';
+
+const contract = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const expectedExecutable = process.argv[3];
+const versionPattern = /^\d+\.\d+\.\d+$/;
+const keys = ['nodeMinimum', 'sqliteMinimum', 'pnpmExact'];
+if (contract.schemaVersion !== 1 || keys.some((key) => !versionPattern.test(contract[key]))) {
+  throw new Error('invalid runtime requirements contract');
+}
+function compare(left, right) {
+  const a = left.split('.').map(Number);
+  const b = right.split('.').map(Number);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const delta = (a[index] ?? 0) - (b[index] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return 0;
+}
+const sqlite = process.versions.sqlite ?? '0.0.0';
+if (process.execPath !== expectedExecutable) throw new Error('installed Node resolved to a different executable');
+if (compare(process.versions.node, contract.nodeMinimum) < 0) throw new Error('installed Node is below the runtime floor');
+if (compare(sqlite, contract.sqliteMinimum) < 0) throw new Error('installed SQLite is below the runtime floor');
+process.stdout.write(`${process.versions.node}\t${sqlite}`);
+NODE
+  )"; then
+    die "installed runtime is incompatible: $runtime_values"
+  fi
+  IFS=$'\t' read -r NODE_VERSION SQLITE_VERSION <<< "$runtime_values"
+  [[ "$NODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "installed Node returned an invalid version"
+  [[ "$SQLITE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "installed Node returned an invalid SQLite version"
+
+  CAPTURE_CHECK="$REPO/scripts/install-capture-app"
+  require_physical_file "$CAPTURE_CHECK" "capture app verifier"
+  [ -x "$CAPTURE_CHECK" ] || die "capture app verifier is not executable"
+  "$CAPTURE_CHECK" --check >/dev/null || die "installed capture app failed its strict read-only check"
+  APPLICATIONS_DIR="$HOME/Applications"
+  require_physical_directory "$APPLICATIONS_DIR" "HOME/Applications"
+  CAPTURE_APP="$APPLICATIONS_DIR/OpenMurmur Capture.app"
+  require_physical_directory "$CAPTURE_APP" "installed capture app"
+  require_physical_directory "$CAPTURE_APP/Contents" "installed capture Contents"
+  require_physical_directory "$CAPTURE_APP/Contents/MacOS" "installed capture MacOS directory"
+  CAPTURE_EXECUTABLE="$CAPTURE_APP/Contents/MacOS/OpenMurmurCapture"
+  require_physical_file "$CAPTURE_EXECUTABLE" "installed capture executable"
+  [ -x "$CAPTURE_EXECUTABLE" ] || die "installed capture executable is not executable"
+  CAPTURE_SOURCE_DIGEST="$("$CAPTURE_EXECUTABLE" --source-digest 2>/dev/null)" || \
+    die "installed capture helper did not report its source digest"
+  [[ "$CAPTURE_SOURCE_DIGEST" =~ ^[0-9a-f]{64}$ ]] || die "installed capture helper returned an invalid source digest"
+  if authorization_output="$("$CAPTURE_EXECUTABLE" --authorization-status 2>&1)"; then
+    authorization_code=0
+  else
+    authorization_code=$?
+  fi
+  [ "$authorization_code" -eq 0 ] && \
+    [ "$authorization_output" = '{"authorized":true,"status":"authorized"}' ] || \
+    die "installed capture helper is not authorized under its fixed non-prompting status contract"
+  CAPTURE_AUTHORIZATION_STATUS=authorized
+
+  REPO_ID="$(directory_identity "$REPO")"
+  CLI_ID="$(file_identity "$CLI_ENTRY")"
+  CLI_SHA256="$(file_sha256 "$CLI_ENTRY")"
+  NODE_ID="$(file_identity "$NODE_BIN")"
+  NODE_SHA256="$(file_sha256 "$NODE_BIN")"
+  STATE_ROOT_ID="$(directory_identity "$STATE_ROOT")"
+  DAEMON_PLIST_ID="$(file_identity "$DAEMON_PLIST")"
+  DAEMON_PLIST_SHA256="$(file_sha256 "$DAEMON_PLIST")"
+  DAEMON_PLIST_MODE="$(file_mode "$DAEMON_PLIST")"
+  DIGEST_PLIST_ID="$(file_identity "$DIGEST_PLIST")"
+  DIGEST_PLIST_SHA256="$(file_sha256 "$DIGEST_PLIST")"
+  DIGEST_PLIST_MODE="$(file_mode "$DIGEST_PLIST")"
+  CAPTURE_EXECUTABLE_ID="$(file_identity "$CAPTURE_EXECUTABLE")"
+  CAPTURE_EXECUTABLE_SHA256="$(file_sha256 "$CAPTURE_EXECUTABLE")"
+  EVIDENCE_DIR_ID="$(directory_identity "$EVIDENCE_DIR")"
+  D120_REFERENCE="$EVIDENCE_DIR/D120.reference.json"
+  D121_REFERENCE="$EVIDENCE_DIR/D121.reference.json"
+  D122_REFERENCE="$EVIDENCE_DIR/D122.reference.json"
+}
+
+capture_fact_args() {
+  FACT_ARGS=(
+    "$RELEASE_HEAD" "$REPO" "$REPO_ID" "$CLI_ENTRY" "$CLI_ID" "$CLI_SHA256"
+    "$NODE_BIN" "$NODE_ID" "$NODE_SHA256" "$NODE_VERSION" "$SQLITE_VERSION"
+    "$STATE_ROOT" "$STATE_ROOT_ID"
+    "$DAEMON_PLIST" "$DAEMON_PLIST_ID" "$DAEMON_PLIST_SHA256" "$DAEMON_PLIST_MODE"
+    "$DIGEST_PLIST" "$DIGEST_PLIST_ID" "$DIGEST_PLIST_SHA256" "$DIGEST_PLIST_MODE"
+    "$CAPTURE_EXECUTABLE" "$CAPTURE_EXECUTABLE_ID" "$CAPTURE_EXECUTABLE_SHA256"
+    "$CAPTURE_SOURCE_DIGEST" "$CAPTURE_AUTHORIZATION_STATUS"
+    "$EVIDENCE_DIR" "$EVIDENCE_DIR_ID" "$D120_REFERENCE" "$D121_REFERENCE" "$D122_REFERENCE"
+  )
+}
+
+revalidate_snapshot() {
+  local index
+
+  inspect_current_facts
+  capture_fact_args
+  [ "${#FACT_ARGS[@]}" -eq "${#INITIAL_FACT_ARGS[@]}" ] || die "release provenance changed during inspection"
+  index=0
+  while [ "$index" -lt "${#FACT_ARGS[@]}" ]; do
+    [ "${FACT_ARGS[$index]}" = "${INITIAL_FACT_ARGS[$index]}" ] || \
+      die "release provenance changed during inspection"
+    index=$((index + 1))
+  done
+}
+
+write_manifest() {
+  local output="$1"
+  shift
+  "$NODE_BIN" --input-type=module - "$output" "$@" <<'NODE'
+import { closeSync, fsyncSync, openSync, writeFileSync } from 'node:fs';
+
+const [
+  output, releaseCommit, repositoryPath, repositoryIdentity, cliPath, cliIdentity, cliSha256,
+  nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion, stateRootPath, stateRootIdentity,
+  daemonPath, daemonIdentity, daemonSha256, daemonMode,
+  digestPath, digestIdentity, digestSha256, digestMode,
+  capturePath, captureIdentity, captureSha256, captureSourceDigest, captureAuthorizationStatus,
+  evidenceDirectory, evidenceDirectoryIdentity, d120, d121, d122,
+] = process.argv.slice(2);
+const manifest = {
+  schemaVersion: 1,
+  releaseCommit,
+  repository: { path: repositoryPath, identity: repositoryIdentity, cliPath, cliIdentity, cliSha256 },
+  runtime: { nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion },
+  stateRoot: { path: stateRootPath, identity: stateRootIdentity },
+  plists: {
+    daemon: { path: daemonPath, identity: daemonIdentity, sha256: daemonSha256, mode: daemonMode },
+    digest: { path: digestPath, identity: digestIdentity, sha256: digestSha256, mode: digestMode },
+  },
+  capture: {
+    executablePath: capturePath,
+    executableIdentity: captureIdentity,
+    executableSha256: captureSha256,
+    sourceDigest: captureSourceDigest,
+    authorizationStatus: captureAuthorizationStatus,
+  },
+  evidenceDirectory: { path: evidenceDirectory, identity: evidenceDirectoryIdentity },
+  requiredLiveEvidenceReferences: { D120: d120, D121: d121, D122: d122 },
+};
+writeFileSync(output, `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+const descriptor = openSync(output, 'r');
+try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+NODE
+}
+
+verify_manifest() {
+  local manifest="$1"
+  shift
+  "$NODE_BIN" --input-type=module - "$manifest" "$@" <<'NODE'
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+const [
+  manifestPath, releaseCommit, repositoryPath, repositoryIdentity, cliPath, cliIdentity, cliSha256,
+  nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion, stateRootPath, stateRootIdentity,
+  daemonPath, daemonIdentity, daemonSha256, daemonMode,
+  digestPath, digestIdentity, digestSha256, digestMode,
+  capturePath, captureIdentity, captureSha256, captureSourceDigest, captureAuthorizationStatus,
+  evidenceDirectory, evidenceDirectoryIdentity, d120, d121, d122,
+] = process.argv.slice(2);
+const expected = {
+  schemaVersion: 1,
+  releaseCommit,
+  repository: { path: repositoryPath, identity: repositoryIdentity, cliPath, cliIdentity, cliSha256 },
+  runtime: { nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion },
+  stateRoot: { path: stateRootPath, identity: stateRootIdentity },
+  plists: {
+    daemon: { path: daemonPath, identity: daemonIdentity, sha256: daemonSha256, mode: daemonMode },
+    digest: { path: digestPath, identity: digestIdentity, sha256: digestSha256, mode: digestMode },
+  },
+  capture: {
+    executablePath: capturePath,
+    executableIdentity: captureIdentity,
+    executableSha256: captureSha256,
+    sourceDigest: captureSourceDigest,
+    authorizationStatus: captureAuthorizationStatus,
+  },
+  evidenceDirectory: { path: evidenceDirectory, identity: evidenceDirectoryIdentity },
+  requiredLiveEvidenceReferences: { D120: d120, D121: d121, D122: d122 },
+};
+const raw = readFileSync(manifestPath, 'utf8');
+if (Buffer.byteLength(raw) > 64 * 1024) throw new Error('manifest exceeds the bounded v1 size');
+const actual = JSON.parse(raw);
+assert.equal(raw, `${JSON.stringify(actual, null, 2)}\n`, 'manifest is not canonical v1 JSON');
+assert.deepEqual(actual, expected, 'manifest no longer matches the selected source and installation');
+NODE
+}
+
+fsync_directory() {
+  "$NODE_BIN" --input-type=module - "$1" <<'NODE'
+import { closeSync, fsyncSync, openSync } from 'node:fs';
+
+const descriptor = openSync(process.argv[2], 'r');
+try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+NODE
+}
+
+require_private_evidence_directory
+inspect_current_facts
+MANIFEST="$EVIDENCE_DIR/$MANIFEST_NAME"
+
+# Pass facts to Node directly as argv instead of parsing a generated text record.
+capture_fact_args
+INITIAL_FACT_ARGS=("${FACT_ARGS[@]}")
+
+if [ "$MODE" = prepare ]; then
+  [ ! -e "$MANIFEST" ] && [ ! -L "$MANIFEST" ] || die "provenance manifest already exists: $MANIFEST"
+  STAGE_DIR="$(mktemp -d "$EVIDENCE_DIR/.release-signoff.XXXXXX")"
+  chmod 0700 "$STAGE_DIR"
+  STAGE_DIR_ID="$(directory_identity "$STAGE_DIR")"
+  trap cleanup_stage EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  STAGE_MANIFEST="$STAGE_DIR/$MANIFEST_NAME"
+  write_manifest "$STAGE_MANIFEST" "${FACT_ARGS[@]}"
+  [ -f "$STAGE_MANIFEST" ] && [ ! -L "$STAGE_MANIFEST" ] && [ "$(file_mode "$STAGE_MANIFEST")" = 600 ] || \
+    die "staged manifest is not a private regular file"
+  verify_manifest "$STAGE_MANIFEST" "${FACT_ARGS[@]}"
+  revalidate_snapshot
+  require_private_evidence_directory
+  [ "$(directory_identity "$EVIDENCE_DIR")" = "$EVIDENCE_DIR_ID" ] || die "evidence directory changed before publication"
+  /bin/ln "$STAGE_MANIFEST" "$MANIFEST" || die "manifest publication lost create-if-absent race"
+  [ "$(file_identity "$MANIFEST")" = "$(file_identity "$STAGE_MANIFEST")" ] || die "published manifest identity is ambiguous"
+  fsync_directory "$EVIDENCE_DIR"
+  verify_manifest "$MANIFEST" "${FACT_ARGS[@]}"
+  printf 'Release provenance prepared for %s\n' "$RELEASE_HEAD"
+  printf 'Manifest: %s\n' "$MANIFEST"
+else
+  require_physical_file "$MANIFEST" "release provenance manifest"
+  [ "$(file_owner "$MANIFEST")" = "$(id -u)" ] || die "release provenance manifest has the wrong owner"
+  [ "$(file_mode "$MANIFEST")" = 600 ] || die "release provenance manifest mode must be exactly 0600"
+  verify_manifest "$MANIFEST" "${FACT_ARGS[@]}" || die "release provenance drift detected"
+  revalidate_snapshot
+  verify_manifest "$MANIFEST" "${FACT_ARGS[@]}" || die "release provenance drift detected"
+  printf 'Release provenance still matches %s\n' "$RELEASE_HEAD"
+  printf 'D120-D122 remain live until their evidence is audited at the manifest-declared reference paths.\n'
+fi
