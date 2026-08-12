@@ -49,6 +49,7 @@ import {
 import { renderSleepMessage } from '../health/sleep.ts';
 import {
   failureCategory,
+  openMurmurRecoveryCommand,
   renderAsrUnavailableDetail,
   renderDeadJobAlert,
   renderLlmUnavailableDetail,
@@ -1692,7 +1693,10 @@ export function enqueueCaptureFailureNotice(
     ordinal: 1,
     payload: {
       type: 'text',
-      text: renderCaptureFailure(recordingWasAnnounced),
+      text: renderCaptureFailure(
+        recordingWasAnnounced,
+        openMurmurRecoveryCommand(TELEGRAM_RECOVERY_COMMAND_CONTEXT, 'doctor'),
+      ),
     },
   });
 }

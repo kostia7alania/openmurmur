@@ -353,13 +353,16 @@ export function renderStatus(input: StatusReportInput): string {
 }
 
 /** Stable chat copy; the capture exception itself remains in the local log. */
-export function renderCaptureFailure(recordingWasAnnounced: boolean): string {
+export function renderCaptureFailure(
+  recordingWasAnnounced: boolean,
+  doctorCommand = 'pnpm openmurmur doctor',
+): string {
   const heading = recordingWasAnnounced ? '🔴 Запись остановлена' : '🔴 Запись не запустилась';
   return [
     heading,
     '',
     'Не удалось получать аудио с микрофона.',
-    'Проверьте доступ к микрофону и запустите `pnpm openmurmur doctor` в корне репозитория.',
+    `Проверьте доступ к микрофону и запустите \`${doctorCommand}\` в корне репозитория.`,
     'Технические подробности сохранены в локальном журнале.',
   ].join('\n');
 }

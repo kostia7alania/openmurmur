@@ -46,6 +46,15 @@ describe('capture failure copy', () => {
         'Технические подробности сохранены в локальном журнале.',
     );
     assert.match(renderCaptureFailure(true), /^🔴 Запись остановлена$/m);
+    const customRoot = renderCaptureFailure(
+      true,
+      `pnpm openmurmur --root "\${OPENMURMUR_STATE_ROOT:?set exact daemon state root locally}" doctor`,
+    );
+    assert.match(
+      customRoot,
+      /--root "\$\{OPENMURMUR_STATE_ROOT:\?set exact daemon state root locally\}" doctor/,
+    );
+    assert.ok(!customRoot.includes('/Users/'));
   });
 });
 

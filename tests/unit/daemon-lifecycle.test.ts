@@ -1119,7 +1119,7 @@ describe('daemon terminal state reconciliation', () => {
       text:
         '🔴 Запись остановлена\n\n' +
         'Не удалось получать аудио с микрофона.\n' +
-        'Проверьте доступ к микрофону и запустите `pnpm openmurmur doctor` в корне репозитория.\n' +
+        `Проверьте доступ к микрофону и запустите \`pnpm openmurmur --root "\${OPENMURMUR_STATE_ROOT:?set exact daemon state root locally}" doctor\` в корне репозитория.\n` +
         'Технические подробности сохранены в локальном журнале.',
     });
     assert.doesNotMatch(pending.payload, /CaptureError|ffmpeg|\/private\//u);
