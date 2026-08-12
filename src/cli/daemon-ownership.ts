@@ -37,9 +37,15 @@ export interface DaemonMaintenanceClaim extends DaemonOwnershipRecord {
   readonly token: string;
   /** Actual process birth marker used to prove this maintenance holder is still alive. */
   readonly ownerProcessBirth: string;
+  readonly purpose: DaemonMaintenancePurpose;
 }
 
-const MAINTENANCE_PROCESS_BIRTH_PREFIX = 'openmurmur-maintenance:v1:';
+export type DaemonMaintenancePurpose = 'telegram' | 'recovery';
+
+const MAINTENANCE_PROCESS_BIRTH_PREFIXES = {
+  telegram: 'openmurmur-maintenance:v1:',
+  recovery: 'openmurmur-recovery-maintenance:v1:',
+} as const satisfies Record<DaemonMaintenancePurpose, string>;
 export const DAEMON_MAINTENANCE_RENEW_INTERVAL_MS = 30 * 1000;
 
 export function daemonJobOwner(owner: DaemonOwnershipRecord): string {
@@ -201,6 +207,7 @@ interface DaemonMaintenanceDependencies {
   readonly inspect?: typeof inspectDaemonProcess;
   readonly now?: () => number;
   readonly daemonRunningError?: string;
+  readonly purpose?: DaemonMaintenancePurpose;
 }
 
 function canonicalUtc(value: string): boolean {
@@ -274,15 +281,27 @@ function readStoredDaemonOwnership(
 interface MaintenanceProcessBirth {
   readonly token: string;
   readonly ownerProcessBirth: string;
+  readonly purpose: DaemonMaintenancePurpose;
 }
 
-function maintenanceProcessBirth(token: string, ownerProcessBirth: string): string {
-  return `${MAINTENANCE_PROCESS_BIRTH_PREFIX}${token}:${Buffer.from(ownerProcessBirth, 'utf8').toString('base64url')}`;
+function maintenanceProcessBirth(
+  purpose: DaemonMaintenancePurpose,
+  token: string,
+  ownerProcessBirth: string,
+): string {
+  return `${MAINTENANCE_PROCESS_BIRTH_PREFIXES[purpose]}${token}:${Buffer.from(ownerProcessBirth, 'utf8').toString('base64url')}`;
 }
 
 function parseMaintenanceProcessBirth(value: string): MaintenanceProcessBirth | null {
-  if (!value.startsWith(MAINTENANCE_PROCESS_BIRTH_PREFIX)) return null;
-  const encoded = value.slice(MAINTENANCE_PROCESS_BIRTH_PREFIX.length);
+  let purpose: DaemonMaintenancePurpose;
+  if (value.startsWith(MAINTENANCE_PROCESS_BIRTH_PREFIXES.telegram)) {
+    purpose = 'telegram';
+  } else if (value.startsWith(MAINTENANCE_PROCESS_BIRTH_PREFIXES.recovery)) {
+    purpose = 'recovery';
+  } else {
+    return null;
+  }
+  const encoded = value.slice(MAINTENANCE_PROCESS_BIRTH_PREFIXES[purpose].length);
   const separator = encoded.indexOf(':');
   const token = encoded.slice(0, separator);
   const birthEncoded = encoded.slice(separator + 1);
@@ -299,7 +318,7 @@ function parseMaintenanceProcessBirth(value: string): MaintenanceProcessBirth | 
   ) {
     throw daemonOwnershipError('maintenance process birth is invalid');
   }
-  return { token, ownerProcessBirth };
+  return { token, ownerProcessBirth, purpose };
 }
 
 type DaemonOwnershipAuthority =
@@ -571,7 +590,7 @@ function assertNoPredecessorLeases(db: Database['handle'], predecessorOwner: str
   if (lease !== undefined) {
     throw new Error(
       'the proven-dead daemon still owns leased work; start OpenMurmur once to recover jobs ' +
-        'before running Telegram maintenance',
+        'before running maintenance',
     );
   }
 }
@@ -713,6 +732,7 @@ export async function claimDaemonMaintenance(
   const birthMarker = dependencies.birthMarker ?? processBirthMarker;
   const inspect = dependencies.inspect ?? inspectDaemonProcess;
   const now = dependencies.now ?? Date.now;
+  const purpose = dependencies.purpose ?? 'telegram';
   await assertMaintenancePreflight(db, pidFile, root, inspect, dependencies.daemonRunningError);
   const ownerProcessBirth = await birthMarker(process.pid);
   if (ownerProcessBirth === null) {
@@ -723,9 +743,10 @@ export async function claimDaemonMaintenance(
     pid: process.pid,
     root,
     startedAt: new Date(now()).toISOString(),
-    processBirth: maintenanceProcessBirth(token, ownerProcessBirth),
+    processBirth: maintenanceProcessBirth(purpose, token, ownerProcessBirth),
     token,
     ownerProcessBirth,
+    purpose,
   } satisfies DaemonMaintenanceClaim;
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -775,7 +796,7 @@ export function assertCurrentDaemonMaintenance(
   claim: DaemonMaintenanceClaim,
 ): void {
   if (!sameDaemonOwnership(readStoredDaemonOwnership(db, claim.root)?.record ?? null, claim)) {
-    throw new Error('exclusive Telegram maintenance ownership was lost');
+    throw new Error('exclusive maintenance ownership was lost');
   }
 }
 

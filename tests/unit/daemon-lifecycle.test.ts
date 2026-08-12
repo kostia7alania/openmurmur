@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
@@ -40,7 +40,9 @@ import {
   renewDaemonMaintenance,
   stopOwnedDaemon,
 } from '../../src/cli/daemon-ownership.ts';
+import { main, withStoppedDaemonForRecovery } from '../../src/cli/main.ts';
 import { resolvePaths } from '../../src/config/paths.ts';
+import { DEFAULT_CONFIG } from '../../src/config/schema.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
 import { appendIncomingTranscript, IncomingFileRepository } from '../../src/database/repository.ts';
 import { AlertEvaluator } from '../../src/health/alerts.ts';
@@ -259,6 +261,107 @@ describe('daemon PID ownership', () => {
     );
     assert.equal(afterProcessDeath.reclaimedPreviousDaemon, false);
     await releaseDaemonPid(db.handle, pidFile, afterProcessDeath);
+  });
+
+  it('runs mutating recovery under a distinct exclusive owner and releases it after one repair', async () => {
+    const paths = resolvePaths(dir);
+    db.close();
+    db = openDatabase({ file: paths.databaseFile });
+    mkdirSync(paths.tempDir, { recursive: true });
+    mkdirSync(paths.audioDir, { recursive: true });
+    mkdirSync(paths.runtimeDir, { recursive: true });
+    const sessionId = 'recovery-owner-session';
+    const at = '2026-08-12T12:00:00.000Z';
+    db.handle
+      .prepare(
+        `INSERT INTO audio_sessions
+           (session_id, state, started_at, created_at, updated_at)
+         VALUES (?, 'ACTIVE', ?, ?, ?)`,
+      )
+      .run(sessionId, at, at, at);
+    db.handle
+      .prepare(
+        `INSERT INTO audio_parts
+           (part_id, session_id, part_index, path, started_at, ended_at, duration_ms,
+            bytes, sha256, finalized, created_at)
+         VALUES (?, ?, 0, ?, ?, ?, 1000, 100, 'sha', 1, ?)`,
+      )
+      .run(`${sessionId}-p0`, sessionId, join(paths.audioDir, 'source.flac'), at, at, at);
+
+    const liveDaemon = await claimDaemonPid(db.handle, paths.pidFile, paths.root, {
+      birthMarker: async () => 'live-daemon-birth',
+    });
+    assert.equal(existsSync(paths.quarantineDir), false);
+    await assert.rejects(
+      main(['recover', '--yes', '--root', paths.root]),
+      /stop[\s\S]*recover --yes[\s\S]*start/,
+    );
+    assert.equal(
+      existsSync(paths.quarantineDir),
+      false,
+      'a rejected mutating recovery must not create managed directories',
+    );
+    assert.equal(
+      (db.handle.prepare('SELECT state FROM audio_sessions').get() as { state: string }).state,
+      'ACTIVE',
+    );
+    assert.equal(new JobQueue(db.handle).pendingCount(), 0);
+    await releaseDaemonPid(db.handle, paths.pidFile, liveDaemon);
+
+    await withStoppedDaemonForRecovery(
+      { config: DEFAULT_CONFIG, paths, fromFile: false },
+      async (recoveryDb) => {
+        const owner = recoveryDb
+          .prepare('SELECT process_birth FROM daemon_ownership WHERE ownership_id = 1')
+          .get() as { process_birth: string };
+        assert.match(owner.process_birth, /^openmurmur-recovery-maintenance:v1:/);
+
+        const aliveMaintenance = async (_pid: number, processBirth: string | null) => ({
+          alive: true,
+          identityMatches: false,
+          command: 'node src/cli/main.ts recover --yes',
+          processBirth,
+        });
+        await assert.rejects(
+          claimDaemonPid(db.handle, paths.pidFile, paths.root, {
+            birthMarker: async () => 'concurrent-daemon-birth',
+            inspect: aliveMaintenance,
+          }),
+          /maintenance operation is still active/,
+        );
+        await assert.rejects(
+          claimDaemonMaintenance(db.handle, paths.pidFile, paths.root, {
+            birthMarker: async () => 'concurrent-telegram-birth',
+            inspect: aliveMaintenance,
+          }),
+          /maintenance operation is still active/,
+        );
+
+        const repaired = await recoverAfterCrash(recoveryDb, paths, nullLogger);
+        assert.deepEqual(repaired.stalledSessions, [sessionId]);
+        const repeated = await recoverAfterCrash(recoveryDb, paths, nullLogger);
+        assert.deepEqual(repeated.stalledSessions, []);
+      },
+      { birthMarker: async () => 'recovery-maintenance-birth' },
+    );
+
+    assert.equal(new JobQueue(db.handle).pendingCount('deliver_audio'), 1);
+    assert.equal(new JobQueue(db.handle).pendingCount('asr'), 1);
+    assert.equal(
+      (
+        db.handle
+          .prepare(
+            "SELECT count(*) AS count FROM telegram_outbox WHERE delivery_part_id = 'session-status:finalized:recovery-owner-session'",
+          )
+          .get() as { count: number }
+      ).count,
+      1,
+    );
+    const afterRecovery = await claimDaemonPid(db.handle, paths.pidFile, paths.root, {
+      birthMarker: async () => 'after-recovery-daemon-birth',
+    });
+    assert.equal(afterRecovery.reclaimedPreviousDaemon, false);
+    await releaseDaemonPid(db.handle, paths.pidFile, afterRecovery);
   });
 
   it('never changes predecessor-owned leases while acquiring maintenance', async () => {

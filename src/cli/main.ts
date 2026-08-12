@@ -16,7 +16,7 @@ import {
 } from '../capture/native.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
 import { recoverAfterCrash, renderRecoveryReport } from '../capture/recovery.ts';
-import { ensureDirectories, loadConfig } from '../config/load.ts';
+import { ensureDirectories, type LoadedConfig, loadConfig } from '../config/load.ts';
 import { type AudioConfig, ConfigError } from '../config/schema.ts';
 import { openDatabase } from '../database/db.ts';
 import { TranscriptRepository } from '../database/repository.ts';
@@ -73,6 +73,7 @@ import {
   assertCurrentDaemonMaintenance,
   claimDaemonMaintenance,
   DAEMON_MAINTENANCE_RENEW_INTERVAL_MS,
+  type DaemonMaintenancePurpose,
   inspectDaemonControl,
   releaseDaemonMaintenance,
   releaseDaemonPid,
@@ -229,20 +230,18 @@ async function main(argv: readonly string[]): Promise<number> {
       return stopDaemon(loaded);
 
     case 'recover': {
-      await ensureDirectories(loaded.paths);
-      const db = openDatabase({ file: loaded.paths.databaseFile });
-      try {
-        // Read-only unless --yes: seeing what a crash left is not the same as
-        // agreeing to delete it.
-        const report = await recoverAfterCrash(db.handle, loaded.paths, logger, {
-          remove: values['yes'] === true,
-          repair: values['yes'] === true,
+      const apply = values['yes'] === true;
+      if (!apply) await ensureDirectories(loaded.paths);
+      const runRecovery = async (db: DatabaseSync): Promise<number> => {
+        const report = await recoverAfterCrash(db, loaded.paths, logger, {
+          remove: apply,
+          repair: apply,
         });
         process.stdout.write(
           asJson ? `${JSON.stringify(report, null, 2)}\n` : `${renderRecoveryReport(report)}\n`,
         );
         if (
-          values['yes'] !== true &&
+          !apply &&
           (report.orphans.length > 0 ||
             report.recoveredPublishedParts.length > 0 ||
             report.settledMissingParts.length > 0 ||
@@ -253,6 +252,17 @@ async function main(argv: readonly string[]): Promise<number> {
           );
         }
         return 0;
+      };
+
+      if (apply) {
+        return withStoppedDaemonForRecovery(loaded, async (db) => {
+          await ensureDirectories(loaded.paths);
+          return runRecovery(db);
+        });
+      }
+      const db = openDatabase({ file: loaded.paths.databaseFile });
+      try {
+        return await runRecovery(db.handle);
       } finally {
         db.close();
       }
@@ -1238,10 +1248,28 @@ function stoppedDaemonTelegramRunbook(root: string, command: StoppedDaemonTelegr
   ].join('\n');
 }
 
-/** Keeps credential publication and diagnostic getUpdates exclusive with the exact root owner. */
-export async function withStoppedDaemonForTelegram<T>(
-  loaded: Awaited<ReturnType<typeof loadConfig>>,
-  command: StoppedDaemonTelegramCommand,
+function stoppedDaemonRecoveryRunbook(root: string): string {
+  const quotedRoot = shellQuotedStateRoot(root);
+  const commandContext = recoveryCommandContextForRoot(root);
+  return [
+    'The OpenMurmur daemon must be stopped before mutating crash recovery.',
+    ...(quotedRoot === null
+      ? [
+          'The state root is not safe to print. Set OPENMURMUR_STATE_ROOT to its exact value',
+          'outside this terminal, then use the placeholder below.',
+        ]
+      : []),
+    'Run from the repository checkout:',
+    `  ${openMurmurRecoveryCommand(commandContext, 'stop')}`,
+    `  ${openMurmurRecoveryCommand(commandContext, 'recover --yes')}`,
+    `  ${openMurmurRecoveryCommand(commandContext, 'start')}`,
+  ].join('\n');
+}
+
+async function withStoppedDaemonMaintenance<T>(
+  loaded: LoadedConfig,
+  purpose: DaemonMaintenancePurpose,
+  daemonRunningError: string,
   action: (db: DatabaseSync) => Promise<T>,
   maintenanceDependencies: Parameters<typeof claimDaemonMaintenance>[3] = {},
 ): Promise<T> {
@@ -1252,19 +1280,20 @@ export async function withStoppedDaemonForTelegram<T>(
   try {
     claim = await claimDaemonMaintenance(db.handle, loaded.paths.pidFile, loaded.paths.root, {
       ...maintenanceDependencies,
-      daemonRunningError: stoppedDaemonTelegramRunbook(loaded.paths.root, command),
+      purpose,
+      daemonRunningError,
     });
     assertCurrentDaemonMaintenance(db.handle, claim);
     const renew = () => {
       if (claim === null) return;
       try {
         if (!renewDaemonMaintenance(db.handle, claim)) {
-          renewalFailure = new Error('exclusive Telegram maintenance ownership was lost');
+          renewalFailure = new Error(`exclusive ${purpose} maintenance ownership was lost`);
         } else {
           renewalFailure = null;
         }
       } catch (error) {
-        renewalFailure = new Error('could not renew exclusive Telegram maintenance ownership', {
+        renewalFailure = new Error(`could not renew exclusive ${purpose} maintenance ownership`, {
           cause: error,
         });
       }
@@ -1286,6 +1315,37 @@ export async function withStoppedDaemonForTelegram<T>(
     if (claim !== null) await releaseDaemonMaintenance(db.handle, loaded.paths.pidFile, claim);
     db.close();
   }
+}
+
+/** Keeps credential publication and diagnostic getUpdates exclusive with the exact root owner. */
+export async function withStoppedDaemonForTelegram<T>(
+  loaded: LoadedConfig,
+  command: StoppedDaemonTelegramCommand,
+  action: (db: DatabaseSync) => Promise<T>,
+  maintenanceDependencies: Parameters<typeof claimDaemonMaintenance>[3] = {},
+): Promise<T> {
+  return withStoppedDaemonMaintenance(
+    loaded,
+    'telegram',
+    stoppedDaemonTelegramRunbook(loaded.paths.root, command),
+    action,
+    maintenanceDependencies,
+  );
+}
+
+/** Serializes database/file repair with daemon startup and Telegram maintenance. */
+export async function withStoppedDaemonForRecovery<T>(
+  loaded: LoadedConfig,
+  action: (db: DatabaseSync) => Promise<T>,
+  maintenanceDependencies: Parameters<typeof claimDaemonMaintenance>[3] = {},
+): Promise<T> {
+  return withStoppedDaemonMaintenance(
+    loaded,
+    'recovery',
+    stoppedDaemonRecoveryRunbook(loaded.paths.root),
+    action,
+    maintenanceDependencies,
+  );
 }
 
 function writeRemoteReconciliationReport(
