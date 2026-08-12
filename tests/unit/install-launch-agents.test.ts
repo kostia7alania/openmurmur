@@ -9,6 +9,8 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -456,6 +458,164 @@ describe('launch agent installation check', () => {
       }
     } finally {
       rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects linked install roots and preserves a concurrent replacement on rollback', () => {
+    const linkedHome = makeHome('om-launchd-linked-root-');
+    const swappedHome = makeHome('om-launchd-swapped-root-');
+    const replacementHome = makeHome('om-launchd-replacement-');
+    try {
+      const linkedState = join(linkedHome, 'state');
+      const linkedLibrary = join(linkedHome, 'Library');
+      const redirectedAgents = join(linkedHome, 'redirected-agents');
+      const linkedBin = join(linkedHome, 'bin');
+      const linkedLaunchLog = join(linkedHome, 'launchctl.log');
+      prepareNativeCapture(linkedHome, linkedState);
+      mkdirSync(linkedLibrary);
+      mkdirSync(redirectedAgents);
+      mkdirSync(linkedBin);
+      symlinkSync(redirectedAgents, join(linkedLibrary, 'LaunchAgents'));
+      writeFileSync(
+        join(linkedBin, 'launchctl'),
+        [
+          '#!/bin/sh',
+          `printf '%s\n' "$*" >> ${JSON.stringify(linkedLaunchLog)}`,
+          'exit 1',
+          '',
+        ].join('\n'),
+        { mode: 0o700 },
+      );
+
+      const linked = spawnSync(
+        'bash',
+        [INSTALLER, '--check', '--node', process.execPath, '--root', linkedState],
+        {
+          cwd: REPO,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            HOME: linkedHome,
+            PATH: `${linkedBin}:${process.env['PATH'] ?? ''}`,
+          },
+        },
+      );
+      assert.equal(linked.status, 1, `${linked.stdout}\n${linked.stderr}`);
+      assert.match(linked.stderr, /LaunchAgents.*symlink/);
+      assert.equal(existsSync(linkedLaunchLog), false, 'linked roots must fail before launchctl');
+      assert.deepEqual(readdirSync(redirectedAgents), [], 'linked roots must receive no writes');
+
+      const swappedState = join(swappedHome, 'state');
+      renderInstalledPlists(swappedHome, swappedState);
+      const swappedAgents = join(swappedHome, 'Library', 'LaunchAgents');
+      const movedAgents = join(swappedHome, 'Library', 'LaunchAgents.moved');
+      const swappedBin = join(swappedHome, 'check-bin');
+      mkdirSync(swappedBin, { recursive: true });
+      writeFileSync(
+        join(swappedBin, 'mktemp'),
+        [
+          '#!/bin/sh',
+          `if [ "\${2##*/}" = "openmurmur-launchd-check.XXXXXX" ] && [ -d ${JSON.stringify(swappedAgents)} ] && [ ! -L ${JSON.stringify(swappedAgents)} ]; then`,
+          `  /bin/mv ${JSON.stringify(swappedAgents)} ${JSON.stringify(movedAgents)}`,
+          `  /bin/ln -s ${JSON.stringify(movedAgents)} ${JSON.stringify(swappedAgents)}`,
+          'fi',
+          'exec /usr/bin/mktemp "$@"',
+          '',
+        ].join('\n'),
+        { mode: 0o700 },
+      );
+      const swapped = runCheck(swappedHome, swappedState);
+      assert.equal(swapped.status, 1, `${swapped.stdout}\n${swapped.stderr}`);
+      assert.match(swapped.stderr, /LaunchAgents changed before inspection/);
+      assert.equal(realpathSync(swappedAgents), movedAgents);
+      for (const name of PLISTS) {
+        assert.equal(readFileSync(join(movedAgents, name), 'utf8').length > 0, true);
+      }
+
+      const replacementState = join(replacementHome, 'state');
+      renderInstalledPlists(replacementHome, replacementState);
+      const agents = join(replacementHome, 'Library', 'LaunchAgents');
+      const daemon = join(agents, PLISTS[0]);
+      chmodSync(daemon, 0o640);
+      const previous = new Map(
+        PLISTS.map((name) => [name, readFileSync(join(agents, name), 'utf8')] as const),
+      );
+      const previousDaemonIdentity = statSync(daemon).ino;
+      const mocks = prepareLaunchctlHealthMocks(replacementHome, {
+        daemon: 'running',
+        pid: 123,
+        heartbeatStatus: 'fresh',
+        recorderRunning: true,
+        lastSourceFrameAgeMs: 12,
+      });
+      const concurrent = join(replacementHome, 'concurrent-daemon.plist');
+      const replaceMarker = join(replacementHome, 'replace-after-publish');
+      writeFileSync(concurrent, 'concurrent replacement\n', { mode: 0o600 });
+      writeFileSync(replaceMarker, 'replace\n');
+
+      writeFileSync(
+        join(mocks.bin, 'mv'),
+        [
+          '#!/bin/sh',
+          `if [ "$1" = ${JSON.stringify(daemon)} ] && [ -f ${JSON.stringify(replaceMarker)} ]; then`,
+          '  /bin/mv "$@" || exit $?',
+          `  /bin/mv ${JSON.stringify(concurrent)} "$1"`,
+          `  /bin/rm -f ${JSON.stringify(replaceMarker)}`,
+          '  exit 0',
+          'fi',
+          'exec /bin/mv "$@"',
+          '',
+        ].join('\n'),
+        { mode: 0o700 },
+      );
+
+      const replaced = spawnSync(
+        'bash',
+        [INSTALLER, '--yes', '--node', mocks.node, '--root', replacementState],
+        {
+          cwd: REPO,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            HOME: replacementHome,
+            PATH: `${mocks.bin}:${process.env['PATH'] ?? ''}`,
+          },
+        },
+      );
+      assert.equal(replaced.status, 1, `${replaced.stdout}\n${replaced.stderr}`);
+      assert.match(replaced.stderr, /Could not publish the rendered plists/);
+      for (const [name, content] of previous) {
+        assert.equal(readFileSync(join(agents, name), 'utf8'), content, `${name} was not restored`);
+        assert.equal(
+          readFileSync(join(replacementHome, 'launch-state', name.replace(/\.plist$/, '')), 'utf8'),
+          'loaded\n',
+        );
+      }
+      assert.equal(
+        statSync(daemon).ino,
+        previousDaemonIdentity,
+        'rollback lost the original inode',
+      );
+      assert.equal(statSync(daemon).mode & 0o777, 0o640, 'rollback changed the original mode');
+      const evidence = readdirSync(agents).filter((name) =>
+        name.startsWith('.openmurmur-install.'),
+      );
+      assert.equal(evidence.length, 1);
+      assert.equal(
+        readFileSync(join(agents, evidence[0] ?? '', `${PLISTS[0]}.conflict`), 'utf8'),
+        'concurrent replacement\n',
+      );
+      assert.deepEqual(
+        readdirSync(agents).filter(
+          (name) => name.includes('.plist.openmurmur.') || name.endsWith('.plist.restore'),
+        ),
+        [],
+        'installer exposed a predictable public staging path',
+      );
+    } finally {
+      rmSync(linkedHome, { recursive: true, force: true });
+      rmSync(swappedHome, { recursive: true, force: true });
+      rmSync(replacementHome, { recursive: true, force: true });
     }
   });
 

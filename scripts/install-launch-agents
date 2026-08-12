@@ -10,6 +10,15 @@ REPO="$(pwd -P)"
 AGENTS="$HOME/Library/LaunchAgents"
 SERVICE_DOMAIN="gui/$(id -u)"
 RUNTIME_CONTRACT="$REPO/runtime-requirements.json"
+NAMES=(
+  "io.openmurmur.daemon.plist"
+  "io.openmurmur.digest.plist"
+)
+TEMPLATES=(
+  "launchd/io.openmurmur.daemon.plist.example"
+  "launchd/io.openmurmur.digest.plist.example"
+)
+ROOT_ARGUMENT_INDEXES=(4 5)
 
 CHECK_ONLY=false
 REQUESTED_NODE=""
@@ -19,6 +28,84 @@ bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 ok()   { printf '\033[32m✓ %s\033[0m\n' "$1"; }
 fail() { printf '\033[31m✗ %s\033[0m\n' "$1" >&2; }
 die()  { fail "$1"; exit 1; }
+
+require_physical_directory() {
+  local path="$1"
+  local description="$2"
+  local physical
+
+  [ -d "$path" ] && [ ! -L "$path" ] || \
+    die "$description is missing, not a directory, or is a symlink: $path"
+  physical="$(cd "$path" && pwd -P)"
+  [ "$physical" = "$path" ] || \
+    die "$description is not its canonical physical path: $path"
+}
+
+directory_identity() {
+  /usr/bin/stat -f '%d:%i' "$1" 2>/dev/null
+}
+
+file_identity() {
+  /usr/bin/stat -f '%d:%i' "$1" 2>/dev/null
+}
+
+file_sha256() {
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+file_mode() {
+  /usr/bin/stat -f '%Lp' "$1" 2>/dev/null
+}
+
+AGENTS_PRESENT=false
+AGENTS_ID=""
+
+inspect_agents_boundary() {
+  local name
+
+  require_physical_directory "$HOME" "HOME"
+  if [ -e "$HOME/Library" ] || [ -L "$HOME/Library" ]; then
+    require_physical_directory "$HOME/Library" "HOME/Library"
+  fi
+
+  AGENTS_PRESENT=false
+  AGENTS_ID=""
+  if [ -e "$AGENTS" ] || [ -L "$AGENTS" ]; then
+    require_physical_directory "$AGENTS" "HOME/Library/LaunchAgents"
+    AGENTS_ID="$(directory_identity "$AGENTS")"
+    [ -n "$AGENTS_ID" ] || die "Could not identify HOME/Library/LaunchAgents."
+    AGENTS_PRESENT=true
+    for name in "${NAMES[@]}"; do
+      if [ -L "$AGENTS/$name" ] || \
+        { [ -e "$AGENTS/$name" ] && [ ! -f "$AGENTS/$name" ]; }; then
+        die "Refusing an unsafe launch agent path: $AGENTS/$name"
+      fi
+    done
+  fi
+}
+
+create_agents_directory() {
+  if [ ! -e "$HOME/Library" ] && [ ! -L "$HOME/Library" ]; then
+    mkdir -m 0700 "$HOME/Library" || die "Could not create HOME/Library."
+  fi
+  require_physical_directory "$HOME/Library" "HOME/Library"
+
+  if [ ! -e "$AGENTS" ] && [ ! -L "$AGENTS" ]; then
+    mkdir -m 0700 "$AGENTS" || die "Could not create HOME/Library/LaunchAgents."
+  fi
+  require_physical_directory "$AGENTS" "HOME/Library/LaunchAgents"
+  AGENTS_ID="$(directory_identity "$AGENTS")"
+  [ -n "$AGENTS_ID" ] || die "Could not identify HOME/Library/LaunchAgents."
+  AGENTS_PRESENT=true
+}
+
+agents_directory_unchanged() {
+  local physical
+
+  [ "$AGENTS_PRESENT" = true ] && [ -d "$AGENTS" ] && [ ! -L "$AGENTS" ] || return 1
+  physical="$(cd "$AGENTS" 2>/dev/null && pwd -P)" || return 1
+  [ "$physical" = "$AGENTS" ] && [ "$(directory_identity "$AGENTS")" = "$AGENTS_ID" ]
+}
 
 usage() {
   cat <<'USAGE'
@@ -213,33 +300,77 @@ if [ "$CAPTURE_BACKEND" != "native" ]; then
   die "launchd background recording requires audio.captureBackend=\"native\". The effective backend is ffmpeg; run in the foreground instead: pnpm openmurmur start --root \"$STATE_ROOT\""
 fi
 
-if ! "$REPO/scripts/install-capture-app" --check; then
+CAPTURE_CHECK_OUTPUT=""
+if ! CAPTURE_CHECK_OUTPUT="$("$REPO/scripts/install-capture-app" --check 2>&1)"; then
+  if [ -n "$CAPTURE_CHECK_OUTPUT" ]; then printf '%s\n' "$CAPTURE_CHECK_OUTPUT" >&2; fi
   die "Native capture app preflight failed. Install and explicitly authorize the stable app, then run ./scripts/install-capture-app --check."
 fi
+if [ -n "$CAPTURE_CHECK_OUTPUT" ]; then printf '%s\n' "$CAPTURE_CHECK_OUTPUT"; fi
 ok "native capture app is signed, current and authorized"
 
-TMP_BASE="${TMPDIR:-/tmp}"
-WORK_DIR="$(mktemp -d "$TMP_BASE/openmurmur-launchd.XXXXXX")"
+inspect_agents_boundary
+
+WORK_DIR=""
+WORK_DIR_ID=""
+WORK_DIR_IS_ADJACENT=false
 PRESERVE_WORK_DIR=false
+MUTATION_STARTED=false
+ROLLBACK_ATTEMPTED=false
+COMPLETED=false
+
+work_directory_unchanged() {
+  local physical
+
+  [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ] && [ ! -L "$WORK_DIR" ] || return 1
+  physical="$(cd "$WORK_DIR" 2>/dev/null && pwd -P)" || return 1
+  [ "$physical" = "$WORK_DIR" ] && [ "$(directory_identity "$WORK_DIR")" = "$WORK_DIR_ID" ]
+}
 
 cleanup_work_dir() {
+  if [ -z "$WORK_DIR" ]; then return; fi
   if [ "$PRESERVE_WORK_DIR" = true ]; then
     fail "Rollback evidence and previous plists were kept at $WORK_DIR."
-  else
-    rm -rf "$WORK_DIR"
+    return
   fi
+  if ! work_directory_unchanged || \
+    { [ "$WORK_DIR_IS_ADJACENT" = true ] && ! agents_directory_unchanged; }; then
+    PRESERVE_WORK_DIR=true
+    fail "Installer evidence was preserved because a directory identity changed: $WORK_DIR"
+    return
+  fi
+  /bin/rm -rf "$WORK_DIR"
 }
-trap cleanup_work_dir EXIT
 
-NAMES=(
-  "io.openmurmur.daemon.plist"
-  "io.openmurmur.digest.plist"
-)
-TEMPLATES=(
-  "launchd/io.openmurmur.daemon.plist.example"
-  "launchd/io.openmurmur.digest.plist.example"
-)
-ROOT_ARGUMENT_INDEXES=(4 5)
+finish_on_exit() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [ "$MUTATION_STARTED" = true ] && \
+    [ "$COMPLETED" != true ] && [ "$ROLLBACK_ATTEMPTED" != true ]; then
+    if ! restore_previous_installation; then status=1; fi
+  fi
+  cleanup_work_dir
+  exit "$status"
+}
+
+if [ "$CHECK_ONLY" = true ]; then
+  TMP_BASE="${TMPDIR:-/tmp}"
+  TMP_BASE="$(cd "$TMP_BASE" && pwd -P)"
+  WORK_DIR="$(mktemp -d "$TMP_BASE/openmurmur-launchd-check.XXXXXX")"
+else
+  create_agents_directory
+  WORK_DIR="$(mktemp -d "$AGENTS/.openmurmur-install.XXXXXX")"
+  WORK_DIR_IS_ADJACENT=true
+fi
+chmod 0700 "$WORK_DIR"
+require_physical_directory "$WORK_DIR" "launch agent installer work directory"
+WORK_DIR_ID="$(directory_identity "$WORK_DIR")"
+[ -n "$WORK_DIR_ID" ] || die "Could not identify the launch agent installer work directory."
+trap finish_on_exit EXIT
+trap 'exit 130' HUP INT TERM
+
+RENDER_SHA256=()
+RENDER_MODE=()
+RENDER_ID=()
 
 render_template() {
   local template="$1"
@@ -272,9 +403,16 @@ NODE
 }
 
 for index in "${!NAMES[@]}"; do
-  render_template "${TEMPLATES[$index]}" "$WORK_DIR/${NAMES[$index]}"
-  plutil -lint "$WORK_DIR/${NAMES[$index]}" >/dev/null || \
+  name="${NAMES[$index]}"
+  work_directory_unchanged || die "The private render directory changed before rendering $name."
+  render_template "${TEMPLATES[$index]}" "$WORK_DIR/$name.rendered"
+  work_directory_unchanged || die "The private render directory changed while rendering $name."
+  plutil -lint "$WORK_DIR/$name.rendered" >/dev/null || \
     die "Rendered plist is invalid: ${NAMES[$index]}"
+  RENDER_SHA256[$index]="$(file_sha256 "$WORK_DIR/$name.rendered")"
+  RENDER_MODE[$index]="$(file_mode "$WORK_DIR/$name.rendered")"
+  RENDER_ID[$index]="$(file_identity "$WORK_DIR/$name.rendered")"
+  work_directory_unchanged || die "The private render directory changed after rendering $name."
 done
 
 installed_value() {
@@ -286,6 +424,11 @@ installed_value() {
 check_installation() {
   local issues=0
   local index name target installed_node installed_root root_index label
+
+  work_directory_unchanged || die "The private check directory changed before inspection."
+  if [ "$AGENTS_PRESENT" = true ]; then
+    agents_directory_unchanged || die "HOME/Library/LaunchAgents changed before inspection."
+  fi
 
   bold "OpenMurmur launch agent check"
   echo "  repo:  $REPO"
@@ -299,7 +442,15 @@ check_installation() {
     root_index="${ROOT_ARGUMENT_INDEXES[$index]}"
     label="${name%.plist}"
 
-    if [ ! -f "$target" ]; then
+    work_directory_unchanged || die "The private check directory changed during inspection."
+    if [ "$AGENTS_PRESENT" = true ]; then
+      agents_directory_unchanged || die "HOME/Library/LaunchAgents changed during inspection."
+    fi
+
+    if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
+      fail "$name is an unsafe linked or non-regular path"
+      issues=$((issues + 1))
+    elif [ ! -f "$target" ]; then
       fail "$name is not installed"
       issues=$((issues + 1))
     else
@@ -315,7 +466,7 @@ check_installation() {
         issues=$((issues + 1))
       fi
 
-      if ! cmp -s "$WORK_DIR/$name" "$target"; then
+      if ! cmp -s "$WORK_DIR/$name.rendered" "$target"; then
         fail "$name template drift"
         issues=$((issues + 1))
       else
@@ -349,28 +500,62 @@ echo "  node:  $NODE_BIN (v$PROBED_NODE_VERSION, SQLite $PROBED_SQLITE_VERSION)"
 echo "  root:  $STATE_ROOT"
 echo
 
-# Everything above this point is read-only apart from the private render directory.
-install -d -m 0700 "$AGENTS" "$STATE_ROOT" "$STATE_ROOT/logs"
+# Everything above this point changed only the private adjacent render directory.
+agents_directory_unchanged || die "HOME/Library/LaunchAgents changed before installation."
+install -d -m 0700 "$STATE_ROOT" "$STATE_ROOT/logs"
 
 EXISTED=()
 WAS_LOADED=()
-SERVICES_TOUCHED=false
+PLIST_ID=()
+PLIST_SHA256=()
+PLIST_MODE=()
 
 for index in "${!NAMES[@]}"; do
   name="${NAMES[$index]}"
   target="$AGENTS/$name"
+  if ! agents_directory_unchanged || ! work_directory_unchanged; then
+    PRESERVE_WORK_DIR=true
+    die "LaunchAgents or the private work directory changed during the installation snapshot."
+  fi
   if [ -f "$target" ]; then
-    cp "$target" "$WORK_DIR/$name.previous"
+    [ ! -L "$target" ] || die "Refusing an unsafe launch agent path: $target"
     EXISTED[$index]=1
+    PLIST_ID[$index]="$(file_identity "$target")"
+    PLIST_SHA256[$index]="$(file_sha256 "$target")"
+    PLIST_MODE[$index]="$(file_mode "$target")"
+    if ! /bin/cp -p "$target" "$WORK_DIR/$name.snapshot" || \
+      ! /bin/ln "$target" "$WORK_DIR/$name.original" || \
+      [ "$(file_identity "$target")" != "${PLIST_ID[$index]}" ] || \
+      [ "$(file_identity "$WORK_DIR/$name.original")" != "${PLIST_ID[$index]}" ] || \
+      [ "$(file_sha256 "$WORK_DIR/$name.snapshot")" != "${PLIST_SHA256[$index]}" ] || \
+      [ "$(file_mode "$WORK_DIR/$name.snapshot")" != "${PLIST_MODE[$index]}" ]; then
+      PRESERVE_WORK_DIR=true
+      die "Launch agent changed while its exact installation snapshot was being saved; inspect $WORK_DIR and $target"
+    fi
   else
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      die "Refusing an unsafe launch agent path: $target"
+    fi
     EXISTED[$index]=0
+    PLIST_ID[$index]=""
+    PLIST_SHA256[$index]=""
+    PLIST_MODE[$index]=""
   fi
   if launchctl print "$SERVICE_DOMAIN/${name%.plist}" >/dev/null 2>&1; then
     WAS_LOADED[$index]=1
+    [ "${EXISTED[$index]}" -eq 1 ] || \
+      die "${name%.plist} is registered but its plist is missing; no service was changed."
   else
     WAS_LOADED[$index]=0
   fi
 done
+
+if ! agents_directory_unchanged || ! work_directory_unchanged; then
+  PRESERVE_WORK_DIR=true
+  die "LaunchAgents or the private work directory changed after the installation snapshot."
+fi
+
+SERVICES_TOUCHED=false
 
 SERVICE_UNREGISTER_ATTEMPTS=100
 SERVICE_UNREGISTER_DELAY_SECONDS=0.1
@@ -386,8 +571,80 @@ wait_until_unregistered() {
   done
 }
 
+original_target_unchanged() {
+  local index="$1"
+  local name="${NAMES[$index]}"
+  local target="$AGENTS/$name"
+
+  if [ "${EXISTED[$index]}" -eq 0 ]; then
+    [ ! -e "$target" ] && [ ! -L "$target" ]
+    return
+  fi
+  [ -f "$target" ] && [ ! -L "$target" ] && \
+    [ "$(file_identity "$target")" = "${PLIST_ID[$index]}" ] && \
+    [ "$(file_sha256 "$target")" = "${PLIST_SHA256[$index]}" ] && \
+    [ "$(file_mode "$target")" = "${PLIST_MODE[$index]}" ]
+}
+
+rendered_target_unchanged() {
+  local index="$1"
+  local target="$AGENTS/${NAMES[$index]}"
+
+  [ -f "$target" ] && [ ! -L "$target" ] && \
+    [ "$(file_identity "$target")" = "${RENDER_ID[$index]}" ] && \
+    [ "$(file_sha256 "$target")" = "${RENDER_SHA256[$index]}" ] && \
+    [ "$(file_mode "$target")" = "${RENDER_MODE[$index]}" ]
+}
+
+all_original_targets_unchanged() {
+  local index
+  agents_directory_unchanged && work_directory_unchanged || return 1
+  for index in "${!NAMES[@]}"; do
+    original_target_unchanged "$index" || return 1
+  done
+}
+
+all_rendered_targets_unchanged() {
+  local index
+  agents_directory_unchanged && work_directory_unchanged || return 1
+  for index in "${!NAMES[@]}"; do
+    rendered_target_unchanged "$index" || return 1
+  done
+}
+
+registration_set_unchanged() {
+  local index label current
+  for index in "${!NAMES[@]}"; do
+    label="${NAMES[$index]%.plist}"
+    if launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+      current=1
+    else
+      current=0
+    fi
+    [ "$current" -eq "${WAS_LOADED[$index]}" ] || return 1
+  done
+}
+
+all_services_absent() {
+  local name label
+  for name in "${NAMES[@]}"; do
+    label="${name%.plist}"
+    if launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then return 1; fi
+  done
+}
+
+all_services_registered() {
+  local name label
+  for name in "${NAMES[@]}"; do
+    label="${name%.plist}"
+    launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1 || return 1
+  done
+}
+
 restore_previous_installation() {
-  local index name target label restored_all=true
+  local index name target label current_loaded displaced current_is_rendered
+  local restored_all=true services_absent=true
+  ROLLBACK_ATTEMPTED=true
   set +e
 
   if [ "$SERVICES_TOUCHED" = true ]; then
@@ -398,32 +655,82 @@ restore_previous_installation() {
         if ! launchctl bootout "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
           fail "Rollback could not unload $label."
           restored_all=false
+          services_absent=false
         fi
       fi
       if ! wait_until_unregistered "$label"; then
         fail "Rollback timed out waiting for $label to leave launchd."
         restored_all=false
+        services_absent=false
       fi
     done
   fi
 
-  for index in "${!NAMES[@]}"; do
-    name="${NAMES[$index]}"
-    target="$AGENTS/$name"
-    if [ "${EXISTED[$index]}" -eq 1 ]; then
-      cp "$WORK_DIR/$name.previous" "$target.restore" && \
-        chmod 0600 "$target.restore" && mv -f "$target.restore" "$target" || restored_all=false
-    else
-      rm -f "$target"
-    fi
-  done
+  if ! agents_directory_unchanged || ! work_directory_unchanged; then
+    fail "Rollback refused a changed LaunchAgents or work-directory identity."
+    restored_all=false
+    PRESERVE_WORK_DIR=true
+  else
+    for index in "${!NAMES[@]}"; do
+      name="${NAMES[$index]}"
+      target="$AGENTS/$name"
 
-  if [ "$SERVICES_TOUCHED" = true ] && [ "$restored_all" = true ]; then
+      if ! agents_directory_unchanged || ! work_directory_unchanged; then
+        fail "Rollback stopped because a directory identity changed."
+        restored_all=false
+        PRESERVE_WORK_DIR=true
+        break
+      fi
+
+      if ! original_target_unchanged "$index"; then
+        if [ -e "$target" ] || [ -L "$target" ]; then
+          current_is_rendered=false
+          if rendered_target_unchanged "$index"; then current_is_rendered=true; fi
+          if [ "$current_is_rendered" = true ]; then
+            displaced="$WORK_DIR/$name.failed"
+          else
+            displaced="$WORK_DIR/$name.conflict"
+            PRESERVE_WORK_DIR=true
+          fi
+          if [ -e "$displaced" ] || [ -L "$displaced" ] || \
+            ! /bin/mv "$target" "$displaced"; then
+            fail "Rollback could not preserve the current path at $target."
+            restored_all=false
+            continue
+          fi
+        fi
+
+        if [ "${EXISTED[$index]}" -eq 1 ]; then
+          if ! agents_directory_unchanged || ! work_directory_unchanged || \
+            [ ! -f "$WORK_DIR/$name.original" ] || \
+            [ -L "$WORK_DIR/$name.original" ] || \
+            [ "$(file_identity "$WORK_DIR/$name.original")" != "${PLIST_ID[$index]}" ] || \
+            [ "$(file_sha256 "$WORK_DIR/$name.original")" != "${PLIST_SHA256[$index]}" ] || \
+            [ "$(file_mode "$WORK_DIR/$name.original")" != "${PLIST_MODE[$index]}" ] || \
+            [ -e "$target" ] || [ -L "$target" ] || \
+            ! /bin/ln "$WORK_DIR/$name.original" "$target"; then
+            fail "Rollback could not restore the exact original $name."
+            restored_all=false
+          fi
+        fi
+      fi
+
+      if [ "${EXISTED[$index]}" -eq 1 ]; then
+        if ! original_target_unchanged "$index"; then restored_all=false; fi
+      elif [ -e "$target" ] || [ -L "$target" ]; then
+        restored_all=false
+      fi
+    done
+  fi
+
+  if [ "$SERVICES_TOUCHED" = true ] && \
+    [ "$services_absent" = true ] && [ "$restored_all" = true ]; then
     for index in "${!NAMES[@]}"; do
       if [ "${WAS_LOADED[$index]}" -eq 1 ]; then
         name="${NAMES[$index]}"
         target="$AGENTS/$name"
-        if launchctl bootstrap "$SERVICE_DOMAIN" "$target" >/dev/null 2>&1; then
+        if agents_directory_unchanged && original_target_unchanged "$index" && \
+          launchctl bootstrap "$SERVICE_DOMAIN" "$target" >/dev/null 2>&1; then
           launchctl print "$SERVICE_DOMAIN/${name%.plist}" >/dev/null 2>&1 || restored_all=false
         else
           restored_all=false
@@ -432,25 +739,69 @@ restore_previous_installation() {
     done
   fi
 
+  for index in "${!NAMES[@]}"; do
+    label="${NAMES[$index]%.plist}"
+    if launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+      current_loaded=1
+    else
+      current_loaded=0
+    fi
+    if [ "$current_loaded" -ne "${WAS_LOADED[$index]}" ]; then restored_all=false; fi
+  done
+
   if [ "$restored_all" != true ]; then
     PRESERVE_WORK_DIR=true
     fail "Automatic rollback was incomplete; inspect $AGENTS and $WORK_DIR before retrying."
+    set -e
+    return 1
   fi
   set -e
+  return 0
 }
 
 publish_rendered_plists() {
-  local index name target staged
+  local index previous name target displaced
+  all_original_targets_unchanged || return 1
+  registration_set_unchanged || return 1
+
   for index in "${!NAMES[@]}"; do
     name="${NAMES[$index]}"
     target="$AGENTS/$name"
-    staged="$target.openmurmur.$$"
-    if ! cp "$WORK_DIR/$name" "$staged" || \
-      ! chmod 0600 "$staged" || ! mv -f "$staged" "$target"; then
-      rm -f "$staged"
-      return 1
+    agents_directory_unchanged && work_directory_unchanged || return 1
+    original_target_unchanged "$index" || return 1
+    for ((previous = 0; previous < index; previous += 1)); do
+      rendered_target_unchanged "$previous" || return 1
+    done
+
+    if [ "${EXISTED[$index]}" -eq 1 ]; then
+      displaced="$WORK_DIR/$name.previous"
+      [ ! -e "$displaced" ] && [ ! -L "$displaced" ] || return 1
+      # A rename may race the preceding proof, but it never destroys the source:
+      # an unexpected inode is retained privately and makes publication fail.
+      mv "$target" "$displaced" || return 1
+      if [ -L "$displaced" ] || [ ! -f "$displaced" ] || \
+        [ "$(file_identity "$displaced")" != "${PLIST_ID[$index]}" ] || \
+        [ "$(file_sha256 "$displaced")" != "${PLIST_SHA256[$index]}" ] || \
+        [ "$(file_mode "$displaced")" != "${PLIST_MODE[$index]}" ]; then
+        if [ ! -e "$WORK_DIR/$name.conflict" ] && [ ! -L "$WORK_DIR/$name.conflict" ]; then
+          /bin/mv "$displaced" "$WORK_DIR/$name.conflict" || true
+        fi
+        PRESERVE_WORK_DIR=true
+        return 1
+      fi
     fi
+
+    agents_directory_unchanged && work_directory_unchanged || return 1
+    # Hard-link publication is an atomic create-if-absent operation on this
+    # adjacent filesystem. A concurrently appeared path is never overwritten.
+    /bin/ln "$WORK_DIR/$name.rendered" "$target" || return 1
+    agents_directory_unchanged && work_directory_unchanged || return 1
+    rendered_target_unchanged "$index" || return 1
   done
+
+  all_rendered_targets_unchanged || return 1
+  registration_set_unchanged || return 1
+  all_rendered_targets_unchanged
 }
 
 DAEMON_HEALTH_ATTEMPTS=20
@@ -509,45 +860,73 @@ NODE
   return 1
 }
 
+MUTATION_STARTED=true
 if ! publish_rendered_plists; then
-  restore_previous_installation
+  restore_previous_installation || true
   die "Could not publish the rendered plists; the previous files were restored."
 fi
 
 SERVICES_TOUCHED=true
 for index in "${!NAMES[@]}"; do
+  if ! all_rendered_targets_unchanged; then
+    restore_previous_installation || true
+    die "Launch agent paths changed before service replacement; the previous installation was restored where possible."
+  fi
   if [ "${WAS_LOADED[$index]}" -eq 1 ]; then
     name="${NAMES[$index]}"
     label="${name%.plist}"
+    if ! launchctl print "$SERVICE_DOMAIN/$label" >/dev/null 2>&1; then
+      restore_previous_installation || true
+      die "$label changed registration state before bootout; the previous installation was restored where possible."
+    fi
     if ! launchctl bootout "$SERVICE_DOMAIN/$label"; then
-      restore_previous_installation
+      restore_previous_installation || true
       die "Could not unload $name; the previous installation was restored."
     fi
     if ! wait_until_unregistered "$label"; then
-      restore_previous_installation
+      restore_previous_installation || true
       die "Timed out waiting for $label to leave launchd after bootout; the previous installation was restored where possible."
     fi
   fi
 done
 
+if ! all_services_absent || ! all_rendered_targets_unchanged; then
+  restore_previous_installation || true
+  die "Launch agent state changed before bootstrap; the previous installation was restored where possible."
+fi
+
 for index in "${!NAMES[@]}"; do
   name="${NAMES[$index]}"
   target="$AGENTS/$name"
+  if ! agents_directory_unchanged || ! rendered_target_unchanged "$index"; then
+    restore_previous_installation || true
+    die "$name changed before bootstrap; the previous installation was restored where possible."
+  fi
   if ! launchctl bootstrap "$SERVICE_DOMAIN" "$target"; then
-    restore_previous_installation
+    restore_previous_installation || true
     die "Could not load $name; the previous installation was restored where possible."
   fi
   if ! launchctl print "$SERVICE_DOMAIN/${name%.plist}" >/dev/null 2>&1; then
-    restore_previous_installation
+    restore_previous_installation || true
     die "launchctl accepted $name but ${name%.plist} is not registered; the previous installation was restored where possible."
   fi
   ok "$name registered"
 done
 
+if ! all_rendered_targets_unchanged; then
+  restore_previous_installation || true
+  die "Installed launch agent paths changed after registration; the previous installation was restored where possible."
+fi
+
 if ! probe_daemon_health; then
-  restore_previous_installation
+  restore_previous_installation || true
   die "Daemon readiness failed after registration: $DAEMON_HEALTH_LAST; the previous installation was restored where possible."
 fi
+if ! all_rendered_targets_unchanged || ! all_services_registered; then
+  restore_previous_installation || true
+  die "Launch agent files or registrations changed before commit; the previous installation was restored where possible."
+fi
+COMPLETED=true
 ok "daemon heartbeat is fresh and audio frames are arriving"
 
 echo
