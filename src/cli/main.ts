@@ -73,6 +73,7 @@ import {
   renderSetupPlan,
   renderTelegramSetupCompletion,
   setupTelegram,
+  type TelegramSetupRole,
 } from './setup.ts';
 import {
   heartbeatFreshForMs,
@@ -89,7 +90,7 @@ Usage: pnpm openmurmur <command> [options]
 
 Setup and diagnostics
   doctor                 Check every dependency. Read-only: changes nothing.
-  setup                  Create directories, config and database (shows a plan first).
+  setup --telegram-role owner|send-only  Create state with one explicit Telegram role.
   setup telegram owner|send-only  Connect a Telegram bot with one explicit input role.
   capture authorize      Inspect native microphone access; request it only when undecided.
   capture test           Record a few seconds and report input levels.
@@ -129,6 +130,7 @@ Options
   --limit N              Maximum search results (default 20).
   --since ISO --until ISO  Restrict search to a time range.
   --language CODE        Force ru, th, en or zh when retrying ASR/incoming audio.
+  --telegram-role ROLE   Set owner or send-only when creating a fresh config.
   --part ID | --session ID  Select delivery reconciliation scope.
   --ack-at UTC --operator ID --evidence TEXT  Exact manual reconciliation proof.
   --delivery-part ID --telegram-message-id N  Exact remote Telegram reconciliation identity.
@@ -149,6 +151,7 @@ async function main(argv: readonly string[]): Promise<number> {
       since: { type: 'string' },
       until: { type: 'string' },
       language: { type: 'string' },
+      'telegram-role': { type: 'string' },
       part: { type: 'string' },
       session: { type: 'string' },
       'delivery-part': { type: 'string' },
@@ -189,7 +192,13 @@ async function main(argv: readonly string[]): Promise<number> {
     }
 
     case 'setup':
-      return setupCommand(loaded, positionals[1], positionals[2], values['yes'] === true);
+      return setupCommand(
+        loaded,
+        positionals[1],
+        positionals[2],
+        typeof values['telegram-role'] === 'string' ? values['telegram-role'] : undefined,
+        values['yes'] === true,
+      );
 
     case 'capture':
       return captureCommand(positionals[1], loaded.config.audio);
@@ -406,19 +415,26 @@ async function recallCommand(
 async function setupCommand(
   loaded: Awaited<ReturnType<typeof loadConfig>>,
   subcommand: string | undefined,
-  telegramRole: string | undefined,
+  positionalTelegramRole: string | undefined,
+  requestedTelegramRole: string | undefined,
   yes: boolean,
 ): Promise<number> {
   if (subcommand === 'telegram') {
-    if (telegramRole !== 'owner' && telegramRole !== 'send-only') {
+    if (requestedTelegramRole !== undefined) {
+      process.stderr.write(
+        '--telegram-role is only for creating the base config; use the positional role here.\n',
+      );
+      return 1;
+    }
+    if (positionalTelegramRole !== 'owner' && positionalTelegramRole !== 'send-only') {
       process.stderr.write('Usage: pnpm openmurmur setup telegram <owner|send-only>\n');
       return 1;
     }
-    const configuredRole = loaded.config.telegram.receiveUpdates ? 'owner' : 'send-only';
-    if (telegramRole !== configuredRole) {
+    const configuredRole = telegramRoleFor(loaded.config.telegram.receiveUpdates);
+    if (positionalTelegramRole !== configuredRole) {
       process.stderr.write(
-        `Telegram setup role is ${telegramRole}, but telegram.receiveUpdates selects ${configuredRole}. ` +
-          `Set it to ${telegramRole === 'owner' ? 'true' : 'false'} and retry.\n`,
+        `Telegram setup role is ${positionalTelegramRole}, but telegram.receiveUpdates selects ${configuredRole}. ` +
+          `Set it to ${positionalTelegramRole === 'owner' ? 'true' : 'false'} and retry.\n`,
       );
       return 1;
     }
@@ -426,15 +442,50 @@ async function setupCommand(
     const result = await setupTelegram(
       loaded.paths,
       loaded.config.telegram.apiBaseUrl,
-      telegramRole,
+      positionalTelegramRole,
       (message) => process.stdout.write(`${message}\n`),
     );
     process.stdout.write(`\n${renderTelegramSetupCompletion(result)}\n`);
     return 0;
   }
 
+  if (subcommand !== undefined || positionalTelegramRole !== undefined) {
+    process.stderr.write(
+      'Usage: pnpm openmurmur setup [--telegram-role owner|send-only] [--yes]\n',
+    );
+    return 1;
+  }
+  if (
+    requestedTelegramRole !== undefined &&
+    requestedTelegramRole !== 'owner' &&
+    requestedTelegramRole !== 'send-only'
+  ) {
+    process.stderr.write('--telegram-role must be owner or send-only.\n');
+    return 1;
+  }
+
   // Every filesystem change is printed before anything is written.
-  const plan = planSetup(loaded.paths, await exists(loaded.paths.configFile));
+  const configExists = await exists(loaded.paths.configFile);
+  if (!configExists && requestedTelegramRole === undefined) {
+    process.stderr.write(
+      'Fresh setup requires --telegram-role owner or --telegram-role send-only. Nothing was changed.\n',
+    );
+    return 1;
+  }
+  const configuredRole = telegramRoleFor(loaded.config.telegram.receiveUpdates);
+  if (
+    configExists &&
+    requestedTelegramRole !== undefined &&
+    requestedTelegramRole !== configuredRole
+  ) {
+    process.stderr.write(
+      `The existing config selects Telegram role ${configuredRole} and setup will not rewrite it. ` +
+        `Edit telegram.receiveUpdates intentionally, then rerun without --telegram-role.\n`,
+    );
+    return 1;
+  }
+  const telegramRole = requestedTelegramRole ?? configuredRole;
+  const plan = planSetup(loaded.paths, configExists, telegramRole);
   process.stdout.write(`${renderSetupPlan(plan)}\n\n`);
   if (!yes && !(await confirm('Proceed? [y/N] '))) {
     process.stdout.write('Cancelled. Nothing was changed.\n');
@@ -442,8 +493,12 @@ async function setupCommand(
   }
 
   await applySetup(loaded.paths, plan);
-  process.stdout.write(`\n${renderSetupCompletion()}\n`);
+  process.stdout.write(`\n${renderSetupCompletion(telegramRole)}\n`);
   return 0;
+}
+
+function telegramRoleFor(receiveUpdates: boolean): TelegramSetupRole {
+  return receiveUpdates ? 'owner' : 'send-only';
 }
 
 async function exists(path: string): Promise<boolean> {

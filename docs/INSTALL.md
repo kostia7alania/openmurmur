@@ -226,11 +226,14 @@ if it is not, run `nvm install && nvm use` and check
 ## 9. Create the state directory
 
 ```bash
-pnpm openmurmur setup
+pnpm openmurmur setup --telegram-role owner
 ```
 
 It prints a plan and does nothing until you confirm. Everything lives in
 `~/Library/Application Support/OpenMurmur` — audio, database, config, logs.
+Use `--telegram-role send-only` on every other Mac sharing the same bot. Setup
+sets this role only while creating a fresh config and never rewrites an existing
+one.
 
 ## 10. Microphone permission
 
@@ -300,9 +303,9 @@ OpenMurmur adds no indicator of its own and does not try to hide that one.
 Message [@BotFather](https://t.me/BotFather), send `/newbot`, follow the
 prompts, and keep the token.
 
-This Mac is the input owner, so first set `telegram.receiveUpdates=true` in
-`openmurmur.json`. Any other Mac sharing the bot must use `setup telegram
-send-only`; exactly one host may receive updates.
+The fresh setup above selected this Mac as the input owner. Any other Mac
+sharing the bot must use both `--telegram-role send-only` during fresh setup and
+`setup telegram send-only`; exactly one host may receive updates.
 
 ```bash
 pnpm openmurmur setup telegram owner

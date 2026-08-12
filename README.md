@@ -111,12 +111,12 @@ pnpm openmurmur doctor
 ```
 
 ```bash
-pnpm openmurmur setup
+pnpm openmurmur setup --telegram-role owner
 ```
 
-On the one Mac that receives bot updates, first set
-`telegram.receiveUpdates=true` in `openmurmur.json`. Other Macs sharing the bot
-must use `send-only`; there must be exactly one input owner.
+This creates the fresh config with `telegram.receiveUpdates=true`. Other Macs
+sharing the bot must instead use `--telegram-role send-only`; there must be
+exactly one input owner. Setup never rewrites an existing config.
 
 ```bash
 pnpm openmurmur setup telegram owner
@@ -369,7 +369,7 @@ able to stop your recorder or delete your data.
 
 ```bash
 pnpm openmurmur doctor              # check every dependency (read-only)
-pnpm openmurmur setup               # create dirs, config, database (shows a plan first)
+pnpm openmurmur setup --telegram-role owner # create fresh owner config and state
 pnpm openmurmur setup telegram owner     # connect the one bot input owner
 pnpm openmurmur setup telegram send-only # connect an output-only host
 pnpm openmurmur capture authorize   # inspect permission; prompt only when undecided

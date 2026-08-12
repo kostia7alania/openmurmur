@@ -5,17 +5,17 @@ it yourself. This document describes exactly what crosses that boundary.
 
 ## Setup
 
-Choose the role before setup. Configuration defaults to send-only, so a second
-host cannot silently start consuming the same bot's updates. On the one input
-owner, set:
+Choose the role while creating the fresh config. Configuration defaults to
+send-only, so a second host cannot silently start consuming the same bot's
+updates. On the one input owner, run:
 
-```json
-{
-  "telegram": {
-    "receiveUpdates": true
-  }
-}
+```bash
+pnpm openmurmur setup --telegram-role owner
 ```
+
+This writes `telegram.receiveUpdates: true` only when the config is first
+created. Setup never rewrites an existing config; an existing host must change
+that field intentionally before rebinding its role.
 
 Then, from the repository checkout, run:
 
@@ -39,8 +39,8 @@ pnpm openmurmur setup telegram owner
    replaced, versioned **macOS Keychain** item (service `io.openmurmur`).
 9. A test message confirms the whole path.
 
-Every other host using that token stays at the default
-`telegram.receiveUpdates: false` and runs:
+Every other host using that token selects `--telegram-role send-only` during
+fresh setup, then runs:
 
 ```bash
 pnpm openmurmur setup telegram send-only

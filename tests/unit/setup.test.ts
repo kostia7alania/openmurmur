@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -41,7 +42,7 @@ function update(
 
 describe('setup completion output', () => {
   it('leads a fresh setup through Telegram to one verifiable ambient session', () => {
-    const output = renderSetupCompletion();
+    const output = renderSetupCompletion('owner');
     const expectedInOrder = [
       'pnpm openmurmur setup telegram owner',
       'pnpm openmurmur capture test',
@@ -56,6 +57,45 @@ describe('setup completion output', () => {
       const index = output.indexOf(text);
       assert.ok(index > previous, `expected "${text}" after the previous onboarding step`);
       previous = index;
+    }
+  });
+
+  it('selects the fresh Telegram role without ever rewriting an existing config', () => {
+    const root = mkdtempSync(join(tmpdir(), 'om-setup-role-'));
+    const configFile = resolvePaths(root).configFile;
+    try {
+      const ambiguous = spawnSync(
+        process.execPath,
+        ['src/cli/main.ts', 'setup', '--yes', '--root', root],
+        { cwd: process.cwd(), encoding: 'utf8' },
+      );
+      assert.equal(ambiguous.status, 1);
+      assert.match(ambiguous.stderr, /Fresh setup requires --telegram-role/);
+      assert.equal(existsSync(configFile), false);
+
+      const created = spawnSync(
+        process.execPath,
+        ['src/cli/main.ts', 'setup', '--telegram-role', 'owner', '--yes', '--root', root],
+        { cwd: process.cwd(), encoding: 'utf8' },
+      );
+      assert.equal(created.status, 0, created.stderr);
+      assert.match(created.stdout, /set Telegram role owner \(telegram\.receiveUpdates=true\)/);
+      assert.match(created.stdout, /pnpm openmurmur setup telegram owner/);
+
+      const original = readFileSync(configFile, 'utf8');
+      const config = JSON.parse(original) as { telegram?: { receiveUpdates?: unknown } };
+      assert.equal(config.telegram?.receiveUpdates, true);
+
+      const refused = spawnSync(
+        process.execPath,
+        ['src/cli/main.ts', 'setup', '--telegram-role', 'send-only', '--yes', '--root', root],
+        { cwd: process.cwd(), encoding: 'utf8' },
+      );
+      assert.equal(refused.status, 1);
+      assert.match(refused.stderr, /existing config selects Telegram role owner/);
+      assert.equal(readFileSync(configFile, 'utf8'), original);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

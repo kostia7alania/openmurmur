@@ -42,11 +42,12 @@ cd openmurmur
   hf download Qwen/Qwen3-ASR-1.7B \
   --include '*.json' --include '*.safetensors' --include '*.txt' --include '*.model'
 pnpm openmurmur doctor
-pnpm openmurmur setup
+pnpm openmurmur setup --telegram-role owner
 ```
 
-На единственном Mac, который принимает update бота, установите
-`telegram.receiveUpdates=true` в `openmurmur.json`, затем продолжайте:
+Эта команда сразу создаёт свежий config с `telegram.receiveUpdates=true`. На
+остальных Mac с тем же ботом используйте `--telegram-role send-only`; setup
+никогда не перезаписывает уже существующий config. Затем продолжайте:
 
 ```bash
 pnpm openmurmur setup telegram owner

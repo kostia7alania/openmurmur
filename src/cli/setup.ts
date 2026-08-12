@@ -1,4 +1,4 @@
-import { type FileHandle, open, unlink, writeFile } from 'node:fs/promises';
+import { type FileHandle, open, unlink } from 'node:fs/promises';
 import process, { stdin, stdout } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import type { DatabaseSync } from 'node:sqlite';
@@ -16,6 +16,7 @@ import {
   telegramBotScope,
 } from '../telegram/keychain.ts';
 import { clearOffset, nextOffsetFor, readOffsetOrZero, writeOffset } from '../telegram/router.ts';
+import { writeTextAtomically } from '../util/atomic-file.ts';
 
 /**
  * Reads a secret without echoing it and without leaving it in shell history.
@@ -76,22 +77,35 @@ export interface SetupPlan {
   readonly configFile: string;
   readonly databaseFile: string;
   readonly willCreateConfig: boolean;
+  readonly telegramRole: TelegramSetupRole;
 }
 
-export function planSetup(paths: Paths, configExists: boolean): SetupPlan {
+export function planSetup(
+  paths: Paths,
+  configExists: boolean,
+  telegramRole: TelegramSetupRole,
+): SetupPlan {
   return {
     directories: managedDirectories(paths),
     configFile: paths.configFile,
     databaseFile: paths.databaseFile,
     willCreateConfig: !configExists,
+    telegramRole,
   };
 }
 
 export function renderSetupPlan(plan: SetupPlan): string {
   const lines = ['pnpm openmurmur setup will make these changes:', ''];
   for (const dir of plan.directories) lines.push(`  create directory  ${dir}`);
-  if (plan.willCreateConfig) lines.push(`  write config      ${plan.configFile}`);
-  else lines.push(`  keep config       ${plan.configFile} (already exists, untouched)`);
+  if (plan.willCreateConfig) {
+    lines.push(`  write config      ${plan.configFile}`);
+    lines.push(
+      `  set Telegram role ${plan.telegramRole} (telegram.receiveUpdates=${plan.telegramRole === 'owner'})`,
+    );
+  } else {
+    lines.push(`  keep config       ${plan.configFile} (already exists, untouched)`);
+    lines.push(`  keep Telegram role ${plan.telegramRole} (from existing config)`);
+  }
   lines.push(`  create database   ${plan.databaseFile}`);
   lines.push('');
   lines.push('It will NOT download models, contact any network service, or touch the Keychain.');
@@ -99,13 +113,17 @@ export function renderSetupPlan(plan: SetupPlan): string {
 }
 
 /** The clone-based install has no global binary, so every next step is runnable as printed. */
-export function renderSetupNextSteps(telegramConfigured: boolean): string {
+export function renderSetupNextSteps(
+  telegramConfigured: boolean,
+  telegramRole?: TelegramSetupRole,
+): string {
   const lines = ['Next, verify the complete foreground path:'];
   let step = 1;
   if (!telegramConfigured) {
-    lines.push(
-      `  ${step}. Choose the one input owner, set telegram.receiveUpdates=true there, then run: pnpm openmurmur setup telegram owner`,
-    );
+    if (telegramRole === undefined) {
+      throw new Error('Telegram role is required before Telegram setup');
+    }
+    lines.push(`  ${step}. Connect Telegram: pnpm openmurmur setup telegram ${telegramRole}`);
     step += 1;
   }
   lines.push(`  ${step}. Verify the microphone: pnpm openmurmur capture test`);
@@ -122,8 +140,15 @@ export function renderSetupNextSteps(telegramConfigured: boolean): string {
 export async function applySetup(paths: Paths, plan: SetupPlan): Promise<void> {
   await ensureDirectories(paths);
   if (plan.willCreateConfig) {
-    await writeFile(paths.configFile, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`, {
-      mode: 0o600,
+    const config = {
+      ...DEFAULT_CONFIG,
+      telegram: {
+        ...DEFAULT_CONFIG.telegram,
+        receiveUpdates: plan.telegramRole === 'owner',
+      },
+    };
+    await writeTextAtomically(paths.configFile, `${JSON.stringify(config, null, 2)}\n`, {
+      replaceExisting: false,
     });
   }
   const db = openDatabase({ file: paths.databaseFile });
@@ -189,8 +214,8 @@ async function withTelegramSetupLock<T>(
   }
 }
 
-export function renderSetupCompletion(): string {
-  return `✅ Setup complete.\n\n${renderSetupNextSteps(false)}`;
+export function renderSetupCompletion(telegramRole: TelegramSetupRole): string {
+  return `✅ Setup complete.\n\n${renderSetupNextSteps(false, telegramRole)}`;
 }
 
 export function renderTelegramSetupCompletion(result: TelegramSetupResult): string {
