@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -70,6 +70,25 @@ function updateWithIdentity(
 }
 
 describe('setup completion output', () => {
+  it('rejects an explicitly empty root before creating state', () => {
+    const workingDirectory = mkdtempSync(join(tmpdir(), 'om-empty-root-'));
+    const cli = join(process.cwd(), 'src', 'cli', 'main.ts');
+    try {
+      const result = spawnSync(
+        process.execPath,
+        [cli, 'setup', '--telegram-role', 'owner', '--yes', '--root', ''],
+        { cwd: workingDirectory, encoding: 'utf8' },
+      );
+
+      assert.equal(result.status, 1);
+      assert.equal(result.stdout, '');
+      assert.equal(result.stderr, '--root must be a non-empty path.\n');
+      assert.deepEqual(readdirSync(workingDirectory), []);
+    } finally {
+      rmSync(workingDirectory, { recursive: true, force: true });
+    }
+  });
+
   it('leads a fresh setup through Telegram to one verifiable ambient session on the exact root', () => {
     const root = "/private/tmp/Open Murmur's state";
     const rootArgument = `'/private/tmp/Open Murmur'"'"'s state'`;

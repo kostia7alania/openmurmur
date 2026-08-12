@@ -83,19 +83,19 @@ value once):
 
 ```bash
 STATE_ROOT="/absolute/path/to/openmurmur-state"
-pnpm openmurmur --root "$STATE_ROOT" stop
-pnpm openmurmur --root "$STATE_ROOT" setup telegram owner
-pnpm openmurmur --root "$STATE_ROOT" start
+pnpm openmurmur --root "${STATE_ROOT:?set exact OpenMurmur state root}" stop
+pnpm openmurmur --root "${STATE_ROOT:?set exact OpenMurmur state root}" setup telegram owner
+pnpm openmurmur --root "${STATE_ROOT:?set exact OpenMurmur state root}" start
 ```
 
 On a send-only host, use
-`pnpm openmurmur --root "$STATE_ROOT" setup telegram send-only` as the middle
+`pnpm openmurmur --root "${STATE_ROOT:?set exact OpenMurmur state root}" setup telegram send-only` as the middle
 command instead.
 
 ```bash
-pnpm openmurmur --root "$STATE_ROOT" stop
-pnpm openmurmur --root "$STATE_ROOT" telegram poll
-pnpm openmurmur --root "$STATE_ROOT" start
+pnpm openmurmur --root "${STATE_ROOT:?set exact OpenMurmur state root}" stop
+pnpm openmurmur --root "${STATE_ROOT:?set exact OpenMurmur state root}" telegram poll
+pnpm openmurmur --root "${STATE_ROOT:?set exact OpenMurmur state root}" start
 ```
 
 Setup and poll hold a renewable local maintenance claim for that exact root.
@@ -119,8 +119,8 @@ command, environment variable, file, log, or evidence bundle.
 2. Run exact-root owner setup:
 
    ```bash
-   pnpm openmurmur --root "$STATE_ROOT" setup --telegram-role owner --yes
-   pnpm openmurmur --root "$STATE_ROOT" setup telegram owner
+   pnpm openmurmur --root "${STATE_ROOT:?set exact disposable state root}" setup --telegram-role owner --yes
+   pnpm openmurmur --root "${STATE_ROOT:?set exact disposable state root}" setup telegram owner
    ```
 
    Send a fresh private `/start`, verify the displayed bot/account/chat ids,
@@ -143,7 +143,7 @@ command, environment variable, file, log, or evidence bundle.
 4. Wait at least two seconds after the baseline metadata snapshot. With the
    exact root still stopped, preserve the disposable config bytes,
    change only `telegram.receiveUpdates` to `false`, then run
-   `pnpm openmurmur --root "$STATE_ROOT" setup telegram send-only`. Enter the
+   `pnpm openmurmur --root "${STATE_ROOT:?set exact disposable state root}" setup telegram send-only`. Enter the
    **same** disposable token and the impossible positive chat id
    `9007199254740991`, confirm, and do not interrupt the command. Accept only a
    nonzero result with the authoritative Bot API `400` / `chat not found`; a

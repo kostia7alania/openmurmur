@@ -152,6 +152,8 @@ Options
   --help, --version
 `;
 
+class CliArgumentError extends Error {}
+
 async function main(argv: readonly string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: [...argv],
@@ -178,6 +180,7 @@ async function main(argv: readonly string[]): Promise<number> {
       version: { type: 'boolean', default: false },
     },
   });
+  const root = selectedStateRoot(values['root']);
 
   if (values['version'] === true) {
     process.stdout.write(`${VERSION}\n`);
@@ -189,7 +192,6 @@ async function main(argv: readonly string[]): Promise<number> {
     return command === undefined ? 1 : 0;
   }
 
-  const root = typeof values['root'] === 'string' ? values['root'] : undefined;
   const loaded = await loadConfig(root);
   const logger = createLogger({
     level: loaded.config.logLevel,
@@ -425,6 +427,12 @@ async function recallCommand(
   } finally {
     db.close();
   }
+}
+
+function selectedStateRoot(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  if (value.trim().length === 0) throw new CliArgumentError('--root must be a non-empty path.');
+  return value;
 }
 
 async function setupCommand(
@@ -1586,7 +1594,7 @@ if (import.meta.main) {
   try {
     process.exitCode = await main(process.argv.slice(2));
   } catch (error) {
-    if (error instanceof ConfigError) {
+    if (error instanceof CliArgumentError || error instanceof ConfigError) {
       process.stderr.write(`${error.message}\n`);
     } else {
       process.stderr.write(`Error: ${(error as Error).message}\n`);
