@@ -19,6 +19,7 @@ import {
   readDaemonPid,
   reconcileIncomingDelivery,
   recordIncomingDownload,
+  recordKeychainAccessAlert,
   releaseDaemonPid,
   releaseInterruptedJob,
   retirePendingAlertDeliveries,
@@ -37,6 +38,7 @@ import {
 } from '../../src/cli/daemon-ownership.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
 import { appendIncomingTranscript, IncomingFileRepository } from '../../src/database/repository.ts';
+import { AlertEvaluator } from '../../src/health/alerts.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
 import { Outbox } from '../../src/telegram/outbox.ts';
 import {
@@ -1079,7 +1081,82 @@ describe('daemon terminal state reconciliation', () => {
     assert.equal(shouldEnqueueHealthAlert('telegram_delivery', 'raised'), false);
     assert.equal(shouldEnqueueHealthAlert('telegram_delivery', 'repeated'), false);
     assert.equal(shouldEnqueueHealthAlert('telegram_delivery', 'cleared'), true);
+    assert.equal(shouldEnqueueHealthAlert('keychain_unavailable', 'raised'), false);
+    assert.equal(shouldEnqueueHealthAlert('keychain_unavailable', 'cleared'), true);
     assert.equal(shouldEnqueueHealthAlert('asr_backlog', 'raised'), true);
+  });
+
+  it('persists a Keychain outage and atomically publishes one safe recovery edge', () => {
+    const now = Date.parse('2026-08-12T10:00:00.000Z');
+    const alerts = new AlertEvaluator(db.handle, { cooldownMinutes: 30, now: () => now });
+    const outbox = new Outbox(db.handle);
+    const unavailable = () =>
+      recordKeychainAccessAlert(db.handle, alerts, outbox, 'unavailable', now);
+
+    assert.equal(unavailable().transition, 'raised');
+    assert.equal(unavailable().transition, 'none');
+    assert.deepEqual(
+      {
+        ...db.handle
+          .prepare(
+            "SELECT active, occurrences FROM alert_state WHERE alert_id = 'keychain_unavailable'",
+          )
+          .get(),
+      },
+      { active: 1, occurrences: 1 },
+    );
+    assert.equal(outbox.pendingCount(), 0, 'an unavailable channel cannot deliver its own warning');
+
+    assert.equal(
+      recordKeychainAccessAlert(db.handle, alerts, outbox, 'available_without_credentials', now)
+        .transition,
+      'cleared',
+    );
+    assert.equal(outbox.pendingCount(), 0, 'missing setup must not emit a stale recovery');
+    assert.equal(unavailable().transition, 'raised');
+
+    db.handle.exec(`
+      CREATE TRIGGER fail_keychain_recovery
+      BEFORE INSERT ON telegram_outbox
+      WHEN NEW.delivery_part_id GLOB 'alert:keychain_unavailable:clear:*'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected Keychain recovery enqueue failure');
+      END;
+    `);
+    assert.throws(
+      () => recordKeychainAccessAlert(db.handle, alerts, outbox, 'available_with_credentials', now),
+      /injected Keychain recovery enqueue failure/,
+    );
+    assert.equal(alerts.isActive('keychain_unavailable'), true, 'failed enqueue rolls back clear');
+    db.handle.exec('DROP TRIGGER fail_keychain_recovery');
+
+    assert.equal(
+      recordKeychainAccessAlert(db.handle, alerts, outbox, 'available_with_credentials', now)
+        .transition,
+      'cleared',
+    );
+    assert.equal(
+      recordKeychainAccessAlert(db.handle, alerts, outbox, 'available_with_credentials', now)
+        .transition,
+      'none',
+    );
+
+    const rows = db.handle
+      .prepare(
+        `SELECT delivery_part_id, payload FROM telegram_outbox
+          WHERE delivery_part_id GLOB 'alert:keychain_unavailable:*'`,
+      )
+      .all() as { delivery_part_id: string; payload: string }[];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.delivery_part_id, `alert:keychain_unavailable:clear:${now}`);
+    assert.deepEqual(JSON.parse(rows[0]?.payload ?? ''), {
+      type: 'text',
+      text: '🟢 Учётные данные Telegram снова доступны из Keychain — возобновляю попытки доставки.',
+    });
+    assert.doesNotMatch(
+      rows[0]?.payload ?? '',
+      /Telegram восстановлен|secret|token|Users|KeychainError/i,
+    );
   });
 
   it('returns shutdown-interrupted work without burning its attempt', () => {

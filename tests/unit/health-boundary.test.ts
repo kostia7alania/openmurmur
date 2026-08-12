@@ -165,6 +165,11 @@ const ALERT_GOLDENS: Readonly<
     raised: '🟡 Доставка в Telegram не работает',
     cleared: '🟢 Доставка в Telegram восстановлена',
   },
+  keychain_unavailable: {
+    raised: '🟡 Учётные данные Telegram недоступны в Keychain',
+    cleared:
+      '🟢 Учётные данные Telegram снова доступны из Keychain — возобновляю попытки доставки.',
+  },
   digest_missing: {
     raised: '🟡 Дневной дайджест не сформирован',
     cleared: '🟢 Дайджест сформирован',

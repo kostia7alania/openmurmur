@@ -20,6 +20,7 @@ export type AlertId =
   | 'asr_backlog'
   | 'dead_jobs'
   | 'telegram_delivery'
+  | 'keychain_unavailable'
   | 'digest_missing';
 
 export interface AlertDecision {
@@ -196,6 +197,10 @@ export function renderAlert(
     telegram_delivery: {
       up: '🟡 Доставка в Telegram не работает',
       down: '🟢 Доставка в Telegram восстановлена',
+    },
+    keychain_unavailable: {
+      up: '🟡 Учётные данные Telegram недоступны в Keychain',
+      down: '🟢 Учётные данные Telegram снова доступны из Keychain — возобновляю попытки доставки.',
     },
     digest_missing: { up: '🟡 Дневной дайджест не сформирован', down: '🟢 Дайджест сформирован' },
   };

@@ -183,7 +183,7 @@ export class Daemon {
   #daemonStartedAt: string | null = null;
   #stopPromise: Promise<void> | null = null;
   #nextSecretsRetryAt = 0;
-  #telegramUnavailable = false;
+  #telegramCredentialsMissing = false;
   #nextLlmReadinessProbeAt = 0;
   #nextAsrReadinessProbeAt = 0;
   #asrReadinessProbe: Promise<void> | null = null;
@@ -1485,54 +1485,66 @@ export class Daemon {
 
   async #ensureTelegramConfigured(force: boolean): Promise<boolean> {
     if (this.#stopping) return false;
-    if (this.#client !== null && this.#chatId !== null) return true;
+    if (this.#client !== null && this.#chatId !== null) {
+      this.#recordKeychainAccess('available_with_credentials');
+      return true;
+    }
     if (!force && Date.now() < this.#nextSecretsRetryAt) return false;
     this.#nextSecretsRetryAt = Date.now() + 60_000;
 
+    let secrets: Awaited<ReturnType<SecretsProvider['load']>>;
     try {
-      const secrets = await (this.#options.secrets ?? keychainProvider).load();
-      if (this.#stopping) return false;
-      if (secrets === null) {
-        if (!this.#telegramUnavailable) {
-          const role = this.#options.loaded.config.telegram.receiveUpdates ? 'owner' : 'send-only';
-          this.#options.logger.warn(
-            `Telegram is not configured; run \`pnpm openmurmur setup telegram ${role}\` from the repository checkout`,
-          );
-        }
-        this.#telegramUnavailable = true;
-        return false;
-      }
-
-      const client = new TelegramClient({
-        token: secrets.token,
-        baseUrl: this.#options.loaded.config.telegram.apiBaseUrl,
-      });
-      this.#client = client;
-      this.#chatId = secrets.chatId;
-      this.#botScope = telegramBotScope(secrets.token);
-      try {
-        await client.setMyCommands(OPENMURMUR_BOT_COMMANDS);
-      } catch (error) {
-        this.#options.logger.warn('could not refresh the Telegram command menu', {
-          error: (error as Error).message,
-        });
-      }
-      if (this.#telegramUnavailable) {
-        this.#enqueueText(
-          '🟢 Доступ к Telegram восстановлен — отправляю накопленные сообщения.',
-          `notice:telegram-access-recovered:${Date.now()}`,
+      secrets = await (this.#options.secrets ?? keychainProvider).load();
+    } catch {
+      const decision = this.#recordKeychainAccess('unavailable');
+      if (decision === null || decision.send) {
+        this.#options.logger.error(
+          'Telegram credentials are unavailable in Keychain; recording continues and delivery will retry',
         );
       }
-      this.#telegramUnavailable = false;
-      return true;
-    } catch (error) {
-      if (!this.#telegramUnavailable) {
-        this.#options.logger.error('could not read the Telegram secrets; recording anyway', {
-          error: (error as Error).message,
-        });
-      }
-      this.#telegramUnavailable = true;
+      this.#telegramCredentialsMissing = false;
       return false;
+    }
+    if (this.#stopping) return false;
+    if (secrets === null) {
+      this.#recordKeychainAccess('available_without_credentials');
+      if (!this.#telegramCredentialsMissing) {
+        const role = this.#options.loaded.config.telegram.receiveUpdates ? 'owner' : 'send-only';
+        this.#options.logger.warn(
+          `Telegram is not configured; run \`pnpm openmurmur setup telegram ${role}\` from the repository checkout`,
+        );
+      }
+      this.#telegramCredentialsMissing = true;
+      return false;
+    }
+
+    const client = new TelegramClient({
+      token: secrets.token,
+      baseUrl: this.#options.loaded.config.telegram.apiBaseUrl,
+    });
+    this.#client = client;
+    this.#chatId = secrets.chatId;
+    this.#botScope = telegramBotScope(secrets.token);
+    this.#recordKeychainAccess('available_with_credentials');
+    try {
+      await client.setMyCommands(OPENMURMUR_BOT_COMMANDS);
+    } catch (error) {
+      this.#options.logger.warn('could not refresh the Telegram command menu', {
+        error: (error as Error).message,
+      });
+    }
+    this.#telegramCredentialsMissing = false;
+    return true;
+  }
+
+  #recordKeychainAccess(access: KeychainAccess) {
+    try {
+      return recordKeychainAccessAlert(this.#db.handle, this.#alerts, this.#outbox, access);
+    } catch (error) {
+      this.#options.logger.warn('could not persist the Telegram Keychain health edge', {
+        error: (error as Error).message,
+      });
+      return null;
     }
   }
 
@@ -1695,7 +1707,41 @@ export function shouldEnqueueHealthAlert(
   // An outage cannot report itself through the unavailable channel. Queueing
   // the warning only makes a stale warning arrive after recovery and can grow
   // the very backlog it describes. The recovery edge remains useful.
-  return alertId !== 'telegram_delivery' || transition === 'cleared';
+  return (
+    (alertId !== 'telegram_delivery' && alertId !== 'keychain_unavailable') ||
+    transition === 'cleared'
+  );
+}
+
+type KeychainAccess =
+  | 'unavailable'
+  | 'available_without_credentials'
+  | 'available_with_credentials';
+
+export function recordKeychainAccessAlert(
+  db: Database['handle'],
+  alerts: AlertEvaluator,
+  outbox: Outbox,
+  access: KeychainAccess,
+  now = Date.now(),
+) {
+  const unavailable = access === 'unavailable';
+  return alerts.evaluate('keychain_unavailable', unavailable, undefined, (decision) => {
+    if (unavailable || access !== 'available_with_credentials' || decision.transition === 'none')
+      return;
+    const alert = renderAlert('keychain_unavailable', decision.transition, '', now);
+    retirePendingAlertDeliveries(
+      db,
+      'keychain_unavailable',
+      'superseded by recovered Keychain access',
+    );
+    outbox.enqueue({
+      deliveryPartId: alert.deliveryPartId,
+      kind: 'alert',
+      ordinal: 5,
+      payload: { type: 'text', text: alert.text },
+    });
+  });
 }
 
 /** A retry in progress is neither a new failure nor proof of recovery. */

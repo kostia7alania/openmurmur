@@ -843,8 +843,11 @@ offline slice is recorded on the item itself below.
   status; exhausted jobs expose bounded local diagnostics and fingerprinted
   alerts with explicit retry. Recorder/session state is exposed only from a
   fresh heartbeat whose PID and start identity match the live daemon, and
-  doctor checks Telegram setup metadata without reading the token. Full live
-  Keychain/worker/digest recovery evidence is still outstanding, so the item
+  doctor checks Telegram setup metadata without reading the token. A Keychain
+  outage and its recovery are now durable edge state: the unavailable warning
+  stays local, while readable credentials atomically enqueue one bounded clear
+  without claiming that Telegram accepted a request. Full live Keychain,
+  worker, and digest recovery evidence is still outstanding, so the item
   remains yellow.
 
 #### AR-11 ✅ Remove the duplicated session-opening frame
