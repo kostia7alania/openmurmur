@@ -160,16 +160,34 @@ bold "Installing the Python audio worker (CI-safe subset)"
 ok "Python worker ready"
 
 echo
-warn "The MLX ASR stack is NOT installed by default (several GB, needs Metal):"
-echo "    /usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx"
+warn "The required MLX ASR stack and model are NOT installed by default (several GB, needs Metal)."
+cat <<'MLX_STEPS'
+  Before doctor can report local speech readiness, run these foreground commands:
+
+    /usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx
+
+    /usr/bin/env -u UV_PROJECT_ENVIRONMENT \
+      HF_ENDPOINT=https://huggingface.co HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
+      uv run --no-sync --project python/openmurmur_audio \
+      hf download Qwen/Qwen3-ASR-1.7B \
+      --include '*.json' --include '*.safetensors' --include '*.txt' --include '*.model'
+
+  The model download contacts huggingface.co and its storage/CDN hosts, discloses
+  the public model id plus ordinary HTTPS metadata, and stores about 4.4 GiB in
+  the Hugging Face cache. It sends no audio, transcript, or Telegram secret.
+  See docs/INSTALL.md, step 7, and PRIVACY.md for the exact boundary.
+
+  If you skip these commands, doctor is expected to keep mlx_readiness and
+  speech_detection blocking; that is not a completed local runtime.
+MLX_STEPS
 echo
 warn "Ollama is optional. Without it you get audio and transcripts, but no summaries:"
-echo "    brew install ollama && ollama serve && ollama pull qwen3.6:27b"
+echo "    brew install ollama && brew services start ollama && ollama pull qwen3.6:27b"
 echo
 
 bold "Next steps"
 cat <<'STEPS'
-  pnpm openmurmur doctor                            # verify everything
+  pnpm openmurmur doctor                            # verify required local readiness
   pnpm openmurmur setup --telegram-role owner       # fresh input-owner config
   pnpm openmurmur setup telegram owner              # connect the input owner
   # Or, on every output-only sibling, use the matching send-only pair:
