@@ -8,6 +8,7 @@ import {
   claimDaemonPid,
   claimIncomingRequest,
   commandLooksLikeOpenMurmurDaemon,
+  enqueueCaptureFailureNotice,
   enqueueIncomingRequest,
   expectedDigestIsMissing,
   findIncomingFile,
@@ -41,7 +42,9 @@ import { type Database, openDatabase } from '../../src/database/db.ts';
 import { appendIncomingTranscript, IncomingFileRepository } from '../../src/database/repository.ts';
 import { AlertEvaluator } from '../../src/health/alerts.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
-import { Outbox } from '../../src/telegram/outbox.ts';
+import { nullLogger } from '../../src/logging/logger.ts';
+import { TelegramClient } from '../../src/telegram/client.ts';
+import { drainOutbox, Outbox } from '../../src/telegram/outbox.ts';
 import {
   incomingTelegramProvenance,
   renderProvenancePlain,
@@ -1078,6 +1081,87 @@ describe('daemon terminal state reconciliation', () => {
         },
       ],
     );
+  });
+
+  it('preserves one generation-scoped capture failure across restart and delivers it once', async () => {
+    const generation = '2026-08-12T10:20:30.000Z';
+    const deliveryPartId = `capture-failure:${generation}`;
+    const outbox = new Outbox(db.handle);
+
+    assert.equal(enqueueCaptureFailureNotice(outbox, generation, true), true);
+    assert.equal(
+      enqueueCaptureFailureNotice(outbox, generation, true),
+      false,
+      'the same failed capture generation must not create a second chat message',
+    );
+
+    const restartCutoff = new Date(Date.now() + 1000).toISOString();
+    assert.equal(outbox.recoverSending(), 0);
+    assert.equal(retireStaleNotices(db.handle, restartCutoff), 0);
+
+    const pending = db.handle
+      .prepare(
+        `SELECT outbox_id, state, attempts, payload, last_error
+           FROM telegram_outbox WHERE delivery_part_id = ?`,
+      )
+      .get(deliveryPartId) as {
+      outbox_id: string;
+      state: string;
+      attempts: number;
+      payload: string;
+      last_error: string | null;
+    };
+    assert.equal(pending.state, 'pending');
+    assert.equal(pending.attempts, 0);
+    assert.equal(pending.last_error, null);
+    assert.deepEqual(JSON.parse(pending.payload), {
+      type: 'text',
+      text:
+        '🔴 Запись остановлена\n\n' +
+        'Не удалось получать аудио с микрофона.\n' +
+        'Проверьте доступ к микрофону и запустите `pnpm openmurmur doctor` в корне репозитория.\n' +
+        'Технические подробности сохранены в локальном журнале.',
+    });
+    assert.doesNotMatch(pending.payload, /CaptureError|ffmpeg|\/private\//u);
+
+    const requests: string[] = [];
+    const client = new TelegramClient({
+      token: 'test-token',
+      baseUrl: 'https://api.telegram.org',
+      fetchImpl: (async (input: string | URL | Request) => {
+        requests.push(String(input));
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            result: { message_id: 77, date: 0, chat: { id: 42, type: 'private' } },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }) as typeof fetch,
+    });
+    const restartedOutbox = new Outbox(db.handle);
+    const deps = {
+      outbox: restartedOutbox,
+      client,
+      chatId: 42,
+      logger: nullLogger,
+      maxOutgoingBytes: 50 * 1024 * 1024,
+    };
+
+    assert.equal(await drainOutbox(deps), 1);
+    assert.equal(await drainOutbox(deps), 0);
+    assert.equal(requests.length, 1);
+    const sent = db.handle
+      .prepare(
+        `SELECT state, attempts, telegram_message_id
+           FROM telegram_outbox WHERE outbox_id = ?`,
+      )
+      .get(pending.outbox_id) as {
+      state: string;
+      attempts: number;
+      telegram_message_id: number | null;
+    };
+    assert.deepEqual({ ...sent }, { state: 'sent', attempts: 1, telegram_message_id: 77 });
   });
 
   it('coalesces pending alerts and never queues a stale delivery-down warning', () => {

@@ -394,7 +394,8 @@ export class Daemon {
         throw new Error('capture stopped for system sleep; restart required', { cause: error });
       }
       logger.error('capture failed', { error: this.#recorderFailure });
-      await this.#sendNow(renderCaptureFailure(this.#announcedRecording));
+      enqueueCaptureFailureNotice(this.#outbox, this.#daemonStartedAt, this.#announcedRecording);
+      await this.#tickOutbox().catch(() => {});
       throw new Error(`capture failed: ${this.#recorderFailure}`, { cause: error });
     }
   }
@@ -1663,6 +1664,22 @@ export function releaseInterruptedJob(
       now,
     );
   return result.changes === 1;
+}
+
+export function enqueueCaptureFailureNotice(
+  outbox: Outbox,
+  daemonStartedAt: string | null,
+  recordingWasAnnounced: boolean,
+): boolean {
+  return outbox.enqueue({
+    deliveryPartId: `capture-failure:${daemonStartedAt ?? 'unknown-generation'}`,
+    kind: 'status',
+    ordinal: 1,
+    payload: {
+      type: 'text',
+      text: renderCaptureFailure(recordingWasAnnounced),
+    },
+  });
 }
 
 export function retireStaleNotices(
