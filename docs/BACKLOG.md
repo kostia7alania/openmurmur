@@ -298,14 +298,22 @@ dependencies, risk, estimate (S/M/L), release, tests.
   `/health` but do not enqueue warnings into the failed channel itself; one
   recovery edge is sent after the backlog clears. New pending alert states
   supersede older unsent reminders. Exhausted jobs have their own fingerprinted
-  alert instead of being mislabeled as an ASR backlog.
+  alert instead of being mislabeled as an ASR backlog. A terminal capture
+  failure is one durable incident across launchd generations: repeated failed
+  starts do not flood the chat, and only a real source frame can clear it.
 - **Acceptance:** A changing runtime condition produces at most one message per
   cooldown; an unchanged exhausted-job set is reported once, a changed set is
-  reported once, and clearing produces exactly one recovery message.
+  reported once, and clearing produces exactly one recovery message. A failed
+  capture clear cannot commit a separate green notice; the durable transition
+  is retried atomically. Legacy generation-scoped pending capture notices are
+  retired on upgrade rather than replayed as a backlog flood.
 - **Dependencies:** P0-04 · **Risk:** low · **Estimate:** M
-- **Tests:** 8 alert-deduplication tests, including unchanged and changed
-  exhausted-job fingerprints and rollback when durable notification creation
-  fails.
+- **Tests:** Alert-deduplication coverage includes unchanged and changed
+  exhausted-job fingerprints, three failed capture generations collapsing to
+  one red edge, real-frame clear and a later new incident, legacy-row retirement,
+  and rollback when durable clear notification creation fails. D020/D117 remain
+  live until a physical device/TCC/process fault run proves the same behavior
+  through launchd and real Telegram delivery.
 
 ### P0-24 ✅ CI
 
