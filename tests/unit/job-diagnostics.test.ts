@@ -8,8 +8,11 @@ import {
   renderAsrUnavailableDetail,
   renderDeadJobAlert,
   renderLlmUnavailableDetail,
+  TELEGRAM_RECOVERY_COMMAND_CONTEXT,
 } from '../../src/jobs/diagnostics.ts';
 import type { DeadJob } from '../../src/jobs/queue.ts';
+
+const LOCAL_COMMAND_CONTEXT = { stateRootArgument: "'/tmp/openmurmur'" } as const;
 
 function deadJob(overrides: Partial<DeadJob> = {}): DeadJob {
   return {
@@ -26,14 +29,19 @@ function deadJob(overrides: Partial<DeadJob> = {}): DeadJob {
 
 describe('failed job diagnostics', () => {
   it('shows host, job kind, bounded cause, install hint and retry command', () => {
-    const alert = renderDeadJobAlert('prod-mac.local', [deadJob()], 'qwen3.6:27b');
+    const alert = renderDeadJobAlert(
+      'prod-mac.local',
+      [deadJob()],
+      'qwen3.6:27b',
+      LOCAL_COMMAND_CONTEXT,
+    );
 
     assert.equal(alert.active, true);
     assert.match(alert.detail, /Демон: prod-mac\.local/);
     assert.match(alert.detail, /asr — job-1/);
     assert.match(alert.detail, /Локальный ASR\/MLX worker/);
     assert.match(alert.detail, /uv sync --project python\/openmurmur_audio --extra mlx/);
-    assert.match(alert.detail, /pnpm openmurmur jobs retry job-1/);
+    assert.match(alert.detail, /pnpm openmurmur --root '\/tmp\/openmurmur' jobs retry job-1/);
   });
 
   it('suggests the configured Ollama model for a summary failure', () => {
@@ -41,6 +49,7 @@ describe('failed job diagnostics', () => {
       'prod-mac.local',
       [deadJob({ kind: 'summarize', lastError: 'Ollama is not reachable' })],
       'qwen3.6:27b',
+      LOCAL_COMMAND_CONTEXT,
     );
     assert.match(alert.detail, /ollama pull qwen3\.6:27b/);
   });
@@ -57,6 +66,7 @@ describe('failed job diagnostics', () => {
         }),
       ],
       'qwen3.6:27b',
+      LOCAL_COMMAND_CONTEXT,
       { technicalDetails: true },
     );
 
@@ -76,13 +86,18 @@ describe('failed job diagnostics', () => {
       'prod.local',
       [deadJob({ lastError: privateError })],
       'qwen\nrm -rf data',
+      TELEGRAM_RECOVERY_COMMAND_CONTEXT,
     );
     assert.ok(!telegram.detail.includes('/Users/alice'));
     assert.ok(!telegram.detail.includes('rm -rf'));
 
-    const local = renderDeadJobAlert('prod.local', [deadJob({ lastError: privateError })], 'qwen', {
-      technicalDetails: true,
-    });
+    const local = renderDeadJobAlert(
+      'prod.local',
+      [deadJob({ lastError: privateError })],
+      'qwen',
+      LOCAL_COMMAND_CONTEXT,
+      { technicalDetails: true },
+    );
     assert.match(local.detail, /\/Users\/alice\/private/);
   });
 
@@ -94,10 +109,15 @@ describe('failed job diagnostics', () => {
 
   it('gives local repair steps for unavailable ASR and Ollama dependencies', () => {
     assert.match(
-      renderAsrUnavailableDetail('prod.local', 'worker exited'),
+      renderAsrUnavailableDetail('prod.local', 'worker exited', LOCAL_COMMAND_CONTEXT),
       /uv sync --project python\/openmurmur_audio --extra mlx/,
     );
-    const llm = renderLlmUnavailableDetail('prod.local', 'not reachable', 'qwen3.6:27b');
+    const llm = renderLlmUnavailableDetail(
+      'prod.local',
+      'not reachable',
+      'qwen3.6:27b',
+      LOCAL_COMMAND_CONTEXT,
+    );
     assert.match(llm, /Аудио и расшифровки продолжают работать/);
     assert.match(llm, /brew services start ollama/);
     assert.match(llm, /ollama pull qwen3\.6:27b/);

@@ -5,22 +5,30 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { markExhaustedIncomingFile } from '../../src/cli/daemon.ts';
+import { shellQuotedStateRoot } from '../../src/cli/setup.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
 import { appendIncomingTranscript, IncomingFileRepository } from '../../src/database/repository.ts';
+import {
+  renderDeadJobAlert,
+  TELEGRAM_RECOVERY_COMMAND_CONTEXT,
+} from '../../src/jobs/diagnostics.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
 import { Outbox } from '../../src/telegram/outbox.ts';
 
 let root: string;
+let temporaryRoot: string;
 let db: Database;
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'om-cli-jobs-'));
+  temporaryRoot = mkdtempSync(join(tmpdir(), 'om-cli-jobs-'));
+  root = join(temporaryRoot, "state root's files");
+  mkdirSync(root);
   db = openDatabase({ file: join(root, 'openmurmur.db') });
 });
 
 afterEach(() => {
   db.close();
-  rmSync(root, { recursive: true, force: true });
+  rmSync(temporaryRoot, { recursive: true, force: true });
 });
 
 function run(...args: string[]) {
@@ -45,6 +53,7 @@ describe('failed-job CLI recovery', () => {
 
     const listed = run('jobs', 'failed', '--json');
     assert.equal(listed.status, 0, listed.stderr);
+    assert.ok(!listed.stdout.includes(root), 'JSON diagnostics must not add the selected root');
     const payload = JSON.parse(listed.stdout) as {
       hostName: string;
       failedJobs: { jobId: string; kind: string; lastError: string }[];
@@ -157,12 +166,69 @@ describe('failed-job CLI recovery', () => {
     assert.equal(retryClaim.payload['forcedLanguage'], 'Russian');
     assert.deepEqual(retryClaim.payload['message'], message);
 
-    assert.equal(jobs.fail(retryClaim, 'forced ASR failed'), 'dead');
+    assert.equal(
+      jobs.fail(
+        retryClaim,
+        'ASR failed: Japanese tokenization requires optional dependency `nagisa`.',
+      ),
+      'dead',
+    );
     assert.equal(markExhaustedIncomingFile(db.handle, retryClaim.payload), true);
     assert.equal(new Outbox(db.handle).stateOf(`incoming-failed:${incoming.fileUid}`), 'pending');
 
-    const finalRetry = run('jobs', 'retry', claimed.jobId, '--language', 'ru');
-    assert.equal(finalRetry.status, 0, finalRetry.stderr);
+    const telegramAlert = renderDeadJobAlert(
+      'test-mac.local',
+      jobs.deadJobs(),
+      'qwen3.6:latest',
+      TELEGRAM_RECOVERY_COMMAND_CONTEXT,
+    );
+    assert.ok(!telegramAlert.detail.includes(root), 'Telegram must not expose the state root');
+    const recoveryCommands = telegramAlert.detail.split('\n').flatMap((line) => {
+      const start = line.indexOf('pnpm openmurmur ');
+      return start === -1 ? [] : [line.slice(start)];
+    });
+    assert.equal(recoveryCommands.length, 5, 'doctor plus four language retries');
+    assert.ok(
+      recoveryCommands.every((command) =>
+        command.includes(TELEGRAM_RECOVERY_COMMAND_CONTEXT.stateRootArgument),
+      ),
+    );
+    const russianRetry = recoveryCommands.find((command) => command.endsWith('--language ru'));
+    assert.ok(russianRetry);
+
+    const unsetEnvironment = { ...process.env };
+    delete unsetEnvironment['OPENMURMUR_STATE_ROOT'];
+    const unset = spawnSync('/bin/sh', ['-c', russianRetry], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: unsetEnvironment,
+    });
+    assert.notEqual(unset.status, 0);
+    assert.match(unset.stderr, /set exact daemon state root locally/);
+    assert.equal(jobs.deadCount(), 1, 'unset placeholder must fail before the CLI mutates a job');
+
+    const localReport = run('jobs', 'failed');
+    assert.equal(localReport.status, 0, localReport.stderr);
+    const quotedRoot = shellQuotedStateRoot(root);
+    assert.ok(quotedRoot);
+    assert.match(localReport.stdout, new RegExp(`--root ${escapeRegExp(quotedRoot)}`));
+
+    const quotedNode = shellQuotedStateRoot(process.execPath);
+    assert.ok(quotedNode);
+    const productionScriptRetry = [
+      'pnpm() {',
+      '  [ "$1" = openmurmur ] || return 97',
+      '  shift',
+      `  ${quotedNode} src/cli/main.ts "$@"`,
+      '}',
+      russianRetry,
+    ].join('\n');
+    const finalRetry = spawnSync('/bin/sh', ['-c', productionScriptRetry], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: { ...process.env, OPENMURMUR_STATE_ROOT: root },
+    });
+    assert.equal(finalRetry.status, 0, `${finalRetry.stderr}\n${finalRetry.stdout}`);
     const finalClaim = jobs.claim(['incoming_audio']);
     assert.ok(finalClaim);
     assert.equal(finalClaim.payload['forcedLanguage'], 'Russian');
@@ -201,3 +267,7 @@ describe('failed-job CLI recovery', () => {
     );
   });
 });
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}

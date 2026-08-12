@@ -36,7 +36,13 @@ import {
   publishDigestSnapshot,
   readDigestDeliveryPayload,
 } from '../digest/delivery.ts';
-import { compactJobError, renderDeadJobAlert } from '../jobs/diagnostics.ts';
+import {
+  compactJobError,
+  openMurmurRecoveryCommand,
+  type RecoveryCommandContext,
+  renderDeadJobAlert,
+  TELEGRAM_RECOVERY_COMMAND_CONTEXT,
+} from '../jobs/diagnostics.ts';
 import { canRetryDeadJob, JobQueue } from '../jobs/queue.ts';
 import { createLogger } from '../logging/logger.ts';
 import { applyRetention, planRetention } from '../retention/policy.ts';
@@ -774,6 +780,7 @@ async function localStatus(
   loaded: Awaited<ReturnType<typeof loadConfig>>,
   asJson: boolean,
 ): Promise<number> {
+  const commandContext = localRecoveryCommandContext(loaded.paths.root);
   const db = openDatabase({ file: loaded.paths.databaseFile });
   try {
     const daemon = await inspectDaemonControl(db.handle, loaded.paths.pidFile, loaded.paths.root);
@@ -808,7 +815,9 @@ async function localStatus(
         `Sessions:          ${counts.sessions} (${counts.done} delivered, ${counts.rejected} rejected)`,
         `Audio parts on disk: ${counts.parts}`,
         ...renderQueueStatus(counts, join(loaded.paths.logsDir, 'openmurmur.ndjson')),
-        ...(counts.jobsDead > 0 ? ['Failed job details: pnpm openmurmur jobs failed'] : []),
+        ...(counts.jobsDead > 0
+          ? [`Failed job details: ${openMurmurRecoveryCommand(commandContext, 'jobs failed')}`]
+          : []),
         `SQLite:            ${db.sqliteVersion}`,
         '',
       ].join('\n'),
@@ -817,6 +826,11 @@ async function localStatus(
   } finally {
     db.close();
   }
+}
+
+function localRecoveryCommandContext(root: string): RecoveryCommandContext {
+  const stateRootArgument = shellQuotedStateRoot(root);
+  return stateRootArgument === null ? TELEGRAM_RECOVERY_COMMAND_CONTEXT : { stateRootArgument };
 }
 
 function jobsCommand(
@@ -834,6 +848,7 @@ function jobsCommand(
   const db = openDatabase({ file: loaded.paths.databaseFile });
   try {
     const jobs = new JobQueue(db.handle);
+    const commandContext = localRecoveryCommandContext(loaded.paths.root);
     if (subcommand === 'failed') {
       if (languageOption !== undefined) {
         process.stderr.write('--language is only valid with jobs retry JOB_ID.\n');
@@ -859,19 +874,21 @@ function jobsCommand(
       } else {
         process.stdout.write(
           `${
-            renderDeadJobAlert(hostname(), failed, loaded.config.llm.model, {
+            renderDeadJobAlert(hostname(), failed, loaded.config.llm.model, commandContext, {
               technicalDetails: true,
             }).detail
           }\n`,
         );
         for (const job of failed.slice(1).filter((candidate) => canRetryDeadJob(candidate.kind))) {
-          process.stdout.write(`Retry ${job.kind}: pnpm openmurmur jobs retry ${job.jobId}\n`);
+          process.stdout.write(
+            `Retry ${job.kind}: ${openMurmurRecoveryCommand(commandContext, `jobs retry ${job.jobId}`)}\n`,
+          );
         }
       }
       return 0;
     }
 
-    return retryDeadJob(jobs, jobId, languageOption, asJson);
+    return retryDeadJob(jobs, jobId, languageOption, asJson, commandContext);
   } finally {
     db.close();
   }
@@ -993,6 +1010,7 @@ function retryDeadJob(
   jobId: string | undefined,
   languageOption: unknown,
   asJson: boolean,
+  commandContext: RecoveryCommandContext,
 ): number {
   if (jobId === undefined) {
     process.stderr.write('Usage: pnpm openmurmur jobs retry JOB_ID [--language ru|th|en|zh]\n');
@@ -1012,7 +1030,8 @@ function retryDeadJob(
   }
   if (outcome === 'unsupported') {
     process.stderr.write(
-      `Failed job ${jobId} has no daemon worker and cannot be retried. Run: pnpm openmurmur doctor\n`,
+      `Failed job ${jobId} has no daemon worker and cannot be retried. ` +
+        `Run: ${openMurmurRecoveryCommand(commandContext, 'doctor')}\n`,
     );
     return 1;
   }

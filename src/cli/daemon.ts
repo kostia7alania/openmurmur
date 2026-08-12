@@ -52,6 +52,7 @@ import {
   renderAsrUnavailableDetail,
   renderDeadJobAlert,
   renderLlmUnavailableDetail,
+  TELEGRAM_RECOVERY_COMMAND_CONTEXT,
 } from '../jobs/diagnostics.ts';
 import { handleJob, markAudioDelivered, reconcileSessionDelivery } from '../jobs/pipeline.ts';
 import { type ClaimedJob, type JobKind, JobLeaseLostError, JobQueue } from '../jobs/queue.ts';
@@ -1189,7 +1190,12 @@ export class Daemon {
       activeSessionMs: snapshot.sessionStartedMonotonicMs,
       asrBacklogMinutes: this.#jobs.oldestPendingAgeMinutes('asr'),
       deadJobs: deadJobs.length,
-      deadJobAlert: renderDeadJobAlert(hostname(), deadJobs, config.llm.model),
+      deadJobAlert: renderDeadJobAlert(
+        hostname(),
+        deadJobs,
+        config.llm.model,
+        TELEGRAM_RECOVERY_COMMAND_CONTEXT,
+      ),
       outboxAgeMinutes: this.#outbox.oldestPendingAgeMinutes(),
       deadOutbox: this.#outbox.deadCount(),
       diskFreeGb: await diskFreeGb(paths.root),
@@ -1235,14 +1241,23 @@ export class Daemon {
             {
               id: 'worker_crashed' as const,
               active: workerAlertActive,
-              detail: renderAsrUnavailableDetail(hostname(), inputs.workerDetail),
+              detail: renderAsrUnavailableDetail(
+                hostname(),
+                inputs.workerDetail,
+                TELEGRAM_RECOVERY_COMMAND_CONTEXT,
+              ),
               fingerprint: inputs.workerReady ? '' : `asr:${failureCategory(inputs.workerDetail)}`,
             },
           ]),
       {
         id: 'llm_unavailable',
         active: !inputs.ollamaReady,
-        detail: renderLlmUnavailableDetail(hostname(), inputs.ollamaDetail, config.llm.model),
+        detail: renderLlmUnavailableDetail(
+          hostname(),
+          inputs.ollamaDetail,
+          config.llm.model,
+          TELEGRAM_RECOVERY_COMMAND_CONTEXT,
+        ),
         fingerprint: inputs.ollamaReady
           ? ''
           : `ollama:${config.llm.model}:${failureCategory(inputs.ollamaDetail)}`,

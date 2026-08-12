@@ -24,6 +24,23 @@ export interface DeadJobAlert {
   readonly detail: string;
 }
 
+export interface RecoveryCommandContext {
+  /** One already shell-safe argument following `--root`. */
+  readonly stateRootArgument: string;
+  /** Optional operator instruction shown before copyable commands. */
+  readonly instruction?: string;
+}
+
+export const TELEGRAM_RECOVERY_COMMAND_CONTEXT: RecoveryCommandContext = {
+  stateRootArgument: `"\${OPENMURMUR_STATE_ROOT:?set exact daemon state root locally}"`,
+  instruction:
+    'Локально задай OPENMURMUR_STATE_ROOT равным точному state root этого демона; путь не отправляется в Telegram.',
+};
+
+export function openMurmurRecoveryCommand(context: RecoveryCommandContext, args: string): string {
+  return `pnpm openmurmur --root ${context.stateRootArgument} ${args}`;
+}
+
 export function deadJobFingerprint(jobs: readonly DeadJob[]): string {
   if (jobs.length === 0) return '';
   const identity = jobs
@@ -87,6 +104,7 @@ export function renderDeadJobAlert(
   hostName: string,
   jobs: readonly DeadJob[],
   llmModel: string,
+  commandContext: RecoveryCommandContext,
   options: { readonly technicalDetails?: boolean } = {},
 ): DeadJobAlert {
   if (jobs.length === 0) return { active: false, fingerprint: '', detail: '' };
@@ -116,7 +134,9 @@ export function renderDeadJobAlert(
       failureCategory(job.lastError) === 'asr_dependency' &&
       (job.lastError === null || !OPTIONAL_TOKENIZER_FAILURE.test(job.lastError)),
   );
-  lines.push('', 'Что сделать на этом Mac:', '1. pnpm openmurmur doctor');
+  lines.push('', 'Что сделать на этом Mac:');
+  if (commandContext.instruction !== undefined) lines.push(commandContext.instruction);
+  lines.push(`1. ${openMurmurRecoveryCommand(commandContext, 'doctor')}`);
   if (hasGeneralAsrFailure) {
     lines.push(
       '   Если ASR/MLX не установлен: /usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx',
@@ -126,23 +146,23 @@ export function renderDeadJobAlert(
     lines.push(
       '   Если Ollama не установлен: brew install ollama',
       '   Если Ollama не запущен: brew services start ollama',
-      `   ${ollamaPullInstruction(llmModel)}`,
+      `   ${ollamaPullInstruction(llmModel, commandContext)}`,
     );
   }
   if (optionalTokenizerJob !== undefined) {
     lines.push(
       '2. Auto дошёл до необязательного токенизатора. Повтори задачу с фактическим языком аудио:',
-      `   Русский: pnpm openmurmur jobs retry ${optionalTokenizerJob.jobId} --language ru`,
-      `   Тайский: pnpm openmurmur jobs retry ${optionalTokenizerJob.jobId} --language th`,
-      `   English: pnpm openmurmur jobs retry ${optionalTokenizerJob.jobId} --language en`,
-      `   中文: pnpm openmurmur jobs retry ${optionalTokenizerJob.jobId} --language zh`,
+      `   Русский: ${openMurmurRecoveryCommand(commandContext, `jobs retry ${optionalTokenizerJob.jobId} --language ru`)}`,
+      `   Тайский: ${openMurmurRecoveryCommand(commandContext, `jobs retry ${optionalTokenizerJob.jobId} --language th`)}`,
+      `   English: ${openMurmurRecoveryCommand(commandContext, `jobs retry ${optionalTokenizerJob.jobId} --language en`)}`,
+      `   中文: ${openMurmurRecoveryCommand(commandContext, `jobs retry ${optionalTokenizerJob.jobId} --language zh`)}`,
     );
   } else {
     const retryable = jobs.find((job) => canRetryDeadJob(job.kind));
     lines.push(
       retryable === undefined
-        ? '2. Эти legacy-задачи не обслуживаются демоном; обнови OpenMurmur и снова запусти doctor.'
-        : `2. После исправления: pnpm openmurmur jobs retry ${retryable.jobId}`,
+        ? `2. Эти legacy-задачи не обслуживаются демоном; обнови OpenMurmur и снова запусти ${openMurmurRecoveryCommand(commandContext, 'doctor')}.`
+        : `2. После исправления: ${openMurmurRecoveryCommand(commandContext, `jobs retry ${retryable.jobId}`)}`,
     );
   }
 
@@ -153,13 +173,18 @@ export function renderDeadJobAlert(
   };
 }
 
-export function renderAsrUnavailableDetail(hostName: string, reason: string): string {
+export function renderAsrUnavailableDetail(
+  hostName: string,
+  reason: string,
+  commandContext: RecoveryCommandContext,
+): string {
   return [
     `Демон: ${hostName}`,
     `Причина: ${publicJobFailureReason(reason)}`,
     '',
     'Что сделать на этом Mac:',
-    '1. pnpm openmurmur doctor',
+    ...(commandContext.instruction === undefined ? [] : [commandContext.instruction]),
+    `1. ${openMurmurRecoveryCommand(commandContext, 'doctor')}`,
     '2. Если ASR/MLX не установлен: /usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx',
   ].join('\n');
 }
@@ -168,6 +193,7 @@ export function renderLlmUnavailableDetail(
   hostName: string,
   reason: string,
   llmModel: string,
+  commandContext: RecoveryCommandContext,
 ): string {
   return [
     `Демон: ${hostName}`,
@@ -175,15 +201,16 @@ export function renderLlmUnavailableDetail(
     'Аудио и расшифровки продолжают работать; недоступен только структурный отчёт.',
     '',
     'Что сделать на этом Mac:',
-    '1. pnpm openmurmur doctor',
+    ...(commandContext.instruction === undefined ? [] : [commandContext.instruction]),
+    `1. ${openMurmurRecoveryCommand(commandContext, 'doctor')}`,
     '2. Если Ollama не установлен: brew install ollama',
     '3. Если Ollama не запущен: brew services start ollama',
-    `4. ${ollamaPullInstruction(llmModel)}`,
+    `4. ${ollamaPullInstruction(llmModel, commandContext)}`,
   ].join('\n');
 }
 
-function ollamaPullInstruction(model: string): string {
+function ollamaPullInstruction(model: string, commandContext: RecoveryCommandContext): string {
   return isSafeOllamaModel(model)
     ? `Если модели нет: ollama pull ${model}`
-    : 'Имя модели в config небезопасно для команды; исправь его и снова запусти doctor.';
+    : `Имя модели в config небезопасно для команды; исправь его и снова запусти ${openMurmurRecoveryCommand(commandContext, 'doctor')}.`;
 }
