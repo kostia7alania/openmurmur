@@ -1208,8 +1208,16 @@ and `/usr/bin/env -u UV_PROJECT_ENVIRONMENT uv run --offline --no-sync --project
 python/openmurmur_audio pytest`. The
 offline install may refresh ignored dependency files, but none of the gates may
 download packages. Any failing gate publishes neither a receipt nor a manifest.
-After all three pass, `--prepare` atomically creates, but never replaces, a
-private verification receipt and provenance manifest. Neither mode calls
+After all three pass, `--prepare` publishes a private verification receipt and
+provenance manifest, fsyncs both directory entries, then atomically commits the
+exact set with a final create-if-absent marker and a second directory fsync. A
+receipt or manifest without that marker is invalid. A rerun reuses markerless
+evidence only when a unique preserved private staging directory proves the
+exact inode, bytes, commit and current runtime boundary; ambiguous paths are
+left untouched. If an interruption leaves all three exact files visible before
+the marker directory entry was fsynced, rerunning `--prepare` verifies the full
+current boundary twice and fsyncs the evidence directory before accepting it.
+Neither mode calls
 `launchctl`, opens the microphone, reads Keychain values or uses the network;
 both use only the native helper's signed non-prompting checks.
 
@@ -1232,7 +1240,9 @@ attended evidence is complete:
 
 The strict receipt records the full clean commit, exact Node/SQLite, pnpm and uv
 identities and versions, exact gate commands, exit codes and SHA-256 digests of
-each gate's stdout and stderr. The manifest binds that receipt's exact bytes to
+each gate's stdout and stderr. The final marker binds the exact receipt and
+manifest identities, hashes and commit; `--check` rejects an absent or changed
+marker without rerunning gates. The manifest binds the receipt's exact bytes to
 the physical installed CLI, state root, plist bytes and signed authorized
 capture helper. It also declares fixed reference-file paths for D120, D121 and
 D122 so the final human audit has one evidence index; the D121 reference may

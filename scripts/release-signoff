@@ -8,6 +8,7 @@ REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 RUNTIME_CONTRACT="$REPO/runtime-requirements.json"
 MANIFEST_NAME="release-signoff-v2.json"
 RECEIPT_NAME="release-verification-v1.json"
+COMMIT_NAME="release-signoff-commit-v1.json"
 
 MODE=""
 EVIDENCE_DIR=""
@@ -577,6 +578,55 @@ try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
 NODE
 }
 
+write_commit_marker() {
+  local output="$1"
+  shift
+  "$NODE_BIN" --input-type=module - "$output" "$@" <<'NODE'
+import { closeSync, fsyncSync, openSync, writeFileSync } from 'node:fs';
+
+const [
+  output, releaseCommit,
+  receiptPath, receiptIdentity, receiptSha256,
+  manifestPath, manifestIdentity, manifestSha256,
+] = process.argv.slice(2);
+const marker = {
+  schemaVersion: 1,
+  releaseCommit,
+  receipt: { path: receiptPath, identity: receiptIdentity, sha256: receiptSha256 },
+  manifest: { path: manifestPath, identity: manifestIdentity, sha256: manifestSha256 },
+};
+writeFileSync(output, `${JSON.stringify(marker, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+const descriptor = openSync(output, 'r');
+try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+NODE
+}
+
+verify_commit_marker() {
+  local marker="$1"
+  shift
+  "$NODE_BIN" --input-type=module - "$marker" "$@" <<'NODE'
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+const [
+  markerPath, releaseCommit,
+  receiptPath, receiptIdentity, receiptSha256,
+  manifestPath, manifestIdentity, manifestSha256,
+] = process.argv.slice(2);
+const expected = {
+  schemaVersion: 1,
+  releaseCommit,
+  receipt: { path: receiptPath, identity: receiptIdentity, sha256: receiptSha256 },
+  manifest: { path: manifestPath, identity: manifestIdentity, sha256: manifestSha256 },
+};
+const raw = readFileSync(markerPath, 'utf8');
+if (Buffer.byteLength(raw) > 16 * 1024) throw new Error('release commit marker exceeds the bounded v1 size');
+const actual = JSON.parse(raw);
+assert.equal(raw, `${JSON.stringify(actual, null, 2)}\n`, 'release commit marker is not canonical v1 JSON');
+assert.deepEqual(actual, expected, 'release commit marker no longer binds the exact evidence set');
+NODE
+}
+
 verify_manifest() {
   local manifest="$1"
   shift
@@ -661,14 +711,16 @@ rollback_publication() {
     printf 'release-signoff: evidence directory changed; published evidence was not removed\n' >&2
     return 1
   fi
-  for path in "$MANIFEST" "$RECEIPT"; do
-    if [ "$path" = "$MANIFEST" ]; then
+  for path in "$COMMIT_MARKER" "$MANIFEST" "$RECEIPT"; do
+    if [ "$path" = "$COMMIT_MARKER" ]; then
+      expected_identity="${COMMIT_ID:-}"
+    elif [ "$path" = "$MANIFEST" ]; then
       expected_identity="$MANIFEST_ID"
     else
       expected_identity="$RECEIPT_ID"
     fi
     if [ -e "$path" ] || [ -L "$path" ]; then
-      if [ -f "$path" ] && [ ! -L "$path" ] && \
+      if [ -n "$expected_identity" ] && [ -f "$path" ] && [ ! -L "$path" ] && \
          [ "$(file_identity "$path")" = "$expected_identity" ]; then
         /bin/rm "$path" || complete=0
       else
@@ -679,6 +731,162 @@ rollback_publication() {
   done
   fsync_directory "$EVIDENCE_DIR" || complete=0
   [ "$complete" -eq 1 ]
+}
+
+recover_markerless_publication() {
+  local candidate candidate_count=0 recovered_stage="" recovered_stage_id=""
+  local staged_receipt staged_manifest staged_commit
+
+  if [ -e "$COMMIT_MARKER" ] || [ -L "$COMMIT_MARKER" ]; then
+    die "release evidence commit marker already exists: $COMMIT_MARKER"
+  fi
+  if [ ! -e "$RECEIPT" ] && [ ! -L "$RECEIPT" ] && \
+     [ ! -e "$MANIFEST" ] && [ ! -L "$MANIFEST" ]; then
+    return
+  fi
+  require_physical_file "$RECEIPT" "markerless release verification receipt"
+  [ "$(file_owner "$RECEIPT")" = "$(id -u)" ] && [ "$(file_mode "$RECEIPT")" = 600 ] || \
+    die "markerless receipt is not exact private release-signoff evidence; it was preserved"
+  verify_receipt "$RECEIPT" || die "markerless receipt is ambiguous; it was preserved"
+  RECEIPT_ID="$(file_identity "$RECEIPT")"
+  RECEIPT_SHA256="$(file_sha256 "$RECEIPT")"
+  for candidate in "$EVIDENCE_DIR"/.release-signoff.*; do
+    [ -e "$candidate" ] || continue
+    if [ -d "$candidate" ] && [ ! -L "$candidate" ] && \
+       [ "$(cd "$candidate" 2>/dev/null && pwd -P)" = "$candidate" ] && \
+       [ "$(file_owner "$candidate")" = "$(id -u)" ] && \
+       [ "$(file_mode "$candidate")" = 700 ]; then
+      staged_receipt="$candidate/$RECEIPT_NAME"
+      if frozen_private_file_matches "$staged_receipt" "$RECEIPT_ID" "$RECEIPT_SHA256"; then
+        candidate_count=$((candidate_count + 1))
+        recovered_stage="$candidate"
+        recovered_stage_id="$(directory_identity "$candidate")"
+      fi
+    fi
+  done
+  [ "$candidate_count" -eq 1 ] || \
+    die "markerless receipt has no unique exact release-signoff staging owner; all evidence was preserved"
+
+  staged_receipt="$recovered_stage/$RECEIPT_NAME"
+  staged_manifest="$recovered_stage/$MANIFEST_NAME"
+  staged_commit="$recovered_stage/$COMMIT_NAME"
+  require_physical_file "$staged_manifest" "staged markerless provenance manifest"
+  require_physical_file "$staged_commit" "staged markerless release commit marker"
+  [ "$(file_owner "$staged_manifest")" = "$(id -u)" ] && \
+    [ "$(file_mode "$staged_manifest")" = 600 ] && \
+    [ "$(file_owner "$staged_commit")" = "$(id -u)" ] && \
+    [ "$(file_mode "$staged_commit")" = 600 ] || \
+    die "markerless staging owner is not exact private release-signoff evidence; it was preserved"
+  MANIFEST_ID="$(file_identity "$staged_manifest")"
+  MANIFEST_SHA256="$(file_sha256 "$staged_manifest")"
+  COMMIT_ID="$(file_identity "$staged_commit")"
+  COMMIT_SHA256="$(file_sha256 "$staged_commit")"
+  MANIFEST_ARGS=("${FACT_ARGS[@]}" "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" "$RELEASE_HEAD")
+  COMMIT_ARGS=(
+    "$RELEASE_HEAD"
+    "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256"
+    "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256"
+  )
+  verify_receipt "$staged_receipt" || die "markerless staging receipt is ambiguous; it was preserved"
+  verify_manifest "$staged_manifest" "${MANIFEST_ARGS[@]}" || \
+    die "markerless staging manifest is ambiguous; it was preserved"
+  verify_commit_marker "$staged_commit" "${COMMIT_ARGS[@]}" || \
+    die "markerless staging commit marker is ambiguous; it was preserved"
+  if [ -e "$MANIFEST" ] || [ -L "$MANIFEST" ]; then
+    frozen_private_file_matches "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" || \
+      die "markerless final manifest conflicts with its exact staging owner; it was preserved"
+  fi
+  revalidate_snapshot
+  frozen_private_file_matches "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" && \
+    frozen_private_file_matches "$staged_receipt" "$RECEIPT_ID" "$RECEIPT_SHA256" && \
+    frozen_private_file_matches "$staged_manifest" "$MANIFEST_ID" "$MANIFEST_SHA256" && \
+    frozen_private_file_matches "$staged_commit" "$COMMIT_ID" "$COMMIT_SHA256" || \
+    die "markerless release evidence changed during recovery; it was preserved"
+  verify_receipt "$RECEIPT" || die "markerless receipt changed during recovery; it was preserved"
+  verify_manifest "$staged_manifest" "${MANIFEST_ARGS[@]}" || \
+    die "markerless manifest changed during recovery; it was preserved"
+  verify_commit_marker "$staged_commit" "${COMMIT_ARGS[@]}" || \
+    die "markerless commit marker changed during recovery; it was preserved"
+  require_private_evidence_directory
+  [ "$(directory_identity "$EVIDENCE_DIR")" = "$EVIDENCE_DIR_ID" ] && \
+    [ -d "$recovered_stage" ] && [ ! -L "$recovered_stage" ] && \
+    [ "$(directory_identity "$recovered_stage")" = "$recovered_stage_id" ] || \
+    die "release-signoff boundaries changed during markerless recovery"
+
+  if [ ! -e "$MANIFEST" ] && [ ! -L "$MANIFEST" ]; then
+    /bin/ln "$staged_manifest" "$MANIFEST" || \
+      die "markerless manifest recovery lost create-if-absent race; evidence was preserved"
+  fi
+  frozen_private_file_matches "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" || \
+    die "recovered markerless manifest does not match its exact staging owner"
+  fsync_directory "$EVIDENCE_DIR"
+  /bin/ln "$staged_commit" "$COMMIT_MARKER" || \
+    die "markerless commit recovery lost create-if-absent race; evidence was preserved"
+  frozen_private_file_matches "$COMMIT_MARKER" "$COMMIT_ID" "$COMMIT_SHA256" || \
+    die "recovered release commit marker does not match its exact staging owner"
+  fsync_directory "$EVIDENCE_DIR"
+  frozen_private_file_matches "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" && \
+    frozen_private_file_matches "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" && \
+    frozen_private_file_matches "$COMMIT_MARKER" "$COMMIT_ID" "$COMMIT_SHA256" || \
+    die "recovered release evidence changed before durable verification"
+  verify_commit_marker "$COMMIT_MARKER" "${COMMIT_ARGS[@]}" || \
+    die "recovered release evidence failed final commit verification"
+  STAGE_DIR="$recovered_stage"
+  STAGE_DIR_ID="$recovered_stage_id"
+  trap cleanup_stage EXIT
+  RECOVERED_COMMIT=true
+}
+
+recover_visible_commit() {
+  if [ ! -e "$COMMIT_MARKER" ] && [ ! -L "$COMMIT_MARKER" ]; then return; fi
+
+  require_physical_file "$COMMIT_MARKER" "visible release evidence commit marker"
+  require_physical_file "$RECEIPT" "visible committed release verification receipt"
+  require_physical_file "$MANIFEST" "visible committed release provenance manifest"
+  [ "$(file_owner "$COMMIT_MARKER")" = "$(id -u)" ] && \
+    [ "$(file_mode "$COMMIT_MARKER")" = 600 ] && \
+    [ "$(file_owner "$RECEIPT")" = "$(id -u)" ] && \
+    [ "$(file_mode "$RECEIPT")" = 600 ] && \
+    [ "$(file_owner "$MANIFEST")" = "$(id -u)" ] && \
+    [ "$(file_mode "$MANIFEST")" = 600 ] || \
+    die "visible release evidence is not an exact private committed set; all paths were preserved"
+  RECEIPT_ID="$(file_identity "$RECEIPT")"
+  RECEIPT_SHA256="$(file_sha256 "$RECEIPT")"
+  MANIFEST_ID="$(file_identity "$MANIFEST")"
+  MANIFEST_SHA256="$(file_sha256 "$MANIFEST")"
+  COMMIT_ID="$(file_identity "$COMMIT_MARKER")"
+  COMMIT_SHA256="$(file_sha256 "$COMMIT_MARKER")"
+  MANIFEST_ARGS=("${FACT_ARGS[@]}" "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" "$RELEASE_HEAD")
+  COMMIT_ARGS=(
+    "$RELEASE_HEAD"
+    "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256"
+    "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256"
+  )
+  verify_receipt "$RECEIPT" || die "visible release receipt is ambiguous; all evidence was preserved"
+  verify_manifest "$MANIFEST" "${MANIFEST_ARGS[@]}" || \
+    die "visible release manifest is ambiguous; all evidence was preserved"
+  verify_commit_marker "$COMMIT_MARKER" "${COMMIT_ARGS[@]}" || \
+    die "visible release commit marker is ambiguous; all evidence was preserved"
+  revalidate_snapshot
+  frozen_private_file_matches "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" && \
+    frozen_private_file_matches "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" && \
+    frozen_private_file_matches "$COMMIT_MARKER" "$COMMIT_ID" "$COMMIT_SHA256" || \
+    die "visible release evidence changed during durability recovery; all paths were preserved"
+  require_private_evidence_directory
+  [ "$(directory_identity "$EVIDENCE_DIR")" = "$EVIDENCE_DIR_ID" ] || \
+    die "evidence directory changed during durability recovery"
+  fsync_directory "$EVIDENCE_DIR"
+  revalidate_snapshot
+  frozen_private_file_matches "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" && \
+    frozen_private_file_matches "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" && \
+    frozen_private_file_matches "$COMMIT_MARKER" "$COMMIT_ID" "$COMMIT_SHA256" || \
+    die "release evidence changed after durability recovery; all paths were preserved"
+  verify_receipt "$RECEIPT" || die "release receipt failed durability recovery verification"
+  verify_manifest "$MANIFEST" "${MANIFEST_ARGS[@]}" || \
+    die "release manifest failed durability recovery verification"
+  verify_commit_marker "$COMMIT_MARKER" "${COMMIT_ARGS[@]}" || \
+    die "release marker failed durability recovery verification"
+  RECOVERED_COMMIT=true
 }
 
 publication_failed() {
@@ -694,14 +902,29 @@ require_private_evidence_directory
 inspect_current_facts
 MANIFEST="$EVIDENCE_DIR/$MANIFEST_NAME"
 RECEIPT="$EVIDENCE_DIR/$RECEIPT_NAME"
+COMMIT_MARKER="$EVIDENCE_DIR/$COMMIT_NAME"
 
 # Pass facts to Node directly as argv instead of parsing a generated text record.
 capture_fact_args
 INITIAL_FACT_ARGS=("${FACT_ARGS[@]}")
 
 if [ "$MODE" = prepare ]; then
+  RECOVERED_COMMIT=false
+  recover_visible_commit
+  if [ "$RECOVERED_COMMIT" = true ]; then
+    printf 'Release provenance was already complete and its directory durability was re-proven for %s\n' "$RELEASE_HEAD"
+    printf 'Commit marker: %s\n' "$COMMIT_MARKER"
+    exit 0
+  fi
+  recover_markerless_publication
+  if [ "$RECOVERED_COMMIT" = true ]; then
+    printf 'Release provenance recovered and committed for %s\n' "$RELEASE_HEAD"
+    printf 'Commit marker: %s\n' "$COMMIT_MARKER"
+    exit 0
+  fi
   [ ! -e "$MANIFEST" ] && [ ! -L "$MANIFEST" ] || die "provenance manifest already exists: $MANIFEST"
   [ ! -e "$RECEIPT" ] && [ ! -L "$RECEIPT" ] || die "release verification receipt already exists: $RECEIPT"
+  [ ! -e "$COMMIT_MARKER" ] && [ ! -L "$COMMIT_MARKER" ] || die "release evidence commit marker already exists: $COMMIT_MARKER"
   STAGE_DIR="$(mktemp -d "$EVIDENCE_DIR/.release-signoff.XXXXXX")"
   chmod 0700 "$STAGE_DIR"
   STAGE_DIR_ID="$(directory_identity "$STAGE_DIR")"
@@ -742,15 +965,33 @@ if [ "$MODE" = prepare ]; then
   verify_manifest "$STAGE_MANIFEST" "${MANIFEST_ARGS[@]}"
   MANIFEST_ID="$(file_identity "$STAGE_MANIFEST")"
   MANIFEST_SHA256="$(file_sha256 "$STAGE_MANIFEST")"
+  STAGE_COMMIT="$STAGE_DIR/$COMMIT_NAME"
+  COMMIT_ARGS=(
+    "$RELEASE_HEAD"
+    "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256"
+    "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256"
+  )
+  write_commit_marker "$STAGE_COMMIT" "${COMMIT_ARGS[@]}"
+  [ -f "$STAGE_COMMIT" ] && [ ! -L "$STAGE_COMMIT" ] && [ "$(file_mode "$STAGE_COMMIT")" = 600 ] || \
+    die "staged release commit marker is not a private regular file"
+  verify_commit_marker "$STAGE_COMMIT" "${COMMIT_ARGS[@]}"
+  COMMIT_ID="$(file_identity "$STAGE_COMMIT")"
+  COMMIT_SHA256="$(file_sha256 "$STAGE_COMMIT")"
   revalidate_snapshot
   verify_receipt "$STAGE_RECEIPT"
   frozen_private_file_matches "$STAGE_RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" || \
     die "staged release receipt changed before publication"
   frozen_private_file_matches "$STAGE_MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" || \
     die "staged provenance manifest changed before publication"
+  frozen_private_file_matches "$STAGE_COMMIT" "$COMMIT_ID" "$COMMIT_SHA256" || \
+    die "staged release commit marker changed before publication"
   verify_manifest "$STAGE_MANIFEST" "${MANIFEST_ARGS[@]}"
+  verify_commit_marker "$STAGE_COMMIT" "${COMMIT_ARGS[@]}"
   require_private_evidence_directory
   [ "$(directory_identity "$EVIDENCE_DIR")" = "$EVIDENCE_DIR_ID" ] || die "evidence directory changed before publication"
+  trap 'publication_failed "release evidence publication interrupted by HUP"' HUP
+  trap 'publication_failed "release evidence publication interrupted by INT"' INT
+  trap 'publication_failed "release evidence publication interrupted by TERM"' TERM
   /bin/ln "$STAGE_RECEIPT" "$RECEIPT" || die "receipt publication lost create-if-absent race"
   frozen_private_file_matches "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" || \
     publication_failed "published receipt does not match the frozen bytes"
@@ -767,26 +1008,56 @@ if [ "$MODE" = prepare ]; then
   verify_receipt "$RECEIPT" || publication_failed "published receipt failed final verification"
   verify_manifest "$MANIFEST" "${MANIFEST_ARGS[@]}" || \
     publication_failed "published manifest failed final verification"
+  /bin/ln "$STAGE_COMMIT" "$COMMIT_MARKER" || \
+    publication_failed "release commit marker publication lost create-if-absent race"
+  frozen_private_file_matches "$COMMIT_MARKER" "$COMMIT_ID" "$COMMIT_SHA256" || \
+    publication_failed "published release commit marker does not match the frozen bytes"
+  fsync_directory "$EVIDENCE_DIR" || publication_failed "could not durably commit release evidence"
+  frozen_private_file_matches "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" && \
+    frozen_private_file_matches "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" && \
+    frozen_private_file_matches "$COMMIT_MARKER" "$COMMIT_ID" "$COMMIT_SHA256" || \
+    publication_failed "committed release evidence changed before final verification"
+  verify_commit_marker "$COMMIT_MARKER" "${COMMIT_ARGS[@]}" || \
+    publication_failed "published release commit marker failed final verification"
   printf 'Release provenance prepared for %s\n' "$RELEASE_HEAD"
   printf 'Offline verification receipt: %s\n' "$RECEIPT"
   printf 'Manifest: %s\n' "$MANIFEST"
+  printf 'Commit marker: %s\n' "$COMMIT_MARKER"
 else
+  require_physical_file "$COMMIT_MARKER" "release evidence commit marker"
+  [ "$(file_owner "$COMMIT_MARKER")" = "$(id -u)" ] || die "release commit marker has the wrong owner"
+  [ "$(file_mode "$COMMIT_MARKER")" = 600 ] || die "release commit marker mode must be exactly 0600"
   require_physical_file "$RECEIPT" "release verification receipt"
   [ "$(file_owner "$RECEIPT")" = "$(id -u)" ] || die "release verification receipt has the wrong owner"
   [ "$(file_mode "$RECEIPT")" = 600 ] || die "release verification receipt mode must be exactly 0600"
   verify_receipt "$RECEIPT" || die "release verification receipt drift detected"
   RECEIPT_ID="$(file_identity "$RECEIPT")"
   RECEIPT_SHA256="$(file_sha256 "$RECEIPT")"
-  MANIFEST_ARGS=("${FACT_ARGS[@]}" "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" "$RELEASE_HEAD")
   require_physical_file "$MANIFEST" "release provenance manifest"
+  MANIFEST_ID="$(file_identity "$MANIFEST")"
+  MANIFEST_SHA256="$(file_sha256 "$MANIFEST")"
+  COMMIT_ARGS=(
+    "$RELEASE_HEAD"
+    "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256"
+    "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256"
+  )
+  verify_commit_marker "$COMMIT_MARKER" "${COMMIT_ARGS[@]}" || die "release evidence is not atomically committed"
+  COMMIT_ID="$(file_identity "$COMMIT_MARKER")"
+  COMMIT_SHA256="$(file_sha256 "$COMMIT_MARKER")"
+  MANIFEST_ARGS=("${FACT_ARGS[@]}" "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" "$RELEASE_HEAD")
   [ "$(file_owner "$MANIFEST")" = "$(id -u)" ] || die "release provenance manifest has the wrong owner"
   [ "$(file_mode "$MANIFEST")" = 600 ] || die "release provenance manifest mode must be exactly 0600"
   verify_manifest "$MANIFEST" "${MANIFEST_ARGS[@]}" || die "release provenance drift detected"
   revalidate_snapshot
   [ "$(file_identity "$RECEIPT")" = "$RECEIPT_ID" ] && \
     [ "$(file_sha256 "$RECEIPT")" = "$RECEIPT_SHA256" ] || die "release verification receipt changed during inspection"
+  frozen_private_file_matches "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" || \
+    die "release provenance manifest changed during inspection"
+  frozen_private_file_matches "$COMMIT_MARKER" "$COMMIT_ID" "$COMMIT_SHA256" || \
+    die "release evidence commit marker changed during inspection"
   verify_receipt "$RECEIPT" || die "release verification receipt drift detected"
   verify_manifest "$MANIFEST" "${MANIFEST_ARGS[@]}" || die "release provenance drift detected"
+  verify_commit_marker "$COMMIT_MARKER" "${COMMIT_ARGS[@]}" || die "release evidence commit drift detected"
   printf 'Release provenance still matches %s\n' "$RELEASE_HEAD"
   printf 'D120-D122 remain live until their evidence is audited at the manifest-declared reference paths.\n'
 fi

@@ -102,12 +102,48 @@ function writeInstalledBoundary(home: string, repository: string, stateRoot: str
   );
 }
 
-function createFixtureRepository(root: string): string {
+function createFixtureRepository(
+  root: string,
+  options: {
+    readonly crashAfterReceiptOnce?: boolean;
+    readonly crashAfterCommitOnce?: boolean;
+  } = {},
+): string {
   const repository = join(root, 'source');
   const node = realpathSync(process.execPath).replaceAll("'", "'\"'\"'");
   mkdirSync(join(repository, 'scripts'), { recursive: true });
   mkdirSync(join(repository, 'src', 'cli'), { recursive: true });
   copyFileSync(RELEASE_SIGNOFF, join(repository, 'scripts', 'release-signoff'));
+  if (options.crashAfterReceiptOnce === true) {
+    const signoff = join(repository, 'scripts', 'release-signoff');
+    const source = readFileSync(signoff, 'utf8');
+    const publication =
+      '  /bin/ln "$STAGE_RECEIPT" "$RECEIPT" || die "receipt publication lost create-if-absent race"\n';
+    assert.equal(source.split(publication).length, 2, 'fixture needs one receipt publication seam');
+    writeFileSync(
+      signoff,
+      source.replace(
+        publication,
+        () =>
+          `${publication}  if [ -f "$HOME/crash-after-receipt-once" ]; then\n    /bin/rm "$HOME/crash-after-receipt-once"\n    /bin/kill -KILL $$\n  fi\n`,
+      ),
+    );
+  }
+  if (options.crashAfterCommitOnce === true) {
+    const signoff = join(repository, 'scripts', 'release-signoff');
+    const source = readFileSync(signoff, 'utf8');
+    const publication =
+      '  /bin/ln "$STAGE_COMMIT" "$COMMIT_MARKER" || \\\n    publication_failed "release commit marker publication lost create-if-absent race"\n';
+    assert.equal(source.split(publication).length, 2, 'fixture needs one marker publication seam');
+    writeFileSync(
+      signoff,
+      source.replace(
+        publication,
+        () =>
+          `${publication}  if [ -f "$HOME/crash-after-commit-once" ]; then\n    /bin/rm "$HOME/crash-after-commit-once"\n    /bin/kill -KILL $$\n  fi\n`,
+      ),
+    );
+  }
   chmodSync(join(repository, 'scripts', 'release-signoff'), 0o700);
   writeFileSync(join(repository, 'src', 'cli', 'main.ts'), 'process.stdout.write("fixture");\n');
   writeFileSync(
@@ -236,6 +272,169 @@ function sha256(contents: string): string {
 }
 
 describe('release sign-off provenance', () => {
+  it('recovers only its exact markerless receipt after a publication crash', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'openmurmur-release-crash-')));
+    try {
+      const repository = createFixtureRepository(root, {
+        crashAfterReceiptOnce: true,
+        crashAfterCommitOnce: true,
+      });
+      const home = join(root, 'home');
+      const stateRoot = join(root, 'state');
+      const evidence = join(root, 'evidence');
+      const markerEvidence = join(root, 'marker-evidence');
+      const foreignEvidence = join(root, 'foreign-evidence');
+      mkdirSync(join(home, 'Library'), { recursive: true });
+      mkdirSync(stateRoot, { recursive: true });
+      mkdirSync(evidence, { mode: 0o700 });
+      mkdirSync(markerEvidence, { mode: 0o700 });
+      mkdirSync(foreignEvidence, { mode: 0o700 });
+      chmodSync(evidence, 0o700);
+      chmodSync(markerEvidence, 0o700);
+      chmodSync(foreignEvidence, 0o700);
+      createNativeHelper(home);
+      createReleaseTools(home);
+      writeInstalledBoundary(home, repository, stateRoot);
+
+      writeFileSync(join(home, 'crash-after-receipt-once'), 'armed\n');
+      const interrupted = run(
+        'bash',
+        [
+          join(repository, 'scripts', 'release-signoff'),
+          '--prepare',
+          '--evidence-dir',
+          evidence,
+          '--root',
+          stateRoot,
+        ],
+        repository,
+        home,
+      );
+      assert.ok(
+        interrupted.signal === 'SIGKILL' || interrupted.status === 137,
+        `expected injected SIGKILL, status=${interrupted.status} signal=${interrupted.signal}\n${interrupted.stderr}`,
+      );
+      const receiptPath = join(evidence, 'release-verification-v1.json');
+      const manifestPath = join(evidence, 'release-signoff-v2.json');
+      const markerPath = join(evidence, 'release-signoff-commit-v1.json');
+      assert.equal(JSON.parse(readFileSync(receiptPath, 'utf8')).schemaVersion, 1);
+      assert.throws(() => readFileSync(manifestPath));
+      assert.throws(() => readFileSync(markerPath));
+
+      const incompleteCheck = run(
+        'bash',
+        [join(repository, 'scripts', 'release-signoff'), '--check', '--evidence-dir', evidence],
+        repository,
+        home,
+      );
+      assert.notEqual(incompleteCheck.status, 0);
+      assert.match(incompleteCheck.stderr, /release evidence commit marker/);
+      const gateLog = readFileSync(join(home, 'release-gates.log'), 'utf8');
+
+      const recovered = run(
+        'bash',
+        [join(repository, 'scripts', 'release-signoff'), '--prepare', '--evidence-dir', evidence],
+        repository,
+        home,
+      );
+      assert.equal(recovered.status, 0, `${recovered.stdout}\n${recovered.stderr}`);
+      assert.match(recovered.stdout, /Release provenance recovered and committed/);
+      assert.equal(readFileSync(join(home, 'release-gates.log'), 'utf8'), gateLog);
+      const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+      assert.equal(marker.releaseCommit, runGit(repository, ['rev-parse', 'HEAD']));
+      assert.equal(marker.receipt.sha256, sha256(readFileSync(receiptPath, 'utf8')));
+      assert.equal(marker.manifest.sha256, sha256(readFileSync(manifestPath, 'utf8')));
+
+      const recoveredCheck = run(
+        'bash',
+        [join(repository, 'scripts', 'release-signoff'), '--check', '--evidence-dir', evidence],
+        repository,
+        home,
+      );
+      assert.equal(recoveredCheck.status, 0, `${recoveredCheck.stdout}\n${recoveredCheck.stderr}`);
+
+      writeFileSync(join(home, 'crash-after-commit-once'), 'armed\n');
+      const markerInterrupted = run(
+        'bash',
+        [
+          join(repository, 'scripts', 'release-signoff'),
+          '--prepare',
+          '--evidence-dir',
+          markerEvidence,
+        ],
+        repository,
+        home,
+      );
+      assert.ok(
+        markerInterrupted.signal === 'SIGKILL' || markerInterrupted.status === 137,
+        `expected marker-window SIGKILL, status=${markerInterrupted.status} signal=${markerInterrupted.signal}\n${markerInterrupted.stderr}`,
+      );
+      const markerWindowReceipt = join(markerEvidence, 'release-verification-v1.json');
+      const markerWindowManifest = join(markerEvidence, 'release-signoff-v2.json');
+      const markerWindowCommit = join(markerEvidence, 'release-signoff-commit-v1.json');
+      readFileSync(markerWindowReceipt);
+      readFileSync(markerWindowManifest);
+      readFileSync(markerWindowCommit);
+      const markerGateLog = readFileSync(join(home, 'release-gates.log'), 'utf8');
+      const markerRecovered = run(
+        'bash',
+        [
+          join(repository, 'scripts', 'release-signoff'),
+          '--prepare',
+          '--evidence-dir',
+          markerEvidence,
+        ],
+        repository,
+        home,
+      );
+      assert.equal(
+        markerRecovered.status,
+        0,
+        `${markerRecovered.stdout}\n${markerRecovered.stderr}`,
+      );
+      assert.match(markerRecovered.stdout, /directory durability was re-proven/);
+      assert.equal(readFileSync(join(home, 'release-gates.log'), 'utf8'), markerGateLog);
+      const markerRecoveredCheck = run(
+        'bash',
+        [
+          join(repository, 'scripts', 'release-signoff'),
+          '--check',
+          '--evidence-dir',
+          markerEvidence,
+        ],
+        repository,
+        home,
+      );
+      assert.equal(
+        markerRecoveredCheck.status,
+        0,
+        `${markerRecoveredCheck.stdout}\n${markerRecoveredCheck.stderr}`,
+      );
+
+      const foreignReceipt = join(foreignEvidence, 'release-verification-v1.json');
+      writeFileSync(foreignReceipt, '{"foreign":true}\n', { mode: 0o600 });
+      const foreignBefore = readFileSync(foreignReceipt, 'utf8');
+      const foreignPrepare = run(
+        'bash',
+        [
+          join(repository, 'scripts', 'release-signoff'),
+          '--prepare',
+          '--evidence-dir',
+          foreignEvidence,
+        ],
+        repository,
+        home,
+      );
+      assert.notEqual(foreignPrepare.status, 0);
+      assert.match(foreignPrepare.stderr, /markerless receipt is ambiguous/);
+      assert.equal(readFileSync(foreignReceipt, 'utf8'), foreignBefore);
+      assert.throws(() => readFileSync(join(foreignEvidence, 'release-signoff-v2.json')));
+      assert.throws(() => readFileSync(join(foreignEvidence, 'release-signoff-commit-v1.json')));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('publishes only green offline gates and rejects receipt or source drift', () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'openmurmur-release-signoff-')));
     try {
@@ -275,6 +474,7 @@ describe('release sign-off provenance', () => {
       assert.match(failedPrepare.stderr, /node-check failed with exit code 9/);
       assert.throws(() => readFileSync(join(failedEvidence, 'release-verification-v1.json')));
       assert.throws(() => readFileSync(join(failedEvidence, 'release-signoff-v2.json')));
+      assert.throws(() => readFileSync(join(failedEvidence, 'release-signoff-commit-v1.json')));
       rmSync(join(home, 'fail-node-check'));
       rmSync(join(home, 'release-gates.log'));
 
@@ -296,6 +496,7 @@ describe('release sign-off provenance', () => {
       assert.match(racedPrepare.stderr, /staged release receipt changed before publication/);
       assert.throws(() => readFileSync(join(racedEvidence, 'release-verification-v1.json')));
       assert.throws(() => readFileSync(join(racedEvidence, 'release-signoff-v2.json')));
+      assert.throws(() => readFileSync(join(racedEvidence, 'release-signoff-commit-v1.json')));
       rmSync(join(home, 'mutate-staged-receipt'));
       rmSync(join(home, 'release-gates.log'));
 
@@ -315,13 +516,17 @@ describe('release sign-off provenance', () => {
       assert.equal(prepare.status, 0, `${prepare.stdout}\n${prepare.stderr}`);
       const receiptPath = join(evidence, 'release-verification-v1.json');
       const manifestPath = join(evidence, 'release-signoff-v2.json');
+      const markerPath = join(evidence, 'release-signoff-commit-v1.json');
       const receiptRaw = readFileSync(receiptPath, 'utf8');
       const receipt = JSON.parse(receiptRaw);
       const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+      const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
       assert.equal(manifest.releaseCommit, runGit(repository, ['rev-parse', 'HEAD']));
       assert.equal(manifest.repository.path, repository);
       assert.equal(manifest.verificationReceipt.path, receiptPath);
       assert.equal(manifest.verificationReceipt.sha256, sha256(receiptRaw));
+      assert.equal(marker.receipt.sha256, sha256(receiptRaw));
+      assert.equal(marker.manifest.sha256, sha256(readFileSync(manifestPath, 'utf8')));
       assert.equal(receipt.releaseCommit, manifest.releaseCommit);
       assert.equal(receipt.tools.pnpm.version, '10.19.0');
       assert.equal(receipt.tools.uv.version, 'uv 0.12.2 (fixture)');
@@ -358,7 +563,7 @@ describe('release sign-off provenance', () => {
         home,
       );
       assert.notEqual(tamperedCheck.status, 0);
-      assert.match(tamperedCheck.stderr, /release provenance drift detected/);
+      assert.match(tamperedCheck.stderr, /release evidence is not atomically committed/);
       writeFileSync(receiptPath, receiptRaw, { mode: 0o600 });
 
       rmSync(join(home, 'capture-check-count'));
