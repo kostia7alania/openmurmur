@@ -89,9 +89,12 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Acceptance:** Speech in a noisy room is detected; a television alone does
   not sustain a session past the minimum-speech gate.
 - **Dependencies:** P0-05, P0-11 · **Risk:** medium · **Estimate:** M
-- **Tests:** Segment assembly fully tested in Python (7 tests). The ONNX model
-  is not in the CI-installed subset; a historical same-machine smoke run is
-  recorded in `docs/DEPENDENCIES.md`, but it was not repeated on this revision.
+- **Tests:** Segment assembly is covered offline. On 2026-08-12 a production
+  `Daemon` loaded the real cached Silero/ONNX worker, scored its warm-up frame
+  in 791 ms inside the five-second bound, then started synthetic capture and
+  reaped both worker and capture trees. This proves current-revision startup
+  gating, not noisy-room/television discrimination or real microphone cadence;
+  those remain D014/D114.
 
 ### P0-07 ✅ Sessionizer state machine
 
@@ -152,10 +155,11 @@ dependencies, risk, estimate (S/M/L), release, tests.
   a missing model produces an actionable error naming the `uv sync` command.
 - **Dependencies:** P0-02 · **Risk:** high (model behaviour unverified here)
   · **Estimate:** L
-- **Tests:** Protocol framing, dispatch, error paths and result normalization —
-  36 Python tests, all without MLX. A historical same-machine inference smoke
-  run is recorded in `docs/DEPENDENCIES.md`; the current revision still needs
-  an end-to-end rerun.
+- **Tests:** Protocol framing, dispatch, error paths and result normalization
+  run without MLX. Current-revision production scheduling also completed real
+  cached-model transcriptions, reused one bounded worker and recovered a killed
+  worker generation exactly once (D039/D090/D091). A real microphone corpus in
+  all three advertised languages remains unverified and keeps this item yellow.
 
 ### P0-12 ✅ Transcript revisions
 
@@ -572,7 +576,7 @@ offline slice is recorded on the item itself below.
 
 ### Blocking correctness and privacy repairs
 
-#### AR-01 🟡 Own one bounded ASR worker lifecycle
+#### AR-01 ✅ Own one bounded ASR worker lifecycle
 
 - **Severity:** P0 · **Epic:** ASR/runtime · **Estimate:** M
 - **Risk:** A new persistent Python worker is created per job and not closed,
@@ -592,10 +596,15 @@ offline slice is recorded on the item itself below.
   request and output state; timeout, non-zero exit and intentional close use a
   bounded TERM/KILL join; restart waits for cleanup; and late events from the
   retired child cannot clear its replacement. Offline timeout/restart,
-  shutdown-latch and stale-handler regressions pass. This remains yellow until
-  repeated real-model jobs and process/resource cleanup are exercised live.
+  shutdown-latch and stale-handler regressions pass.
+- **2026-08-12 evidence:** Four real post-restart MLX transcriptions reused one
+  worker generation with bounded warm-tree RSS and complete process cleanup.
+  A separate production `JobQueue` run killed the real Python worker inside a
+  leased transcription: one replacement generation completed the next job,
+  then retried the interrupted job exactly once without stale transcript or
+  outbox facts. See D090 and D091 in [`MVP_123.md`](MVP_123.md).
 
-#### AR-02 🟡 Make state transitions crash-consistent
+#### AR-02 ✅ Make state transitions crash-consistent
 
 - **Severity:** P0 · **Epic:** Storage/orchestration · **Estimate:** L
 - **Risk:** A crash can strand work at four boundaries: `PROCESSING` before ASR
@@ -620,11 +629,18 @@ offline slice is recorded on the item itself below.
   without duplicates. Separate callback fault injection also proves that an
   outbox `sent` row commits atomically with audio delivery time and the final
   transcript/report `DONE` transition; retry converges after rollback.
-- **Remaining evidence gap:** Recovery proves and republishes a FLAC renamed
-  before its database update, but cannot reconstruct the exact monotonic
-  `duration_ms` / `speech_ms` lost in a hard-crash window. Sent-delivery to
-  domain-state and Telegram-update to durable-outcome fault matrices also
-  remain. Keep AR-02 yellow until those boundaries have equivalent evidence.
+- **2026-08-12 evidence:** Recorder finalization now journals exact monotonic
+  duration and speech facts before archive publication. Three real
+  process-group `SIGKILL` boundaries—before that journal, after atomic archive
+  publication, and after part finalization but before session/jobs/status—were
+  reopened and recovered twice each. They converged without invented timing,
+  duplicate jobs/status, temp files or surviving children; integrity, foreign
+  keys, archive hashes and ffprobe facts remained exact. Telegram routing now
+  advances its cursor only after every returned update has a durable outcome,
+  while sent outbox rows commit their domain callback in the same transaction
+  or remain explicitly reconcilable as remote-unknown. This is process-crash
+  evidence under the configured SQLite durability, not a hardware power-loss
+  guarantee. See D024–D028 in [`MVP_123.md`](MVP_123.md).
 
 #### AR-03 🟡 Make incoming Telegram retry and deduplication recoverable
 
@@ -943,7 +959,7 @@ offline slice is recorded on the item itself below.
 | Item | Why it matters |
 | --- | --- |
 | ⬜ Sandbox FFmpeg decode of incoming files | The most plausible RCE path (T3 in the threat model). |
-| ⬜ Repeat the real MLX ASR end-to-end on the current revision | P0-11 and P0-06 have historical same-machine smoke evidence, not a post-repair live run. |
+| ✅ Repeat the real MLX ASR end-to-end on the current revision | D039, D090 and D091 record production daemon scheduling, repeated real-worker reuse and a real worker-death retry on the current repair line. This still does not substitute for the microphone-to-Telegram release run in D120. |
 | ⬜ Verify live Telegram delivery with a real bot | Closes P0-14, P0-18, P0-20. |
 | ⬜ Verify launchd under a real login session | Closes P0-21; TCC under launchd is the known risk. |
 | ⬜ Test sleep/wake behaviour | Documented in the README from design intent, not from observation. |

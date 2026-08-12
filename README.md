@@ -42,9 +42,10 @@ Everything else is scriptable. `docs/SERVER.md` says where each one falls.
 
 **v0.1.0 — early MVP.** The control plane, sessionizer, storage, staged
 delivery, retention and Telegram integration are implemented and covered by
-offline automated tests. Live microphone capture, real model inference, real
-Telegram delivery, launchd and sleep/wake remain **unverified in the current
-release record** — see [What is verified](#what-is-verified).
+offline automated tests. Bounded real-model rehearsals are recorded below, but
+the complete current-revision microphone → models → Telegram path, launchd
+login/reboot and sleep/wake remain **unverified in the current release record**
+— see [What is verified](#what-is-verified).
 
 ## Requirements
 

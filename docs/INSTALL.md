@@ -372,6 +372,176 @@ at least one real audio frame. The probe is bounded to 20 seconds and reads no
 Keychain value or network service. If readiness never becomes true, both plist
 files and the previously loaded service set are restored where possible.
 
+#### Attended upgrade rollback rehearsal
+
+An ordinary successful upgrade does not prove rollback. Use this D121 rehearsal
+only when both agents are already installed, from the logged-in GUI account,
+with the native helper already authorized. It saves the exact plist hashes,
+registration set and full read-only `launchctl print` output in a private
+directory. It then makes `logLevel` invalid temporarily: the installer's native
+and TCC preflight still passes, but the daemon and the same `status` readiness
+probe reject the config before capture opens. The installer must return
+non-zero and restore the prior files and loaded-label set.
+
+This deliberately changes launchd state and therefore needs explicit operator
+approval. After the config is restored, the previous daemon is required to
+start again: normal startup may read its Keychain credentials and reopen the
+already-authorized microphone. The rehearsal requests no new TCC prompt. If
+the installed agents use a non-default state root, change both `STATE_ROOT`
+assignments below to that exact root before running anything.
+
+```bash
+(
+set -euo pipefail
+
+STATE_ROOT="$HOME/Library/Application Support/OpenMurmur"
+CONFIG_FILE="$STATE_ROOT/openmurmur.json"
+AGENT_DIR="$HOME/Library/LaunchAgents"
+NODE_BIN="$(command -v node)"
+EVIDENCE_DIR="$(mktemp -d /private/tmp/openmurmur-d121.XXXXXX)"
+chmod 0700 "$EVIDENCE_DIR"
+
+./scripts/install-capture-app --check
+[ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ]
+[ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ]
+for label in io.openmurmur.daemon io.openmurmur.digest; do
+  [ -f "$AGENT_DIR/$label.plist" ] || {
+    echo "D121 needs an existing installed-agent baseline: $label.plist is missing" >&2
+    exit 1
+  }
+done
+
+cp -p "$CONFIG_FILE" "$EVIDENCE_DIR/openmurmur.json.before"
+chmod 0600 "$EVIDENCE_DIR/openmurmur.json.before"
+/usr/bin/shasum -a 256 \
+  "$AGENT_DIR/io.openmurmur.daemon.plist" \
+  "$AGENT_DIR/io.openmurmur.digest.plist" \
+  > "$EVIDENCE_DIR/plists.before.sha256"
+
+snapshot_launchd() {
+  local phase="$1"
+  local label
+  local registration
+  : > "$EVIDENCE_DIR/labels.$phase"
+  for label in io.openmurmur.daemon io.openmurmur.digest; do
+    if launchctl print "gui/$(id -u)/$label" \
+      > "$EVIDENCE_DIR/$label.$phase.print" 2>&1; then
+      registration=registered
+    else
+      registration=absent
+    fi
+    printf '%s %s\n' "$label" "$registration" >> "$EVIDENCE_DIR/labels.$phase"
+  done
+}
+
+restore_config() {
+  local staged="$CONFIG_FILE.d121-restore.$$"
+  [ ! -e "$staged" ] && [ ! -L "$staged" ]
+  cp -p "$EVIDENCE_DIR/openmurmur.json.before" "$staged"
+  chmod 0600 "$staged"
+  mv -f "$staged" "$CONFIG_FILE"
+}
+
+wait_for_restored_daemon() {
+  local phase="$1"
+  local attempt=1
+  local output
+  local validation
+  while [ "$attempt" -le 20 ]; do
+    validation=""
+    if output="$("$NODE_BIN" src/cli/main.ts status --root "$STATE_ROOT" --json 2>&1)" && \
+      validation="$("$NODE_BIN" --input-type=module - "$output" 2>&1 <<'NODE'
+const status = JSON.parse(process.argv[2]);
+if (
+  status.daemon !== 'running' ||
+  status.heartbeatStatus !== 'fresh' ||
+  status.recorderRunning !== true ||
+  typeof status.lastSourceFrameAgeMs !== 'number' ||
+  !Number.isFinite(status.lastSourceFrameAgeMs) ||
+  status.lastSourceFrameAgeMs < 0
+) {
+  process.exit(1);
+}
+NODE
+      )"; then
+      printf '%s\n' "$output" > "$EVIDENCE_DIR/restored-status.$phase.json"
+      return 0
+    fi
+    printf '%s\n' "${validation:-$output}" > "$EVIDENCE_DIR/restored-status.$phase.last-error"
+    attempt=$((attempt + 1))
+    [ "$attempt" -le 20 ] && sleep 1
+  done
+  echo "Restored daemon did not return to a fresh real-frame heartbeat; inspect $EVIDENCE_DIR" >&2
+  return 1
+}
+
+snapshot_launchd before
+wait_for_restored_daemon before
+trap restore_config EXIT
+trap 'exit 130' HUP INT TERM
+
+"$NODE_BIN" --input-type=module - "$CONFIG_FILE" <<'NODE'
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+
+const configFile = process.argv[2];
+const config = JSON.parse(readFileSync(configFile, 'utf8'));
+if (config?.audio?.captureBackend !== 'native') {
+  throw new Error('D121 rehearsal requires audio.captureBackend="native"');
+}
+config.logLevel = '__d121_readiness_failure__';
+const staged = `${configFile}.d121-${process.pid}`;
+writeFileSync(staged, `${JSON.stringify(config, null, 2)}\n`, {
+  flag: 'wx',
+  mode: 0o600,
+});
+renameSync(staged, configFile);
+NODE
+
+if "$NODE_BIN" src/cli/main.ts status --root "$STATE_ROOT" --json \
+  > "$EVIDENCE_DIR/invalid-status.stdout" \
+  2> "$EVIDENCE_DIR/invalid-status.stderr"; then
+  echo "Refusing rehearsal: the invalid config did not fail the readiness command" >&2
+  exit 1
+fi
+
+set +e
+./scripts/install-launch-agents --yes --node "$NODE_BIN" --root "$STATE_ROOT" \
+  > "$EVIDENCE_DIR/installer.stdout" \
+  2> "$EVIDENCE_DIR/installer.stderr"
+INSTALL_EXIT=$?
+set -e
+
+if [ "$INSTALL_EXIT" -eq 0 ] || \
+  ! /usr/bin/grep -Fq "Daemon readiness failed after registration" \
+    "$EVIDENCE_DIR/installer.stderr"; then
+  echo "Installer did not reach the expected readiness rollback; inspect $EVIDENCE_DIR" >&2
+  exit 1
+fi
+
+restore_config
+cmp "$EVIDENCE_DIR/openmurmur.json.before" "$CONFIG_FILE"
+trap - EXIT HUP INT TERM
+/usr/bin/shasum -a 256 -c "$EVIDENCE_DIR/plists.before.sha256"
+snapshot_launchd after
+cmp "$EVIDENCE_DIR/labels.before" "$EVIDENCE_DIR/labels.after"
+wait_for_restored_daemon after
+echo "D121 rollback restored exact plist bytes, registration set and live audio readiness."
+echo "Evidence: $EVIDENCE_DIR"
+)
+```
+
+Only after that rollback proof, run the real PCM check and the valid D069
+upgrade. These commands are the live gate; this document does not claim their
+success before they are run:
+
+```bash
+STATE_ROOT="$HOME/Library/Application Support/OpenMurmur"
+pnpm openmurmur --root "$STATE_ROOT" capture test
+./scripts/install-launch-agents --root "$STATE_ROOT"
+./scripts/install-launch-agents --check --root "$STATE_ROOT"
+pnpm openmurmur --root "$STATE_ROOT" status
+```
+
 ```bash
 pnpm openmurmur status
 ```
