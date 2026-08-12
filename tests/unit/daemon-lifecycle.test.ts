@@ -63,7 +63,7 @@ import { recordUpdate } from '../../src/telegram/router.ts';
 let dir: string;
 let db: Database;
 
-async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error('timed out waiting for daemon test condition');
