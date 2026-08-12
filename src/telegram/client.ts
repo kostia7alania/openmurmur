@@ -402,7 +402,7 @@ export class TelegramClient {
 
   async sendDocument(
     chatId: number,
-    filePath: string,
+    document: string | Blob,
     options: {
       caption?: string;
       filename?: string;
@@ -427,9 +427,12 @@ export class TelegramClient {
     if (options.replyMarkup !== undefined) {
       form.set('reply_markup', JSON.stringify(options.replyMarkup));
     }
-    // openAsBlob streams from disk instead of buffering a 50 MB file in RAM.
-    const blob = await openAsBlob(filePath);
-    form.set('document', blob, options.filename ?? basename(filePath));
+    // Path-backed documents stream from disk. Integrity-fenced generated
+    // documents arrive as an already verified immutable Blob.
+    const blob = typeof document === 'string' ? await openAsBlob(document) : document;
+    const filename =
+      options.filename ?? (typeof document === 'string' ? basename(document) : 'document');
+    form.set('document', blob, filename);
     return this.#call<TelegramMessage>('sendDocument', form, undefined, this.#transferTimeoutMs);
   }
 

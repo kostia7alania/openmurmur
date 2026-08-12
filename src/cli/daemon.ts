@@ -26,13 +26,18 @@ import {
   buildDigest,
   hasUnfinishedSessionsForDate,
   hoursSinceLastDigest,
-  renderDigest,
-  renderDigestCaption,
-  renderDigestMarkdown,
+  readStoredDigest,
   scheduledDigestDate,
-  storeDigest,
   zonedDateTime,
 } from '../digest/daily.ts';
+import {
+  cleanupDurableDigestTemps,
+  ensureDigestDeliveryArtifact,
+  prepareDigestDelivery,
+  prepareDigestDocumentForSend,
+  publishDigestSnapshot,
+  readDigestDeliveryPayload,
+} from '../digest/delivery.ts';
 import { AlertEvaluator, type AlertId, renderAlert } from '../health/alerts.ts';
 import {
   diskFreeGb,
@@ -94,7 +99,6 @@ import {
   parseAsrModeCallback,
   renderAsrSettings,
 } from '../telegram/settings.ts';
-import { writeTextAtomically } from '../util/atomic-file.ts';
 import { createAsrBackend, createLlmBackend, createVadBackend } from './backends.ts';
 import {
   claimDaemonPid,
@@ -292,6 +296,14 @@ export class Daemon {
 
       const reclaimedJobs = reclaimedAfterDaemonDeath + this.#jobs.recoverStaleLeases();
       const reclaimedSends = this.#outbox.recoverSending();
+      let removedDigestTemps = 0;
+      try {
+        removedDigestTemps = await cleanupDurableDigestTemps(this.#db.handle, paths.transcriptsDir);
+      } catch (error) {
+        logger.warn('could not finish bounded digest temp cleanup', {
+          error: (error as Error).message,
+        });
+      }
       const retiredStaleNotices = retireStaleNotices(
         this.#db.handle,
         staleNoticeCutoff,
@@ -299,10 +311,16 @@ export class Daemon {
       );
       this.#reconcileDeadAsrSessions();
       this.#reconcileDeadIncomingFiles();
-      if (reclaimedJobs > 0 || reclaimedSends > 0 || retiredStaleNotices > 0) {
+      if (
+        reclaimedJobs > 0 ||
+        reclaimedSends > 0 ||
+        removedDigestTemps > 0 ||
+        retiredStaleNotices > 0
+      ) {
         logger.info('recovered work from a previous run', {
           reclaimedJobs,
           reclaimedSends,
+          removedDigestTemps,
           retiredStaleNotices,
         });
       }
@@ -669,6 +687,13 @@ export class Daemon {
       chatId,
       logger: this.#options.logger.child('outbox'),
       maxOutgoingBytes: this.#options.loaded.config.telegram.maxOutgoingBytes,
+      prepareDigestDocument: (deliveryPartId, payload) =>
+        prepareDigestDocumentForSend(
+          this.#db.handle,
+          deliveryPartId,
+          payload,
+          this.#options.loaded.paths.transcriptsDir,
+        ),
       onDelivered: ({ deliveryPartId, sessionId: linkedSessionId, payload }) => {
         if (payload.type === 'document' && payload.partId !== undefined) {
           markAudioDelivered(this.#db.handle, payload.partId);
@@ -1356,10 +1381,14 @@ export class Daemon {
       });
       return;
     }
-    const existing = this.#db.handle
-      .prepare('SELECT 1 AS present FROM digests WHERE digest_date = ?')
-      .get(date);
-    if (existing !== undefined) {
+    let winner = readStoredDigest(this.#db.handle, date);
+    if (winner !== undefined) {
+      const payload = readDigestDeliveryPayload(this.#db.handle, date);
+      await ensureDigestDeliveryArtifact(
+        winner,
+        payload,
+        this.#options.loaded.paths.transcriptsDir,
+      );
       digestLogger.debug('digest already exists', { date });
       return;
     }
@@ -1372,27 +1401,36 @@ export class Daemon {
     }
 
     const digest = buildDigest(this.#db.handle, date, config.digest.timezone, hostname());
-    const rendered = renderDigest(digest, config.digest.timezone);
-    let payload: OutboxPayload = { type: 'text', text: rendered, parseMode: 'HTML' };
-    if (rendered.length > config.telegram.transcriptInlineLimit) {
-      const filename = `digest-${date}.md`;
-      const path = join(this.#options.loaded.paths.transcriptsDir, filename);
-      await writeTextAtomically(path, renderDigestMarkdown(digest, config.digest.timezone));
-      payload = { type: 'document', path, filename, caption: renderDigestCaption(digest) };
-    }
-    transaction(this.#db.handle, () => {
-      storeDigest(this.#db.handle, digest);
-      this.#outbox.enqueue({
-        deliveryPartId: `digest:${date}`,
-        kind: 'digest',
-        ordinal: 30,
-        payload,
+    const prepared = prepareDigestDelivery(
+      digest,
+      config.digest.timezone,
+      config.telegram.transcriptInlineLimit,
+      this.#options.loaded.paths.transcriptsDir,
+    );
+    const publication = publishDigestSnapshot(
+      this.#db.handle,
+      digest,
+      prepared.payload,
+      config.digest.timezone,
+    );
+    if (publication === 'stale') {
+      digestLogger.info('digest sources changed during snapshot; retrying on the next tick', {
+        date,
       });
-    });
+      return;
+    }
+    winner = readStoredDigest(this.#db.handle, date);
+    if (winner === undefined) throw new Error(`digest ${date} publication produced no winner`);
+    const payload = readDigestDeliveryPayload(this.#db.handle, date);
+    await ensureDigestDeliveryArtifact(winner, payload, this.#options.loaded.paths.transcriptsDir);
+    if (publication === 'exists') {
+      digestLogger.info('concurrent digest snapshot already won', { date });
+      return;
+    }
     digestLogger.info('digest stored and enqueued', {
       date,
-      sessionCount: digest.sessionCount,
-      speechMs: digest.totalSpeechMs,
+      sessionCount: winner.sessionCount,
+      speechMs: winner.totalSpeechMs,
       payloadType: payload.type,
     });
   }

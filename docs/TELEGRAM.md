@@ -527,9 +527,19 @@ established its baseline and explicitly confirmed by the user, can become the
 allowlisted chat.
 
 Daily digests follow the same text bound as reports: a short digest is one HTML
-message; a long one is one trusted `digest-YYYY-MM-DD.md` document. The stable
-`digest:<date>` delivery id is shared by daemon scheduling and the digest CLI
-safety net. The launchd fallback checks the real enabled/time/timezone config
+message; a long one is one trusted content-addressed
+`digest-YYYY-MM-DD-<sha256>.md` document. Decisions, tasks, questions and
+per-session summaries are visibly labelled as model drafts. Each new snapshot
+keeps its exact summary/current-transcript revision, session/time attribution,
+model-reported segment indexes and one bounded localized excerpt (or an
+explicit missing/unlocalized label). A legacy snapshot is not reconstructed
+from newer transcript state and says that its claim source was not retained.
+The first complete snapshot wins atomically with the stable `digest:<date>`
+delivery id, shared by daemon scheduling and the digest CLI safety net. Only
+that durable payload publishes or reconstructs the content-addressed file; a
+concurrent loser creates no artifact. New digest documents carry an exact byte
+count and SHA-256, and the verified bytes—not a later path read—are uploaded on
+every retry. The launchd fallback checks the real enabled/time/timezone config
 every five minutes; automatic snapshots wait for already-running sessions and
 include only `DONE` sessions. They are not revised for a session that starts
 after the date's digest was already delivered (tracked in AR-08).

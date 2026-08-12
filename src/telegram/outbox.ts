@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import { rm, stat } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFile, rm, stat } from 'node:fs/promises';
 import type { DatabaseSync } from 'node:sqlite';
 import { transaction } from '../database/db.ts';
 import type { Logger } from '../logging/logger.ts';
@@ -46,6 +46,11 @@ export type OutboxPayload =
       readonly replyMarkup?: TelegramInlineKeyboardMarkup;
       /** Ephemeral delivery artifact, safe to remove only after Telegram accepted it. */
       readonly deleteAfterSend?: boolean;
+      /** Optional immutable-byte fence for durable generated documents. */
+      readonly contentSha256?: string;
+      readonly contentBytes?: number;
+      /** Exact timezone needed to reconstruct a durable digest artifact after a crash. */
+      readonly digestTimezone?: string;
     };
 
 export interface EnqueueMessage {
@@ -304,6 +309,12 @@ export interface OutboxWorkerDeps {
   readonly chatId: number;
   readonly logger: Logger;
   readonly maxOutgoingBytes: number;
+  readonly prepareDigestDocument?:
+    | ((
+        deliveryPartId: string,
+        payload: Extract<OutboxPayload, { type: 'document' }>,
+      ) => Promise<void>)
+    | undefined;
   readonly onDelivered?: (row: {
     deliveryPartId: string;
     sessionId: string | null;
@@ -375,7 +386,7 @@ export async function drainOutbox(deps: OutboxWorkerDeps, budget = 25): Promise<
 
     const payload = JSON.parse(row.payload) as OutboxPayload;
     try {
-      const messageId = await sendPayload(deps, payload);
+      const messageId = await sendPayload(deps, row, payload);
       const outcome = deps.outbox.markSent(row, messageId, () => {
         deps.onDelivered?.({
           deliveryPartId: row.delivery_part_id,
@@ -448,13 +459,35 @@ async function cleanupEphemeralPayload(payload: OutboxPayload, logger: Logger): 
   }
 }
 
-async function sendPayload(deps: OutboxWorkerDeps, payload: OutboxPayload): Promise<number | null> {
+async function sendPayload(
+  deps: OutboxWorkerDeps,
+  row: ClaimedOutboxRow,
+  payload: OutboxPayload,
+): Promise<number | null> {
   if (payload.type === 'text') {
     const message = await deps.client.sendMessage(deps.chatId, payload.text, {
       parseMode: payload.parseMode,
       ...(payload.replyMarkup === undefined ? {} : { replyMarkup: payload.replyMarkup }),
     });
     return message.message_id;
+  }
+
+  if (row.kind === 'digest') {
+    if (deps.prepareDigestDocument === undefined) {
+      throw Object.assign(new Error('digest artifact has no durable snapshot verifier'), {
+        errorCode: 409,
+      });
+    }
+    try {
+      await deps.prepareDigestDocument(row.delivery_part_id, payload);
+    } catch (error) {
+      if ((error as { errorCode?: unknown }).errorCode === 409) {
+        throw Object.assign(new Error('digest artifact failed its durable snapshot proof'), {
+          errorCode: 409,
+        });
+      }
+      throw new Error('digest artifact could not be materialized from its durable snapshot');
+    }
   }
 
   // Size is re-checked against the live file immediately before upload: the
@@ -468,7 +501,39 @@ async function sendPayload(deps: OutboxWorkerDeps, payload: OutboxPayload): Prom
       { errorCode: 413 },
     );
   }
-  const message = await deps.client.sendDocument(deps.chatId, payload.path, {
+  const integrityFields = [payload.contentSha256, payload.contentBytes];
+  const hasIntegrityFence = integrityFields.some((value) => value !== undefined);
+  let document: string | Blob = payload.path;
+  if (hasIntegrityFence) {
+    if (
+      typeof payload.contentSha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/u.test(payload.contentSha256) ||
+      !Number.isSafeInteger(payload.contentBytes) ||
+      (payload.contentBytes ?? -1) < 0
+    ) {
+      throw Object.assign(new Error(`${payload.filename} has invalid immutable-byte metadata`), {
+        errorCode: 400,
+      });
+    }
+    if (info.size !== payload.contentBytes) {
+      throw Object.assign(
+        new Error(`${payload.filename} no longer matches its durable byte count`),
+        { errorCode: 409 },
+      );
+    }
+    const contents = await readFile(payload.path);
+    const sha256 = createHash('sha256').update(contents).digest('hex');
+    if (contents.byteLength !== payload.contentBytes || sha256 !== payload.contentSha256) {
+      throw Object.assign(
+        new Error(`${payload.filename} no longer matches its durable content digest`),
+        { errorCode: 409 },
+      );
+    }
+    // Blob owns the verified bytes. A later path mutation therefore cannot
+    // change what this particular Telegram request uploads.
+    document = new Blob([contents]);
+  }
+  const message = await deps.client.sendDocument(deps.chatId, document, {
     filename: payload.filename,
     ...(payload.replyMarkup === undefined ? {} : { replyMarkup: payload.replyMarkup }),
     ...(payload.caption !== undefined

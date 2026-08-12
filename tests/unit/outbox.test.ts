@@ -1,10 +1,16 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { type Database, openDatabase } from '../../src/database/db.ts';
 import { SessionRepository } from '../../src/database/repository.ts';
+import {
+  prepareDigestDelivery,
+  prepareDigestDocumentForSend,
+  publishDigestSnapshot,
+} from '../../src/digest/delivery.ts';
 import { nullLogger } from '../../src/logging/logger.ts';
 import {
   isClientShutdown,
@@ -12,7 +18,7 @@ import {
   TelegramClient,
   telegramLongPollDeadlineMs,
 } from '../../src/telegram/client.ts';
-import { drainOutbox, Outbox } from '../../src/telegram/outbox.ts';
+import { drainOutbox, Outbox, type OutboxPayload } from '../../src/telegram/outbox.ts';
 import {
   markUpdateHandled,
   nextOffsetFor,
@@ -112,7 +118,33 @@ function deps(
     chatId: 42,
     logger: nullLogger,
     maxOutgoingBytes,
+    prepareDigestDocument: (
+      deliveryPartId: string,
+      payload: Extract<OutboxPayload, { type: 'document' }>,
+    ) => prepareDigestDocumentForSend(db.handle, deliveryPartId, payload, dir),
   };
+}
+
+function v2DigestSnapshot(date: string) {
+  return {
+    sourceKind: 'local_daily_digest' as const,
+    processingHost: 'test-host',
+    date,
+    sessionCount: 0,
+    totalSpeechMs: 0,
+    claimSourceVersion: 2 as const,
+    rows: [],
+  };
+}
+
+function insertV2DigestSnapshot(date: string): void {
+  db.handle
+    .prepare(
+      `INSERT INTO digests
+         (digest_id, digest_date, session_count, speech_ms, payload, created_at)
+       VALUES (?, ?, 0, 0, ?, ?)`,
+    )
+    .run(`digest-${date}`, date, JSON.stringify(v2DigestSnapshot(date)), new Date().toISOString());
 }
 
 describe('outbox idempotency', () => {
@@ -693,6 +725,117 @@ describe('outbox delivery', () => {
     writeFileSync(filePath, Buffer.alloc(900));
     assert.equal(await drainOutbox(d), 0);
     assert.equal(calls.length, 0);
+  });
+
+  it('never uploads changed bytes when an integrity-fenced document retries', async () => {
+    const filePath = join(dir, 'digest.md');
+    const original = Buffer.from('first durable digest');
+    writeFileSync(filePath, original);
+    insertV2DigestSnapshot('2026-08-09');
+    const { fetch: impl, calls } = scriptedFetch([
+      () => {
+        throw new TypeError('fetch failed');
+      },
+      () => okMessage(),
+    ]);
+    const d = deps(impl, 500);
+    d.outbox.enqueue({
+      deliveryPartId: 'report:immutable-retry',
+      kind: 'report',
+      ordinal: 30,
+      payload: {
+        type: 'document',
+        path: filePath,
+        filename: 'digest.md',
+        contentBytes: original.byteLength,
+        contentSha256: createHash('sha256').update(original).digest('hex'),
+      },
+    });
+
+    assert.equal(await drainOutbox(d), 0);
+    assert.equal(calls.length, 1);
+    writeFileSync(filePath, Buffer.from('other durable digest'));
+    db.handle.prepare("UPDATE telegram_outbox SET run_after = '1970-01-01T00:00:00.000Z'").run();
+
+    const retryDeps = deps(impl, 500);
+    assert.equal(await drainOutbox(retryDeps), 0);
+    assert.equal(calls.length, 1, 'the changed artifact must not reach Telegram on retry');
+    const row = db.handle.prepare('SELECT state, last_error FROM telegram_outbox').get() as {
+      state: string;
+      last_error: string;
+    };
+    assert.equal(row.state, 'dead');
+    assert.match(row.last_error, /durable (byte count|content digest)/);
+  });
+
+  it('reconstructs the exact v2 digest before send and rejects a self-consistent substitute', async () => {
+    const date = '2026-08-09';
+    const digest = v2DigestSnapshot(date);
+    const prepared = prepareDigestDelivery(digest, 'UTC', 0, dir);
+    assert.equal(prepared.payload.type, 'document');
+    assert.equal(publishDigestSnapshot(db.handle, digest, prepared.payload, 'UTC'), 'inserted');
+    assert.equal(existsSync(prepared.payload.path), false);
+    const { fetch: impl, calls } = scriptedFetch([() => okMessage()]);
+    const d = deps(impl, 500_000);
+
+    assert.ok(d.prepareDigestDocument);
+    const unavailable = {
+      ...d,
+      prepareDigestDocument: async () => {
+        throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+      },
+    };
+    assert.equal(await drainOutbox(unavailable), 0);
+    assert.equal(calls.length, 0);
+    const deferred = db.handle
+      .prepare(
+        "SELECT state, last_error FROM telegram_outbox WHERE delivery_part_id = 'digest:2026-08-09'",
+      )
+      .get() as { state: string; last_error: string };
+    assert.equal(deferred.state, 'pending');
+    assert.match(deferred.last_error, /could not be materialized/);
+    assert.doesNotMatch(deferred.last_error, /no space|device/i);
+    db.handle
+      .prepare(
+        "UPDATE telegram_outbox SET run_after = '1970-01-01T00:00:00.000Z' WHERE delivery_part_id = 'digest:2026-08-09'",
+      )
+      .run();
+
+    assert.equal(await drainOutbox(d), 1);
+    assert.equal(calls.length, 1);
+    assert.equal(
+      existsSync(prepared.payload.path),
+      true,
+      'pre-send proof reconstructs the crash gap',
+    );
+
+    const filePath = join(dir, 'digest.md');
+    const arbitrary = Buffer.from('arbitrary private file');
+    writeFileSync(filePath, arbitrary);
+    insertV2DigestSnapshot('2026-08-10');
+    d.outbox.enqueue({
+      deliveryPartId: 'digest:2026-08-10',
+      kind: 'digest',
+      ordinal: 30,
+      payload: {
+        type: 'document',
+        path: filePath,
+        filename: 'digest.md',
+        contentBytes: arbitrary.byteLength,
+        contentSha256: createHash('sha256').update(arbitrary).digest('hex'),
+        digestTimezone: 'UTC',
+      },
+    });
+
+    assert.equal(await drainOutbox(d), 0);
+    assert.equal(calls.length, 1, 'the substitute must not reach Telegram');
+    const row = db.handle
+      .prepare(
+        "SELECT state, last_error FROM telegram_outbox WHERE delivery_part_id = 'digest:2026-08-10'",
+      )
+      .get() as { state: string; last_error: string };
+    assert.equal(row.state, 'dead');
+    assert.match(row.last_error, /failed its durable snapshot proof/);
   });
 
   it('removes an ephemeral split only after Telegram accepts it', async () => {

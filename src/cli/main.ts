@@ -18,7 +18,7 @@ import { normalizeToWav, probeAudio } from '../capture/probe.ts';
 import { recoverAfterCrash, renderRecoveryReport } from '../capture/recovery.ts';
 import { ensureDirectories, loadConfig } from '../config/load.ts';
 import { type AudioConfig, ConfigError } from '../config/schema.ts';
-import { openDatabase, transaction } from '../database/db.ts';
+import { openDatabase } from '../database/db.ts';
 import { TranscriptRepository } from '../database/repository.ts';
 import { renderSearchResults, searchTranscripts } from '../database/search.ts';
 import {
@@ -26,12 +26,16 @@ import {
   hasUnfinishedSessionsForDate,
   readStoredDigest,
   renderDigest,
-  renderDigestCaption,
-  renderDigestMarkdown,
   scheduledDigestDate,
-  storeDigest,
   zonedDateTime,
 } from '../digest/daily.ts';
+import {
+  type DigestPublication,
+  ensureDigestDeliveryArtifact,
+  prepareDigestDelivery,
+  publishDigestSnapshot,
+  readDigestDeliveryPayload,
+} from '../digest/delivery.ts';
 import { compactJobError, renderDeadJobAlert } from '../jobs/diagnostics.ts';
 import { canRetryDeadJob, JobQueue } from '../jobs/queue.ts';
 import { createLogger } from '../logging/logger.ts';
@@ -45,7 +49,6 @@ import {
 import { EnergyVad, rmsDbfs } from '../sessionizer/vad.ts';
 import { TelegramClient, type TelegramUpdate } from '../telegram/client.ts';
 import { keychain, telegramBotScope } from '../telegram/keychain.ts';
-import { Outbox, type OutboxPayload } from '../telegram/outbox.ts';
 import {
   inspectDeadOutbox,
   renderDeadOutboxReport,
@@ -57,7 +60,6 @@ import {
   renderUnacknowledgedTelegramDeliveries,
 } from '../telegram/reconcile-delivery.ts';
 import { readOffset, routeUpdate } from '../telegram/router.ts';
-import { writeTextAtomically } from '../util/atomic-file.ts';
 import { systemClock } from '../util/clock.ts';
 import { createAsrBackend } from './backends.ts';
 import { Daemon } from './daemon.ts';
@@ -305,44 +307,46 @@ async function digestCommand(
   await ensureDirectories(loaded.paths);
   const db = openDatabase({ file: loaded.paths.databaseFile });
   try {
-    if (scheduled) {
-      const existing = db.handle
-        .prepare('SELECT 1 AS present FROM digests WHERE digest_date = ?')
-        .get(date);
+    let winner = readStoredDigest(db.handle, date);
+    let publication: DigestPublication = 'exists';
+    if (winner === undefined) {
       if (
-        existing !== undefined ||
+        scheduled &&
         hasUnfinishedSessionsForDate(db.handle, date, loaded.config.digest.timezone)
       ) {
         return 0;
       }
+      const digest = buildDigest(db.handle, date, loaded.config.digest.timezone, hostname());
+      const prepared = prepareDigestDelivery(
+        digest,
+        loaded.config.digest.timezone,
+        loaded.config.telegram.transcriptInlineLimit,
+        loaded.paths.transcriptsDir,
+      );
+      publication = publishDigestSnapshot(
+        db.handle,
+        digest,
+        prepared.payload,
+        loaded.config.digest.timezone,
+      );
+      winner = readStoredDigest(db.handle, date);
     }
+    if (publication === 'stale') {
+      throw new Error(`digest ${date} sources changed while the snapshot was being built; retry`);
+    }
+    if (winner === undefined) throw new Error(`digest ${date} publication produced no winner`);
 
-    const stored = readStoredDigest(db.handle, date);
-    if (stored !== undefined) {
-      const rendered = renderDigest(stored, loaded.config.digest.timezone);
-      process.stdout.write(asJson ? `${JSON.stringify(stored, null, 2)}\n` : `${rendered}\n`);
+    const payload = readDigestDeliveryPayload(db.handle, date);
+    await ensureDigestDeliveryArtifact(winner, payload, loaded.paths.transcriptsDir);
+    if (scheduled && publication === 'exists') {
       return 0;
     }
-
-    const digest = buildDigest(db.handle, date, loaded.config.digest.timezone, hostname());
-    const rendered = renderDigest(digest, loaded.config.digest.timezone);
-    let payload: OutboxPayload = { type: 'text', text: rendered, parseMode: 'HTML' };
-    if (rendered.length > loaded.config.telegram.transcriptInlineLimit) {
-      const filename = `digest-${date}.md`;
-      const path = join(loaded.paths.transcriptsDir, filename);
-      await writeTextAtomically(path, renderDigestMarkdown(digest, loaded.config.digest.timezone));
-      payload = { type: 'document', path, filename, caption: renderDigestCaption(digest) };
-    }
-    transaction(db.handle, () => {
-      storeDigest(db.handle, digest);
-      new Outbox(db.handle).enqueue({
-        deliveryPartId: `digest:${date}`,
-        kind: 'digest',
-        ordinal: 30,
-        payload,
-      });
-    });
-    process.stdout.write(asJson ? `${JSON.stringify(digest, null, 2)}\n` : `${rendered}\n`);
+    const displayTimezone =
+      payload.type === 'document' && payload.digestTimezone !== undefined
+        ? payload.digestTimezone
+        : loaded.config.digest.timezone;
+    const rendered = payload.type === 'text' ? payload.text : renderDigest(winner, displayTimezone);
+    process.stdout.write(asJson ? `${JSON.stringify(winner, null, 2)}\n` : `${rendered}\n`);
     return 0;
   } finally {
     db.close();

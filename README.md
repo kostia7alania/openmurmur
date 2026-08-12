@@ -453,8 +453,11 @@ zone) with DST-correct local-day bounds. It retries the most recent due date and
 waits for sessions already in progress for that date; only `DONE` sessions enter
 the automatic snapshot. Storing a digest and enqueueing its stable Telegram row
 share one SQLite transaction. A short digest stays inline; a long one is a
-trusted `digest-YYYY-MM-DD.md` document. The five-minute launchd fallback reads
-the same enabled/time/timezone config and uses the same delivery identity.
+trusted content-addressed `digest-YYYY-MM-DD-<sha256>.md` document. Its durable
+outbox row owns the exact path, bytes and digest: a crash gap is reconstructed
+from that snapshot, and every retry verifies the bytes before upload. The
+five-minute launchd fallback reads the same enabled/time/timezone config and
+uses the same delivery identity.
 
 The snapshot is a cutoff, not a mutable thread: a new session that starts after
 that date's digest was stored is not retroactively appended. Configure

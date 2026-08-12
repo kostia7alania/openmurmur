@@ -137,9 +137,16 @@ Digest day boundaries come from `digest.timezone` (`local` or a valid IANA
 zone), including DST transitions. Storing a digest and enqueueing its stable
 `digest:<date>` row are one SQLite transaction. The CLI/launchd digest path uses
 the same identity as a safety net. Short digests are HTML text; long ones are
-trusted `digest-YYYY-MM-DD.md` documents. Automatic snapshots contain only
-`DONE` sessions and wait while that date has active/processing/delivering work;
-before today's configured time, the scheduler retries the previous due date.
+trusted content-addressed `digest-YYYY-MM-DD-<sha256>.md` documents. The first
+durable snapshot/outbox writer wins; only that exact payload may publish or
+reconstruct the document, and every upload checks its stored byte count and
+SHA-256. A concurrent loser creates no artifact. Automatic snapshots contain
+only `DONE` sessions and wait while that date has active/processing/delivering
+work; before today's configured time, the scheduler retries the previous due
+date. Visible model claims are labelled as drafts and retain their exact summary
+and transcript revision plus the model-reported segment reference and one
+bounded localized excerpt. An older summary is never attached to a newer
+current transcript revision.
 The launchd fallback wakes every five minutes and evaluates the same configured
 timezone and time. A session starting after its date's snapshot is not revised
 into that already delivered digest; AR-08 tracks that late-session policy gap.

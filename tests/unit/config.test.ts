@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { decodeResponse, encodeRequest, LineSplitter } from '../../src/asr/protocol.ts';
 import { sessionIdFromDeliveryPart } from '../../src/cli/daemon.ts';
@@ -12,6 +12,7 @@ import { ConfigError, DEFAULT_CONFIG, parseConfig } from '../../src/config/schem
 import { openDatabase } from '../../src/database/db.ts';
 import {
   buildDigest,
+  digestSnapshotStillCurrent,
   hasUnfinishedSessionsForDate,
   localDayBounds,
   readStoredDigest,
@@ -21,6 +22,15 @@ import {
   scheduledDigestDate,
   storeDigest,
 } from '../../src/digest/daily.ts';
+import {
+  cleanupDurableDigestTemps,
+  ensureDigestDeliveryArtifact,
+  prepareDigestDelivery,
+  prepareDigestDocumentForSend,
+  publishDigestSnapshot,
+  readDigestDeliveryPayload,
+} from '../../src/digest/delivery.ts';
+import { EMPTY_SUMMARY } from '../../src/llm/schema.ts';
 import { EnergyVad, rmsDbfs } from '../../src/sessionizer/vad.ts';
 import { Outbox } from '../../src/telegram/outbox.ts';
 
@@ -493,32 +503,100 @@ describe('digest day boundaries', () => {
     assert.throws(() => localDayBounds('2026-02-30', 'UTC'), /does not exist/);
   });
 
-  it('keeps the host-A digest artifact and payloads on an explicit host-B repeat', () => {
+  it('keeps one revision-bound digest and reconstructs only its durable artifact', async () => {
     const root = mkdtempSync(join(tmpdir(), 'om-digest-repeat-'));
     const db = openDatabase({ file: join(root, 'openmurmur.db') });
     const processingHost = `snapshot-before-${hostname()}`;
-    const digest = {
-      sourceKind: 'local_daily_digest' as const,
-      processingHost,
-      date: '2026-08-09',
-      sessionCount: 1,
-      totalSpeechMs: 60_000,
-      rows: [
-        {
-          sessionId: 's1',
-          startedAt: '2026-08-09T10:00:00.000Z',
-          speechMs: 60_000,
-          summary: '<script>alert(1)</script> **heading**',
-          decisions: Array.from(
-            { length: 20 },
-            (_, index) => `ship item ${index}: [now](https://example.com) ${'x'.repeat(220)}`,
-          ),
-          tasks: [],
-          questions: [],
-        },
-      ],
-    };
     try {
+      const now = '2026-08-09T10:00:00.000Z';
+      db.handle
+        .prepare(
+          `INSERT INTO audio_sessions
+             (session_id, state, started_at, ended_at, duration_ms, speech_ms, created_at, updated_at)
+           VALUES ('s1', 'DONE', ?, ?, 60000, 60000, ?, ?)`,
+        )
+        .run(now, '2026-08-09T10:01:00.000Z', now, now);
+      db.handle
+        .prepare(
+          `INSERT INTO transcript_revisions
+             (revision_id, session_id, revision_number, engine, model, languages, text,
+              word_count, is_current, created_at)
+           VALUES
+             ('revision-old', 's1', 1, 'fake', 'fake', '["Russian"]', 'Старый текст',
+              2, 0, ?),
+             ('revision-current', 's1', 2, 'fake', 'fake', '["Russian"]', 'Текущий текст',
+              2, 1, ?)`,
+        )
+        .run(now, now);
+      const misleadingPrefix = `САМОЕ НАЧАЛО НЕ ДОЛЖНО ПОПАСТЬ. ${'Нерелевантное вступление. '.repeat(20)}`;
+      db.handle
+        .prepare(
+          `INSERT INTO transcript_segments
+             (revision_id, segment_index, start_ms, end_ms, timestamp_source, text)
+           VALUES ('revision-current', 0, 0, 1000, 'aligner', ?),
+                  ('revision-current', 1, 1000, 2000, 'aligner', 'Бюджет пока обсуждается.')`,
+        )
+        .run(
+          `${misleadingPrefix}Я постараюсь отправить отчёт до пятницы, но пока не обещаю. После этого разговор ушёл дальше.`,
+        );
+      db.handle
+        .prepare(
+          `INSERT INTO summaries
+             (summary_id, session_id, revision_id, engine, model, payload, created_at)
+           VALUES ('summary-old', 's1', 'revision-old', 'fake', 'fake', ?, ?),
+                  ('summary-current', 's1', 'revision-current', 'fake', 'fake', ?, ?)`,
+        )
+        .run(
+          JSON.stringify({ ...EMPTY_SUMMARY, summary: 'СТАРОЕ РЕЗЮМЕ' }),
+          '2026-08-09T10:02:00.000Z',
+          JSON.stringify({
+            ...EMPTY_SUMMARY,
+            summary: '<script>alert(1)</script> **heading**',
+            decisions: [
+              'Отправлю отчёт до пятницы.',
+              ...Array.from(
+                { length: 19 },
+                (_, index) => `ship item ${index}: [now](https://example.com) ${'x'.repeat(220)}`,
+              ),
+            ],
+            tasks: ['Позвонить Анне'],
+            questions: ['Утверждён ли бюджет?'],
+            claimEvidence: [
+              { field: 'summary', item: 0, segments: [1] },
+              { field: 'decisions', item: 0, segments: [0] },
+              { field: 'questions', item: 0, segments: [1] },
+            ],
+          }),
+          '2026-08-09T10:01:00.000Z',
+        );
+
+      const digest = buildDigest(db.handle, '2026-08-09', 'UTC', processingHost);
+      assert.equal(digest.claimSourceVersion, 2);
+      assert.equal(digest.rows[0]?.summaryId, 'summary-current');
+      assert.equal(digest.rows[0]?.summaryRevisionId, 'revision-current');
+      assert.doesNotMatch(JSON.stringify(digest), /СТАРОЕ РЕЗЮМЕ/);
+      assert.equal(digestSnapshotStillCurrent(db.handle, digest, 'UTC'), true);
+      db.handle
+        .prepare(
+          "UPDATE transcript_revisions SET is_current = 0 WHERE revision_id = 'revision-current'",
+        )
+        .run();
+      db.handle
+        .prepare(
+          "UPDATE transcript_revisions SET is_current = 1 WHERE revision_id = 'revision-old'",
+        )
+        .run();
+      assert.equal(digestSnapshotStillCurrent(db.handle, digest, 'UTC'), false);
+      db.handle
+        .prepare(
+          "UPDATE transcript_revisions SET is_current = 0 WHERE revision_id = 'revision-old'",
+        )
+        .run();
+      db.handle
+        .prepare(
+          "UPDATE transcript_revisions SET is_current = 1 WHERE revision_id = 'revision-current'",
+        )
+        .run();
       const markdown = renderDigestMarkdown(digest, 'America/New_York');
       const telegram = renderDigest(digest, 'America/New_York');
       const caption = renderDigestCaption(digest);
@@ -538,34 +616,114 @@ describe('digest day boundaries', () => {
       assert.match(markdown, /# Дайджест OpenMurmur/);
       assert.match(markdown, /06:00/);
       assert.match(telegram, /06:00/);
+      assert.match(telegram, /Черновик модели: решения/);
+      assert.match(telegram, /Я постараюсь отправить отчёт до пятницы, но пока не обещаю/);
+      assert.doesNotMatch(telegram, /САМОЕ НАЧАЛО/);
+      assert.match(telegram, /ссылка модели: не указана/);
+      assert.match(telegram, /revision-current/);
+      assert.match(markdown, /черновик модели/i);
+      assert.match(markdown, /Я постараюсь отправить отчёт до пятницы, но пока не обещаю/);
       assert.doesNotMatch(markdown, /<script>/);
       assert.doesNotMatch(markdown, /\*\*heading\*\*/);
-      storeDigest(db.handle, digest);
+      const transcriptsDir = join(root, 'transcripts');
+      mkdirSync(transcriptsDir, { recursive: true });
+      const prepared = prepareDigestDelivery(
+        digest,
+        'America/New_York',
+        DEFAULT_CONFIG.telegram.transcriptInlineLimit,
+        transcriptsDir,
+      );
+      assert.equal(prepared.payload.type, 'document');
+      assert.equal(publishDigestSnapshot(db.handle, digest, prepared.payload, 'UTC'), 'inserted');
+
+      // A delayed loser must observe the durable winner before source
+      // revalidation. It cannot classify the shared winner as stale or delete
+      // the winner's content-addressed artifact.
+      db.handle
+        .prepare(
+          "UPDATE transcript_revisions SET is_current = 0 WHERE revision_id = 'revision-current'",
+        )
+        .run();
+      db.handle
+        .prepare(
+          "UPDATE transcript_revisions SET is_current = 1 WHERE revision_id = 'revision-old'",
+        )
+        .run();
+      const losingDigest = { ...digest, processingHost: 'losing-concurrent-host' };
+      const losingPrepared = prepareDigestDelivery(
+        losingDigest,
+        'UTC',
+        DEFAULT_CONFIG.telegram.transcriptInlineLimit,
+        transcriptsDir,
+      );
+      assert.equal(
+        publishDigestSnapshot(db.handle, losingDigest, losingPrepared.payload, 'UTC'),
+        'exists',
+      );
+      db.handle
+        .prepare(
+          "UPDATE transcript_revisions SET is_current = 0 WHERE revision_id = 'revision-old'",
+        )
+        .run();
+      db.handle
+        .prepare(
+          "UPDATE transcript_revisions SET is_current = 1 WHERE revision_id = 'revision-current'",
+        )
+        .run();
+
       const stored = db.handle
         .prepare('SELECT payload FROM digests WHERE digest_date = ?')
         .get(digest.date) as { payload: string };
       assert.deepEqual(JSON.parse(stored.payload), digest);
+      assert.doesNotMatch(stored.payload, /losing-concurrent-host/);
 
       const outbox = new Outbox(db.handle);
-      const artifactPath = join(root, 'transcripts', `digest-${digest.date}.md`);
-      mkdirSync(join(root, 'transcripts'), { recursive: true });
-      writeFileSync(artifactPath, markdown);
-      outbox.enqueue({
-        deliveryPartId: `digest:${digest.date}`,
-        kind: 'digest',
-        ordinal: 30,
-        payload: {
-          type: 'document',
-          path: artifactPath,
-          filename: `digest-${digest.date}.md`,
-          caption,
-        },
-      });
+      const durablePayload = readDigestDeliveryPayload(db.handle, digest.date);
+      assert.equal(durablePayload.type, 'document');
+      assert.equal(durablePayload.digestTimezone, 'America/New_York');
+      assert.match(durablePayload.contentSha256 ?? '', /^[0-9a-f]{64}$/u);
+      assert.ok((durablePayload.contentBytes ?? 0) > 0);
+      const artifactPath = durablePayload.path;
+      assert.equal(existsSync(artifactPath), false, 'the transaction does not publish a file');
+      await ensureDigestDeliveryArtifact(digest, durablePayload, transcriptsDir);
       const storedBeforeRepeat = stored.payload;
       const outboxBeforeRepeat = db.handle
         .prepare('SELECT payload FROM telegram_outbox WHERE delivery_part_id = ?')
         .get(`digest:${digest.date}`) as { payload: string };
       const artifactBeforeRepeat = readFileSync(artifactPath);
+      rmSync(artifactPath);
+      assert.equal(existsSync(artifactPath), false);
+
+      const interruptedTemp = join(
+        transcriptsDir,
+        `.${basename(artifactPath)}.${process.pid}.00000000-0000-4000-8000-000000000000.tmp`,
+      );
+      writeFileSync(interruptedTemp, artifactBeforeRepeat);
+      db.handle
+        .prepare("UPDATE telegram_outbox SET state = 'sent' WHERE delivery_part_id = ?")
+        .run(`digest:${digest.date}`);
+      assert.equal(await cleanupDurableDigestTemps(db.handle, transcriptsDir), 1);
+      assert.equal(existsSync(artifactPath), false);
+      assert.equal(existsSync(interruptedTemp), false, 'startup removes a sent winner temp');
+
+      await prepareDigestDocumentForSend(
+        db.handle,
+        `digest:${digest.date}`,
+        durablePayload,
+        transcriptsDir,
+      );
+      assert.deepEqual(readFileSync(artifactPath), artifactBeforeRepeat);
+      db.handle
+        .prepare(
+          `UPDATE telegram_outbox
+              SET state = 'pending', run_after = '1970-01-01T00:00:00.000Z',
+                  attempts = 0, claim_generation = 0, telegram_message_id = NULL
+            WHERE delivery_part_id = ?`,
+        )
+        .run(`digest:${digest.date}`);
+
+      rmSync(artifactPath);
+      assert.equal(existsSync(artifactPath), false);
 
       const repeated = spawnSync(
         process.execPath,
@@ -574,6 +732,7 @@ describe('digest day boundaries', () => {
       );
       assert.equal(repeated.status, 0, repeated.stderr);
       assert.deepEqual(JSON.parse(repeated.stdout), digest);
+      assert.equal(existsSync(artifactPath), true, 'the durable owner reconstructs a crash gap');
       assert.deepEqual(readFileSync(artifactPath), artifactBeforeRepeat);
       assert.equal(
         (
@@ -600,6 +759,35 @@ describe('digest day boundaries', () => {
       assert.equal(retried.payload, first.payload);
       assert.ok(retried.payload.includes(processingHost));
 
+      const digestRow = digest.rows[0];
+      assert.ok(digestRow);
+      const legacyDigest = {
+        sourceKind: 'local_daily_digest' as const,
+        processingHost: 'legacy-host',
+        date: '2026-08-08',
+        sessionCount: 1,
+        totalSpeechMs: digestRow.speechMs,
+        rows: [
+          {
+            sessionId: digestRow.sessionId,
+            startedAt: digestRow.startedAt,
+            speechMs: digestRow.speechMs,
+            summary: digestRow.summary,
+            decisions: digestRow.decisions,
+            tasks: digestRow.tasks,
+            questions: digestRow.questions,
+          },
+        ],
+      };
+      assert.equal(storeDigest(db.handle, legacyDigest), true);
+      const legacyStored = readStoredDigest(db.handle, legacyDigest.date);
+      assert.ok(legacyStored);
+      assert.equal(legacyStored.claimSourceVersion, undefined);
+      assert.match(
+        renderDigest(legacyStored, 'UTC'),
+        /legacy snapshot: источник model claim не сохранён/,
+      );
+
       const malformed = [
         ['sessionCount', { ...digest, sessionCount: 2 }],
         ['totalSpeechMs', { ...digest, totalSpeechMs: 60_001 }],
@@ -613,6 +801,10 @@ describe('digest day boundaries', () => {
         [
           'rows\\[0\\]\\.decisions',
           { ...digest, rows: [{ ...digest.rows[0], decisions: ['valid', 7] }] },
+        ],
+        [
+          'rows\\[0\\]\\.claimSources',
+          { ...digest, rows: [{ ...digest.rows[0], claimSources: [] }] },
         ],
       ] as const;
       for (const [field, payload] of malformed) {

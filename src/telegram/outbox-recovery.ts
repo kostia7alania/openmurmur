@@ -240,14 +240,32 @@ function canonicalDocumentPayload(payload: Record<string, unknown>): boolean {
     payload['type'] === 'document' &&
     hasOnly(
       payload,
-      new Set(['type', 'path', 'filename', 'caption', 'partId', 'replyMarkup', 'deleteAfterSend']),
+      new Set([
+        'type',
+        'path',
+        'filename',
+        'caption',
+        'partId',
+        'replyMarkup',
+        'deleteAfterSend',
+        'contentSha256',
+        'contentBytes',
+        'digestTimezone',
+      ]),
     ) &&
     typeof payload['path'] === 'string' &&
     typeof filename === 'string' &&
     filename.length > 0 &&
     basename(filename) === filename &&
     (payload['caption'] === undefined || typeof payload['caption'] === 'string') &&
-    (payload['replyMarkup'] === undefined || isRecord(payload['replyMarkup']))
+    (payload['replyMarkup'] === undefined || isRecord(payload['replyMarkup'])) &&
+    (payload['contentSha256'] === undefined ||
+      (typeof payload['contentSha256'] === 'string' &&
+        /^[0-9a-f]{64}$/u.test(payload['contentSha256']))) &&
+    (payload['contentBytes'] === undefined ||
+      (Number.isSafeInteger(payload['contentBytes']) &&
+        (payload['contentBytes'] as number) >= 0)) &&
+    (payload['digestTimezone'] === undefined || typeof payload['digestTimezone'] === 'string')
   );
 }
 

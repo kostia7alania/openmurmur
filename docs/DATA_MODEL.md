@@ -204,8 +204,9 @@ collapsed summary, that companion row is
 cannot create a second logical copy of either presentation.
 
 Long reports and digests are document payloads pointing only at trusted
-`<sessionId>.<revisionId>.report.md` and `digest-YYYY-MM-DD.md` paths. Telegram's
-user-facing report filename remains `<sessionId>.report.md`.
+`<sessionId>.<revisionId>.report.md` and content-addressed
+`digest-YYYY-MM-DD-<sha256>.md` paths. Telegram's user-facing report filename
+remains `<sessionId>.report.md`.
 
 ### `telegram_updates` and `telegram_offset`
 
@@ -272,7 +273,7 @@ of duplicate messages.
 problem persists. Events older than 30 days are removed and a hard 5,000-row
 cap bounds even pathological flapping; healthy baseline polls create no rows.
 The other tables hold one live JSON summary payload per immutable transcript
-revision, one digest per local date (`UNIQUE`, upserted), and the
+revision, one immutable first-writer digest per local date (`UNIQUE`), and the
 applied-migration ledger. Migration 012 archives ambiguous legacy duplicates in
 `summary_revision_conflicts` before enforcing revision uniqueness; no payload
 is discarded. Each summary row is bound to one immutable
@@ -287,11 +288,20 @@ retention fact or routing decision.
 
 Digest day bounds use the configured `digest.timezone`, including IANA-zone DST
 transitions. Digest storage and enqueue of `digest:<date>` share one transaction,
-so the daemon and CLI/launchd safety net converge on one delivery unit. A long
-digest document uses the trusted path `digest-YYYY-MM-DD.md`. Automatic digests
-select only `DONE` sessions and defer while a session already belonging to that
-date is unfinished. The stable row is a cutoff: sessions starting after it was
-stored require the late-session revision policy tracked in AR-08.
+so the daemon and CLI/launchd safety net converge on one delivery unit. Storage
+is insert-only: the first complete snapshot wins, while a concurrent loser
+cannot overwrite its JSON or outbox payload and never publishes an unowned
+document. The durable payload names the exact content-addressed path, display
+timezone, byte count and SHA-256; a missing post-commit artifact is rebuilt
+from the immutable snapshot, while a changed artifact is rejected before every
+retry. New v2 snapshots bind each visible model claim to the exact summary/current
+transcript revision and persist only bounded model-reported segment references
+and localized excerpts. Legacy snapshots remain readable and explicitly say
+that claim sources were not retained; they are never backfilled from newer DB
+state. Automatic digests select only `DONE` sessions and defer while a session
+already belonging to that date is unfinished. The stable row is a cutoff:
+sessions starting after it was stored require the late-session revision policy
+tracked in AR-08.
 
 ## Invariants
 
