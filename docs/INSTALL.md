@@ -1351,7 +1351,11 @@ chmod 0700 "$RELEASE_EVIDENCE_DIR"
 Index the earlier persistent D121 evidence without copying or weakening it.
 This creates the exact reference path declared by the release manifest and
 binds the readable evidence manifest bytes; the final human audit must still
-inspect the referenced files before D123 can be marked done:
+inspect the referenced files before D123 can be marked done. The reference is
+staged and fsynced in a private adjacent directory, published create-if-absent,
+and committed by fsyncing the release evidence directory. A rerun accepts and
+re-fsyncs only the exact canonical bytes for the same frozen artifacts; any
+foreign path or artifact drift is preserved and fails closed:
 
 ```bash
 : "${D121_EVIDENCE_DIR:?export the persistent D121 evidence directory printed above}"
@@ -1362,13 +1366,18 @@ NODE_BIN="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$DAEMON_PLIS
   "$D121_MANIFEST" "$RELEASE_EVIDENCE_DIR/D121.reference.json" \
   "$RELEASE_EVIDENCE_DIR" <<'NODE'
 import {
+  chmodSync,
   closeSync,
   constants,
   fsyncSync,
+  linkSync,
   lstatSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   realpathSync,
+  rmdirSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -1414,6 +1423,7 @@ if (!Array.isArray(manifest.files) || !/^[0-9a-f]{40}$/.test(manifest.repository
   throw new Error('D121 evidence manifest contents are invalid');
 }
 const seen = new Set();
+const artifacts = [];
 for (const entry of manifest.files) {
   if (
     typeof entry?.path !== 'string' ||
@@ -1439,10 +1449,20 @@ for (const entry of manifest.files) {
   ) {
     throw new Error(`D121 evidence artifact drifted: ${entry.path}`);
   }
+  artifacts.push({
+    path: artifactPath,
+    name: entry.path,
+    dev: artifactStat.dev,
+    ino: artifactStat.ino,
+    mode: artifactStat.mode & 0o777,
+    bytes: entry.bytes,
+    sha256: entry.sha256,
+  });
 }
 const releaseManifestPath = join(evidenceDirectory, 'release-signoff-v2.json');
 const releaseManifestStat = lstatSync(releaseManifestPath);
-const releaseManifest = JSON.parse(readFileSync(releaseManifestPath, 'utf8'));
+const releaseManifestBytes = readFileSync(releaseManifestPath);
+const releaseManifest = JSON.parse(releaseManifestBytes.toString('utf8'));
 if (
   !releaseManifestStat.isFile() ||
   releaseManifestStat.isSymbolicLink() ||
@@ -1452,32 +1472,6 @@ if (
   releaseManifest.requiredLiveEvidenceReferences?.D121 !== output
 ) {
   throw new Error('D121 evidence does not match the frozen release manifest');
-}
-const finalD121EvidenceStat = lstatSync(manifest.evidenceDirectory);
-const finalManifestStat = lstatSync(manifestPath);
-const finalReleaseEvidenceStat = lstatSync(evidenceDirectory);
-const finalManifestBytes = readFileSync(manifestPath);
-if (
-  !finalD121EvidenceStat.isDirectory() ||
-  finalD121EvidenceStat.isSymbolicLink() ||
-  finalD121EvidenceStat.uid !== process.getuid() ||
-  (finalD121EvidenceStat.mode & 0o777) !== 0o700 ||
-  finalD121EvidenceStat.dev !== d121EvidenceStat.dev ||
-  finalD121EvidenceStat.ino !== d121EvidenceStat.ino ||
-  !finalManifestStat.isFile() ||
-  finalManifestStat.isSymbolicLink() ||
-  finalManifestStat.dev !== manifestStat.dev ||
-  finalManifestStat.ino !== manifestStat.ino ||
-  finalManifestStat.size !== manifestStat.size ||
-  !finalManifestBytes.equals(manifestBytes) ||
-  !finalReleaseEvidenceStat.isDirectory() ||
-  finalReleaseEvidenceStat.isSymbolicLink() ||
-  finalReleaseEvidenceStat.uid !== process.getuid() ||
-  (finalReleaseEvidenceStat.mode & 0o777) !== 0o700 ||
-  finalReleaseEvidenceStat.dev !== evidenceStat.dev ||
-  finalReleaseEvidenceStat.ino !== evidenceStat.ino
-) {
-  throw new Error('D121 evidence changed during reference inspection');
 }
 const reference = {
   schemaVersion: 1,
@@ -1489,16 +1483,201 @@ const reference = {
     sha256: createHash('sha256').update(manifestBytes).digest('hex'),
   },
 };
-writeFileSync(output, `${JSON.stringify(reference, null, 2)}\n`, {
-  flag: 'wx',
-  mode: 0o600,
-});
-for (const path of [output, evidenceDirectory]) {
+const referenceBytes = Buffer.from(`${JSON.stringify(reference, null, 2)}\n`);
+
+function fsyncPath(path) {
   const fd = openSync(path, constants.O_RDONLY);
   try {
     fsyncSync(fd);
   } finally {
     closeSync(fd);
+  }
+}
+
+function assertArtifactsUnchanged() {
+  for (const artifact of artifacts) {
+    const stat = lstatSync(artifact.path);
+    const bytes = readFileSync(artifact.path);
+    if (
+      !stat.isFile() ||
+      stat.isSymbolicLink() ||
+      stat.uid !== process.getuid() ||
+      stat.dev !== artifact.dev ||
+      stat.ino !== artifact.ino ||
+      (stat.mode & 0o777) !== artifact.mode ||
+      bytes.length !== artifact.bytes ||
+      createHash('sha256').update(bytes).digest('hex') !== artifact.sha256
+    ) {
+      throw new Error(`D121 evidence artifact changed during inspection: ${artifact.name}`);
+    }
+  }
+}
+
+function assertInputsUnchanged() {
+  const finalD121EvidenceStat = lstatSync(manifest.evidenceDirectory);
+  const finalManifestStat = lstatSync(manifestPath);
+  const finalReleaseEvidenceStat = lstatSync(evidenceDirectory);
+  const finalReleaseManifestStat = lstatSync(releaseManifestPath);
+  const finalManifestBytes = readFileSync(manifestPath);
+  const finalReleaseManifestBytes = readFileSync(releaseManifestPath);
+  if (
+    !finalD121EvidenceStat.isDirectory() ||
+    finalD121EvidenceStat.isSymbolicLink() ||
+    finalD121EvidenceStat.uid !== process.getuid() ||
+    (finalD121EvidenceStat.mode & 0o777) !== 0o700 ||
+    finalD121EvidenceStat.dev !== d121EvidenceStat.dev ||
+    finalD121EvidenceStat.ino !== d121EvidenceStat.ino ||
+    !finalManifestStat.isFile() ||
+    finalManifestStat.isSymbolicLink() ||
+    finalManifestStat.dev !== manifestStat.dev ||
+    finalManifestStat.ino !== manifestStat.ino ||
+    finalManifestStat.size !== manifestStat.size ||
+    !finalManifestBytes.equals(manifestBytes) ||
+    !finalReleaseEvidenceStat.isDirectory() ||
+    finalReleaseEvidenceStat.isSymbolicLink() ||
+    finalReleaseEvidenceStat.uid !== process.getuid() ||
+    (finalReleaseEvidenceStat.mode & 0o777) !== 0o700 ||
+    finalReleaseEvidenceStat.dev !== evidenceStat.dev ||
+    finalReleaseEvidenceStat.ino !== evidenceStat.ino ||
+    !finalReleaseManifestStat.isFile() ||
+    finalReleaseManifestStat.isSymbolicLink() ||
+    finalReleaseManifestStat.dev !== releaseManifestStat.dev ||
+    finalReleaseManifestStat.ino !== releaseManifestStat.ino ||
+    finalReleaseManifestStat.size !== releaseManifestStat.size ||
+    !finalReleaseManifestBytes.equals(releaseManifestBytes)
+  ) {
+    throw new Error('D121 evidence changed during reference inspection');
+  }
+  assertArtifactsUnchanged();
+}
+
+function inspectReference() {
+  let stat;
+  try {
+    stat = lstatSync(output);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+  const bytes = readFileSync(output);
+  if (
+    !stat.isFile() ||
+    stat.isSymbolicLink() ||
+    stat.uid !== process.getuid() ||
+    (stat.mode & 0o777) !== 0o600 ||
+    !bytes.equals(referenceBytes)
+  ) {
+    throw new Error('existing D121 reference conflicts with the frozen evidence');
+  }
+  return { stat, bytes };
+}
+
+function acceptExistingReference() {
+  assertInputsUnchanged();
+  const before = inspectReference();
+  if (before === null) return false;
+  fsyncPath(output);
+  fsyncPath(evidenceDirectory);
+  assertInputsUnchanged();
+  const after = inspectReference();
+  if (
+    after === null ||
+    after.stat.dev !== before.stat.dev ||
+    after.stat.ino !== before.stat.ino ||
+    !after.bytes.equals(before.bytes)
+  ) {
+    throw new Error('D121 reference changed while proving durability');
+  }
+  return true;
+}
+
+if (!acceptExistingReference()) {
+  assertInputsUnchanged();
+  const stageDirectory = mkdtempSync(join(evidenceDirectory, '.D121-reference.'));
+  chmodSync(stageDirectory, 0o700);
+  const stageDirectoryStat = lstatSync(stageDirectory);
+  const stagePath = join(stageDirectory, 'D121.reference.json');
+  let stageStat;
+  let published = false;
+  try {
+    if (
+      !stageDirectoryStat.isDirectory() ||
+      stageDirectoryStat.isSymbolicLink() ||
+      stageDirectoryStat.uid !== process.getuid() ||
+      (stageDirectoryStat.mode & 0o777) !== 0o700 ||
+      realpathSync(stageDirectory) !== stageDirectory
+    ) {
+      throw new Error('D121 reference staging directory is unsafe');
+    }
+    writeFileSync(stagePath, referenceBytes, { flag: 'wx', mode: 0o600 });
+    fsyncPath(stagePath);
+    stageStat = lstatSync(stagePath);
+    if (
+      !stageStat.isFile() ||
+      stageStat.isSymbolicLink() ||
+      stageStat.uid !== process.getuid() ||
+      (stageStat.mode & 0o777) !== 0o600 ||
+      !readFileSync(stagePath).equals(referenceBytes)
+    ) {
+      throw new Error('D121 reference staging file changed before publication');
+    }
+    assertInputsUnchanged();
+    try {
+      linkSync(stagePath, output);
+      published = true;
+    } catch (error) {
+      if (error?.code !== 'EEXIST' || !acceptExistingReference()) throw error;
+    }
+    if (published) {
+      fsyncPath(evidenceDirectory);
+      assertInputsUnchanged();
+      const finalReference = inspectReference();
+      if (
+        finalReference === null ||
+        finalReference.stat.dev !== stageStat.dev ||
+        finalReference.stat.ino !== stageStat.ino
+      ) {
+        throw new Error('published D121 reference changed before durability proof');
+      }
+    }
+  } finally {
+    const finalStageDirectoryStat = lstatSync(stageDirectory);
+    if (
+      !finalStageDirectoryStat.isDirectory() ||
+      finalStageDirectoryStat.isSymbolicLink() ||
+      finalStageDirectoryStat.dev !== stageDirectoryStat.dev ||
+      finalStageDirectoryStat.ino !== stageDirectoryStat.ino
+    ) {
+      throw new Error(`preserving untrusted D121 reference stage: ${stageDirectory}`);
+    }
+    if (stageStat !== undefined) {
+      const finalStageStat = lstatSync(stagePath);
+      const finalStageBytes = readFileSync(stagePath);
+      if (
+        !finalStageStat.isFile() ||
+        finalStageStat.isSymbolicLink() ||
+        finalStageStat.uid !== process.getuid() ||
+        finalStageStat.dev !== stageStat.dev ||
+        finalStageStat.ino !== stageStat.ino ||
+        (finalStageStat.mode & 0o777) !== 0o600 ||
+        !finalStageBytes.equals(referenceBytes)
+      ) {
+        throw new Error(`preserving changed D121 reference stage: ${stageDirectory}`);
+      }
+      unlinkSync(stagePath);
+    }
+    rmdirSync(stageDirectory);
+    fsyncPath(evidenceDirectory);
+  }
+  assertInputsUnchanged();
+  const cleanedReference = inspectReference();
+  if (
+    cleanedReference === null ||
+    (published &&
+      (cleanedReference.stat.dev !== stageStat.dev ||
+        cleanedReference.stat.ino !== stageStat.ino))
+  ) {
+    throw new Error('D121 reference changed during staging cleanup');
   }
 }
 NODE
