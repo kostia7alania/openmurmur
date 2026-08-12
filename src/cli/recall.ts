@@ -1,6 +1,6 @@
 import { open } from 'node:fs/promises';
 import type { DatabaseSync } from 'node:sqlite';
-import { escapeFtsQuery } from '../database/search.ts';
+import { literalSnippet, unicodeFold, validatedSearchQuery } from '../database/search.ts';
 
 export type SourceAudioAvailability = 'available' | 'partial' | 'deleted' | 'unknown';
 
@@ -52,7 +52,6 @@ interface RecallRow {
   readonly recorded_at: string;
   readonly capture_timezone: string | null;
   readonly capture_host: string | null;
-  readonly match_rowid: number | null;
   readonly revision_text: string;
   readonly expected_parts: number;
 }
@@ -201,22 +200,6 @@ async function inspectSourceAudio(
   }
 }
 
-function unicodeFold(value: string): string {
-  return value.normalize('NFC').toLocaleLowerCase();
-}
-
-function literalSnippet(text: string, query: string): string {
-  // Use the un-normalized strings for offsets: NFC can change their code-unit
-  // length, so an index from the folded copy must never slice the source text.
-  const index = text.toLocaleLowerCase().indexOf(query.toLocaleLowerCase());
-  if (index < 0) return text.slice(0, 180);
-  const start = Math.max(0, index - 72);
-  const end = Math.min(text.length, index + query.length + 72);
-  const prefix = start === 0 ? '' : '…';
-  const suffix = end === text.length ? '' : '…';
-  return `${prefix}${text.slice(start, index)}[${text.slice(index, index + query.length)}]${text.slice(index + query.length, end)}${suffix}`;
-}
-
 function normalizedStoredTimestamp(value: string): string {
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : value;
@@ -227,80 +210,35 @@ export async function recallTranscripts(
   options: RecallOptions,
 ): Promise<RecallMatch[]> {
   const normalized = normalizeRecallOptions(options);
-  const match = escapeFtsQuery(normalized.query);
-  const segmentRows = db
-    .prepare(
-      `SELECT r.revision_id,
+  const query = validatedSearchQuery(normalized.query);
+  const foldedQuery = unicodeFold(query);
+  const rows = (
+    db
+      .prepare(
+        `SELECT r.revision_id,
               s.session_id,
               s.started_at AS recorded_at,
               s.capture_timezone,
               s.capture_host,
-              min(f.rowid) AS match_rowid,
-              r.text AS revision_text,
-              s.part_count AS expected_parts
-         FROM transcript_fts f
-         JOIN transcript_revisions r ON r.revision_id = f.revision_id
-         JOIN audio_sessions s ON s.session_id = r.session_id
-        WHERE transcript_fts MATCH ?
-          AND r.is_current = 1
-          AND (? IS NULL OR s.started_at >= ?)
-          AND (? IS NULL OR s.started_at < ?)
-        GROUP BY r.revision_id, s.session_id, s.started_at, s.capture_timezone, s.capture_host,
-                 r.text, s.part_count
-        ORDER BY recorded_at DESC
-        LIMIT ?`,
-    )
-    .all(
-      match,
-      normalized.since,
-      normalized.since,
-      normalized.until,
-      normalized.until,
-      normalized.limit,
-    ) as unknown as RecallRow[];
-  const revisionOnlyCandidates = db
-    .prepare(
-      `SELECT r.revision_id,
-              s.session_id,
-              s.started_at AS recorded_at,
-              s.capture_timezone,
-              s.capture_host,
-              NULL AS match_rowid,
               r.text AS revision_text,
               s.part_count AS expected_parts
          FROM transcript_revisions r
          JOIN audio_sessions s ON s.session_id = r.session_id
         WHERE r.is_current = 1
-          AND NOT EXISTS (
-                SELECT 1 FROM transcript_segments seg WHERE seg.revision_id = r.revision_id
-              )
           AND (? IS NULL OR s.started_at >= ?)
           AND (? IS NULL OR s.started_at < ?)
-        ORDER BY recorded_at DESC`,
-    )
-    .all(
-      normalized.since,
-      normalized.since,
-      normalized.until,
-      normalized.until,
-    ) as unknown as RecallRow[];
-  const foldedQuery = unicodeFold(normalized.query);
-  const rows = [
-    ...segmentRows,
-    ...revisionOnlyCandidates.filter((row) => unicodeFold(row.revision_text).includes(foldedQuery)),
-  ]
-    .sort(
-      (left, right) =>
-        right.recorded_at.localeCompare(left.recorded_at) ||
-        left.revision_id.localeCompare(right.revision_id),
-    )
+        ORDER BY recorded_at DESC, r.revision_id`,
+      )
+      .all(
+        normalized.since,
+        normalized.since,
+        normalized.until,
+        normalized.until,
+      ) as unknown as RecallRow[]
+  )
+    .filter((row) => unicodeFold(row.revision_text).includes(foldedQuery))
     .slice(0, normalized.limit);
 
-  const readSnippet = db.prepare(
-    `SELECT snippet(transcript_fts, 0, '[', ']', '…', 18) AS snippet
-       FROM transcript_fts
-      WHERE transcript_fts MATCH ? AND rowid = ?`,
-  );
   const readParts = db.prepare(
     `SELECT path, finalized, deleted_at
        FROM audio_parts
@@ -311,17 +249,13 @@ export async function recallTranscripts(
     rows.map(async (row) => {
       const parts = readParts.all(row.session_id) as unknown as AudioPartRow[];
       const audio = await inspectSourceAudio(row.expected_parts, parts);
-      const snippetRow =
-        row.match_rowid === null
-          ? undefined
-          : (readSnippet.get(match, row.match_rowid) as { readonly snippet: string } | undefined);
       return {
         revisionId: row.revision_id,
         sessionId: row.session_id,
         recordedAt: normalizedStoredTimestamp(row.recorded_at),
         captureTimezone: row.capture_timezone,
         captureHost: row.capture_host,
-        snippet: snippetRow?.snippet ?? literalSnippet(row.revision_text, normalized.query),
+        snippet: literalSnippet(row.revision_text, query),
         audioAvailability: sourceAudioAvailability(audio.facts),
         audioAvailabilityBasis: 'filesystem_snapshot',
         audioCheckedAt: audio.checkedAt,

@@ -44,7 +44,7 @@ export class SearchError extends Error {
 const MAX_QUERY_CODE_POINTS = 512;
 const MAX_RESULTS = 200;
 
-function validatedQuery(query: string): string {
+export function validatedSearchQuery(query: string): string {
   const trimmed = query.trim();
   const length = [...trimmed].length;
   if (length === 0) throw new SearchError('search query is empty');
@@ -77,12 +77,12 @@ function boundedLimit(value: number | undefined): number {
  * embedded quote is doubled — the FTS5 escape.
  */
 export function escapeFtsQuery(query: string): string {
-  const trimmed = validatedQuery(query);
+  const trimmed = validatedSearchQuery(query);
   return `"${trimmed.replaceAll('"', '""')}"`;
 }
 
 export function searchTranscripts(db: DatabaseSync, options: SearchOptions): SearchHit[] {
-  const query = validatedQuery(options.query);
+  const query = validatedSearchQuery(options.query);
   const foldedQuery = unicodeFold(query);
   const limit = boundedLimit(options.limit);
 
@@ -498,7 +498,7 @@ const FULL_CASE_FOLD_EXCEPTIONS: ReadonlyMap<number, string> = new Map([
   [0xfb17, 'մխ'],
 ]);
 
-function unicodeFold(value: string): string {
+export function unicodeFold(value: string): string {
   let folded = '';
   for (const character of value.normalize('NFC')) {
     const codePoint = character.codePointAt(0);
@@ -510,7 +510,7 @@ function unicodeFold(value: string): string {
   return folded.normalize('NFC');
 }
 
-function literalSnippet(text: string, query: string): string {
+export function literalSnippet(text: string, query: string): string {
   const foldedQuery = unicodeFold(query);
   const segments = [...new Intl.Segmenter('und', { granularity: 'grapheme' }).segment(text)];
   let foldedText = '';

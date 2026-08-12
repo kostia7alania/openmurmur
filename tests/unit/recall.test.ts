@@ -160,6 +160,39 @@ describe('grounded transcript recall', () => {
     assert.match(match.snippet, /\[launch decision\]/);
   });
 
+  it('finds a remembered phrase that crosses two ASR segment boundaries', async () => {
+    new TranscriptRepository(db.handle).append({
+      sessionId: 'available-session',
+      engine: 'fixture',
+      model: 'segmented-ru',
+      languages: ['ru'],
+      text: 'Обсудили бюджет на пятницу и записали решение.',
+      segments: [
+        {
+          startMs: 0,
+          endMs: 1000,
+          timestampSource: 'vad',
+          language: 'ru',
+          text: 'Обсудили бюджет',
+        },
+        {
+          startMs: 1000,
+          endMs: 2000,
+          timestampSource: 'vad',
+          language: 'ru',
+          text: ' на пятницу и записали решение.',
+        },
+      ],
+    });
+
+    const matches = await recallTranscripts(db.handle, { query: 'бюджет на пятницу' });
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0]?.sessionId, 'available-session');
+    assert.equal(matches[0]?.captureTimezone, 'Europe/Moscow');
+    assert.equal(matches[0]?.audioAvailability, 'available');
+    assert.match(matches[0]?.snippet ?? '', /\[бюджет на пятницу\]/u);
+  });
+
   it('Unicode-folds Russian revision-only text outside SQLite NOCASE', async () => {
     new TranscriptRepository(db.handle).append({
       sessionId: 'available-session',
