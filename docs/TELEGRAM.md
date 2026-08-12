@@ -1,7 +1,9 @@
 # Telegram
 
-Telegram is the **only** network destination OpenMurmur has, and you configure
-it yourself. This document describes exactly what crosses that boundary.
+During normal operation Telegram is the **only** network destination OpenMurmur
+uses, and you configure it yourself. Explicit foreground dependency and model
+provisioning may contact their documented package/model hosts; this document
+describes exactly what crosses the Telegram boundary.
 
 ## Setup
 
