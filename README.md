@@ -504,7 +504,7 @@ Honesty matters more than a green badge, so:
 | Evidence level | Current authoritative evidence | Boundary it does **not** cross |
 | --- | --- | --- |
 | Offline automated | The exact current-revision Node and Python gate is recorded immediately below; every covered guarantee names deterministic repository tests. | No microphone, model weights, Telegram credential, Keychain mutation, launchd login session or sleep/wake cycle is exercised. |
-| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama runs, including real-Qwen CLI transcription, daemon-owned worker reuse, a real worker-death `JobQueue` retry, real-model source-audio-first outbox eligibility, and the RU/EN/TH summary corpus. | The Ollama corpus did not meet its acceptance threshold; these bounded runs are not the complete capture-to-delivery or current-revision live release evidence. |
+| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama runs, including real-Qwen CLI transcription, daemon-owned worker reuse, a real worker-death `JobQueue` retry, real-model source-audio-first outbox eligibility, and the accepted frozen-digest RU/EN/TH summary corpus. | The repository-default Ollama tag, mixed/unknown-language quality and complete capture-to-delivery current-revision release remain unverified. |
 | Live release | No current-revision end-to-end live run is recorded yet; D120–D122 in [`docs/MVP_123.md`](docs/MVP_123.md) are the required gates. | Until those rows are evidenced, the project does not claim real microphone → models → Telegram, launchd login/reboot or sleep/wake verification. |
 
 **Verified on this revision through offline TypeScript/Python checks and the
@@ -549,8 +549,9 @@ converged through the production ASR job lease/failure/retry path without a
 stale transcript, outbox row, downstream job or duplicate revision. A bounded
 live `Daemon` also processed two real Qwen jobs on one observed Python
 generation and reaped it on stop. The real single-language Ollama corpus also
-exposed an output-language defect and verified its narrow RU/EN/TH prompt fix,
-but remains below its summary acceptance target.
+exposed language and modality defects, then verified the bounded RU/EN/TH fix
+at 18/18 grounded facts and claims, 100% precision and zero forbidden hits on
+one frozen model digest.
 That is useful bounded product evidence, but it is not the complete daemon
 service. **Still not verified end-to-end on this revision:** live microphone
 capture through the long-running daemon, real Telegram delivery, launchd under

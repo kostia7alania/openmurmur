@@ -401,6 +401,33 @@ is not being treated as a substitute for modality review. Calls took 16.711 s
 partial: the corrected measurement removed test wording noise but preserved the
 real repeatable model defect.
 
+A single production follow-up then made the prompt's modality and field contract
+language-independent: bare facts, amounts, assignments and intentions may not be
+promoted to approvals, completed decisions or personal promises. A first verbose
+wording exposed a real 8,192-token context regression before it was accepted.
+The same rule was compressed, leaving the final system prompt 136 UTF-8 bytes
+shorter than the previous production prompt; the exact bounded chunk-orchestration
+check then passed 9/9. The corpus and scorer remained byte-identical (corpus
+SHA-256 `a0967a0bdb3bc76e712dac691d2046cc7c8080f47f4a39f543b2e201b72f741b`).
+
+The final four calls ran on a separate loopback Ollama 0.32.6 process with
+`OLLAMA_NO_CLOUD=1`; its server log explicitly reported cloud disabled and the
+spawned llama-server used `--offline`. The exact model digest and 32,768-token
+loaded context were rechecked before and after the run. Settings remained
+`temperature=0`, `think=false`, `durationMs=0`, with each complete transcript
+as source segment 0.
+
+The bounded RU → EN → TH → RU repeat took 16.094 s, 8.020 s, 8.409 s and
+7.221 s. It passed the frozen gate at 18/18 grounded facts, 18/18 output claims,
+100% precision, zero forbidden hits and 3/3 cases; the RU repeat also passed at
+6/6 and 100%. Manual modality review found no promotion of the assigned task to
+a promise or the budget to an approved decision, and the customer Acme stayed
+out of `places`. This closes D108 for the checked-in single-language corpus and
+frozen model digest. It does not turn model text into verified fact: reports and
+digests still label it as a draft and retain source-linked evidence. The
+repository default model tag, mixed-language summaries and unknown language
+labels remain outside this bounded live-quality run.
+
 Silero's **segment-assembly logic** is separately covered by pure Python tests,
 which take a list of probabilities and need no model.
 
@@ -413,7 +440,7 @@ licence and a Hugging Face token — see [ADR-0008](adr/0008-speaker-diarization
 
 | Service | Version | Verified | Notes |
 | --- | --- | --- | --- |
-| Ollama | configured `qwen3.6:latest` (36B, Q4_K_M; digest above) | ⚠️ real single-language RU/EN/TH corpus executed; acceptance not met | Optional. Its absence degrades the report; it never blocks delivery. The repository default model tag remains unverified. |
+| Ollama | frozen `qwen3.6:latest` (36B, Q4_K_M; digest above) | ✅ bounded single-language RU/EN/TH corpus met its frozen acceptance gate | Optional. Its absence degrades the report; it never blocks delivery. The repository default model tag and mixed/unknown-language quality remain unverified. |
 | Telegram Bot API | Cloud, official | ⚠️ **no live calls made** | Response shapes are exercised with a scripted `fetch`. Blocked on a bot token, which only the owner can create. |
 
 ## How Python 3.14 was chosen

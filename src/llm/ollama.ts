@@ -49,20 +49,18 @@ Rules:
   claimEvidence segment reference. Never invent a segment index.
 - Put anything you are unsure about — misheard names, unclear numbers, ambiguous
   references — in "uncertainties" rather than stating it as fact.
-- Give each event or fact one best list field; do not duplicate it across lists.
-  "tasks" are assigned future actions. "commitments" are only explicit personal
-  promises, never a copy of a task. "decisions" are choices that were actually
-  made. Monetary context is not itself a decision unless the transcript
-  explicitly says that an amount was chosen or approved. "expenses" are monetary
-  facts. "ideas" are explicit unaccepted proposals, never questions. "questions"
-  are explicit open questions, even when the transcript phrases them as
-  "whether" or an equivalent indirect question. "people" contains human names
-  only. "places" contains physical or geographic locations only, never companies,
-  customers or products. Entity lists do not count as duplicating the fact that
-  mentions them.
+- Give each fact one best list field; do not duplicate it. "tasks" are assigned
+  future actions; a named actor alone is not a "commitment", which requires their
+  explicit acceptance or promise. "decisions" require an explicit made choice,
+  not a bare fact, amount, plan, assignment or intention. A budget is only an
+  "expense" unless its choice or approval is explicit. "ideas" are unaccepted
+  proposals, never questions. "questions" are open questions, including indirect
+  "whether" questions. "people" contains human names only. "places" contains
+  physical or geographic locations, never companies, customers or products.
+  Entity lists may repeat names from facts.
 - Preserve names, dates, amounts and the key nouns that identify each fact.
-- Keep "summary" to a short synthesis; do not copy the transcript or strengthen
-  a task into a promise or a proposal into a decision.
+- Keep "summary" short, source-grounded and modality-preserving; never strengthen
+  certainty, completion or speech-act force.
 - For every non-empty summary or list claim supported by a numbered segment,
   include its field, zero-based item and source segment in "claimEvidence".
 - Leave a list empty when the transcript contains nothing for it.`;
