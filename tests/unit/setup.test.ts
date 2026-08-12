@@ -1123,23 +1123,29 @@ describe('Telegram setup persistence', () => {
     }
   });
 
-  it('leaves the old offset untouched when the atomic credential write fails', async () => {
+  it('restores credentials and offset when a Keychain write publishes and then fails', async () => {
     const db = openDatabase({ file: ':memory:' });
     const old = { token: 'old-token', chatId: 10 } as const;
+    const next = { token: 'new-token', chatId: 20 } as const;
     const oldBotScope = telegramBotScope(old.token);
     writeOffset(db.handle, 7, oldBotScope);
+    let stored: TelegramSecrets | null = old;
+    let writes = 0;
+    let confirmed = false;
     const store: SecretsStore = {
       async peek() {
-        return old;
+        return stored;
       },
       async load() {
-        return old;
+        return stored;
       },
-      async storeSecrets() {
-        throw new Error('Keychain write failed');
+      async storeSecrets(value) {
+        stored = value;
+        writes += 1;
+        if (writes === 1) throw new Error('Keychain write failed after publication');
       },
       async clear() {
-        assert.fail('an atomic failed write needs no destructive rollback');
+        stored = null;
       },
     };
     try {
@@ -1147,12 +1153,17 @@ describe('Telegram setup persistence', () => {
         commitTelegramSetup(
           db.handle,
           store,
-          { token: 'new-token', chatId: 20 },
+          next,
           { role: 'owner', nextOffset: 101 },
-          async () => {},
+          async () => {
+            confirmed = true;
+          },
         ),
-        /Keychain write failed/,
+        /Keychain write failed after publication/,
       );
+      assert.deepEqual(stored, old);
+      assert.equal(writes, 2, 'rollback restores the previous pair after clearing the new one');
+      assert.equal(confirmed, false, 'delivery confirmation must not run after a failed write');
       assert.equal(readOffset(db.handle, oldBotScope), 7);
       assert.throws(
         () => readOffset(db.handle, telegramBotScope('new-token')),
@@ -1169,19 +1180,23 @@ describe('Telegram setup persistence', () => {
     const old = { token: 'same-token', chatId: 10 } as const;
     const scope = telegramBotScope(old.token);
     writeOffset(db.handle, 7, scope);
+    let stored: TelegramSecrets | null = old;
+    let writes = 0;
     const store: SecretsStore = {
       async peek() {
-        return old;
+        return stored;
       },
       async load() {
-        return old;
+        return stored;
       },
-      async storeSecrets() {
-        assert.equal(readOffset(db.handle, scope), 101);
-        throw new Error('Keychain write failed');
+      async storeSecrets(value) {
+        assert.equal(readOffset(db.handle, scope), writes === 0 ? 101 : 7);
+        stored = value;
+        writes += 1;
+        if (writes === 1) throw new Error('Keychain write failed after publication');
       },
       async clear() {
-        assert.fail('an atomic failed write needs no destructive rollback');
+        stored = null;
       },
     };
     try {
@@ -1193,8 +1208,10 @@ describe('Telegram setup persistence', () => {
           { role: 'owner', nextOffset: 101 },
           async () => {},
         ),
-        /Keychain write failed/,
+        /Keychain write failed after publication/,
       );
+      assert.deepEqual(stored, old);
+      assert.equal(writes, 2);
       assert.equal(readOffset(db.handle, scope), 7);
     } finally {
       db.close();

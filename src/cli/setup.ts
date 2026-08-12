@@ -475,17 +475,20 @@ export async function commitTelegramSetup(
   const newBotScope = telegramBotScope(secrets.token);
   const previousBotScope =
     previousSecrets === null ? 'legacy' : telegramBotScope(previousSecrets.token);
-  let stored = false;
+  let storeAttempted = false;
   let restoreCursor: (() => void) | null = null;
 
   try {
     restoreCursor = publishTelegramSetupCursor(db, newBotScope, previousBotScope, commit);
+    // The Keychain subprocess can publish the replacement and then fail while
+    // its exit/result is being observed. From this point on, rollback must
+    // treat the new pair as potentially visible even when the await rejects.
+    storeAttempted = true;
     await store.storeSecrets(secrets);
-    stored = true;
     await confirmDelivery();
   } catch (error) {
     const rollbackErrors: unknown[] = [];
-    if (stored) {
+    if (storeAttempted) {
       try {
         await store.clear();
       } catch (rollbackError) {
@@ -503,7 +506,7 @@ export async function commitTelegramSetup(
       }
     }
 
-    if (stored && offsetRestored && previousSecrets !== null) {
+    if (storeAttempted && offsetRestored && previousSecrets !== null) {
       try {
         await store.storeSecrets(previousSecrets);
       } catch (rollbackError) {
