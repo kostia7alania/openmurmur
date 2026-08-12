@@ -26,6 +26,10 @@ process.stdin.on('data', (chunk) => {
     if (line.trim() === '') continue;
     const request = JSON.parse(line);
     if (request.op === 'ping') {
+      if (mode === 'slow-ping') {
+        setTimeout(() => send({ id: request.id, ok: true, op: 'ping', worker_version: 'fake' }), 75);
+        continue;
+      }
       send(mode === 'fail-ping'
         ? { id: request.id, ok: false, code: 'worker_not_ready', error: 'initialization failed' }
         : { id: request.id, ok: true, op: 'ping', worker_version: 'fake' });
@@ -195,6 +199,16 @@ describe('MLX ASR model load health', () => {
     assert.deepEqual(asr.health(), {
       ok: false,
       reason: 'ASR worker readiness failed: initialization failed',
+    });
+  });
+
+  it('allows cold worker startup to use the configured ASR timeout for readiness ping', async (t) => {
+    const { asr } = backend(t, 'slow-ping', 150);
+
+    assert.deepEqual(await asr.ready(), { ok: true });
+    assert.deepEqual(asr.health(), {
+      ok: true,
+      detail: 'model loaded: expected/model (7 ms)',
     });
   });
 

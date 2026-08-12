@@ -98,7 +98,10 @@ export class MlxAsr implements AsrBackend {
   async ready(): Promise<{ ok: true } | { ok: false; reason: string }> {
     try {
       await this.#worker.ensureStarted();
-      const pong = await this.#worker.send({ id: randomUUID(), op: 'ping' }, 30_000);
+      const pong = await this.#worker.send(
+        { id: randomUUID(), op: 'ping' },
+        Math.max(30_000, this.#options.requestTimeoutMs),
+      );
       if (!pong.ok) {
         const reason = `ASR worker readiness failed: ${pong.error}`;
         this.#readinessFailure = reason;
