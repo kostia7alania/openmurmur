@@ -405,6 +405,10 @@ DAEMON_PLIST="$AGENT_DIR/io.openmurmur.daemon.plist"
 RUNTIME_CONTRACT="$PWD/runtime-requirements.json"
 WORK_DIR=""
 WORK_DIR_ID=""
+EVIDENCE_DIR=""
+EVIDENCE_DIR_ID=""
+MANIFEST_WORK_DIR=""
+MANIFEST_WORK_DIR_ID=""
 STATE_ROOT_ID=""
 HOME_ID=""
 AGENT_DIR_ID=""
@@ -446,6 +450,10 @@ require_physical_directory() {
   physical="$(cd "$path" && pwd -P)"
   [ "$physical" = "$path" ] || {
     echo "$label must not contain symlinked or non-canonical components: $path" >&2
+    exit 1
+  }
+  [ "$(/usr/bin/stat -f '%u' "$path")" = "$(id -u)" ] || {
+    echo "$label must be owned by the current user: $path" >&2
     exit 1
   }
 }
@@ -501,6 +509,16 @@ if (
 }
 NODE
 
+evidence_directory_unchanged() {
+  local physical
+  [ -n "$EVIDENCE_DIR" ] && [ -d "$EVIDENCE_DIR" ] && [ ! -L "$EVIDENCE_DIR" ] && \
+    physical="$(cd "$EVIDENCE_DIR" 2>/dev/null && pwd -P)" && \
+    [ "$physical" = "$EVIDENCE_DIR" ] && \
+    [ "$(/usr/bin/stat -f '%u' "$EVIDENCE_DIR")" = "$(id -u)" ] && \
+    [ "$(file_mode "$EVIDENCE_DIR")" = "700" ] && \
+    [ "$(directory_identity "$EVIDENCE_DIR")" = "$EVIDENCE_DIR_ID" ]
+}
+
 boundaries_unchanged() {
   local agents_physical
   local home_physical
@@ -516,7 +534,8 @@ boundaries_unchanged() {
     [ -d "$STATE_ROOT" ] && [ ! -L "$STATE_ROOT" ] && \
     state_physical="$(cd "$STATE_ROOT" 2>/dev/null && pwd -P)" && \
     [ "$state_physical" = "$STATE_ROOT" ] && \
-    [ "$(directory_identity "$STATE_ROOT")" = "$STATE_ROOT_ID" ]
+    [ "$(directory_identity "$STATE_ROOT")" = "$STATE_ROOT_ID" ] && \
+    { [ -z "$EVIDENCE_DIR" ] || evidence_directory_unchanged; }
 }
 
 work_directory_unchanged() {
@@ -525,6 +544,17 @@ work_directory_unchanged() {
     physical="$(cd "$WORK_DIR" 2>/dev/null && pwd -P)" && \
     [ "$physical" = "$WORK_DIR" ] && \
     [ "$(directory_identity "$WORK_DIR")" = "$WORK_DIR_ID" ]
+}
+
+manifest_work_directory_unchanged() {
+  local physical
+  [ -n "$MANIFEST_WORK_DIR" ] && [ -d "$MANIFEST_WORK_DIR" ] && \
+    [ ! -L "$MANIFEST_WORK_DIR" ] && \
+    physical="$(cd "$MANIFEST_WORK_DIR" 2>/dev/null && pwd -P)" && \
+    [ "$physical" = "$MANIFEST_WORK_DIR" ] && \
+    [ "$(/usr/bin/stat -f '%u' "$MANIFEST_WORK_DIR")" = "$(id -u)" ] && \
+    [ "$(file_mode "$MANIFEST_WORK_DIR")" = "700" ] && \
+    [ "$(directory_identity "$MANIFEST_WORK_DIR")" = "$MANIFEST_WORK_DIR_ID" ]
 }
 
 config_is_original() {
@@ -638,11 +668,16 @@ finish_rehearsal() {
       status=1
     fi
   fi
+  if [ -n "$MANIFEST_WORK_DIR" ]; then
+    echo "D121 manifest staging evidence preserved at $MANIFEST_WORK_DIR" >&2
+    status=1
+  fi
   exit "$status"
 }
 
-EVIDENCE_DIR="$(mktemp -d /private/tmp/openmurmur-d121.XXXXXX)"
+EVIDENCE_DIR="$(mktemp -d "$HOME/.openmurmur-d121.XXXXXX")"
 chmod 0700 "$EVIDENCE_DIR"
+EVIDENCE_DIR_ID="$(directory_identity "$EVIDENCE_DIR")"
 WORK_DIR="$(mktemp -d "$STATE_ROOT/.openmurmur-d121.XXXXXX")"
 chmod 0700 "$WORK_DIR"
 WORK_DIR_ID="$(directory_identity "$WORK_DIR")"
@@ -684,6 +719,7 @@ snapshot_launchd() {
   local phase="$1"
   local label
   local registration
+  boundaries_unchanged
   : > "$EVIDENCE_DIR/labels.$phase"
   for label in io.openmurmur.daemon io.openmurmur.digest; do
     if launchctl print "gui/$(id -u)/$label" \
@@ -702,6 +738,7 @@ wait_for_restored_daemon() {
   local max_attempts=60
   local output
   local validation
+  boundaries_unchanged
   while [ "$attempt" -le "$max_attempts" ]; do
     validation=""
     if output="$("$NODE_BIN" src/cli/main.ts status --root "$STATE_ROOT" --json 2>&1)" && \
@@ -722,6 +759,7 @@ NODE
       printf '%s\n' "$output" > "$EVIDENCE_DIR/restored-status.$phase.json"
       return 0
     fi
+    boundaries_unchanged
     printf '%s\n' "${validation:-$output}" > "$EVIDENCE_DIR/restored-status.$phase.last-error"
     attempt=$((attempt + 1))
     [ "$attempt" -le "$max_attempts" ] && sleep 1
@@ -808,6 +846,81 @@ fi
 snapshot_launchd after
 cmp "$EVIDENCE_DIR/labels.before" "$EVIDENCE_DIR/labels.after"
 wait_for_restored_daemon after
+
+D121_HEAD="$(git rev-parse --verify HEAD)"
+[ -z "$(git status --porcelain --untracked-files=all)" ] || {
+  echo "D121 evidence must be recorded from a clean checkout" >&2
+  exit 1
+}
+MANIFEST_WORK_DIR="$(mktemp -d "$HOME/.openmurmur-d121-manifest.XXXXXX")"
+chmod 0700 "$MANIFEST_WORK_DIR"
+MANIFEST_WORK_DIR_ID="$(directory_identity "$MANIFEST_WORK_DIR")"
+D121_MANIFEST_STAGE="$MANIFEST_WORK_DIR/D121.evidence-manifest.json"
+D121_MANIFEST="$EVIDENCE_DIR/D121.evidence-manifest.json"
+boundaries_unchanged && work_directory_unchanged && manifest_work_directory_unchanged
+"$NODE_BIN" --input-type=module - \
+  "$EVIDENCE_DIR" "$D121_MANIFEST_STAGE" "$D121_HEAD" <<'NODE'
+import {
+  closeSync,
+  constants,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+
+const [evidenceDirectory, output, repositoryCommit] = process.argv.slice(2);
+const files = readdirSync(evidenceDirectory).sort().map((name) => {
+  const path = join(evidenceDirectory, name);
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`D121 evidence contains a non-regular entry: ${name}`);
+  }
+  const bytes = readFileSync(path);
+  return {
+    path: name,
+    bytes: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+  };
+});
+const payload = {
+  schemaVersion: 1,
+  kind: 'openmurmur-d121-evidence',
+  repositoryCommit,
+  evidenceDirectory,
+  files,
+};
+writeFileSync(output, `${JSON.stringify(payload, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+const fd = openSync(output, constants.O_RDONLY);
+try {
+  fsyncSync(fd);
+} finally {
+  closeSync(fd);
+}
+NODE
+boundaries_unchanged && work_directory_unchanged && manifest_work_directory_unchanged && \
+  [ ! -e "$D121_MANIFEST" ] && [ ! -L "$D121_MANIFEST" ] && \
+  /bin/ln "$D121_MANIFEST_STAGE" "$D121_MANIFEST"
+"$NODE_BIN" --input-type=module - "$EVIDENCE_DIR" <<'NODE'
+import { closeSync, constants, fsyncSync, openSync } from 'node:fs';
+const fd = openSync(process.argv[2], constants.O_RDONLY);
+try {
+  fsyncSync(fd);
+} finally {
+  closeSync(fd);
+}
+NODE
+boundaries_unchanged
+D121_MANIFEST_SHA256="$(file_sha256 "$D121_MANIFEST")"
+manifest_work_directory_unchanged && /bin/rm -rf "$MANIFEST_WORK_DIR" || {
+  echo "D121 manifest staging directory preserved after an identity change: $MANIFEST_WORK_DIR" >&2
+  exit 1
+}
+MANIFEST_WORK_DIR=""
 trap - EXIT HUP INT TERM
 if [ "$PRESERVE_WORK_DIR" = true ]; then
   echo "D121 config transaction evidence preserved at $WORK_DIR" >&2
@@ -821,8 +934,14 @@ else
 fi
 echo "D121 rollback restored the exact config inode/mode, plist bytes, registration set and live audio readiness."
 echo "Evidence: $EVIDENCE_DIR"
+echo "Evidence manifest: $D121_MANIFEST"
+echo "Evidence manifest SHA-256: $D121_MANIFEST_SHA256"
 )
 ```
+
+The evidence path is intentionally under the physical current user's HOME, not
+`/private/tmp`, because D122 reboots the Mac before the final D123 audit. Keep
+the printed directory unchanged and export it later as `D121_EVIDENCE_DIR`.
 
 Only after that rollback proof, run the real PCM check and the valid D069
 upgrade. These commands are the live gate; this document does not claim their
@@ -1227,6 +1346,162 @@ umask 077
 export RELEASE_EVIDENCE_DIR="$(mktemp -d "$HOME/.openmurmur-release.XXXXXX")"
 chmod 0700 "$RELEASE_EVIDENCE_DIR"
 ./scripts/release-signoff --prepare --evidence-dir "$RELEASE_EVIDENCE_DIR"
+```
+
+Index the earlier persistent D121 evidence without copying or weakening it.
+This creates the exact reference path declared by the release manifest and
+binds the readable evidence manifest bytes; the final human audit must still
+inspect the referenced files before D123 can be marked done:
+
+```bash
+: "${D121_EVIDENCE_DIR:?export the persistent D121 evidence directory printed above}"
+D121_MANIFEST="$D121_EVIDENCE_DIR/D121.evidence-manifest.json"
+DAEMON_PLIST="$HOME/Library/LaunchAgents/io.openmurmur.daemon.plist"
+NODE_BIN="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$DAEMON_PLIST")"
+"$NODE_BIN" --input-type=module - \
+  "$D121_MANIFEST" "$RELEASE_EVIDENCE_DIR/D121.reference.json" \
+  "$RELEASE_EVIDENCE_DIR" <<'NODE'
+import {
+  closeSync,
+  constants,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+
+const [manifestPath, output, evidenceDirectory] = process.argv.slice(2);
+const manifestStat = lstatSync(manifestPath);
+const evidenceStat = lstatSync(evidenceDirectory);
+const outputParent = realpathSync(evidenceDirectory);
+if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
+  throw new Error('D121 evidence manifest must be a regular non-symlink file');
+}
+if (
+  manifestStat.uid !== process.getuid() ||
+  (manifestStat.mode & 0o777) !== 0o600 ||
+  !evidenceStat.isDirectory() ||
+  evidenceStat.isSymbolicLink() ||
+  evidenceStat.uid !== process.getuid() ||
+  (evidenceStat.mode & 0o777) !== 0o700 ||
+  outputParent !== evidenceDirectory
+) {
+  throw new Error('release evidence directory must remain physical and canonical');
+}
+const manifestBytes = readFileSync(manifestPath);
+const manifest = JSON.parse(manifestBytes.toString('utf8'));
+if (typeof manifest.evidenceDirectory !== 'string') {
+  throw new Error('D121 evidence manifest directory is invalid');
+}
+const d121EvidenceStat = lstatSync(manifest.evidenceDirectory);
+if (
+  manifest.schemaVersion !== 1 ||
+  manifest.kind !== 'openmurmur-d121-evidence' ||
+  !d121EvidenceStat.isDirectory() ||
+  d121EvidenceStat.isSymbolicLink() ||
+  d121EvidenceStat.uid !== process.getuid() ||
+  (d121EvidenceStat.mode & 0o777) !== 0o700 ||
+  manifest.evidenceDirectory !== realpathSync(manifest.evidenceDirectory) ||
+  manifestPath !== `${manifest.evidenceDirectory}/D121.evidence-manifest.json`
+) {
+  throw new Error('D121 evidence manifest identity is invalid');
+}
+if (!Array.isArray(manifest.files) || !/^[0-9a-f]{40}$/.test(manifest.repositoryCommit)) {
+  throw new Error('D121 evidence manifest contents are invalid');
+}
+const seen = new Set();
+for (const entry of manifest.files) {
+  if (
+    typeof entry?.path !== 'string' ||
+    entry.path.length === 0 ||
+    entry.path.includes('/') ||
+    seen.has(entry.path) ||
+    !Number.isSafeInteger(entry.bytes) ||
+    entry.bytes < 0 ||
+    !/^[0-9a-f]{64}$/.test(entry.sha256)
+  ) {
+    throw new Error('D121 evidence manifest contains an invalid file entry');
+  }
+  seen.add(entry.path);
+  const artifactPath = join(manifest.evidenceDirectory, entry.path);
+  const artifactStat = lstatSync(artifactPath);
+  const artifactBytes = readFileSync(artifactPath);
+  if (
+    !artifactStat.isFile() ||
+    artifactStat.isSymbolicLink() ||
+    artifactStat.uid !== process.getuid() ||
+    artifactBytes.length !== entry.bytes ||
+    createHash('sha256').update(artifactBytes).digest('hex') !== entry.sha256
+  ) {
+    throw new Error(`D121 evidence artifact drifted: ${entry.path}`);
+  }
+}
+const releaseManifestPath = join(evidenceDirectory, 'release-signoff-v2.json');
+const releaseManifestStat = lstatSync(releaseManifestPath);
+const releaseManifest = JSON.parse(readFileSync(releaseManifestPath, 'utf8'));
+if (
+  !releaseManifestStat.isFile() ||
+  releaseManifestStat.isSymbolicLink() ||
+  releaseManifestStat.uid !== process.getuid() ||
+  (releaseManifestStat.mode & 0o777) !== 0o600 ||
+  releaseManifest.releaseCommit !== manifest.repositoryCommit ||
+  releaseManifest.requiredLiveEvidenceReferences?.D121 !== output
+) {
+  throw new Error('D121 evidence does not match the frozen release manifest');
+}
+const finalD121EvidenceStat = lstatSync(manifest.evidenceDirectory);
+const finalManifestStat = lstatSync(manifestPath);
+const finalReleaseEvidenceStat = lstatSync(evidenceDirectory);
+const finalManifestBytes = readFileSync(manifestPath);
+if (
+  !finalD121EvidenceStat.isDirectory() ||
+  finalD121EvidenceStat.isSymbolicLink() ||
+  finalD121EvidenceStat.uid !== process.getuid() ||
+  (finalD121EvidenceStat.mode & 0o777) !== 0o700 ||
+  finalD121EvidenceStat.dev !== d121EvidenceStat.dev ||
+  finalD121EvidenceStat.ino !== d121EvidenceStat.ino ||
+  !finalManifestStat.isFile() ||
+  finalManifestStat.isSymbolicLink() ||
+  finalManifestStat.dev !== manifestStat.dev ||
+  finalManifestStat.ino !== manifestStat.ino ||
+  finalManifestStat.size !== manifestStat.size ||
+  !finalManifestBytes.equals(manifestBytes) ||
+  !finalReleaseEvidenceStat.isDirectory() ||
+  finalReleaseEvidenceStat.isSymbolicLink() ||
+  finalReleaseEvidenceStat.uid !== process.getuid() ||
+  (finalReleaseEvidenceStat.mode & 0o777) !== 0o700 ||
+  finalReleaseEvidenceStat.dev !== evidenceStat.dev ||
+  finalReleaseEvidenceStat.ino !== evidenceStat.ino
+) {
+  throw new Error('D121 evidence changed during reference inspection');
+}
+const reference = {
+  schemaVersion: 1,
+  kind: 'openmurmur-d121-reference',
+  repositoryCommit: manifest.repositoryCommit,
+  evidenceManifest: {
+    path: manifestPath,
+    bytes: manifestBytes.length,
+    sha256: createHash('sha256').update(manifestBytes).digest('hex'),
+  },
+};
+writeFileSync(output, `${JSON.stringify(reference, null, 2)}\n`, {
+  flag: 'wx',
+  mode: 0o600,
+});
+for (const path of [output, evidenceDirectory]) {
+  const fd = openSync(path, constants.O_RDONLY);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+NODE
 ```
 
 For a custom state root, add the same canonical `--root DIR` to prepare and
