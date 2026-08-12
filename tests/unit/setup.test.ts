@@ -581,7 +581,7 @@ describe('Telegram setup persistence', () => {
     try {
       assert.throws(
         () => readOffset(db.handle, telegramBotScope('interrupted-token')),
-        /Telegram update offset is missing.*pnpm openmurmur setup telegram/,
+        /Telegram update offset is missing.*pnpm openmurmur setup telegram owner/,
       );
       assert.equal(readOffset(db.handle), 0, 'only the pre-scoping legacy cursor defaults to zero');
     } finally {

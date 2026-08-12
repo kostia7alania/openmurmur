@@ -190,7 +190,7 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Scope:** Hidden token prompt, `getMe` verification, chat discovery via
   `/start`, Keychain storage, offset persistence, test message.
 - **Non-goals:** Token via argv, env, config or plist.
-- **Acceptance:** `openmurmur setup telegram` completes and a test message
+- **Acceptance:** `openmurmur setup telegram owner` completes and a test message
   arrives.
 - **Dependencies:** P0-04 · **Risk:** low · **Estimate:** M
 - **Tests:** Redaction and Keychain isolation tested. **The interactive flow

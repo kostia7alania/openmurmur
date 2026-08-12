@@ -152,7 +152,7 @@ export class MissingTelegramOffsetError extends Error {
   constructor(botScope: string) {
     super(
       `Telegram update offset is missing for credential scope ${botScope}; ` +
-        'run `pnpm openmurmur setup telegram` again',
+        'run `pnpm openmurmur setup telegram owner` again',
     );
     this.name = 'MissingTelegramOffsetError';
   }

@@ -1496,8 +1496,9 @@ export class Daemon {
       if (this.#stopping) return false;
       if (secrets === null) {
         if (!this.#telegramUnavailable) {
+          const role = this.#options.loaded.config.telegram.receiveUpdates ? 'owner' : 'send-only';
           this.#options.logger.warn(
-            'Telegram is not configured; run `pnpm openmurmur setup telegram` from the repository checkout',
+            `Telegram is not configured; run \`pnpm openmurmur setup telegram ${role}\` from the repository checkout`,
           );
         }
         this.#telegramUnavailable = true;
