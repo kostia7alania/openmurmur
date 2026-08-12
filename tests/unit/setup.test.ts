@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
+import { recoverAfterCrash } from '../../src/capture/recovery.ts';
 import {
   openMurmurRecoveryCommand,
   recoveryCommandContextForRoot,
@@ -28,8 +29,12 @@ import {
 import { resolvePaths } from '../../src/config/paths.ts';
 import { DEFAULT_CONFIG } from '../../src/config/schema.ts';
 import { openDatabase } from '../../src/database/db.ts';
-import { IncomingFileRepository } from '../../src/database/repository.ts';
+import {
+  AudioFinalizationJournalRepository,
+  IncomingFileRepository,
+} from '../../src/database/repository.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
+import { nullLogger } from '../../src/logging/logger.ts';
 import type { TelegramUpdate } from '../../src/telegram/client.ts';
 import {
   type SecretsStore,
@@ -635,6 +640,228 @@ function memorySecrets(initial: TelegramSecrets | null): {
 }
 
 describe('Telegram setup persistence', () => {
+  it('allows rebind after recovery confirms a writer-close failure has no artifact', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openmurmur-setup-writer-failure-'));
+    const paths = resolvePaths(root);
+    const db = openDatabase({ file: paths.databaseFile });
+    const previous = { token: 'old-token', chatId: 10 } as const;
+    const secrets = memorySecrets(previous);
+    const now = '2026-08-12T00:00:00.000Z';
+    const sessionId = 'writer-close-failed';
+    db.handle
+      .prepare(
+        `INSERT INTO audio_sessions
+           (session_id, state, started_at, ended_at, duration_ms, speech_ms,
+            rejection_reason, timing_exact, created_at, updated_at)
+         VALUES (?, 'FAILED', ?, ?, 3000, 2000, 'audio_finalize_failed', 1, ?, ?)`,
+      )
+      .run(sessionId, now, '2026-08-12T00:00:03.000Z', now, now);
+    db.handle
+      .prepare(
+        `INSERT INTO audio_parts
+           (part_id, session_id, part_index, path, started_at, finalized, created_at)
+         VALUES (?, ?, 0, ?, ?, 0, ?)`,
+      )
+      .run(`${sessionId}-p0`, sessionId, join(paths.audioDir, `${sessionId}.p000.flac`), now, now);
+    const preview = await recoverAfterCrash(db.handle, paths, nullLogger, {
+      remove: false,
+      repair: false,
+    });
+    assert.deepEqual(preview.settledMissingParts, [`${sessionId}-p0`]);
+    assert.equal(
+      (
+        db.handle
+          .prepare('SELECT deleted_at FROM audio_parts WHERE part_id = ?')
+          .get(`${sessionId}-p0`) as { deleted_at: string | null }
+      ).deleted_at,
+      null,
+      'read-only recovery reports the settlement without mutating its audit row',
+    );
+    let claim: Awaited<ReturnType<typeof claimDaemonMaintenance>> | null = null;
+    let confirmed = false;
+    try {
+      claim = await claimDaemonMaintenance(db.handle, paths.pidFile, root, {
+        birthMarker: async () => 'writer-failure-blocked-birth',
+      });
+      await assert.rejects(
+        commitTelegramSetup(
+          db.handle,
+          secrets.store,
+          { token: 'new-token', chatId: 20 },
+          { role: 'owner', nextOffset: 101 },
+          async () => {
+            confirmed = true;
+          },
+        ),
+        /Cannot replace Telegram credentials while unresolved delivery work exists/,
+      );
+      assert.equal(confirmed, false);
+      assert.equal(secrets.writes.length, 0);
+      await releaseDaemonMaintenance(db.handle, paths.pidFile, claim);
+      claim = null;
+
+      const report = await recoverAfterCrash(db.handle, paths, nullLogger);
+      assert.deepEqual(report.recoveredPublishedParts, []);
+      assert.deepEqual(report.settledMissingParts, [`${sessionId}-p0`]);
+      assert.deepEqual(report.stalledSessions, []);
+      assert.equal(new JobQueue(db.handle).pendingCount(), 0);
+      assert.ok(
+        (
+          db.handle
+            .prepare('SELECT deleted_at FROM audio_parts WHERE part_id = ?')
+            .get(`${sessionId}-p0`) as { deleted_at: string | null }
+        ).deleted_at,
+      );
+
+      claim = await claimDaemonMaintenance(db.handle, paths.pidFile, root, {
+        birthMarker: async () => 'writer-failure-rebind-birth',
+      });
+      await commitTelegramSetup(
+        db.handle,
+        secrets.store,
+        { token: 'new-token', chatId: 20 },
+        { role: 'owner', nextOffset: 101 },
+        async () => {
+          confirmed = true;
+        },
+      );
+      assert.equal(confirmed, true);
+      assert.deepEqual(secrets.get(), { token: 'new-token', chatId: 20 });
+    } finally {
+      if (claim !== null) await releaseDaemonMaintenance(db.handle, paths.pidFile, claim);
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps crash-recoverable finalized audio on its original Telegram destination', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openmurmur-setup-recovery-'));
+    const paths = resolvePaths(root);
+    const db = openDatabase({ file: paths.databaseFile });
+    const interleaved = openDatabase({ file: paths.databaseFile });
+    const previous = { token: 'old-token', chatId: 10 } as const;
+    const secrets = memorySecrets(previous);
+    mkdirSync(paths.audioDir, { recursive: true });
+    const now = '2026-08-12T00:00:00.000Z';
+    const sessionId = 'crash-recoverable';
+    const partId = 'crash-recoverable-p0';
+    const partPath = join(paths.audioDir, 'crash-recoverable.p000.flac');
+    db.handle
+      .prepare(
+        `INSERT INTO audio_sessions
+           (session_id, state, started_at, created_at, updated_at)
+         VALUES (?, 'FINALIZING', ?, ?, ?)`,
+      )
+      .run(sessionId, now, now, now);
+    db.handle
+      .prepare(
+        `INSERT INTO audio_parts
+           (part_id, session_id, part_index, path, started_at, finalized, created_at)
+         VALUES (?, ?, 0, ?, ?, 0, ?)`,
+      )
+      .run(partId, sessionId, partPath, now, now);
+    new AudioFinalizationJournalRepository(db.handle).record({
+      partId,
+      sessionId,
+      partEndedAtIso: '2026-08-12T00:00:03.000Z',
+      partDurationMs: 3_000,
+      finalSession: {
+        endedAtIso: '2026-08-12T00:00:03.000Z',
+        durationMs: 3_000,
+        speechMs: 2_000,
+      },
+    });
+    db.handle
+      .prepare(
+        `UPDATE audio_parts
+            SET ended_at = ?, duration_ms = 3000, bytes = 12, sha256 = 'published-sha', finalized = 1
+          WHERE part_id = ?`,
+      )
+      .run('2026-08-12T00:00:03.000Z', partId);
+    writeOffset(db.handle, 7, telegramBotScope(previous.token));
+    let claim: Awaited<ReturnType<typeof claimDaemonMaintenance>> | null = null;
+    let confirmed = false;
+    try {
+      claim = await claimDaemonMaintenance(db.handle, paths.pidFile, root, {
+        birthMarker: async () => 'rebind-recovery-birth',
+      });
+      await assert.rejects(
+        commitTelegramSetup(
+          db.handle,
+          secrets.store,
+          { token: 'new-token', chatId: 20 },
+          { role: 'owner', nextOffset: 101 },
+          async () => {
+            confirmed = true;
+          },
+        ),
+        /Cannot replace Telegram credentials while unresolved delivery work exists/,
+      );
+      assert.equal(confirmed, false);
+      assert.equal(secrets.writes.length, 0);
+      assert.deepEqual(secrets.get(), previous);
+      assert.equal(readOffset(db.handle, telegramBotScope(previous.token)), 7);
+
+      await assert.rejects(
+        recoverAfterCrash(interleaved.handle, paths, nullLogger),
+        /Telegram-producing jobs are paused during exclusive Telegram maintenance/,
+        'second-connection recovery cannot publish jobs after the replacement proof',
+      );
+      assert.equal(new JobQueue(interleaved.handle).pendingCount(), 0);
+      assert.equal(
+        (
+          interleaved.handle
+            .prepare('SELECT count(*) AS count FROM telegram_outbox WHERE session_id = ?')
+            .get(sessionId) as { count: number }
+        ).count,
+        0,
+      );
+      assert.equal(
+        (
+          interleaved.handle
+            .prepare('SELECT state FROM audio_sessions WHERE session_id = ?')
+            .get(sessionId) as { state: string }
+        ).state,
+        'FINALIZING',
+        'the failed interleave rolls back before latent work or session mutation is published',
+      );
+
+      await releaseDaemonMaintenance(db.handle, paths.pidFile, claim);
+      claim = null;
+      const recovered = await recoverAfterCrash(db.handle, paths, nullLogger);
+      assert.deepEqual(recovered.stalledSessions, [sessionId]);
+      db.handle
+        .prepare(
+          `UPDATE jobs
+              SET state = 'done', lease_owner = NULL, lease_expires_at = NULL
+            WHERE idempotency_key IN (?, ?)`,
+        )
+        .run(`asr:${sessionId}`, `deliver-audio:${sessionId}`);
+      db.handle
+        .prepare("UPDATE telegram_outbox SET state = 'sent' WHERE session_id = ?")
+        .run(sessionId);
+      claim = await claimDaemonMaintenance(db.handle, paths.pidFile, root, {
+        birthMarker: async () => 'rebind-settled-birth',
+      });
+      await commitTelegramSetup(
+        db.handle,
+        secrets.store,
+        { token: 'new-token', chatId: 20 },
+        { role: 'owner', nextOffset: 101 },
+        async () => {
+          confirmed = true;
+        },
+      );
+      assert.equal(confirmed, true);
+      assert.deepEqual(secrets.get(), { token: 'new-token', chatId: 20 });
+    } finally {
+      if (claim !== null) await releaseDaemonMaintenance(db.handle, paths.pidFile, claim);
+      interleaved.close();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not move unresolved delivery work across a credential or chat replacement', async () => {
     const root = mkdtempSync(join(tmpdir(), 'openmurmur-setup-rebind-'));
     const paths = resolvePaths(root);

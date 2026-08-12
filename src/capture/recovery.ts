@@ -46,12 +46,101 @@ export interface RecoveryReport {
   readonly orphans: readonly OrphanedPart[];
   /** Complete archive files recovered after a crash before their DB update. */
   readonly recoveredPublishedParts: readonly string[];
+  /** Terminal provisional rows proven to have no archive or journal owner. */
+  readonly settledMissingParts: readonly string[];
   readonly removed: number;
   readonly freedBytes: number;
   /** Sessions found in a live recorder state after the capture process died. */
   readonly stalledSessions: readonly string[];
   /** Whether database reconciliation was applied rather than only reported. */
   readonly repaired: boolean;
+}
+
+interface ProvisionalPartRow {
+  readonly part_id: string;
+  readonly path: string;
+}
+
+function isTerminalMissingProvisionalPart(db: DatabaseSync, row: ProvisionalPartRow): boolean {
+  return (
+    db
+      .prepare(
+        `SELECT 1
+           FROM audio_parts p
+           JOIN audio_sessions s ON s.session_id = p.session_id
+          WHERE p.part_id = ?
+            AND p.path = ?
+            AND p.finalized = 0
+            AND p.delivered = 0
+            AND p.deleted_at IS NULL
+            AND p.ended_at IS NULL
+            AND p.duration_ms IS NULL
+            AND p.bytes IS NULL
+            AND p.sha256 IS NULL
+            AND s.state = 'FAILED'
+            AND s.rejection_reason = 'audio_finalize_failed'
+            AND NOT EXISTS (
+                  SELECT 1
+                    FROM audio_finalization_journal j
+                   WHERE j.part_id = p.part_id
+                     AND j.session_id = p.session_id
+                )`,
+      )
+      .get(row.part_id, row.path) !== undefined
+  );
+}
+
+async function settleMissingProvisionalPart(
+  db: DatabaseSync,
+  row: ProvisionalPartRow,
+  repair: boolean,
+): Promise<boolean> {
+  if (!isTerminalMissingProvisionalPart(db, row)) return false;
+
+  // The first ENOENT was observed by reconcilePublishedParts. Recheck at the
+  // mutation boundary; a terminal FAILED session has no live recorder writer,
+  // and the transaction below re-proves the exact DB lineage.
+  try {
+    const info = await stat(row.path);
+    if (!info.isFile()) throw new Error(`published audio path is not a regular file: ${row.path}`);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (!repair) return true;
+
+  return transaction(db, () => {
+    if (!isTerminalMissingProvisionalPart(db, row)) return false;
+    const updated = db
+      .prepare(
+        `UPDATE audio_parts
+            SET deleted_at = ?
+          WHERE part_id = ?
+            AND path = ?
+            AND finalized = 0
+            AND delivered = 0
+            AND deleted_at IS NULL
+            AND ended_at IS NULL
+            AND duration_ms IS NULL
+            AND bytes IS NULL
+            AND sha256 IS NULL
+            AND EXISTS (
+                  SELECT 1
+                    FROM audio_sessions s
+                   WHERE s.session_id = audio_parts.session_id
+                     AND s.state = 'FAILED'
+                     AND s.rejection_reason = 'audio_finalize_failed'
+                )
+            AND NOT EXISTS (
+                  SELECT 1
+                    FROM audio_finalization_journal j
+                   WHERE j.part_id = audio_parts.part_id
+                     AND j.session_id = audio_parts.session_id
+                )`,
+      )
+      .run(new Date().toISOString(), row.part_id, row.path);
+    return updated.changes === 1;
+  });
 }
 
 /**
@@ -63,12 +152,15 @@ export async function reconcilePublishedParts(
   db: DatabaseSync,
   logger: Logger,
   repair = true,
-): Promise<readonly string[]> {
-  const rows = db.prepare('SELECT part_id, path FROM audio_parts WHERE finalized = 0').all() as {
-    part_id: string;
-    path: string;
-  }[];
+): Promise<{
+  readonly recoveredPublishedParts: readonly string[];
+  readonly settledMissingParts: readonly string[];
+}> {
+  const rows = db
+    .prepare('SELECT part_id, path FROM audio_parts WHERE finalized = 0 AND deleted_at IS NULL')
+    .all() as unknown as ProvisionalPartRow[];
   const recovered: string[] = [];
+  const settledMissingParts: string[] = [];
 
   for (const row of rows) {
     try {
@@ -89,14 +181,28 @@ export async function reconcilePublishedParts(
         timingExact: result.timingExact,
       });
     } catch (error) {
-      // A genuinely missing path is an interrupted temp write and is handled by
-      // stalled-session reconciliation. Permission, hashing and other I/O
-      // failures are not proof that the archive is absent and must stay loud.
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      // A genuinely missing path may be a terminal unpublished part or an
+      // interrupted live session. Permission, hashing and other I/O failures
+      // are not proof that the archive is absent and must stay loud.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        try {
+          if (await settleMissingProvisionalPart(db, row, repair)) {
+            settledMissingParts.push(row.part_id);
+            if (repair) {
+              logger.warn('settled an unpublished terminal audio part', { partId: row.part_id });
+            }
+          }
+        } catch (settlementError) {
+          throw new Error(`could not settle missing audio part ${row.part_id}`, {
+            cause: settlementError,
+          });
+        }
+        continue;
+      }
       throw new Error(`could not reconcile published audio part ${row.part_id}`, { cause: error });
     }
   }
-  return recovered;
+  return { recoveredPublishedParts: recovered, settledMissingParts };
 }
 
 /** `<sessionId>.p000.flac.part` -> `<sessionId>` */
@@ -390,6 +496,71 @@ function assessProcessingRepair(db: DatabaseSync, sessionId: string): Processing
   };
 }
 
+interface StalledSessionRow {
+  readonly session_id: string;
+  readonly state: string;
+  readonly ended_at: string | null;
+  readonly duration_ms: number | null;
+  readonly speech_ms: number;
+  readonly timing_exact: number;
+  readonly finalized_parts: number;
+}
+
+function stalledSessionRows(db: DatabaseSync): StalledSessionRow[] {
+  return db
+    .prepare(
+      `SELECT s.session_id, s.state, s.ended_at, s.duration_ms, s.speech_ms, s.timing_exact,
+              (SELECT count(*) FROM audio_parts p
+                WHERE p.session_id = s.session_id AND p.finalized = 1) AS finalized_parts
+         FROM audio_sessions s
+        WHERE s.state IN ('ACTIVE','FINALIZING')
+           OR (
+                s.state = 'FAILED'
+                AND s.rejection_reason = 'audio_finalize_failed'
+                AND EXISTS (
+                      SELECT 1 FROM audio_parts recovered
+                       WHERE recovered.session_id = s.session_id
+                         AND recovered.finalized = 1
+                    )
+              )`,
+    )
+    .all() as unknown as StalledSessionRow[];
+}
+
+/**
+ * Durable facts that crash recovery can still turn into jobs or Telegram outbox rows.
+ * Credential replacement uses this exact recovery assessment rather than a parallel
+ * approximation, so old recordings cannot wake up under a new bot or chat.
+ */
+export function hasRecoverableTelegramWork(db: DatabaseSync): boolean {
+  if (stalledSessionRows(db).some((session) => session.finalized_parts > 0)) return true;
+
+  // FAILED provisional rows remain blocked until recovery either publishes
+  // their existing archive or durably tombstones an exact terminal ENOENT.
+  const pendingPublication = db
+    .prepare(
+      `SELECT 1
+         FROM audio_parts p
+         JOIN audio_sessions s ON s.session_id = p.session_id
+        WHERE p.finalized = 0
+          AND p.deleted_at IS NULL
+          AND (
+                s.state IN ('ACTIVE','FINALIZING','PROCESSING')
+                OR (s.state = 'FAILED' AND s.rejection_reason = 'audio_finalize_failed')
+              )
+        LIMIT 1`,
+    )
+    .get();
+  if (pendingPublication !== undefined) return true;
+
+  const processing = db
+    .prepare("SELECT session_id FROM audio_sessions WHERE state = 'PROCESSING'")
+    .all() as { session_id: string }[];
+  return processing.some(
+    (session) => assessProcessingRepair(db, session.session_id).status === 'repair',
+  );
+}
+
 function insertMissingProcessingFacts(db: DatabaseSync, plan: ProcessingRepairPlan): void {
   const nowIso = new Date().toISOString();
   const updated = db
@@ -490,32 +661,7 @@ export function reconcileStalledSessions(
   logger: Logger,
   repair = true,
 ): string[] {
-  const stalled = db
-    .prepare(
-      `SELECT s.session_id, s.state, s.ended_at, s.duration_ms, s.speech_ms, s.timing_exact,
-              (SELECT count(*) FROM audio_parts p
-                WHERE p.session_id = s.session_id AND p.finalized = 1) AS finalized_parts
-         FROM audio_sessions s
-        WHERE s.state IN ('ACTIVE','FINALIZING')
-           OR (
-                s.state = 'FAILED'
-                AND s.rejection_reason = 'audio_finalize_failed'
-                AND EXISTS (
-                      SELECT 1 FROM audio_parts recovered
-                       WHERE recovered.session_id = s.session_id
-                         AND recovered.finalized = 1
-                    )
-              )`,
-    )
-    .all() as {
-    session_id: string;
-    state: string;
-    ended_at: string | null;
-    duration_ms: number | null;
-    speech_ms: number;
-    timing_exact: number;
-    finalized_parts: number;
-  }[];
+  const stalled = stalledSessionRows(db);
 
   const reconciled: string[] = [];
   const nowIso = new Date().toISOString();
@@ -641,7 +787,11 @@ export async function recoverAfterCrash(
   options: RecoveryOptions = { remove: true, repair: true },
 ): Promise<RecoveryReport> {
   const repair = options.repair ?? true;
-  const recoveredPublishedParts = await reconcilePublishedParts(db, logger, repair);
+  const { recoveredPublishedParts, settledMissingParts } = await reconcilePublishedParts(
+    db,
+    logger,
+    repair,
+  );
   const orphans = await findOrphanedParts(db, paths, logger);
   const stalledSessions = reconcileStalledSessions(db, logger, repair);
 
@@ -681,6 +831,7 @@ export async function recoverAfterCrash(
   return {
     orphans: confirmedOrphans,
     recoveredPublishedParts,
+    settledMissingParts,
     removed,
     freedBytes,
     stalledSessions,
@@ -692,6 +843,7 @@ export function renderRecoveryReport(report: RecoveryReport): string {
   if (
     report.orphans.length === 0 &&
     report.recoveredPublishedParts.length === 0 &&
+    report.settledMissingParts.length === 0 &&
     report.stalledSessions.length === 0
   ) {
     return 'Nothing to recover: the last shutdown was clean.';
@@ -701,6 +853,11 @@ export function renderRecoveryReport(report: RecoveryReport): string {
   if (report.recoveredPublishedParts.length > 0) {
     lines.push(
       `${report.recoveredPublishedParts.length} complete archive part(s) ${report.repaired ? 'were restored' : 'need restoration'} in the database.`,
+    );
+  }
+  if (report.settledMissingParts.length > 0) {
+    lines.push(
+      `${report.settledMissingParts.length} unpublished terminal audio part(s) ${report.repaired ? 'were marked unavailable' : 'need database reconciliation'}.`,
     );
   }
   if (report.orphans.length > 0) {

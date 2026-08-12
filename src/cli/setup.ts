@@ -2,6 +2,7 @@ import { type FileHandle, open, unlink } from 'node:fs/promises';
 import process, { stdin, stdout } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import type { DatabaseSync } from 'node:sqlite';
+import { hasRecoverableTelegramWork } from '../capture/recovery.ts';
 import { ensureDirectories } from '../config/load.ts';
 import type { Paths } from '../config/paths.ts';
 import { managedDirectories } from '../config/paths.ts';
@@ -451,7 +452,7 @@ export async function commitTelegramSetup(
   // credential/chat pair that owned it when it was queued.
   if (
     replacesDestination &&
-    db
+    (db
       .prepare(
         `SELECT 1
            FROM telegram_outbox
@@ -463,7 +464,8 @@ export async function commitTelegramSetup(
             AND kind NOT IN ('digest','retention')
          LIMIT 1`,
       )
-      .get() !== undefined
+      .get() !== undefined ||
+      hasRecoverableTelegramWork(db))
   ) {
     throw new Error(
       'Cannot replace Telegram credentials while unresolved delivery work exists. ' +

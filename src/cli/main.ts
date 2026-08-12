@@ -245,6 +245,7 @@ async function main(argv: readonly string[]): Promise<number> {
           values['yes'] !== true &&
           (report.orphans.length > 0 ||
             report.recoveredPublishedParts.length > 0 ||
+            report.settledMissingParts.length > 0 ||
             report.stalledSessions.length > 0)
         ) {
           process.stdout.write(

@@ -280,12 +280,14 @@ export class Daemon {
       if (
         recovery.orphans.length > 0 ||
         recovery.recoveredPublishedParts.length > 0 ||
+        recovery.settledMissingParts.length > 0 ||
         recovery.stalledSessions.length > 0
       ) {
         await this.#sendNow(
           `🟡 Предыдущий запуск завершился некорректно\n\n` +
             `Прерванных записей: ${recovery.orphans.length}\n` +
             `Восстановленных частей: ${recovery.recoveredPublishedParts.length}\n` +
+            `Недоступных неопубликованных частей: ${recovery.settledMissingParts.length}\n` +
             `Незавершённых сессий: ${recovery.stalledSessions.length}`,
         );
       }

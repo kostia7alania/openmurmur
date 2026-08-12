@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import {
+  hasRecoverableTelegramWork,
   recoverAfterCrash,
   renderRecoveryReport,
   sessionIdFromPartFilename,
@@ -126,6 +127,68 @@ function seedAudioOutbox(
 }
 
 describe('crash recovery', () => {
+  it('shares the exact recoverable Telegram-work boundary with credential setup', async () => {
+    seedLiveSession('recoverable-finalizing', 1);
+    db.handle
+      .prepare("UPDATE audio_sessions SET state = 'FINALIZING' WHERE session_id = ?")
+      .run('recoverable-finalizing');
+    seedProcessingSession('recoverable-processing');
+
+    assert.equal(hasRecoverableTelegramWork(db.handle), true);
+
+    db.handle
+      .prepare("UPDATE audio_sessions SET state = 'FAILED' WHERE session_id = ?")
+      .run('recoverable-finalizing');
+    assert.equal(hasRecoverableTelegramWork(db.handle), true);
+
+    db.handle
+      .prepare("UPDATE audio_sessions SET state = 'FAILED' WHERE session_id = ?")
+      .run('recoverable-processing');
+    assert.equal(hasRecoverableTelegramWork(db.handle), false);
+
+    const { partId } = seedPendingPublication('failed-provisional', false);
+    db.handle
+      .prepare(
+        `UPDATE audio_sessions
+            SET state = 'FAILED', rejection_reason = 'audio_finalize_failed'
+          WHERE session_id = ?`,
+      )
+      .run('failed-provisional');
+    assert.equal(hasRecoverableTelegramWork(db.handle), true);
+
+    const missing = await recoverAfterCrash(db.handle, paths(), nullLogger);
+    assert.deepEqual(missing.settledMissingParts, [partId]);
+    assert.equal(hasRecoverableTelegramWork(db.handle), false);
+
+    const journalPart = seedPendingPublication('failed-journal-owned', false).partId;
+    db.handle
+      .prepare(
+        `UPDATE audio_sessions
+            SET state = 'FAILED', rejection_reason = 'audio_finalize_failed'
+          WHERE session_id = ?`,
+      )
+      .run('failed-journal-owned');
+    const journal = new AudioFinalizationJournalRepository(db.handle);
+    journal.record({
+      partId: journalPart,
+      sessionId: 'failed-journal-owned',
+      partEndedAtIso: '2026-08-12T00:00:03.000Z',
+      partDurationMs: 3_000,
+      finalSession: {
+        endedAtIso: '2026-08-12T00:00:03.000Z',
+        durationMs: 3_000,
+        speechMs: 2_000,
+      },
+    });
+    assert.equal(
+      hasRecoverableTelegramWork(db.handle),
+      true,
+      'an exact journal still owns future publication recovery',
+    );
+    journal.deletePart(journalPart);
+    assert.equal(hasRecoverableTelegramWork(db.handle), true);
+  });
+
   it('reports a clean shutdown as nothing to do', async () => {
     const report = await recoverAfterCrash(db.handle, paths(), nullLogger);
     assert.deepEqual(report.orphans, []);
@@ -659,6 +722,11 @@ describe('crash recovery', () => {
          VALUES ('db-finalize-p0', 'db-finalize', 0, ?, ?, 0, ?)`,
       )
       .run(archived, at, at);
+    assert.equal(
+      hasRecoverableTelegramWork(db.handle),
+      true,
+      'a legacy published archive without a journal must block rebind before recovery',
+    );
 
     db.handle.exec(`
       CREATE TRIGGER inject_initial_job_failure
