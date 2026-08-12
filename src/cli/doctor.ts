@@ -490,7 +490,11 @@ async function checkStateDirectory(loaded: LoadedConfig): Promise<Check> {
     name: 'state_directory',
     level: writable ? 'ok' : 'warn',
     detail: `${loaded.paths.root}${writable ? '' : ' (missing or not writable)'}`,
-    ...(writable ? {} : { fix: 'Run `pnpm openmurmur setup` to create it.' }),
+    ...(writable
+      ? {}
+      : {
+          fix: 'Run `pnpm openmurmur setup --telegram-role owner` (or `--telegram-role send-only`) to create it.',
+        }),
   };
 }
 

@@ -169,10 +169,12 @@ echo
 
 bold "Next steps"
 cat <<'STEPS'
-  pnpm openmurmur doctor           # verify everything
-  pnpm openmurmur setup            # create directories and config
-  pnpm openmurmur setup telegram owner     # input owner; first set receiveUpdates=true
-  pnpm openmurmur setup telegram send-only # output-only host; default config role
-  pnpm openmurmur capture test     # prove foreground PCM and check levels
-  pnpm openmurmur start            # run the daemon
+  pnpm openmurmur doctor                            # verify everything
+  pnpm openmurmur setup --telegram-role owner       # fresh input-owner config
+  pnpm openmurmur setup telegram owner              # connect the input owner
+  # Or, on every output-only sibling, use the matching send-only pair:
+  pnpm openmurmur setup --telegram-role send-only
+  pnpm openmurmur setup telegram send-only
+  pnpm openmurmur capture test                      # prove foreground PCM and check levels
+  pnpm openmurmur start                             # run the daemon
 STEPS

@@ -99,7 +99,7 @@ Two warnings are expected before setup and do not block anything:
 ## Step 2 — State directory
 
 ```bash
-pnpm openmurmur setup --yes
+pnpm openmurmur setup --telegram-role owner --yes
 ```
 
 Creates `~/Library/Application Support/OpenMurmur` — audio, database, config,

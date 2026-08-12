@@ -127,7 +127,7 @@ if [ "$kc" -eq 44 ]; then
     ok "keychain" "legacy Telegram pair stored and readable; next load will migrate it"
   elif [ "$legacy_token" -eq 44 ] && [ "$legacy_chat" -eq 44 ]; then
     warn "keychain" "no Telegram credentials stored yet"
-    human "Create a bot with @BotFather, then run: pnpm openmurmur setup telegram"
+    human "Create a bot with @BotFather, then use one complete matching pair. Owner: pnpm openmurmur setup --telegram-role owner, then pnpm openmurmur setup telegram owner. Send-only: pnpm openmurmur setup --telegram-role send-only, then pnpm openmurmur setup telegram send-only."
   elif [ "$legacy_token" -eq 65 ] || [ "$legacy_chat" -eq 65 ]; then
     fail "keychain" "legacy Telegram credentials are empty; run setup again"
   else
