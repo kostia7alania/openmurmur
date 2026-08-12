@@ -8,6 +8,7 @@ export interface FfmpegCaptureOptions extends CaptureBackendOptions {
   readonly ffmpegPath: string;
   readonly clock: Clock;
   readonly firstSourceFrameTimeoutMs?: number;
+  readonly sourceFrameStallTimeoutMs?: number;
 }
 
 function buildFfmpegArgs(options: CaptureBackendOptions): string[] {
@@ -61,6 +62,9 @@ export class FfmpegCapture extends ProcessPcmCapture {
       ...(options.firstSourceFrameTimeoutMs === undefined
         ? {}
         : { firstSourceFrameTimeoutMs: options.firstSourceFrameTimeoutMs }),
+      ...(options.sourceFrameStallTimeoutMs === undefined
+        ? {}
+        : { sourceFrameStallTimeoutMs: options.sourceFrameStallTimeoutMs }),
     });
     this.#args = args;
   }

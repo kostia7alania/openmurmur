@@ -87,11 +87,15 @@ function fakePcmSource(
   return path;
 }
 
-function fakePcmSourceIgnoringTerm(frameCount: number): string {
+function fakePcmSourceIgnoringTerm(frameCount: number, pidFile?: string): string {
   const path = join(dir, 'fake-pcm-source-ignoring-term');
   writeFileSync(
     path,
-    `#!${process.execPath}\nprocess.on('SIGTERM', () => {});\nprocess.stdout.write(Buffer.alloc(${frameCount * 2}));\nsetInterval(() => {}, 1000);\n`,
+    `#!${process.execPath}\nprocess.on('SIGTERM', () => {});\n${
+      pidFile === undefined
+        ? ''
+        : `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n`
+    }process.stdout.write(Buffer.alloc(${frameCount * 2}));\nsetInterval(() => {}, 1000);\n`,
     { mode: 0o700 },
   );
   chmodSync(path, 0o700);
@@ -103,6 +107,17 @@ function fakePcmSourceStuckBeforeOutput(pidFile: string): string {
   writeFileSync(
     path,
     `#!${process.execPath}\nprocess.on('SIGTERM', () => {});\nrequire('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+    { mode: 0o700 },
+  );
+  chmodSync(path, 0o700);
+  return path;
+}
+
+function fakePcmSourceTricklingPartialFrame(pidFile: string, bytesPerFrame: number): string {
+  const path = join(dir, 'fake-pcm-source-trickling-partial-frame');
+  writeFileSync(
+    path,
+    `#!${process.execPath}\nprocess.on('SIGTERM', () => {});\nprocess.stdout.on('error', () => {});\nrequire('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nprocess.stdout.write(Buffer.alloc(${bytesPerFrame}));\nsetInterval(() => process.stdout.write(Buffer.alloc(1)), 50);\n`,
     { mode: 0o700 },
   );
   chmodSync(path, 0o700);
@@ -620,6 +635,55 @@ describe('capture backend argument construction', () => {
     assert.equal((await retry.next()).done, false);
     await capture.stop();
     await retry.return?.();
+  });
+
+  it('fails and reaps a capture child that stalls after its first source frame', async () => {
+    const pidFile = join(dir, 'stalled-source.pid');
+    const frameSamples = 512;
+    const bytesPerFrame = frameSamples * 2;
+    const source = fakePcmSourceTricklingPartialFrame(pidFile, bytesPerFrame);
+    const capture = new FfmpegCapture({
+      sampleRate: 16_000,
+      channels: 1,
+      device: 'default',
+      frameSamples,
+      ffmpegPath: source,
+      clock: systemClock,
+      sourceFrameStallTimeoutMs: 250,
+    });
+    const iterator = capture.start();
+    assert.equal((await iterator.next()).done, false);
+
+    const started = Date.now();
+    await waitForCondition(() => {
+      if (!existsSync(pidFile)) return false;
+      const pid = Number(readFileSync(pidFile, 'utf8'));
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'ESRCH';
+      }
+    }, 'the stalled source to be reaped without another iterator pull');
+    await assert.rejects(
+      iterator.next(),
+      /No source audio frame arrived for 250 ms; the input device or capture process may have stalled/,
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 3_100, `expected the SIGKILL fallback, stopped after ${elapsed}ms`);
+    assert.ok(elapsed < 5_000, `bounded source-stall failure took ${elapsed}ms`);
+
+    const childPid = Number(readFileSync(pidFile, 'utf8'));
+    assert.throws(() => process.kill(childPid, 0), { code: 'ESRCH' });
+
+    writeFileSync(
+      source,
+      `#!${process.execPath}\nprocess.stdout.write(Buffer.alloc(${bytesPerFrame}), () => setTimeout(() => process.exit(7), 25));\n`,
+      { mode: 0o700 },
+    );
+    const replacement = capture.start();
+    assert.equal((await replacement.next()).done, false);
+    await assert.rejects(replacement.next(), /ffmpeg exited with code 7/);
   });
 
   it('discards buffered PCM immediately when the capture child exits non-zero', async () => {

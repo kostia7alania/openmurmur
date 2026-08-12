@@ -11,6 +11,7 @@ export interface NativeCaptureOptions extends CaptureBackendOptions {
   readonly executable?: string;
   readonly clock: Clock;
   readonly firstSourceFrameTimeoutMs?: number;
+  readonly sourceFrameStallTimeoutMs?: number;
 }
 
 export interface CaptureBackendSelectionOptions extends CaptureBackendOptions {
@@ -231,6 +232,9 @@ export class NativeCapture extends ProcessPcmCapture {
       ...(options.firstSourceFrameTimeoutMs === undefined
         ? {}
         : { firstSourceFrameTimeoutMs: options.firstSourceFrameTimeoutMs }),
+      ...(options.sourceFrameStallTimeoutMs === undefined
+        ? {}
+        : { sourceFrameStallTimeoutMs: options.sourceFrameStallTimeoutMs }),
     });
   }
 }

@@ -12,6 +12,7 @@ import { CaptureBufferOverflowError, CaptureFrameBuffer } from './frame-buffer.t
 
 const MAX_PROCESSING_LAG_MS = 30_000;
 export const FIRST_SOURCE_FRAME_TIMEOUT_MS = 10_000;
+export const SOURCE_FRAME_STALL_TIMEOUT_MS = 15_000;
 
 export interface ProcessPcmCaptureOptions extends CaptureBackendOptions {
   readonly name: string;
@@ -19,6 +20,7 @@ export interface ProcessPcmCaptureOptions extends CaptureBackendOptions {
   readonly args: readonly string[];
   readonly clock: Clock;
   readonly firstSourceFrameTimeoutMs?: number;
+  readonly sourceFrameStallTimeoutMs?: number;
   readonly classifyExit: (stderr: string, code: number | null) => CaptureError;
 }
 
@@ -30,10 +32,13 @@ export class ProcessPcmCapture implements CaptureBackend {
   readonly #bytesPerFrame: number;
   readonly #frameDurationMs: number;
   readonly #firstSourceFrameTimeoutMs: number;
+  readonly #sourceFrameStallTimeoutMs: number;
 
   #child: ChildProcessByStdio<null, Readable, Readable> | null = null;
   #exitPromise: Promise<CaptureError | null> | null = null;
   #activeFrames: CaptureFrameBuffer | null = null;
+  #cancelActiveWatchdog: (() => void) | null = null;
+  #terminateActiveChild: (() => Promise<void>) | null = null;
   #lastIngressAtMonotonicMs: number | null = null;
   #lastDeliveredFrameMonotonicMs: number | null = null;
   #latestIngressFrameMonotonicMs: number | null = null;
@@ -46,8 +51,13 @@ export class ProcessPcmCapture implements CaptureBackend {
     this.#frameDurationMs = (options.frameSamples / options.sampleRate) * 1000;
     this.#firstSourceFrameTimeoutMs =
       options.firstSourceFrameTimeoutMs ?? FIRST_SOURCE_FRAME_TIMEOUT_MS;
+    this.#sourceFrameStallTimeoutMs =
+      options.sourceFrameStallTimeoutMs ?? SOURCE_FRAME_STALL_TIMEOUT_MS;
     if (!Number.isFinite(this.#firstSourceFrameTimeoutMs) || this.#firstSourceFrameTimeoutMs <= 0) {
       throw new Error('first source frame timeout must be positive');
+    }
+    if (!Number.isFinite(this.#sourceFrameStallTimeoutMs) || this.#sourceFrameStallTimeoutMs <= 0) {
+      throw new Error('source frame stall timeout must be positive');
     }
   }
 
@@ -75,6 +85,12 @@ export class ProcessPcmCapture implements CaptureBackend {
       });
     });
     this.#exitPromise = exited;
+    let terminationPromise: Promise<void> | null = null;
+    const terminate = () => {
+      terminationPromise ??= this.#terminateAndJoin(child, exited);
+      return terminationPromise;
+    };
+    this.#terminateActiveChild = terminate;
 
     const maxBufferedFrames = Math.ceil(MAX_PROCESSING_LAG_MS / this.#frameDurationMs);
     const frames = new CaptureFrameBuffer({
@@ -84,27 +100,53 @@ export class ProcessPcmCapture implements CaptureBackend {
       clock: this.#options.clock,
     });
     this.#activeFrames = frames;
-    const pump = this.#pumpFrames(child, frames, maxBufferedFrames, exited);
-    let firstFrameTimer: NodeJS.Timeout | undefined = setTimeout(() => {
-      const duration =
-        this.#firstSourceFrameTimeoutMs % 1000 === 0
-          ? `${this.#firstSourceFrameTimeoutMs / 1000} seconds`
-          : `${this.#firstSourceFrameTimeoutMs} ms`;
-      frames.abort(
-        new CaptureError(
-          'exit',
-          `No source audio frame arrived within ${duration}; microphone access may be blocked or the input device may be unavailable.`,
-        ),
-      );
-    }, this.#firstSourceFrameTimeoutMs);
+    let sourceFrameSeen = false;
+    let watchdogTimer: NodeJS.Timeout | undefined;
+    const releaseGeneration = () => {
+      if (this.#activeFrames === frames) this.#activeFrames = null;
+      if (this.#exitPromise === exited) this.#exitPromise = null;
+      if (this.#child === child) this.#child = null;
+      if (this.#cancelActiveWatchdog === cancelWatchdog) this.#cancelActiveWatchdog = null;
+      if (this.#terminateActiveChild === terminate) this.#terminateActiveChild = null;
+    };
+    const armWatchdog = () => {
+      if (watchdogTimer !== undefined) clearTimeout(watchdogTimer);
+      const waitingForFirstFrame = !sourceFrameSeen;
+      const timeoutMs = waitingForFirstFrame
+        ? this.#firstSourceFrameTimeoutMs
+        : this.#sourceFrameStallTimeoutMs;
+      watchdogTimer = setTimeout(() => {
+        watchdogTimer = undefined;
+        const duration = this.#renderTimeoutDuration(timeoutMs);
+        frames.abort(
+          new CaptureError(
+            'exit',
+            waitingForFirstFrame
+              ? `No source audio frame arrived within ${duration}; microphone access may be blocked or the input device may be unavailable.`
+              : `No source audio frame arrived for ${duration}; the input device or capture process may have stalled.`,
+          ),
+        );
+        // The recorder can still be processing the previously yielded frame.
+        // Reap this exact generation without waiting for another iterator pull.
+        void terminate().then(releaseGeneration);
+      }, timeoutMs);
+    };
+    const cancelWatchdog = () => {
+      if (watchdogTimer !== undefined) {
+        clearTimeout(watchdogTimer);
+        watchdogTimer = undefined;
+      }
+    };
+    this.#cancelActiveWatchdog = cancelWatchdog;
+    const pump = this.#pumpFrames(child, frames, maxBufferedFrames, exited, () => {
+      sourceFrameSeen = true;
+      armWatchdog();
+    });
+    armWatchdog();
     try {
       while (true) {
         const next = await frames.next();
         if (next.done) break;
-        if (firstFrameTimer !== undefined) {
-          clearTimeout(firstFrameTimer);
-          firstFrameTimer = undefined;
-        }
         this.#lastDeliveredFrameMonotonicMs = next.value.monotonicMs;
         yield next.value;
       }
@@ -112,11 +154,9 @@ export class ProcessPcmCapture implements CaptureBackend {
       const failure = await exited;
       if (failure !== null) throw failure;
     } finally {
-      if (firstFrameTimer !== undefined) clearTimeout(firstFrameTimer);
-      await this.#terminateAndJoin(child, exited);
-      if (this.#activeFrames === frames) this.#activeFrames = null;
-      if (this.#exitPromise === exited) this.#exitPromise = null;
-      if (this.#child === child) this.#child = null;
+      cancelWatchdog();
+      await terminate();
+      releaseGeneration();
     }
   }
 
@@ -125,14 +165,19 @@ export class ProcessPcmCapture implements CaptureBackend {
     frames: CaptureFrameBuffer,
     maxBufferedFrames: number,
     exited: Promise<CaptureError | null>,
+    onIngress: () => void,
   ): Promise<void> {
     try {
       for await (const chunk of child.stdout) {
-        this.#lastIngressAtMonotonicMs = this.#options.clock.monotonicMs();
+        const previousFrameMonotonicMs = frames.latestFrameMonotonicMs;
         try {
           frames.write(chunk as Buffer<ArrayBufferLike>);
         } finally {
           this.#latestIngressFrameMonotonicMs = frames.latestFrameMonotonicMs;
+        }
+        if (frames.latestFrameMonotonicMs !== previousFrameMonotonicMs) {
+          this.#lastIngressAtMonotonicMs = this.#options.clock.monotonicMs();
+          onIngress();
         }
       }
       const failure = await exited;
@@ -156,10 +201,12 @@ export class ProcessPcmCapture implements CaptureBackend {
   async stop(): Promise<void> {
     const child = this.#child;
     const exited = this.#exitPromise;
-    if (child === null || exited === null) return;
+    const terminate = this.#terminateActiveChild;
+    if (child === null || exited === null || terminate === null) return;
     this.#stopping = true;
+    this.#cancelActiveWatchdog?.();
     this.#activeFrames?.stop();
-    await this.#terminateAndJoin(child, exited);
+    await terminate();
   }
 
   msSinceLastFrame(): number | null {
@@ -183,6 +230,10 @@ export class ProcessPcmCapture implements CaptureBackend {
 
   currentStreamEpoch(): number {
     return this.#activeFrames?.streamEpoch ?? 0;
+  }
+
+  #renderTimeoutDuration(timeoutMs: number): string {
+    return timeoutMs % 1000 === 0 ? `${timeoutMs / 1000} seconds` : `${timeoutMs} ms`;
   }
 
   async #terminateAndJoin(
