@@ -836,6 +836,366 @@ pnpm openmurmur --root "$STATE_ROOT" capture test
 pnpm openmurmur --root "$STATE_ROOT" status
 ```
 
+### Attended reboot and lid-sleep evidence (D070/D122)
+
+Run the block below as `before-reboot`, reboot and log back into the same GUI
+account, then run it as `after-reboot`. Run the sleep pair as `before-sleep`,
+close the lid, wake and log in, then run `after-sleep`. Keep the same printed
+persistent `EVIDENCE_DIR` across all four invocations. A failed phase can be
+retried: only an atomically published facts link counts. The block reads the
+exact Node, CLI and state root from the installed plists. It reads no Keychain
+value, requests no TCC prompt and makes no direct config or domain-database
+edit. The installed production agents continue their ordinary writes, and the
+status command may open the database normally while collecting evidence.
+
+```bash
+# The first invocation creates EVIDENCE_DIR and defaults to before-reboot.
+# Later invocations preserve an exported EVIDENCE_DIR and PHASE.
+if [ -z "${EVIDENCE_DIR:-}" ]; then
+  [ -d "$HOME" ] && [ ! -L "$HOME" ] && \
+    [ "$(cd "$HOME" && pwd -P)" = "$HOME" ] && \
+    [ "$(stat -f '%u' "$HOME")" = "$(id -u)" ] || {
+    echo "HOME must be a physical canonical directory owned by this user" >&2
+    exit 1
+  }
+  export EVIDENCE_DIR="$(mktemp -d "$HOME/.openmurmur-lifecycle.XXXXXX")"
+  chmod 0700 "$EVIDENCE_DIR"
+fi
+export PHASE="${PHASE:-before-reboot}"
+(
+set -euo pipefail
+umask 077
+: "${EVIDENCE_DIR:?restore the original evidence directory path}"
+: "${PHASE:?use before-reboot, after-reboot, before-sleep or after-sleep}"
+case "$PHASE" in
+  before-reboot|after-reboot|before-sleep|after-sleep) ;;
+  *) echo "invalid lifecycle phase: $PHASE" >&2; exit 1 ;;
+esac
+case "$EVIDENCE_DIR" in
+  "$HOME"/.openmurmur-lifecycle.*) ;;
+  *) echo "restore the exact lifecycle evidence path under HOME" >&2; exit 1 ;;
+esac
+
+directory_id() { /usr/bin/stat -f '%d:%i' "$1"; }
+file_id() { /usr/bin/stat -f '%d:%i' "$1"; }
+file_sha256() { /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'; }
+require_physical_directory() {
+  local path="$1"
+  [ -d "$path" ] && [ ! -L "$path" ] && \
+    [ "$(cd "$path" && pwd -P)" = "$path" ] || {
+    echo "not a physical canonical directory: $path" >&2
+    exit 1
+  }
+}
+
+require_physical_directory "$HOME"
+[ "$(/usr/bin/stat -f '%u' "$HOME")" = "$(id -u)" ]
+require_physical_directory "$HOME/Library"
+AGENT_DIR="$HOME/Library/LaunchAgents"
+require_physical_directory "$AGENT_DIR"
+require_physical_directory "$EVIDENCE_DIR"
+[ "$(dirname "$EVIDENCE_DIR")" = "$HOME" ]
+[ "$(/usr/bin/stat -f '%u' "$EVIDENCE_DIR")" = "$(id -u)" ]
+[ "$(/usr/bin/stat -f '%Lp' "$EVIDENCE_DIR")" = 700 ]
+HOME_ID="$(directory_id "$HOME")"
+LIBRARY_ID="$(directory_id "$HOME/Library")"
+AGENT_DIR_ID="$(directory_id "$AGENT_DIR")"
+EVIDENCE_ID="$(directory_id "$EVIDENCE_DIR")"
+
+DAEMON_PLIST="$AGENT_DIR/io.openmurmur.daemon.plist"
+DIGEST_PLIST="$AGENT_DIR/io.openmurmur.digest.plist"
+UID_VALUE="$(id -u)"
+for plist in "$DAEMON_PLIST" "$DIGEST_PLIST"; do
+  [ -f "$plist" ] && [ ! -L "$plist" ] || { echo "missing safe plist: $plist" >&2; exit 1; }
+done
+DAEMON_PLIST_ID="$(file_id "$DAEMON_PLIST")"
+DIGEST_PLIST_ID="$(file_id "$DIGEST_PLIST")"
+DAEMON_PLIST_SHA="$(file_sha256 "$DAEMON_PLIST")"
+DIGEST_PLIST_SHA="$(file_sha256 "$DIGEST_PLIST")"
+NODE_BIN="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$DAEMON_PLIST")"
+CLI_ENTRY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$DAEMON_PLIST")"
+STATE_ROOT="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:4' "$DAEMON_PLIST")"
+[ "$NODE_BIN" = "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$DIGEST_PLIST")" ]
+[ "$CLI_ENTRY" = "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$DIGEST_PLIST")" ]
+[ "$STATE_ROOT" = "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:5' "$DIGEST_PLIST")" ]
+[ "${NODE_BIN#/}" != "$NODE_BIN" ] && [ -f "$NODE_BIN" ] && [ ! -L "$NODE_BIN" ] && [ -x "$NODE_BIN" ]
+require_physical_directory "$(dirname "$NODE_BIN")"
+[ "${CLI_ENTRY#/}" != "$CLI_ENTRY" ] && [ -f "$CLI_ENTRY" ] && [ ! -L "$CLI_ENTRY" ]
+require_physical_directory "$(dirname "$CLI_ENTRY")"
+[ "${STATE_ROOT#/}" != "$STATE_ROOT" ]
+require_physical_directory "$STATE_ROOT"
+[ "$(/usr/bin/stat -f '%u' "$STATE_ROOT")" = "$(id -u)" ]
+NODE_ID="$(file_id "$NODE_BIN")"
+CLI_ID="$(file_id "$CLI_ENTRY")"
+STATE_ROOT_ID="$(directory_id "$STATE_ROOT")"
+REPO_ROOT="$(cd "$(dirname "$CLI_ENTRY")/../.." && pwd -P)"
+[ "$CLI_ENTRY" = "$REPO_ROOT/src/cli/main.ts" ]
+[ -f "$REPO_ROOT/scripts/install-launch-agents" ] && \
+  [ ! -L "$REPO_ROOT/scripts/install-launch-agents" ]
+
+paths_unchanged() {
+  [ -d "$HOME" ] && [ ! -L "$HOME" ] && [ "$(cd "$HOME" 2>/dev/null && pwd -P)" = "$HOME" ] && \
+    [ "$(directory_id "$HOME")" = "$HOME_ID" ] && \
+    [ -d "$HOME/Library" ] && [ ! -L "$HOME/Library" ] && \
+    [ "$(cd "$HOME/Library" 2>/dev/null && pwd -P)" = "$HOME/Library" ] && \
+    [ "$(directory_id "$HOME/Library")" = "$LIBRARY_ID" ] && \
+    [ -d "$AGENT_DIR" ] && [ ! -L "$AGENT_DIR" ] && \
+    [ "$(cd "$AGENT_DIR" 2>/dev/null && pwd -P)" = "$AGENT_DIR" ] && \
+    [ "$(directory_id "$AGENT_DIR")" = "$AGENT_DIR_ID" ] && \
+    [ -d "$EVIDENCE_DIR" ] && [ ! -L "$EVIDENCE_DIR" ] && \
+    [ "$(cd "$EVIDENCE_DIR" 2>/dev/null && pwd -P)" = "$EVIDENCE_DIR" ] && \
+    [ "$(directory_id "$EVIDENCE_DIR")" = "$EVIDENCE_ID" ] && \
+    [ -d "$STATE_ROOT" ] && [ ! -L "$STATE_ROOT" ] && \
+    [ "$(cd "$STATE_ROOT" 2>/dev/null && pwd -P)" = "$STATE_ROOT" ] && \
+    [ "$(directory_id "$STATE_ROOT")" = "$STATE_ROOT_ID" ] && \
+    [ -f "$DAEMON_PLIST" ] && [ ! -L "$DAEMON_PLIST" ] && \
+    [ "$(file_id "$DAEMON_PLIST")" = "$DAEMON_PLIST_ID" ] && \
+    [ "$(file_sha256 "$DAEMON_PLIST")" = "$DAEMON_PLIST_SHA" ] && \
+    [ -f "$DIGEST_PLIST" ] && [ ! -L "$DIGEST_PLIST" ] && \
+    [ "$(file_id "$DIGEST_PLIST")" = "$DIGEST_PLIST_ID" ] && \
+    [ "$(file_sha256 "$DIGEST_PLIST")" = "$DIGEST_PLIST_SHA" ] && \
+    [ -f "$NODE_BIN" ] && [ ! -L "$NODE_BIN" ] && [ "$(file_id "$NODE_BIN")" = "$NODE_ID" ] && \
+    [ "$(cd "$(dirname "$NODE_BIN")" 2>/dev/null && pwd -P)/$(basename "$NODE_BIN")" = "$NODE_BIN" ] && \
+    [ -f "$CLI_ENTRY" ] && [ ! -L "$CLI_ENTRY" ] && [ "$(file_id "$CLI_ENTRY")" = "$CLI_ID" ] && \
+    [ "$(cd "$(dirname "$CLI_ENTRY")" 2>/dev/null && pwd -P)/$(basename "$CLI_ENTRY")" = "$CLI_ENTRY" ]
+}
+
+paths_unchanged
+"$REPO_ROOT/scripts/install-launch-agents" --check --node "$NODE_BIN" --root "$STATE_ROOT" >/dev/null
+paths_unchanged
+
+PHASE_FACTS="$EVIDENCE_DIR/$PHASE.accepted.json"
+[ ! -e "$PHASE_FACTS" ] && [ ! -L "$PHASE_FACTS" ] || {
+  echo "$PHASE was already published; choose the correct next phase" >&2
+  exit 1
+}
+PHASE_STAGE="$(mktemp -d "$EVIDENCE_DIR/.$PHASE.XXXXXX")"
+chmod 0700 "$PHASE_STAGE"
+PHASE_STAGE_ID="$(directory_id "$PHASE_STAGE")"
+stage_unchanged() {
+  paths_unchanged && [ -d "$PHASE_STAGE" ] && [ ! -L "$PHASE_STAGE" ] && \
+    [ "$(cd "$PHASE_STAGE" 2>/dev/null && pwd -P)" = "$PHASE_STAGE" ] && \
+    [ "$(dirname "$PHASE_STAGE")" = "$EVIDENCE_DIR" ] && \
+    [ "$(directory_id "$PHASE_STAGE")" = "$PHASE_STAGE_ID" ]
+}
+cleanup_phase() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "${PHASE_STAGE:-}" ]; then
+    if stage_unchanged; then
+      /bin/rm -rf "$PHASE_STAGE"
+    else
+      echo "phase staging evidence was preserved after an identity change: $PHASE_STAGE" >&2
+      status=1
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup_phase EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+case "$PHASE" in
+  after-reboot) PREVIOUS_PHASE=before-reboot ;;
+  after-sleep) PREVIOUS_PHASE=before-sleep ;;
+  *) PREVIOUS_PHASE= ;;
+esac
+if [ -n "$PREVIOUS_PHASE" ]; then
+  PREVIOUS_FACTS="$EVIDENCE_DIR/$PREVIOUS_PHASE.accepted.json"
+  [ -f "$PREVIOUS_FACTS" ] && [ ! -L "$PREVIOUS_FACTS" ] || {
+    echo "missing accepted $PREVIOUS_PHASE evidence" >&2
+    exit 1
+  }
+fi
+
+if [ "$PHASE" = after-reboot ] || [ "$PHASE" = after-sleep ]; then
+  [ "$(stat -f '%Su' /dev/console)" = "$(id -un)" ] || {
+    echo "the expected GUI user is not logged in" >&2
+    exit 1
+  }
+  MINIMUM_DIGEST_RUNS=0
+  WAKE_DIGEST_RUNS=-1
+  if [ "$PHASE" = after-sleep ]; then
+    BEFORE_SLEEP_DIGEST_RUNS="$("$NODE_BIN" -e \
+      'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).digestRuns)' \
+      "$PREVIOUS_FACTS")"
+    wake_digest_print="$(launchctl print "gui/$UID_VALUE/io.openmurmur.digest")"
+    WAKE_DIGEST_RUNS="$(printf '%s\n' "$wake_digest_print" | \
+      awk '$1 == "runs" && $2 == "=" { print $3; exit }')"
+    [ "${BEFORE_SLEEP_DIGEST_RUNS:-}" -ge 0 ] 2>/dev/null
+    [ "${WAKE_DIGEST_RUNS:-}" -ge 0 ] 2>/dev/null
+    if [ "$WAKE_DIGEST_RUNS" -gt "$BEFORE_SLEEP_DIGEST_RUNS" ]; then
+      MINIMUM_DIGEST_RUNS="$WAKE_DIGEST_RUNS"
+    else
+      MINIMUM_DIGEST_RUNS="$BEFORE_SLEEP_DIGEST_RUNS"
+    fi
+  fi
+  attempt=0
+  until digest_print="$(launchctl print "gui/$UID_VALUE/io.openmurmur.digest" 2>&1)" &&
+    runs="$(printf '%s\n' "$digest_print" | awk '$1 == "runs" && $2 == "=" { print $3; exit }')" &&
+    [ "${runs:-0}" -gt "$MINIMUM_DIGEST_RUNS" ] 2>/dev/null &&
+    printf '%s\n' "$digest_print" | grep -Eq 'last exit code = 0'; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 72 ] || { echo "digest agent did not complete cleanly within six minutes" >&2; exit 1; }
+    sleep 5
+  done
+fi
+
+STATUS_FILE="$PHASE_STAGE/status.json"
+if [ -n "$PREVIOUS_PHASE" ]; then
+  attempt=0
+  while :; do
+    paths_unchanged
+    if "$NODE_BIN" "$CLI_ENTRY" status --root "$STATE_ROOT" --json > "$STATUS_FILE" && \
+      "$NODE_BIN" --input-type=module - \
+        "$STATE_ROOT/openmurmur.db" "$STATUS_FILE" "$PREVIOUS_FACTS" <<'NODE'
+import { readFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+
+const [databaseFile, statusFile, previousFile] = process.argv.slice(2);
+const status = JSON.parse(readFileSync(statusFile, 'utf8'));
+const previous = JSON.parse(readFileSync(previousFile, 'utf8'));
+if (
+  status.daemon !== 'running' || status.heartbeatStatus !== 'fresh' ||
+  status.recorderRunning !== true || !Number.isFinite(status.lastSourceFrameAgeMs) ||
+  status.lastSourceFrameAgeMs < 0
+) process.exit(1);
+const db = new DatabaseSync(databaseFile, { readOnly: true });
+const ownership = db.prepare(
+  `SELECT daemon_started_at, process_birth FROM daemon_ownership WHERE ownership_id = 1`,
+).get();
+db.close();
+if (
+  ownership === undefined ||
+  ownership.daemon_started_at === previous.ownership.daemon_started_at ||
+  ownership.process_birth === previous.ownership.process_birth
+) process.exit(1);
+NODE
+    then
+      break
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 72 ] || {
+      echo "new launchd generation did not reach fresh real-frame readiness within six minutes" >&2
+      exit 1
+    }
+    sleep 5
+  done
+else
+  paths_unchanged
+  "$NODE_BIN" "$CLI_ENTRY" status --root "$STATE_ROOT" --json > "$STATUS_FILE"
+fi
+
+for label in io.openmurmur.daemon io.openmurmur.digest; do
+  paths_unchanged
+  launchctl print "gui/$UID_VALUE/$label" > "$PHASE_STAGE/$label.print"
+done
+DIGEST_RUNS="$(awk '$1 == "runs" && $2 == "=" { print $3; exit }' \
+  "$PHASE_STAGE/io.openmurmur.digest.print")"
+[ "${DIGEST_RUNS:-}" -ge 0 ] 2>/dev/null
+
+"$NODE_BIN" --input-type=module - \
+  "$PHASE" "$STATE_ROOT/openmurmur.db" "$STATUS_FILE" "$EVIDENCE_DIR" \
+  "$PHASE_STAGE/facts.json" "$DIGEST_RUNS" "${WAKE_DIGEST_RUNS:--1}" <<'NODE'
+import { createHash } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { join } from 'node:path';
+
+const [phase, databaseFile, statusFile, evidenceDir, outputFile, digestRunsText, wakeRunsText] = process.argv.slice(2);
+const status = JSON.parse(readFileSync(statusFile, 'utf8'));
+if (
+  status.daemon !== 'running' || status.heartbeatStatus !== 'fresh' ||
+  status.recorderRunning !== true || !Number.isFinite(status.lastSourceFrameAgeMs) ||
+  status.lastSourceFrameAgeMs < 0
+) throw new Error(`${phase}: daemon has no fresh real-frame readiness proof`);
+
+const db = new DatabaseSync(databaseFile, { readOnly: true });
+const rows = (sql, ...args) => db.prepare(sql).all(...args).map((row) => ({ ...row }));
+const one = (sql, ...args) => {
+  const row = db.prepare(sql).get(...args);
+  return row === undefined ? null : { ...row };
+};
+const sha256 = (value) => createHash('sha256').update(value).digest('hex');
+const previousPhase = phase === 'after-reboot' ? 'before-reboot'
+  : phase === 'after-sleep' ? 'before-sleep' : null;
+const previous = previousPhase === null
+  ? null
+  : JSON.parse(readFileSync(join(evidenceDir, `${previousPhase}.accepted.json`), 'utf8'));
+const facts = {
+  phase,
+  evidenceStage: outputFile.slice(0, outputFile.lastIndexOf('/')).split('/').at(-1),
+  digestRuns: Number(digestRunsText),
+  wakeDigestRuns: Number(wakeRunsText) < 0 ? null : Number(wakeRunsText),
+  ownership: one(`SELECT daemon_pid, daemon_started_at, process_birth, claimed_at
+                    FROM daemon_ownership WHERE ownership_id = 1`),
+  digests: rows(`SELECT digest_id, digest_date, created_at FROM digests ORDER BY digest_date`),
+  digestOutbox: rows(`SELECT outbox_id, delivery_part_id, payload FROM telegram_outbox
+                       WHERE kind = 'digest' ORDER BY delivery_part_id`)
+    .map((row) => ({
+      outboxId: row.outbox_id,
+      deliveryPartId: row.delivery_part_id,
+      payloadSha256: sha256(row.payload),
+    })),
+  sleepNotices: rows(`SELECT outbox_id, delivery_part_id, state FROM telegram_outbox
+                       WHERE delivery_part_id GLOB 'sleep:*' ORDER BY delivery_part_id`),
+};
+if (facts.ownership === null) throw new Error(`${phase}: daemon ownership is missing`);
+if (!Number.isSafeInteger(facts.digestRuns) || facts.digestRuns < 0)
+  throw new Error(`${phase}: launchd digest run count is invalid`);
+if (new Set(facts.digests.map((row) => row.digest_date)).size !== facts.digests.length)
+  throw new Error(`${phase}: duplicate digest dates`);
+if (new Set(facts.digestOutbox.map((row) => row.deliveryPartId)).size !== facts.digestOutbox.length)
+  throw new Error(`${phase}: duplicate digest delivery identities`);
+
+if (previousPhase !== null) {
+  if (
+    previous.ownership.daemon_started_at === facts.ownership.daemon_started_at ||
+    previous.ownership.process_birth === facts.ownership.process_birth
+  ) throw new Error(`${phase}: launchd did not establish a new exact daemon generation`);
+  if (phase === 'after-reboot' && facts.digestRuns < 1)
+    throw new Error('after-reboot: digest agent did not run');
+  if (
+    phase === 'after-sleep' &&
+    (facts.wakeDigestRuns === null || facts.digestRuns <= previous.digestRuns ||
+      facts.digestRuns <= facts.wakeDigestRuns)
+  ) throw new Error('after-sleep: digest agent did not run after the wake baseline');
+  for (const old of previous.digests) {
+    const current = facts.digests.find((row) => row.digest_date === old.digest_date);
+    if (current?.digest_id !== old.digest_id) throw new Error(`${phase}: digest identity changed`);
+  }
+  for (const old of previous.digestOutbox) {
+    const current = facts.digestOutbox.find((row) => row.deliveryPartId === old.deliveryPartId);
+    if (current?.outboxId !== old.outboxId || current.payloadSha256 !== old.payloadSha256)
+      throw new Error(`${phase}: digest outbox identity changed`);
+  }
+  if (phase === 'after-sleep') {
+    const noticeId = `sleep:${previous.ownership.daemon_started_at}`;
+    if (facts.sleepNotices.filter((row) => row.delivery_part_id === noticeId).length !== 1)
+      throw new Error('after-sleep: exact generation-scoped sleep notice is missing or duplicated');
+  }
+}
+db.close();
+writeFileSync(outputFile, `${JSON.stringify(facts, null, 2)}\n`, {
+  flag: 'wx', mode: 0o600,
+});
+NODE
+paths_unchanged
+stage_unchanged
+/bin/ln "$PHASE_STAGE/facts.json" "$PHASE_FACTS"
+PHASE_STAGE=""
+trap - EXIT HUP INT TERM
+echo "$PHASE evidence accepted at $EVIDENCE_DIR"
+)
+```
+
+This evidence proves only the installed launchd generations, scheduled digest
+execution, real-frame restart and the exact generation-scoped sleep notice. It
+does not prove D115 post-wake session attribution, calibrate D014 AVFoundation
+cadence or discontinuity, exercise a D116 rotation, prove Telegram remote ACK,
+or complete the models and Telegram golden path in D120.
+
 ```bash
 pnpm openmurmur status
 ```
