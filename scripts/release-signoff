@@ -1,12 +1,13 @@
 #!/bin/bash
-# Binds attended release evidence to one clean source revision and installed runtime.
-# This script is read-only outside the operator-provided evidence directory.
+# Binds attended release evidence to one clean, offline-verified source revision.
+# Check mode is read-only; prepare also runs the repository's offline gates.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 RUNTIME_CONTRACT="$REPO/runtime-requirements.json"
-MANIFEST_NAME="release-signoff-v1.json"
+MANIFEST_NAME="release-signoff-v2.json"
+RECEIPT_NAME="release-verification-v1.json"
 
 MODE=""
 EVIDENCE_DIR=""
@@ -25,12 +26,13 @@ Usage:
   ./scripts/release-signoff --prepare --evidence-dir DIR [--root ROOT]
   ./scripts/release-signoff --check   --evidence-dir DIR [--root ROOT]
 
-  --prepare       Atomically create the provenance manifest. Refuses an existing manifest.
-  --check         Read-only: verify the manifest against the current source and installation.
+  --prepare       Run the offline repository gates, then atomically create the receipt and manifest.
+  --check         Read-only: verify the receipt and manifest without rerunning repository gates.
   --evidence-dir  Existing private (0700), physical, user-owned evidence directory.
   --root          Require this exact canonical state root in both installed plists.
 
 Neither mode changes launchd, opens the microphone, reads Keychain values, or uses the network.
+Prepare runs pnpm's frozen offline install before the full Node and Python checks.
 USAGE
 }
 
@@ -153,7 +155,7 @@ inspect_current_facts() {
   local daemon_label digest_label daemon_working digest_working
   local daemon_node digest_node daemon_cli digest_cli
   local daemon_root digest_root
-  local runtime_values
+  local runtime_values tool_candidate
   local authorization_output authorization_code
 
   require_physical_directory "$REPO" "source repository"
@@ -245,14 +247,31 @@ const sqlite = process.versions.sqlite ?? '0.0.0';
 if (process.execPath !== expectedExecutable) throw new Error('installed Node resolved to a different executable');
 if (compare(process.versions.node, contract.nodeMinimum) < 0) throw new Error('installed Node is below the runtime floor');
 if (compare(sqlite, contract.sqliteMinimum) < 0) throw new Error('installed SQLite is below the runtime floor');
-process.stdout.write(`${process.versions.node}\t${sqlite}`);
+process.stdout.write(`${process.versions.node}\t${sqlite}\t${contract.pnpmExact}`);
 NODE
   )"; then
     die "installed runtime is incompatible: $runtime_values"
   fi
-  IFS=$'\t' read -r NODE_VERSION SQLITE_VERSION <<< "$runtime_values"
+  IFS=$'\t' read -r NODE_VERSION SQLITE_VERSION PNPM_EXACT <<< "$runtime_values"
   [[ "$NODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "installed Node returned an invalid version"
   [[ "$SQLITE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "installed Node returned an invalid SQLite version"
+  [[ "$PNPM_EXACT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "runtime contract returned an invalid pnpm version"
+
+  tool_candidate="$(command -v pnpm 2>/dev/null || true)"
+  [ -n "$tool_candidate" ] || die "pnpm $PNPM_EXACT is required for the offline release gates"
+  PNPM_BIN="$(canonical_executable "$tool_candidate" "pnpm")"
+  PNPM_VERSION="$(PATH="$(dirname "$NODE_BIN"):$PATH" "$PNPM_BIN" --version 2>/dev/null)" || \
+    die "could not read the pnpm version"
+  [ "$PNPM_VERSION" = "$PNPM_EXACT" ] || die "pnpm $PNPM_VERSION found; release verification requires exactly $PNPM_EXACT"
+  PNPM_NODE="$(PATH="$(dirname "$NODE_BIN"):$PATH" "$PNPM_BIN" exec node -p process.execPath 2>/dev/null)" || \
+    die "pnpm could not resolve the installed Node runtime"
+  [ "$PNPM_NODE" = "$NODE_BIN" ] || die "pnpm scripts would use $PNPM_NODE instead of the installed Node $NODE_BIN"
+
+  tool_candidate="$(command -v uv 2>/dev/null || true)"
+  [ -n "$tool_candidate" ] || die "uv is required for the offline Python release gate"
+  UV_BIN="$(canonical_executable "$tool_candidate" "uv")"
+  UV_VERSION_OUTPUT="$("$UV_BIN" --version 2>/dev/null)" || die "could not read the uv version"
+  [[ "$UV_VERSION_OUTPUT" =~ ^uv\ [0-9]+\.[0-9]+\.[0-9]+ ]] || die "uv returned an invalid version"
 
   CAPTURE_CHECK="$REPO/scripts/install-capture-app"
   require_physical_file "$CAPTURE_CHECK" "capture app verifier"
@@ -285,6 +304,10 @@ NODE
   CLI_SHA256="$(file_sha256 "$CLI_ENTRY")"
   NODE_ID="$(file_identity "$NODE_BIN")"
   NODE_SHA256="$(file_sha256 "$NODE_BIN")"
+  PNPM_ID="$(file_identity "$PNPM_BIN")"
+  PNPM_SHA256="$(file_sha256 "$PNPM_BIN")"
+  UV_ID="$(file_identity "$UV_BIN")"
+  UV_SHA256="$(file_sha256 "$UV_BIN")"
   STATE_ROOT_ID="$(directory_identity "$STATE_ROOT")"
   DAEMON_PLIST_ID="$(file_identity "$DAEMON_PLIST")"
   DAEMON_PLIST_SHA256="$(file_sha256 "$DAEMON_PLIST")"
@@ -300,10 +323,30 @@ NODE
   D122_REFERENCE="$EVIDENCE_DIR/D122.reference.json"
 }
 
+canonical_executable() {
+  local candidate="$1"
+  local description="$2"
+  local resolved
+
+  [ "${candidate#/}" != "$candidate" ] || die "$description executable must resolve to an absolute path"
+  require_physical_directory "$(dirname "$candidate")" "$description launcher parent"
+  [ -x "$candidate" ] || die "$description launcher is not executable: $candidate"
+  resolved="$("$NODE_BIN" --input-type=module - "$candidate" <<'NODE'
+import { realpathSync } from 'node:fs';
+process.stdout.write(realpathSync(process.argv[2]));
+NODE
+  )" || die "could not resolve the $description executable"
+  require_physical_file "$resolved" "$description executable"
+  [ -x "$resolved" ] || die "$description executable is not executable: $resolved"
+  printf '%s\n' "$resolved"
+}
+
 capture_fact_args() {
   FACT_ARGS=(
     "$RELEASE_HEAD" "$REPO" "$REPO_ID" "$CLI_ENTRY" "$CLI_ID" "$CLI_SHA256"
     "$NODE_BIN" "$NODE_ID" "$NODE_SHA256" "$NODE_VERSION" "$SQLITE_VERSION"
+    "$PNPM_BIN" "$PNPM_ID" "$PNPM_SHA256" "$PNPM_VERSION"
+    "$UV_BIN" "$UV_ID" "$UV_SHA256" "$UV_VERSION_OUTPUT"
     "$STATE_ROOT" "$STATE_ROOT_ID"
     "$DAEMON_PLIST" "$DAEMON_PLIST_ID" "$DAEMON_PLIST_SHA256" "$DAEMON_PLIST_MODE"
     "$DIGEST_PLIST" "$DIGEST_PLIST_ID" "$DIGEST_PLIST_SHA256" "$DIGEST_PLIST_MODE"
@@ -327,6 +370,164 @@ revalidate_snapshot() {
   done
 }
 
+run_release_gate() {
+  local gate="$1"
+  local stdout_file="$STAGE_DIR/$gate.stdout"
+  local stderr_file="$STAGE_DIR/$gate.stderr"
+  local exit_code
+  shift
+
+  set +e
+  (cd "$REPO" && "$@") > "$stdout_file" 2> "$stderr_file"
+  exit_code=$?
+  set -e
+  chmod 0600 "$stdout_file" "$stderr_file"
+  case "$gate" in
+    pnpm-install)
+      PNPM_INSTALL_STDOUT_SHA="$(file_sha256 "$stdout_file")"
+      PNPM_INSTALL_STDERR_SHA="$(file_sha256 "$stderr_file")"
+      PNPM_INSTALL_EXIT="$exit_code"
+      ;;
+    node-check)
+      NODE_CHECK_STDOUT_SHA="$(file_sha256 "$stdout_file")"
+      NODE_CHECK_STDERR_SHA="$(file_sha256 "$stderr_file")"
+      NODE_CHECK_EXIT="$exit_code"
+      ;;
+    python-pytest)
+      PYTHON_PYTEST_STDOUT_SHA="$(file_sha256 "$stdout_file")"
+      PYTHON_PYTEST_STDERR_SHA="$(file_sha256 "$stderr_file")"
+      PYTHON_PYTEST_EXIT="$exit_code"
+      ;;
+    *) die "internal unknown release gate: $gate" ;;
+  esac
+  [ "$exit_code" -eq 0 ] || die "$gate failed with exit code $exit_code; no release receipt was published"
+}
+
+write_receipt() {
+  local output="$1"
+  shift
+  "$NODE_BIN" --input-type=module - "$output" "$@" <<'NODE'
+import { closeSync, fsyncSync, openSync, writeFileSync } from 'node:fs';
+
+const [
+  output, releaseCommit, repositoryPath,
+  nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion,
+  pnpmPath, pnpmIdentity, pnpmSha256, pnpmVersion,
+  uvPath, uvIdentity, uvSha256, uvVersion,
+  pnpmInstallStdout, pnpmInstallStderr, pnpmInstallExit,
+  nodeCheckStdout, nodeCheckStderr, nodeCheckExit,
+  pythonStdout, pythonStderr, pythonExit,
+] = process.argv.slice(2);
+const receipt = {
+  schemaVersion: 1,
+  releaseCommit,
+  repositoryPath,
+  tools: {
+    node: { path: nodePath, identity: nodeIdentity, sha256: nodeSha256, version: nodeVersion, sqliteVersion },
+    pnpm: { path: pnpmPath, identity: pnpmIdentity, sha256: pnpmSha256, version: pnpmVersion },
+    uv: { path: uvPath, identity: uvIdentity, sha256: uvSha256, version: uvVersion },
+  },
+  gates: [
+    {
+      id: 'pnpm-install',
+      command: [pnpmPath, 'install', '--offline', '--frozen-lockfile'],
+      cwd: repositoryPath,
+      environment: { nodePathFirst: nodePath, network: 'offline' },
+      stdoutSha256: pnpmInstallStdout,
+      stderrSha256: pnpmInstallStderr,
+      exitCode: Number(pnpmInstallExit),
+    },
+    {
+      id: 'node-check',
+      command: [pnpmPath, 'run', 'check'],
+      cwd: repositoryPath,
+      environment: { nodePathFirst: nodePath, network: 'not-used' },
+      stdoutSha256: nodeCheckStdout,
+      stderrSha256: nodeCheckStderr,
+      exitCode: Number(nodeCheckExit),
+    },
+    {
+      id: 'python-pytest',
+      command: [uvPath, 'run', '--offline', '--no-sync', '--project', 'python/openmurmur_audio', 'pytest'],
+      cwd: repositoryPath,
+      environment: { UV_OFFLINE: '1', UV_PROJECT_ENVIRONMENT: 'unset', network: 'offline' },
+      stdoutSha256: pythonStdout,
+      stderrSha256: pythonStderr,
+      exitCode: Number(pythonExit),
+    },
+  ],
+};
+writeFileSync(output, `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+const descriptor = openSync(output, 'r');
+try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+NODE
+}
+
+verify_receipt() {
+  local receipt="$1"
+  "$NODE_BIN" --input-type=module - \
+    "$receipt" "$RELEASE_HEAD" "$REPO" \
+    "$NODE_BIN" "$NODE_ID" "$NODE_SHA256" "$NODE_VERSION" "$SQLITE_VERSION" \
+    "$PNPM_BIN" "$PNPM_ID" "$PNPM_SHA256" "$PNPM_VERSION" \
+    "$UV_BIN" "$UV_ID" "$UV_SHA256" "$UV_VERSION_OUTPUT" <<'NODE'
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+const [
+  receiptPath, releaseCommit, repositoryPath,
+  nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion,
+  pnpmPath, pnpmIdentity, pnpmSha256, pnpmVersion,
+  uvPath, uvIdentity, uvSha256, uvVersion,
+] = process.argv.slice(2);
+const raw = readFileSync(receiptPath, 'utf8');
+if (Buffer.byteLength(raw) > 64 * 1024) throw new Error('release receipt exceeds the bounded v1 size');
+const actual = JSON.parse(raw);
+assert.equal(raw, `${JSON.stringify(actual, null, 2)}\n`, 'release receipt is not canonical v1 JSON');
+assert.equal(actual.schemaVersion, 1);
+assert.equal(actual.releaseCommit, releaseCommit);
+assert.equal(actual.repositoryPath, repositoryPath);
+assert.deepEqual(actual.tools, {
+  node: { path: nodePath, identity: nodeIdentity, sha256: nodeSha256, version: nodeVersion, sqliteVersion },
+  pnpm: { path: pnpmPath, identity: pnpmIdentity, sha256: pnpmSha256, version: pnpmVersion },
+  uv: { path: uvPath, identity: uvIdentity, sha256: uvSha256, version: uvVersion },
+});
+const expectedCommands = [
+  {
+    id: 'pnpm-install', command: [pnpmPath, 'install', '--offline', '--frozen-lockfile'],
+    environment: { nodePathFirst: nodePath, network: 'offline' },
+  },
+  {
+    id: 'node-check', command: [pnpmPath, 'run', 'check'],
+    environment: { nodePathFirst: nodePath, network: 'not-used' },
+  },
+  {
+    id: 'python-pytest',
+    command: [uvPath, 'run', '--offline', '--no-sync', '--project', 'python/openmurmur_audio', 'pytest'],
+    environment: { UV_OFFLINE: '1', UV_PROJECT_ENVIRONMENT: 'unset', network: 'offline' },
+  },
+];
+assert.equal(actual.gates?.length, expectedCommands.length);
+const digestPattern = /^[0-9a-f]{64}$/;
+for (let index = 0; index < expectedCommands.length; index += 1) {
+  const gate = actual.gates[index];
+  const expected = expectedCommands[index];
+  assert.equal(gate.id, expected.id);
+  assert.deepEqual(gate.command, expected.command);
+  assert.equal(gate.cwd, repositoryPath);
+  assert.deepEqual(gate.environment, expected.environment);
+  assert.match(gate.stdoutSha256, digestPattern);
+  assert.match(gate.stderrSha256, digestPattern);
+  assert.equal(gate.exitCode, 0);
+  assert.deepEqual(Object.keys(gate), [
+    'id', 'command', 'cwd', 'environment', 'stdoutSha256', 'stderrSha256', 'exitCode',
+  ]);
+}
+assert.deepEqual(Object.keys(actual), [
+  'schemaVersion', 'releaseCommit', 'repositoryPath', 'tools', 'gates',
+]);
+NODE
+}
+
 write_manifest() {
   local output="$1"
   shift
@@ -335,17 +536,25 @@ import { closeSync, fsyncSync, openSync, writeFileSync } from 'node:fs';
 
 const [
   output, releaseCommit, repositoryPath, repositoryIdentity, cliPath, cliIdentity, cliSha256,
-  nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion, stateRootPath, stateRootIdentity,
+  nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion,
+  pnpmPath, pnpmIdentity, pnpmSha256, pnpmVersion,
+  uvPath, uvIdentity, uvSha256, uvVersion,
+  stateRootPath, stateRootIdentity,
   daemonPath, daemonIdentity, daemonSha256, daemonMode,
   digestPath, digestIdentity, digestSha256, digestMode,
   capturePath, captureIdentity, captureSha256, captureSourceDigest, captureAuthorizationStatus,
   evidenceDirectory, evidenceDirectoryIdentity, d120, d121, d122,
+  receiptPath, receiptIdentity, receiptSha256, receiptReleaseCommit,
 ] = process.argv.slice(2);
 const manifest = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   releaseCommit,
   repository: { path: repositoryPath, identity: repositoryIdentity, cliPath, cliIdentity, cliSha256 },
-  runtime: { nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion },
+  runtime: {
+    nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion,
+    pnpmPath, pnpmIdentity, pnpmSha256, pnpmVersion,
+    uvPath, uvIdentity, uvSha256, uvVersion,
+  },
   stateRoot: { path: stateRootPath, identity: stateRootIdentity },
   plists: {
     daemon: { path: daemonPath, identity: daemonIdentity, sha256: daemonSha256, mode: daemonMode },
@@ -358,6 +567,7 @@ const manifest = {
     sourceDigest: captureSourceDigest,
     authorizationStatus: captureAuthorizationStatus,
   },
+  verificationReceipt: { path: receiptPath, identity: receiptIdentity, sha256: receiptSha256, releaseCommit: receiptReleaseCommit },
   evidenceDirectory: { path: evidenceDirectory, identity: evidenceDirectoryIdentity },
   requiredLiveEvidenceReferences: { D120: d120, D121: d121, D122: d122 },
 };
@@ -376,17 +586,25 @@ import { readFileSync } from 'node:fs';
 
 const [
   manifestPath, releaseCommit, repositoryPath, repositoryIdentity, cliPath, cliIdentity, cliSha256,
-  nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion, stateRootPath, stateRootIdentity,
+  nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion,
+  pnpmPath, pnpmIdentity, pnpmSha256, pnpmVersion,
+  uvPath, uvIdentity, uvSha256, uvVersion,
+  stateRootPath, stateRootIdentity,
   daemonPath, daemonIdentity, daemonSha256, daemonMode,
   digestPath, digestIdentity, digestSha256, digestMode,
   capturePath, captureIdentity, captureSha256, captureSourceDigest, captureAuthorizationStatus,
   evidenceDirectory, evidenceDirectoryIdentity, d120, d121, d122,
+  receiptPath, receiptIdentity, receiptSha256, receiptReleaseCommit,
 ] = process.argv.slice(2);
 const expected = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   releaseCommit,
   repository: { path: repositoryPath, identity: repositoryIdentity, cliPath, cliIdentity, cliSha256 },
-  runtime: { nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion },
+  runtime: {
+    nodePath, nodeIdentity, nodeSha256, nodeVersion, sqliteVersion,
+    pnpmPath, pnpmIdentity, pnpmSha256, pnpmVersion,
+    uvPath, uvIdentity, uvSha256, uvVersion,
+  },
   stateRoot: { path: stateRootPath, identity: stateRootIdentity },
   plists: {
     daemon: { path: daemonPath, identity: daemonIdentity, sha256: daemonSha256, mode: daemonMode },
@@ -399,13 +617,14 @@ const expected = {
     sourceDigest: captureSourceDigest,
     authorizationStatus: captureAuthorizationStatus,
   },
+  verificationReceipt: { path: receiptPath, identity: receiptIdentity, sha256: receiptSha256, releaseCommit: receiptReleaseCommit },
   evidenceDirectory: { path: evidenceDirectory, identity: evidenceDirectoryIdentity },
   requiredLiveEvidenceReferences: { D120: d120, D121: d121, D122: d122 },
 };
 const raw = readFileSync(manifestPath, 'utf8');
-if (Buffer.byteLength(raw) > 64 * 1024) throw new Error('manifest exceeds the bounded v1 size');
+if (Buffer.byteLength(raw) > 64 * 1024) throw new Error('manifest exceeds the bounded v2 size');
 const actual = JSON.parse(raw);
-assert.equal(raw, `${JSON.stringify(actual, null, 2)}\n`, 'manifest is not canonical v1 JSON');
+assert.equal(raw, `${JSON.stringify(actual, null, 2)}\n`, 'manifest is not canonical v2 JSON');
 assert.deepEqual(actual, expected, 'manifest no longer matches the selected source and installation');
 NODE
 }
@@ -419,9 +638,62 @@ try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
 NODE
 }
 
+frozen_private_file_matches() {
+  local path="$1"
+  local expected_identity="$2"
+  local expected_sha256="$3"
+
+  [ -f "$path" ] && [ ! -L "$path" ] && \
+    [ "$(file_mode "$path")" = 600 ] && \
+    [ "$(file_identity "$path")" = "$expected_identity" ] && \
+    [ "$(file_sha256 "$path")" = "$expected_sha256" ]
+}
+
+rollback_publication() {
+  local complete=1
+  local path expected_identity
+
+  if [ ! -d "$EVIDENCE_DIR" ] || [ -L "$EVIDENCE_DIR" ] || \
+     [ "$(cd "$EVIDENCE_DIR" 2>/dev/null && pwd -P)" != "$EVIDENCE_DIR" ] || \
+     [ "$(file_owner "$EVIDENCE_DIR")" != "$(id -u)" ] || \
+     [ "$(file_mode "$EVIDENCE_DIR")" != 700 ] || \
+     [ "$(directory_identity "$EVIDENCE_DIR")" != "$EVIDENCE_DIR_ID" ]; then
+    printf 'release-signoff: evidence directory changed; published evidence was not removed\n' >&2
+    return 1
+  fi
+  for path in "$MANIFEST" "$RECEIPT"; do
+    if [ "$path" = "$MANIFEST" ]; then
+      expected_identity="$MANIFEST_ID"
+    else
+      expected_identity="$RECEIPT_ID"
+    fi
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      if [ -f "$path" ] && [ ! -L "$path" ] && \
+         [ "$(file_identity "$path")" = "$expected_identity" ]; then
+        /bin/rm "$path" || complete=0
+      else
+        printf 'release-signoff: conflicting evidence preserved at %s\n' "$path" >&2
+        complete=0
+      fi
+    fi
+  done
+  fsync_directory "$EVIDENCE_DIR" || complete=0
+  [ "$complete" -eq 1 ]
+}
+
+publication_failed() {
+  local message="$1"
+
+  if rollback_publication; then
+    die "$message; exact published evidence was rolled back"
+  fi
+  die "$message; publication rollback is incomplete and conflicting evidence was preserved"
+}
+
 require_private_evidence_directory
 inspect_current_facts
 MANIFEST="$EVIDENCE_DIR/$MANIFEST_NAME"
+RECEIPT="$EVIDENCE_DIR/$RECEIPT_NAME"
 
 # Pass facts to Node directly as argv instead of parsing a generated text record.
 capture_fact_args
@@ -429,6 +701,7 @@ INITIAL_FACT_ARGS=("${FACT_ARGS[@]}")
 
 if [ "$MODE" = prepare ]; then
   [ ! -e "$MANIFEST" ] && [ ! -L "$MANIFEST" ] || die "provenance manifest already exists: $MANIFEST"
+  [ ! -e "$RECEIPT" ] && [ ! -L "$RECEIPT" ] || die "release verification receipt already exists: $RECEIPT"
   STAGE_DIR="$(mktemp -d "$EVIDENCE_DIR/.release-signoff.XXXXXX")"
   chmod 0700 "$STAGE_DIR"
   STAGE_DIR_ID="$(directory_identity "$STAGE_DIR")"
@@ -436,27 +709,84 @@ if [ "$MODE" = prepare ]; then
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  run_release_gate pnpm-install /usr/bin/env \
+    "PATH=$(dirname "$NODE_BIN"):$PATH" \
+    "$PNPM_BIN" install --offline --frozen-lockfile
+  run_release_gate node-check /usr/bin/env \
+    "PATH=$(dirname "$NODE_BIN"):$PATH" \
+    "$PNPM_BIN" run check
+  run_release_gate python-pytest /usr/bin/env -u UV_PROJECT_ENVIRONMENT UV_OFFLINE=1 \
+    "$UV_BIN" run --offline --no-sync --project python/openmurmur_audio pytest
+  revalidate_snapshot
+
+  STAGE_RECEIPT="$STAGE_DIR/$RECEIPT_NAME"
+  write_receipt "$STAGE_RECEIPT" \
+    "$RELEASE_HEAD" "$REPO" \
+    "$NODE_BIN" "$NODE_ID" "$NODE_SHA256" "$NODE_VERSION" "$SQLITE_VERSION" \
+    "$PNPM_BIN" "$PNPM_ID" "$PNPM_SHA256" "$PNPM_VERSION" \
+    "$UV_BIN" "$UV_ID" "$UV_SHA256" "$UV_VERSION_OUTPUT" \
+    "$PNPM_INSTALL_STDOUT_SHA" "$PNPM_INSTALL_STDERR_SHA" "$PNPM_INSTALL_EXIT" \
+    "$NODE_CHECK_STDOUT_SHA" "$NODE_CHECK_STDERR_SHA" "$NODE_CHECK_EXIT" \
+    "$PYTHON_PYTEST_STDOUT_SHA" "$PYTHON_PYTEST_STDERR_SHA" "$PYTHON_PYTEST_EXIT"
+  [ -f "$STAGE_RECEIPT" ] && [ ! -L "$STAGE_RECEIPT" ] && [ "$(file_mode "$STAGE_RECEIPT")" = 600 ] || \
+    die "staged release receipt is not a private regular file"
+  verify_receipt "$STAGE_RECEIPT"
+  RECEIPT_ID="$(file_identity "$STAGE_RECEIPT")"
+  RECEIPT_SHA256="$(file_sha256 "$STAGE_RECEIPT")"
+
   STAGE_MANIFEST="$STAGE_DIR/$MANIFEST_NAME"
-  write_manifest "$STAGE_MANIFEST" "${FACT_ARGS[@]}"
+  MANIFEST_ARGS=("${FACT_ARGS[@]}" "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" "$RELEASE_HEAD")
+  write_manifest "$STAGE_MANIFEST" "${MANIFEST_ARGS[@]}"
   [ -f "$STAGE_MANIFEST" ] && [ ! -L "$STAGE_MANIFEST" ] && [ "$(file_mode "$STAGE_MANIFEST")" = 600 ] || \
     die "staged manifest is not a private regular file"
-  verify_manifest "$STAGE_MANIFEST" "${FACT_ARGS[@]}"
+  verify_manifest "$STAGE_MANIFEST" "${MANIFEST_ARGS[@]}"
+  MANIFEST_ID="$(file_identity "$STAGE_MANIFEST")"
+  MANIFEST_SHA256="$(file_sha256 "$STAGE_MANIFEST")"
   revalidate_snapshot
+  verify_receipt "$STAGE_RECEIPT"
+  frozen_private_file_matches "$STAGE_RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" || \
+    die "staged release receipt changed before publication"
+  frozen_private_file_matches "$STAGE_MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" || \
+    die "staged provenance manifest changed before publication"
+  verify_manifest "$STAGE_MANIFEST" "${MANIFEST_ARGS[@]}"
   require_private_evidence_directory
   [ "$(directory_identity "$EVIDENCE_DIR")" = "$EVIDENCE_DIR_ID" ] || die "evidence directory changed before publication"
-  /bin/ln "$STAGE_MANIFEST" "$MANIFEST" || die "manifest publication lost create-if-absent race"
-  [ "$(file_identity "$MANIFEST")" = "$(file_identity "$STAGE_MANIFEST")" ] || die "published manifest identity is ambiguous"
-  fsync_directory "$EVIDENCE_DIR"
-  verify_manifest "$MANIFEST" "${FACT_ARGS[@]}"
+  /bin/ln "$STAGE_RECEIPT" "$RECEIPT" || die "receipt publication lost create-if-absent race"
+  frozen_private_file_matches "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" || \
+    publication_failed "published receipt does not match the frozen bytes"
+  if ! /bin/ln "$STAGE_MANIFEST" "$MANIFEST"; then
+    publication_failed "manifest publication lost create-if-absent race"
+  fi
+  frozen_private_file_matches "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" || \
+    publication_failed "published manifest does not match the frozen bytes"
+  fsync_directory "$EVIDENCE_DIR" || publication_failed "could not durably publish release evidence"
+  frozen_private_file_matches "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" || \
+    publication_failed "published receipt changed before durable verification"
+  frozen_private_file_matches "$MANIFEST" "$MANIFEST_ID" "$MANIFEST_SHA256" || \
+    publication_failed "published manifest changed before durable verification"
+  verify_receipt "$RECEIPT" || publication_failed "published receipt failed final verification"
+  verify_manifest "$MANIFEST" "${MANIFEST_ARGS[@]}" || \
+    publication_failed "published manifest failed final verification"
   printf 'Release provenance prepared for %s\n' "$RELEASE_HEAD"
+  printf 'Offline verification receipt: %s\n' "$RECEIPT"
   printf 'Manifest: %s\n' "$MANIFEST"
 else
+  require_physical_file "$RECEIPT" "release verification receipt"
+  [ "$(file_owner "$RECEIPT")" = "$(id -u)" ] || die "release verification receipt has the wrong owner"
+  [ "$(file_mode "$RECEIPT")" = 600 ] || die "release verification receipt mode must be exactly 0600"
+  verify_receipt "$RECEIPT" || die "release verification receipt drift detected"
+  RECEIPT_ID="$(file_identity "$RECEIPT")"
+  RECEIPT_SHA256="$(file_sha256 "$RECEIPT")"
+  MANIFEST_ARGS=("${FACT_ARGS[@]}" "$RECEIPT" "$RECEIPT_ID" "$RECEIPT_SHA256" "$RELEASE_HEAD")
   require_physical_file "$MANIFEST" "release provenance manifest"
   [ "$(file_owner "$MANIFEST")" = "$(id -u)" ] || die "release provenance manifest has the wrong owner"
   [ "$(file_mode "$MANIFEST")" = 600 ] || die "release provenance manifest mode must be exactly 0600"
-  verify_manifest "$MANIFEST" "${FACT_ARGS[@]}" || die "release provenance drift detected"
+  verify_manifest "$MANIFEST" "${MANIFEST_ARGS[@]}" || die "release provenance drift detected"
   revalidate_snapshot
-  verify_manifest "$MANIFEST" "${FACT_ARGS[@]}" || die "release provenance drift detected"
+  [ "$(file_identity "$RECEIPT")" = "$RECEIPT_ID" ] && \
+    [ "$(file_sha256 "$RECEIPT")" = "$RECEIPT_SHA256" ] || die "release verification receipt changed during inspection"
+  verify_receipt "$RECEIPT" || die "release verification receipt drift detected"
+  verify_manifest "$MANIFEST" "${MANIFEST_ARGS[@]}" || die "release provenance drift detected"
   printf 'Release provenance still matches %s\n' "$RELEASE_HEAD"
   printf 'D120-D122 remain live until their evidence is audited at the manifest-declared reference paths.\n'
 fi

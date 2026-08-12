@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   copyFileSync,
@@ -23,7 +24,10 @@ function run(command: string, args: readonly string[], cwd: string, home?: strin
   return spawnSync(command, args, {
     cwd,
     encoding: 'utf8',
-    env: home === undefined ? process.env : { ...process.env, HOME: home },
+    env:
+      home === undefined
+        ? process.env
+        : { ...process.env, HOME: home, PATH: `${join(home, 'tool-bin')}:${process.env['PATH']}` },
   });
 }
 
@@ -100,6 +104,7 @@ function writeInstalledBoundary(home: string, repository: string, stateRoot: str
 
 function createFixtureRepository(root: string): string {
   const repository = join(root, 'source');
+  const node = realpathSync(process.execPath).replaceAll("'", "'\"'\"'");
   mkdirSync(join(repository, 'scripts'), { recursive: true });
   mkdirSync(join(repository, 'src', 'cli'), { recursive: true });
   copyFileSync(RELEASE_SIGNOFF, join(repository, 'scripts', 'release-signoff'));
@@ -122,6 +127,13 @@ function createFixtureRepository(root: string): string {
       'printf "%s\\n" "$count" > "$count_file"',
       'if [ -f "$HOME/mutate-on-second-check" ] && [ "$count" -eq 2 ]; then',
       '  printf "\\n" >> "$HOME/Library/LaunchAgents/io.openmurmur.daemon.plist"',
+      'fi',
+      'if [ -f "$HOME/mutate-staged-receipt" ]; then',
+      '  evidence_dir="$(cat "$HOME/mutate-staged-receipt")"',
+      '  set -- "$evidence_dir"/.release-signoff.*/release-verification-v1.json',
+      '  if [ "$#" -eq 1 ] && [ -f "$1" ]; then',
+      `    '${node}' --input-type=module -e 'import { readFileSync, writeFileSync } from "node:fs"; const path = process.argv[1]; const value = JSON.parse(readFileSync(path, "utf8")); value.gates[0].stdoutSha256 = "b".repeat(64); writeFileSync(path, JSON.stringify(value, null, 2) + "\\n");' "$1"`,
+      '  fi',
       'fi',
       '',
     ].join('\n'),
@@ -162,20 +174,130 @@ function createNativeHelper(home: string): void {
   chmodSync(executable, 0o700);
 }
 
+function createReleaseTools(home: string): void {
+  const tools = join(home, 'tool-bin');
+  mkdirSync(tools, { recursive: true });
+  const node = realpathSync(process.execPath).replaceAll("'", "'\"'\"'");
+  writeFileSync(
+    join(tools, 'pnpm'),
+    [
+      '#!/bin/bash',
+      'set -eu',
+      `case "\${1:-}" in`,
+      '  --version) [ "$#" -eq 1 ]; printf \'%s\\n\' 10.19.0 ;;',
+      '  exec)',
+      '    [ "$#" -eq 4 ] && [ "$2" = node ] && [ "$3" = -p ] && [ "$4" = process.execPath ]',
+      `    printf '%s\\n' '${node}'`,
+      '    ;;',
+      '  install)',
+      '    [ "$#" -eq 3 ] && [ "$2" = --offline ] && [ "$3" = --frozen-lockfile ]',
+      "    printf '%s\\n' 'pnpm install --offline --frozen-lockfile' >> \"$HOME/release-gates.log\"",
+      "    printf '%s\\n' 'offline install complete'",
+      '    ;;',
+      '  run)',
+      '    [ "$#" -eq 2 ] && [ "$2" = check ]',
+      "    printf '%s\\n' 'pnpm run check' >> \"$HOME/release-gates.log\"",
+      '    if [ -f "$HOME/fail-node-check" ]; then',
+      "      printf '%s\\n' 'deterministic check failure' >&2",
+      '      exit 9',
+      '    fi',
+      "    printf '%s\\n' 'node check complete'",
+      '    ;;',
+      '  *) exit 64 ;;',
+      'esac',
+      '',
+    ].join('\n'),
+    { mode: 0o700 },
+  );
+  writeFileSync(
+    join(tools, 'uv'),
+    [
+      '#!/bin/bash',
+      'set -eu',
+      'if [ "$#" -eq 1 ] && [ "$1" = --version ]; then',
+      "  printf '%s\\n' 'uv 0.12.2 (fixture)'",
+      '  exit 0',
+      'fi',
+      '[ "$#" -eq 6 ]',
+      '[ "$1" = run ] && [ "$2" = --offline ] && [ "$3" = --no-sync ]',
+      '[ "$4" = --project ] && [ "$5" = python/openmurmur_audio ] && [ "$6" = pytest ]',
+      "printf '%s\\n' 'uv run --offline --no-sync --project python/openmurmur_audio pytest' >> \"$HOME/release-gates.log\"",
+      "printf '%s\\n' 'python tests complete'",
+      '',
+    ].join('\n'),
+    { mode: 0o700 },
+  );
+  chmodSync(join(tools, 'pnpm'), 0o700);
+  chmodSync(join(tools, 'uv'), 0o700);
+}
+
+function sha256(contents: string): string {
+  return createHash('sha256').update(contents).digest('hex');
+}
+
 describe('release sign-off provenance', () => {
-  it('binds a clean installed checkout and rejects dirty or different source', () => {
+  it('publishes only green offline gates and rejects receipt or source drift', () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'openmurmur-release-signoff-')));
     try {
       const repository = createFixtureRepository(root);
       const home = join(root, 'home');
       const stateRoot = join(root, 'state');
       const evidence = join(root, 'evidence');
+      const failedEvidence = join(root, 'failed-evidence');
+      const racedEvidence = join(root, 'raced-evidence');
       mkdirSync(join(home, 'Library'), { recursive: true });
       mkdirSync(stateRoot, { recursive: true });
       mkdirSync(evidence, { mode: 0o700 });
+      mkdirSync(failedEvidence, { mode: 0o700 });
+      mkdirSync(racedEvidence, { mode: 0o700 });
       chmodSync(evidence, 0o700);
+      chmodSync(failedEvidence, 0o700);
+      chmodSync(racedEvidence, 0o700);
       createNativeHelper(home);
+      createReleaseTools(home);
       writeInstalledBoundary(home, repository, stateRoot);
+
+      writeFileSync(join(home, 'fail-node-check'), 'armed\n');
+      const failedPrepare = run(
+        'bash',
+        [
+          join(repository, 'scripts', 'release-signoff'),
+          '--prepare',
+          '--evidence-dir',
+          failedEvidence,
+          '--root',
+          stateRoot,
+        ],
+        repository,
+        home,
+      );
+      assert.notEqual(failedPrepare.status, 0);
+      assert.match(failedPrepare.stderr, /node-check failed with exit code 9/);
+      assert.throws(() => readFileSync(join(failedEvidence, 'release-verification-v1.json')));
+      assert.throws(() => readFileSync(join(failedEvidence, 'release-signoff-v2.json')));
+      rmSync(join(home, 'fail-node-check'));
+      rmSync(join(home, 'release-gates.log'));
+
+      writeFileSync(join(home, 'mutate-staged-receipt'), `${racedEvidence}\n`);
+      const racedPrepare = run(
+        'bash',
+        [
+          join(repository, 'scripts', 'release-signoff'),
+          '--prepare',
+          '--evidence-dir',
+          racedEvidence,
+          '--root',
+          stateRoot,
+        ],
+        repository,
+        home,
+      );
+      assert.notEqual(racedPrepare.status, 0);
+      assert.match(racedPrepare.stderr, /staged release receipt changed before publication/);
+      assert.throws(() => readFileSync(join(racedEvidence, 'release-verification-v1.json')));
+      assert.throws(() => readFileSync(join(racedEvidence, 'release-signoff-v2.json')));
+      rmSync(join(home, 'mutate-staged-receipt'));
+      rmSync(join(home, 'release-gates.log'));
 
       const prepare = run(
         'bash',
@@ -191,13 +313,31 @@ describe('release sign-off provenance', () => {
         home,
       );
       assert.equal(prepare.status, 0, `${prepare.stdout}\n${prepare.stderr}`);
-      const manifest = JSON.parse(readFileSync(join(evidence, 'release-signoff-v1.json'), 'utf8'));
+      const receiptPath = join(evidence, 'release-verification-v1.json');
+      const manifestPath = join(evidence, 'release-signoff-v2.json');
+      const receiptRaw = readFileSync(receiptPath, 'utf8');
+      const receipt = JSON.parse(receiptRaw);
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
       assert.equal(manifest.releaseCommit, runGit(repository, ['rev-parse', 'HEAD']));
       assert.equal(manifest.repository.path, repository);
+      assert.equal(manifest.verificationReceipt.path, receiptPath);
+      assert.equal(manifest.verificationReceipt.sha256, sha256(receiptRaw));
+      assert.equal(receipt.releaseCommit, manifest.releaseCommit);
+      assert.equal(receipt.tools.pnpm.version, '10.19.0');
+      assert.equal(receipt.tools.uv.version, 'uv 0.12.2 (fixture)');
+      assert.deepEqual(
+        receipt.gates.map((gate: { id: string; exitCode: number }) => [gate.id, gate.exitCode]),
+        [
+          ['pnpm-install', 0],
+          ['node-check', 0],
+          ['python-pytest', 0],
+        ],
+      );
       assert.equal(
         manifest.requiredLiveEvidenceReferences.D122,
         join(evidence, 'D122.reference.json'),
       );
+      const gateLog = readFileSync(join(home, 'release-gates.log'), 'utf8');
 
       const exactCheck = run(
         'bash',
@@ -206,6 +346,20 @@ describe('release sign-off provenance', () => {
         home,
       );
       assert.equal(exactCheck.status, 0, `${exactCheck.stdout}\n${exactCheck.stderr}`);
+      assert.equal(readFileSync(join(home, 'release-gates.log'), 'utf8'), gateLog);
+
+      const tamperedReceipt = JSON.parse(receiptRaw);
+      tamperedReceipt.gates[0].stdoutSha256 = 'b'.repeat(64);
+      writeFileSync(receiptPath, `${JSON.stringify(tamperedReceipt, null, 2)}\n`, { mode: 0o600 });
+      const tamperedCheck = run(
+        'bash',
+        [join(repository, 'scripts', 'release-signoff'), '--check', '--evidence-dir', evidence],
+        repository,
+        home,
+      );
+      assert.notEqual(tamperedCheck.status, 0);
+      assert.match(tamperedCheck.stderr, /release provenance drift detected/);
+      writeFileSync(receiptPath, receiptRaw, { mode: 0o600 });
 
       rmSync(join(home, 'capture-check-count'));
       writeFileSync(join(home, 'mutate-on-second-check'), 'armed\n');
