@@ -446,15 +446,28 @@ export async function commitTelegramSetup(
     previousSecrets === null ||
     previousSecrets.token !== secrets.token ||
     previousSecrets.chatId !== secrets.chatId;
+  // Digest and retention are scheduler-only legacy rows. Every other live or
+  // retryable job can still create Telegram output, so it remains bound to the
+  // credential/chat pair that owned it when it was queued.
   if (
     replacesDestination &&
     db
-      .prepare("SELECT 1 FROM telegram_outbox WHERE state IN ('pending','sending','dead') LIMIT 1")
+      .prepare(
+        `SELECT 1
+           FROM telegram_outbox
+          WHERE state IN ('pending','sending','dead')
+         UNION ALL
+         SELECT 1
+           FROM jobs
+          WHERE state IN ('pending','leased','dead')
+            AND kind NOT IN ('digest','retention')
+         LIMIT 1`,
+      )
       .get() !== undefined
   ) {
     throw new Error(
-      'Cannot replace Telegram credentials while unresolved deliveries exist. ' +
-        'Restore the current credentials, finish or reconcile those deliveries, then retry setup.',
+      'Cannot replace Telegram credentials while unresolved delivery work exists. ' +
+        'Restore the current credentials, finish or reconcile deliveries and resolve retryable jobs, then retry setup.',
     );
   }
   const newBotScope = telegramBotScope(secrets.token);

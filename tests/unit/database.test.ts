@@ -160,6 +160,21 @@ describe('migrations', () => {
           payload TEXT NOT NULL,
           created_at TEXT NOT NULL
         ) STRICT;
+        CREATE TABLE jobs (
+          job_id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          payload TEXT NOT NULL,
+          state TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          max_attempts INTEGER NOT NULL DEFAULT 5,
+          lease_owner TEXT,
+          lease_expires_at TEXT,
+          run_after TEXT NOT NULL,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        ) STRICT;
         CREATE TABLE alert_state (
           alert_id TEXT PRIMARY KEY,
           active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
@@ -297,6 +312,7 @@ describe('migrations', () => {
         '016_transcript_timestamp_provenance.sql',
         '017_daemon_ownership.sql',
         '018_telegram_maintenance_outbox_guard.sql',
+        '019_telegram_maintenance_job_guard.sql',
       ]);
       const rows = legacy
         .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')
@@ -552,6 +568,8 @@ describe('migrations', () => {
       DROP INDEX idx_transcript_current_incoming;
       DROP TRIGGER telegram_outbox_block_insert_during_maintenance;
       DROP TRIGGER telegram_outbox_block_requeue_during_maintenance;
+      DROP TRIGGER telegram_jobs_block_insert_during_maintenance;
+      DROP TRIGGER telegram_jobs_block_requeue_during_maintenance;
       ALTER TABLE telegram_outbox DROP COLUMN claim_generation;
       DROP TABLE daemon_ownership;
       DELETE FROM schema_migrations
@@ -560,7 +578,8 @@ describe('migrations', () => {
          '015_telegram_outbox_claim_generation.sql',
          '016_transcript_timestamp_provenance.sql',
          '017_daemon_ownership.sql',
-         '018_telegram_maintenance_outbox_guard.sql'
+         '018_telegram_maintenance_outbox_guard.sql',
+         '019_telegram_maintenance_job_guard.sql'
        );
     `);
     const at = '2026-08-11T01:00:00.000Z';
@@ -591,6 +610,7 @@ describe('migrations', () => {
       '016_transcript_timestamp_provenance.sql',
       '017_daemon_ownership.sql',
       '018_telegram_maintenance_outbox_guard.sql',
+      '019_telegram_maintenance_job_guard.sql',
     ]);
     const pointers = db.handle
       .prepare(

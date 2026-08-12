@@ -28,6 +28,8 @@ import {
 import { resolvePaths } from '../../src/config/paths.ts';
 import { DEFAULT_CONFIG } from '../../src/config/schema.ts';
 import { openDatabase } from '../../src/database/db.ts';
+import { IncomingFileRepository } from '../../src/database/repository.ts';
+import { JobQueue } from '../../src/jobs/queue.ts';
 import type { TelegramUpdate } from '../../src/telegram/client.ts';
 import {
   type SecretsStore,
@@ -633,13 +635,14 @@ function memorySecrets(initial: TelegramSecrets | null): {
 }
 
 describe('Telegram setup persistence', () => {
-  it('does not move unresolved deliveries across a credential or chat replacement', async () => {
+  it('does not move unresolved delivery work across a credential or chat replacement', async () => {
     const root = mkdtempSync(join(tmpdir(), 'openmurmur-setup-rebind-'));
     const paths = resolvePaths(root);
     const db = openDatabase({ file: paths.databaseFile });
     const previous = { token: 'old-token', chatId: 10 } as const;
     const secrets = memorySecrets(previous);
     const outbox = new Outbox(db.handle);
+    const jobs = new JobQueue(db.handle);
     assert.equal(
       outbox.enqueue({
         deliveryPartId: 'status:old-destination',
@@ -649,6 +652,33 @@ describe('Telegram setup persistence', () => {
       }),
       true,
     );
+    const incomingFiles = new IncomingFileRepository(db.handle);
+    const incoming = incomingFiles.claim({
+      telegramFileId: 'old-file-id',
+      telegramUniqueId: 'old-unique-id',
+      chatId: previous.chatId,
+      messageId: 11,
+      botScope: telegramBotScope(previous.token),
+      updateId: 11,
+      telegramSource: 'direct',
+      attachmentType: 'audio',
+      claimedFilename: 'old-private-audio.ogg',
+      telegramMessageAt: '2026-08-12T00:00:00.000Z',
+      originalSentAt: null,
+      daemonHost: 'old-host',
+      declaredBytes: 12,
+      declaredMime: 'audio/ogg',
+    });
+    incomingFiles.markNormalized(incoming.fileUid, '/private/old-normalized.flac', 'flac', 1_000);
+    const incomingJobId = jobs.enqueue({
+      kind: 'incoming_audio',
+      idempotencyKey: 'incoming:old-scope:11',
+      payload: {
+        botScope: telegramBotScope(previous.token),
+        fileUid: incoming.fileUid,
+      },
+    });
+    assert.notEqual(incomingJobId, null);
     writeOffset(db.handle, 7, telegramBotScope(previous.token));
     const claim = await claimDaemonMaintenance(db.handle, paths.pidFile, root, {
       birthMarker: async () => 'test-process-birth',
@@ -665,7 +695,7 @@ describe('Telegram setup persistence', () => {
             confirmed = true;
           },
         ),
-        /Cannot replace Telegram credentials while unresolved deliveries exist/,
+        /Cannot replace Telegram credentials while unresolved delivery work exists/,
       );
       assert.deepEqual(secrets.get(), previous);
       assert.equal(readOffset(db.handle, telegramBotScope(previous.token)), 7);
@@ -677,6 +707,26 @@ describe('Telegram setup persistence', () => {
           "UPDATE telegram_outbox SET state = 'failed' WHERE delivery_part_id = 'status:old-destination'",
         )
         .run();
+      await assert.rejects(
+        commitTelegramSetup(
+          db.handle,
+          secrets.store,
+          { token: 'new-token', chatId: 20 },
+          { role: 'owner', nextOffset: 101 },
+          async () => {
+            confirmed = true;
+          },
+        ),
+        /Cannot replace Telegram credentials while unresolved delivery work exists/,
+        'a latent incoming job must not deliver old private content to the new destination',
+      );
+      assert.deepEqual(secrets.get(), previous);
+      assert.equal(readOffset(db.handle, telegramBotScope(previous.token)), 7);
+      assert.throws(() => readOffset(db.handle, telegramBotScope('new-token')));
+      assert.equal(confirmed, false);
+      assert.equal(secrets.writes.length, 0);
+
+      db.handle.prepare('UPDATE jobs SET state = ? WHERE job_id = ?').run('done', incomingJobId);
       await commitTelegramSetup(
         db.handle,
         secrets.store,
@@ -699,6 +749,22 @@ describe('Telegram setup persistence', () => {
           }),
         /Telegram outbox is paused during exclusive Telegram maintenance/,
       );
+      assert.throws(
+        () =>
+          jobs.enqueue({
+            kind: 'deliver_audio',
+            idempotencyKey: 'deliver-audio:racing-old-destination',
+            payload: { sessionId: 'racing-old-destination' },
+          }),
+        /Telegram-producing jobs are paused during exclusive Telegram maintenance/,
+      );
+      assert.throws(
+        () =>
+          db.handle
+            .prepare('UPDATE jobs SET state = ? WHERE job_id = ?')
+            .run('pending', incomingJobId),
+        /Telegram-producing jobs are paused during exclusive Telegram maintenance/,
+      );
 
       db.handle
         .prepare(
@@ -713,7 +779,7 @@ describe('Telegram setup persistence', () => {
           { role: 'owner', nextOffset: 202 },
           async () => {},
         ),
-        /Cannot replace Telegram credentials while unresolved deliveries exist/,
+        /Cannot replace Telegram credentials while unresolved delivery work exists/,
         'a recoverable dead delivery remains bound to the current destination',
       );
       assert.throws(
