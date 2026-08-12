@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
@@ -9,6 +9,7 @@ import {
   claimDaemonPid,
   claimIncomingRequest,
   commandLooksLikeOpenMurmurDaemon,
+  Daemon,
   enqueueIncomingRequest,
   enqueueRecoveryNotice,
   expectedDigestIsMissing,
@@ -42,14 +43,16 @@ import {
   stopOwnedDaemon,
 } from '../../src/cli/daemon-ownership.ts';
 import { main, withStoppedDaemonForRecovery } from '../../src/cli/main.ts';
+import { ensureDirectories } from '../../src/config/load.ts';
 import { resolvePaths } from '../../src/config/paths.ts';
 import { DEFAULT_CONFIG } from '../../src/config/schema.ts';
 import { type Database, openDatabase } from '../../src/database/db.ts';
 import { appendIncomingTranscript, IncomingFileRepository } from '../../src/database/repository.ts';
 import { AlertEvaluator } from '../../src/health/alerts.ts';
 import { JobQueue } from '../../src/jobs/queue.ts';
-import { nullLogger } from '../../src/logging/logger.ts';
+import { createLogger, nullLogger } from '../../src/logging/logger.ts';
 import { TelegramClient } from '../../src/telegram/client.ts';
+import { staticProvider } from '../../src/telegram/keychain.ts';
 import { drainOutbox, Outbox } from '../../src/telegram/outbox.ts';
 import {
   incomingTelegramProvenance,
@@ -60,6 +63,20 @@ import { recordUpdate } from '../../src/telegram/router.ts';
 let dir: string;
 let db: Database;
 
+async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('timed out waiting for daemon test condition');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function executable(path: string, source: string): string {
+  writeFileSync(path, `#!${process.execPath}\n${source}\n`, { mode: 0o700 });
+  chmodSync(path, 0o700);
+  return path;
+}
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'om-daemon-'));
   db = openDatabase({ file: join(dir, 'test.db') });
@@ -68,6 +85,112 @@ beforeEach(() => {
 afterEach(() => {
   db.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe('daemon startup readiness ordering', () => {
+  it('arms health only after bounded VAD warmup and recorder start', async () => {
+    const root = join(dir, 'startup-root');
+    const paths = resolvePaths(root);
+    await ensureDirectories(paths);
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    executable(
+      join(bin, 'uv'),
+      String.raw`
+let input = '';
+let vadRequests = 0;
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  input += chunk;
+  const lines = input.split('\n');
+  input = lines.pop() || '';
+  for (const line of lines) {
+    if (!line) continue;
+    const request = JSON.parse(line);
+    if (request.op === 'shutdown') {
+      process.stdout.write(JSON.stringify({ id: request.id, ok: true, op: 'shutdown' }) + '\n');
+      setImmediate(() => process.exit(0));
+      continue;
+    }
+    vadRequests += 1;
+    const response = vadRequests === 1
+      ? { id: request.id, ok: false, error: 'bounded warmup failure', code: 'test' }
+      : { id: request.id, ok: true, op: 'vad_stream', probabilities: [0] };
+    setTimeout(() => process.stdout.write(JSON.stringify(response) + '\n'), 120);
+  }
+});
+process.stdin.resume();`,
+    );
+    const capture = executable(
+      join(bin, 'fake-capture'),
+      'process.stdout.write(Buffer.alloc(1024)); setInterval(() => {}, 1000);',
+    );
+    const records: Record<string, unknown>[] = [];
+    const config = {
+      ...DEFAULT_CONFIG,
+      audio: { ...DEFAULT_CONFIG.audio, ffmpegPath: capture },
+      asr: { ...DEFAULT_CONFIG.asr, backend: 'fake' as const },
+      llm: { ...DEFAULT_CONFIG.llm, backend: 'fake' as const },
+      digest: { ...DEFAULT_CONFIG.digest, enabled: false },
+      health: { ...DEFAULT_CONFIG.health, pollIntervalMs: 25 },
+    };
+    const daemon = new Daemon({
+      loaded: { config, paths, fromFile: true },
+      logger: createLogger({ level: 'debug', sink: (record) => records.push(record) }),
+      secrets: staticProvider(null),
+      claimDaemon: (handle, pidFile, stateRoot) =>
+        claimDaemonPid(handle, pidFile, stateRoot, {
+          birthMarker: async () => 'startup-readiness-test-birth',
+        }),
+    });
+    const previousPath = process.env['PATH'];
+    process.env['PATH'] = `${bin}:${previousPath ?? ''}`;
+    const started = daemon.start();
+
+    try {
+      await waitFor(() => records.some((record) => record['msg'] === 'first audio frame received'));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const inspection = openDatabase({ file: paths.databaseFile });
+      try {
+        const recorderAlerts = inspection.handle
+          .prepare(
+            `SELECT delivery_part_id
+               FROM telegram_outbox
+              WHERE delivery_part_id GLOB 'alert:recorder_stale:*'`,
+          )
+          .all();
+        assert.deepEqual(
+          recorderAlerts,
+          [],
+          'VAD readiness must not create a false recorder alert',
+        );
+        const recordingNotices = inspection.handle
+          .prepare(
+            `SELECT COUNT(*) AS count
+               FROM telegram_outbox
+              WHERE payload LIKE '%Запись включена%'`,
+          )
+          .get() as { count: number };
+        assert.equal(recordingNotices.count, 1, 'the first real frame emits one ordinary green');
+        const heartbeat = inspection.handle
+          .prepare('SELECT recorder_running FROM daemon_heartbeat WHERE heartbeat_id = 1')
+          .get() as { recorder_running: number } | undefined;
+        assert.equal(
+          heartbeat?.recorder_running,
+          1,
+          'health observes the recorder only after start',
+        );
+      } finally {
+        inspection.close();
+      }
+    } finally {
+      await daemon.stop();
+      await started;
+      if (previousPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = previousPath;
+    }
+  });
 });
 
 describe('daemon PID ownership', () => {

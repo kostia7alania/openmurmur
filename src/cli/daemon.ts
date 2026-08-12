@@ -153,6 +153,12 @@ export interface DaemonOptions {
   readonly loaded: LoadedConfig;
   readonly logger: Logger;
   readonly secrets?: SecretsProvider;
+  /** Test seam for proving startup ordering without relying on host process metadata. */
+  readonly claimDaemon?: (
+    db: Database['handle'],
+    pidFile: string,
+    root: string,
+  ) => Promise<DaemonPidClaim>;
 }
 
 export class Daemon {
@@ -268,7 +274,11 @@ export class Daemon {
       finishStartupPhase = resolve;
     });
     try {
-      const identity = await claimDaemonPid(this.#db.handle, paths.pidFile, paths.root);
+      const identity = await (this.#options.claimDaemon ?? claimDaemonPid)(
+        this.#db.handle,
+        paths.pidFile,
+        paths.root,
+      );
       this.#pidClaim = identity;
       this.#daemonStartedAt = identity.startedAt;
       this.#jobs = new JobQueue(this.#db.handle, daemonJobOwner(identity));
@@ -349,7 +359,6 @@ export class Daemon {
       } else {
         logger.info('Telegram update polling disabled; outbound delivery remains enabled');
       }
-      this.#loop('health', () => this.#tickHealth(), config.health.pollIntervalMs);
       this.#loop('digest', () => this.#tickDigest(), DIGEST_TICK_INTERVAL_MS);
       this.#loop('retention', () => this.#tickRetention(), 60 * 60 * 1000);
       this.#scheduleAsrReadinessProbe(true);
@@ -366,6 +375,10 @@ export class Daemon {
           });
         }
       }
+      // Health must not observe the recorder before the bounded readiness
+      // attempt has finished and capture is allowed to start. Otherwise the
+      // equal warmup/poll deadlines can create a false recorder_stale edge.
+      this.#loop('health', () => this.#tickHealth(), config.health.pollIntervalMs);
     } finally {
       finishStartupPhase();
     }
