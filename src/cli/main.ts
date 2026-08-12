@@ -36,13 +36,7 @@ import {
   publishDigestSnapshot,
   readDigestDeliveryPayload,
 } from '../digest/delivery.ts';
-import {
-  compactJobError,
-  openMurmurRecoveryCommand,
-  type RecoveryCommandContext,
-  renderDeadJobAlert,
-  TELEGRAM_RECOVERY_COMMAND_CONTEXT,
-} from '../jobs/diagnostics.ts';
+import { compactJobError, renderDeadJobAlert } from '../jobs/diagnostics.ts';
 import { canRetryDeadJob, JobQueue } from '../jobs/queue.ts';
 import { createLogger } from '../logging/logger.ts';
 import { applyRetention, planRetention } from '../retention/policy.ts';
@@ -68,6 +62,12 @@ import {
 import { readOffset, routeUpdate } from '../telegram/router.ts';
 import { systemClock } from '../util/clock.ts';
 import { createAsrBackend } from './backends.ts';
+import {
+  openMurmurRecoveryCommand,
+  type RecoveryCommandContext,
+  recoveryCommandContextForRoot,
+  shellQuotedStateRoot,
+} from './command-context.ts';
 import { Daemon } from './daemon.ts';
 import {
   assertCurrentDaemonMaintenance,
@@ -88,7 +88,6 @@ import {
   renderSetupPlan,
   renderTelegramSetupCompletion,
   setupTelegram,
-  shellQuotedStateRoot,
   type TelegramSetupRole,
 } from './setup.ts';
 import {
@@ -217,7 +216,7 @@ async function main(argv: readonly string[]): Promise<number> {
       );
 
     case 'capture':
-      return captureCommand(positionals[1], loaded.config.audio);
+      return captureCommand(positionals[1], loaded.config.audio, loaded.paths.root);
 
     case 'start': {
       await ensureDirectories(loaded.paths);
@@ -532,10 +531,12 @@ async function exists(path: string): Promise<boolean> {
 function captureCommand(
   subcommand: string | undefined,
   audio: AudioConfig,
+  root: string,
 ): Promise<number> | number {
+  const commandContext = recoveryCommandContextForRoot(root);
   switch (subcommand) {
     case 'authorize':
-      return captureAuthorize();
+      return captureAuthorize(commandContext);
     case 'test':
       return captureTest(audio);
     default:
@@ -544,7 +545,7 @@ function captureCommand(
   }
 }
 
-async function captureAuthorize(): Promise<number> {
+async function captureAuthorize(commandContext: RecoveryCommandContext): Promise<number> {
   const executable = defaultNativeCaptureExecutable();
   if (!nativeCaptureExecutableIsUsable(executable)) {
     process.stderr.write(
@@ -563,7 +564,7 @@ async function captureAuthorize(): Promise<number> {
     );
     return 1;
   }
-  if (status !== 'not_determined') return renderNativeAuthorizationResult(status);
+  if (status !== 'not_determined') return renderNativeAuthorizationResult(status, commandContext);
 
   const app = dirname(dirname(dirname(executable)));
   process.stdout.write(
@@ -606,22 +607,25 @@ async function captureAuthorize(): Promise<number> {
       );
       return 1;
     }
-    if (status !== 'not_determined') return renderNativeAuthorizationResult(status);
+    if (status !== 'not_determined') return renderNativeAuthorizationResult(status, commandContext);
     await new Promise((resolve) => setTimeout(resolve, 250));
   } while (Date.now() < deadline);
 
   process.stderr.write(
     'The GUI flow opened, but no macOS decision was observed within 30 seconds. No permission is claimed.\n' +
-      'Finish the dialog in the GUI session, then prove real PCM with: pnpm openmurmur capture test\n',
+      `Finish the dialog in the GUI session, then prove real PCM with: ${openMurmurRecoveryCommand(commandContext, 'capture test')}\n`,
   );
   return 1;
 }
 
-function renderNativeAuthorizationResult(status: NativeCaptureAuthorizationStatus): number {
+function renderNativeAuthorizationResult(
+  status: NativeCaptureAuthorizationStatus,
+  commandContext: RecoveryCommandContext,
+): number {
   switch (status) {
     case 'authorized':
       process.stdout.write(
-        'Microphone access is granted to OpenMurmur Capture. Prove real PCM with: pnpm openmurmur capture test\n',
+        `Microphone access is granted to OpenMurmur Capture. Prove real PCM with: ${openMurmurRecoveryCommand(commandContext, 'capture test')}\n`,
       );
       return 0;
     case 'denied':
@@ -630,7 +634,7 @@ function renderNativeAuthorizationResult(status: NativeCaptureAuthorizationStatu
           'Open System Settings -> Privacy & Security -> Microphone and enable “OpenMurmur Capture”.\n' +
           'If the entry is absent or stuck, reset only this app, then retry from a GUI session:\n' +
           '  /usr/bin/tccutil reset Microphone io.openmurmur.capture\n' +
-          '  pnpm openmurmur capture authorize\n',
+          `  ${openMurmurRecoveryCommand(commandContext, 'capture authorize')}\n`,
       );
       return 1;
     case 'restricted':
@@ -829,8 +833,7 @@ async function localStatus(
 }
 
 function localRecoveryCommandContext(root: string): RecoveryCommandContext {
-  const stateRootArgument = shellQuotedStateRoot(root);
-  return stateRootArgument === null ? TELEGRAM_RECOVERY_COMMAND_CONTEXT : { stateRootArgument };
+  return recoveryCommandContextForRoot(root);
 }
 
 function jobsCommand(
@@ -1210,7 +1213,7 @@ type StoppedDaemonTelegramCommand =
 
 function stoppedDaemonTelegramRunbook(root: string, command: StoppedDaemonTelegramCommand): string {
   const quotedRoot = shellQuotedStateRoot(root);
-  const rootArgument = quotedRoot ?? '"$OPENMURMUR_STATE_ROOT"';
+  const commandContext = recoveryCommandContextForRoot(root);
   return [
     'The OpenMurmur daemon must be stopped before this Telegram control operation.',
     ...(quotedRoot === null
@@ -1220,9 +1223,9 @@ function stoppedDaemonTelegramRunbook(root: string, command: StoppedDaemonTelegr
         ]
       : []),
     'Run from the repository checkout:',
-    `  pnpm openmurmur --root ${rootArgument} stop`,
-    `  pnpm openmurmur --root ${rootArgument} ${command}`,
-    `  pnpm openmurmur --root ${rootArgument} start`,
+    `  ${openMurmurRecoveryCommand(commandContext, 'stop')}`,
+    `  ${openMurmurRecoveryCommand(commandContext, command)}`,
+    `  ${openMurmurRecoveryCommand(commandContext, 'start')}`,
   ].join('\n');
 }
 
@@ -1402,9 +1405,11 @@ async function telegramCommand(
     return withStoppedDaemonForTelegram(loaded, 'telegram poll', async (db) => {
       const secrets = await keychain.load();
       if (secrets === null) {
-        process.stderr.write(
-          'Telegram is not configured. Run: pnpm openmurmur setup telegram owner\n',
+        const setupCommand = openMurmurRecoveryCommand(
+          recoveryCommandContextForRoot(loaded.paths.root),
+          'setup telegram owner',
         );
+        process.stderr.write(`Telegram is not configured. Run: ${setupCommand}\n`);
         return 1;
       }
       const client = new TelegramClient({
@@ -1412,7 +1417,17 @@ async function telegramCommand(
         baseUrl: loaded.config.telegram.apiBaseUrl,
       });
       const botScope = telegramBotScope(secrets.token);
-      const inspection = await pollTelegramReadOnly(db, client, botScope, secrets.chatId, true);
+      const inspection = await pollTelegramReadOnly(
+        db,
+        client,
+        botScope,
+        secrets.chatId,
+        true,
+        openMurmurRecoveryCommand(
+          recoveryCommandContextForRoot(loaded.paths.root),
+          'setup telegram owner',
+        ),
+      );
       process.stdout.write(
         `Fetched ${inspection.updates.length} update(s) from offset ${inspection.offset} ` +
           '(read-only; offset unchanged).\n',
@@ -1428,9 +1443,11 @@ async function telegramCommand(
     const secrets = await keychain.load();
     if (secrets === null) {
       const role = loaded.config.telegram.receiveUpdates ? 'owner' : 'send-only';
-      process.stderr.write(
-        `Telegram is not configured. Run: pnpm openmurmur setup telegram ${role}\n`,
+      const setupCommand = openMurmurRecoveryCommand(
+        recoveryCommandContextForRoot(loaded.paths.root),
+        `setup telegram ${role}`,
       );
+      process.stderr.write(`Telegram is not configured. Run: ${setupCommand}\n`);
       return 1;
     }
     const client = new TelegramClient({
@@ -1460,6 +1477,7 @@ export async function pollTelegramReadOnly(
   botScope: string,
   chatId: number,
   receiveUpdates: boolean,
+  missingOffsetSetupCommand?: string,
 ): Promise<{
   readonly offset: number;
   readonly updates: readonly { readonly updateId: number; readonly kind: string }[];
@@ -1467,7 +1485,7 @@ export async function pollTelegramReadOnly(
   if (!receiveUpdates) {
     throw new Error('Telegram polling is disabled on this send-only host');
   }
-  const offset = readOffset(db, botScope);
+  const offset = readOffset(db, botScope, missingOffsetSetupCommand);
   const updates = await client.getUpdates(offset, 5);
   return {
     offset,

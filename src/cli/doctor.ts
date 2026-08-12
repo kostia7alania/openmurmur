@@ -14,6 +14,12 @@ import {
   type TelegramSetupReadinessProvider,
 } from '../telegram/keychain.ts';
 import { PYTHON_PROJECT, REPO_ROOT, WORKER_ARGS } from './backends.ts';
+import {
+  openMurmurRecoveryCommand,
+  type RecoveryCommandContext,
+  recoveryCommandContextForRoot,
+  shellQuotedStateRoot,
+} from './command-context.ts';
 
 export type CheckLevel = 'ok' | 'warn' | 'fail' | 'info';
 
@@ -489,13 +495,19 @@ async function checkStateDirectory(loaded: LoadedConfig): Promise<Check> {
   return {
     name: 'state_directory',
     level: writable ? 'ok' : 'warn',
-    detail: `${loaded.paths.root}${writable ? '' : ' (missing or not writable)'}`,
+    detail: `${doctorPathForDisplay(loaded.paths.root)}${writable ? '' : ' (missing or not writable)'}`,
     ...(writable
       ? {}
       : {
-          fix: 'Run `pnpm openmurmur setup --telegram-role owner` (or `--telegram-role send-only`) to create it.',
+          fix:
+            `Run \`${openMurmurRecoveryCommand(recoveryCommandContextForRoot(loaded.paths.root), 'setup --telegram-role owner')}\` ` +
+            '(or use `--telegram-role send-only`) to create it.',
         }),
   };
+}
+
+function doctorPathForDisplay(path: string): string {
+  return shellQuotedStateRoot(path) === null ? '<state root not printed>' : path;
 }
 
 async function checkDisk(loaded: LoadedConfig): Promise<Check> {
@@ -513,7 +525,9 @@ async function checkDisk(loaded: LoadedConfig): Promise<Check> {
       name: 'disk',
       level: 'warn',
       detail: 'free-space probe failed',
-      fix: `Check that ${target} exists and is readable, then rerun doctor.`,
+      fix:
+        `Check that ${doctorPathForDisplay(target)} exists and is readable, then rerun ` +
+        `\`${openMurmurRecoveryCommand(recoveryCommandContextForRoot(loaded.paths.root), 'doctor')}\`.`,
     };
   }
   return {
@@ -559,6 +573,7 @@ function checkBackends(loaded: LoadedConfig): Check {
 
 export async function checkTelegramSetup(
   readiness: TelegramSetupReadinessProvider,
+  commandContext?: RecoveryCommandContext,
 ): Promise<Check> {
   const result = await readiness.inspect();
   if (result.status === 'configured') {
@@ -575,7 +590,10 @@ export async function checkTelegramSetup(
       name: 'telegram_setup',
       level: 'warn',
       detail: 'no Telegram credential items found in the macOS Keychain',
-      fix: 'Set telegram.receiveUpdates for this host, then run either `pnpm openmurmur setup telegram owner` or `pnpm openmurmur setup telegram send-only` from the repository checkout.',
+      fix:
+        'Set telegram.receiveUpdates for this host, then run either ' +
+        `\`${telegramSetupCommand('owner', commandContext)}\` or ` +
+        `\`${telegramSetupCommand('send-only', commandContext)}\` from the repository checkout.`,
     };
   }
   if (result.status === 'incomplete_legacy') {
@@ -583,7 +601,10 @@ export async function checkTelegramSetup(
       name: 'telegram_setup',
       level: 'warn',
       detail: 'an incomplete legacy Telegram credential pair is present in the macOS Keychain',
-      fix: 'Set telegram.receiveUpdates for this host, then run either `pnpm openmurmur setup telegram owner` or `pnpm openmurmur setup telegram send-only` to replace it atomically.',
+      fix:
+        'Set telegram.receiveUpdates for this host, then run either ' +
+        `\`${telegramSetupCommand('owner', commandContext)}\` or ` +
+        `\`${telegramSetupCommand('send-only', commandContext)}\` to replace it atomically.`,
     };
   }
   return {
@@ -592,6 +613,15 @@ export async function checkTelegramSetup(
     detail: `Keychain metadata is inaccessible: ${result.detail}`,
     fix: 'Run doctor from the logged-in GUI user session and verify the login Keychain is available.',
   };
+}
+
+function telegramSetupCommand(
+  role: 'owner' | 'send-only',
+  commandContext: RecoveryCommandContext | undefined,
+): string {
+  return commandContext === undefined
+    ? `pnpm openmurmur setup telegram ${role}`
+    : openMurmurRecoveryCommand(commandContext, `setup telegram ${role}`);
 }
 
 const CHECKS: readonly CheckFn[] = [
@@ -611,7 +641,8 @@ const CHECKS: readonly CheckFn[] = [
   checkDisk,
   checkConfigSource,
   checkBackends,
-  () => checkTelegramSetup(keychainSetupReadiness),
+  (loaded) =>
+    checkTelegramSetup(keychainSetupReadiness, recoveryCommandContextForRoot(loaded.paths.root)),
 ];
 
 /**

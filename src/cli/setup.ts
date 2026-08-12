@@ -17,6 +17,13 @@ import {
 } from '../telegram/keychain.ts';
 import { clearOffset, nextOffsetFor, readOffsetOrZero, writeOffset } from '../telegram/router.ts';
 import { writeTextAtomically } from '../util/atomic-file.ts';
+import {
+  openMurmurRecoveryCommand,
+  recoveryCommandContextForRoot,
+  shellQuotedStateRoot,
+} from './command-context.ts';
+
+export { shellQuotedStateRoot } from './command-context.ts';
 
 /**
  * Reads a secret without echoing it and without leaving it in shell history.
@@ -116,13 +123,6 @@ export function renderSetupPlan(plan: SetupPlan): string {
   return lines.join('\n');
 }
 
-export function shellQuotedStateRoot(root: string): string | null {
-  if (root.length > 512 || !/^[\x20-\x7e]+$/.test(root)) {
-    return null;
-  }
-  return `'${root.replaceAll("'", `'"'"'`)}'`;
-}
-
 function setupPathForDisplay(path: string): string {
   return shellQuotedStateRoot(path) === null ? '<path not printed>' : path;
 }
@@ -134,8 +134,8 @@ export function renderSetupNextSteps(
   telegramRole?: TelegramSetupRole,
 ): string {
   const quotedRoot = shellQuotedStateRoot(root);
-  const rootArgument = quotedRoot ?? '"$OPENMURMUR_STATE_ROOT"';
-  const command = (args: string) => `pnpm openmurmur --root ${rootArgument} ${args}`;
+  const commandContext = recoveryCommandContextForRoot(root);
+  const command = (args: string) => openMurmurRecoveryCommand(commandContext, args);
   const lines = [
     ...(quotedRoot === null
       ? [
@@ -317,7 +317,13 @@ async function setupTelegramLocked(
     log(`Now open Telegram, find ${botDisplay}, and send it:  /start`);
     log('Waiting for the message...');
 
-    const accepted = await waitForStart(client, baselineOffset, botUsername);
+    const accepted = await waitForStart(
+      client,
+      baselineOffset,
+      botUsername,
+      30,
+      openMurmurRecoveryCommand(recoveryCommandContextForRoot(paths.root), 'setup telegram owner'),
+    );
     chatId = accepted.chatId;
     const account = telegramIdentityDisplay(
       accepted.username ?? undefined,
@@ -519,6 +525,7 @@ export async function waitForStart(
   baselineOffset: number,
   botUsername: string | null,
   attempts = 30,
+  setupCommand = 'pnpm openmurmur setup telegram owner',
 ): Promise<{
   chatId: number;
   nextOffset: number;
@@ -553,7 +560,7 @@ export async function waitForStart(
   }
   throw new Error(
     'No message arrived. Make sure you messaged the right bot, then run ' +
-      '`pnpm openmurmur setup telegram owner` again.',
+      `\`${setupCommand}\` again.`,
   );
 }
 

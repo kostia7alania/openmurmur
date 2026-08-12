@@ -149,10 +149,10 @@ export function completeTelegramUpdate(
 }
 
 export class MissingTelegramOffsetError extends Error {
-  constructor(botScope: string) {
+  constructor(botScope: string, setupCommand = 'pnpm openmurmur setup telegram owner') {
     super(
       `Telegram update offset is missing for credential scope ${botScope}; ` +
-        'run `pnpm openmurmur setup telegram owner` again',
+        `run \`${setupCommand}\` again`,
     );
     this.name = 'MissingTelegramOffsetError';
   }
@@ -167,13 +167,17 @@ export class MissingTelegramOffsetError extends Error {
  * Keychain and SQLite publication. Polling from zero would cross the fresh
  * `/start` boundary, so startup fails closed until setup re-establishes it.
  */
-export function readOffset(db: DatabaseSync, botScope = 'legacy'): number {
+export function readOffset(
+  db: DatabaseSync,
+  botScope = 'legacy',
+  missingOffsetSetupCommand?: string,
+): number {
   const row = db
     .prepare('SELECT next_offset FROM telegram_offset WHERE bot_scope = ?')
     .get(botScope) as { next_offset: number } | undefined;
   if (row !== undefined) return row.next_offset;
   if (botScope === 'legacy') return 0;
-  throw new MissingTelegramOffsetError(botScope);
+  throw new MissingTelegramOffsetError(botScope, missingOffsetSetupCommand);
 }
 
 /** Setup-only read before a credential has ever owned a scoped cursor. */

@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
+import { recoveryCommandContextForRoot } from '../../src/cli/command-context.ts';
 import { checkMlxReadiness, checkTelegramSetup } from '../../src/cli/doctor.ts';
 import {
   createTelegramSetupReadinessProbe,
@@ -43,6 +44,19 @@ describe('Telegram setup readiness', () => {
       detail: 'no Telegram credential items found in the macOS Keychain',
       fix: 'Set telegram.receiveUpdates for this host, then run either `pnpm openmurmur setup telegram owner` or `pnpm openmurmur setup telegram send-only` from the repository checkout.',
     });
+  });
+
+  it('renders copyable Telegram setup hints for the exact safely quoted root', async () => {
+    const provider = createTelegramSetupReadinessProbe(async () => ({ code: 44, stderr: '' }));
+    const root = "/private/tmp/Open Murmur's state";
+
+    const check = await checkTelegramSetup(provider, recoveryCommandContextForRoot(root));
+
+    assert.match(
+      check.fix ?? '',
+      /--root '\/private\/tmp\/Open Murmur'"'"'s state' setup telegram owner/,
+    );
+    assert.match(check.fix ?? '', /setup telegram send-only/);
   });
 
   it('reports inaccessible metadata without pretending setup is missing', async () => {

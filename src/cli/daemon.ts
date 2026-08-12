@@ -49,11 +49,9 @@ import {
 import { renderSleepMessage } from '../health/sleep.ts';
 import {
   failureCategory,
-  openMurmurRecoveryCommand,
   renderAsrUnavailableDetail,
   renderDeadJobAlert,
   renderLlmUnavailableDetail,
-  TELEGRAM_RECOVERY_COMMAND_CONTEXT,
 } from '../jobs/diagnostics.ts';
 import { handleJob, markAudioDelivered, reconcileSessionDelivery } from '../jobs/pipeline.ts';
 import { type ClaimedJob, type JobKind, JobLeaseLostError, JobQueue } from '../jobs/queue.ts';
@@ -102,6 +100,11 @@ import {
   renderAsrSettings,
 } from '../telegram/settings.ts';
 import { createAsrBackend, createLlmBackend, createVadBackend } from './backends.ts';
+import {
+  openMurmurRecoveryCommand,
+  recoveryCommandContextForRoot,
+  TELEGRAM_RECOVERY_COMMAND_CONTEXT,
+} from './command-context.ts';
 import {
   claimDaemonPid,
   type DaemonPidClaim,
@@ -719,7 +722,11 @@ export class Daemon {
     const botScope = this.#botScope;
     if (client === null || chatId === null || botScope === null) return;
 
-    const offset = readOffset(this.#db.handle, botScope);
+    const offset = readOffset(
+      this.#db.handle,
+      botScope,
+      openMurmurRecoveryCommand(TELEGRAM_RECOVERY_COMMAND_CONTEXT, 'setup telegram owner'),
+    );
     let updates: Awaited<ReturnType<TelegramClient['getUpdates']>>;
     try {
       updates = await client.getUpdates(
@@ -1527,8 +1534,12 @@ export class Daemon {
       this.#recordKeychainAccess('available_without_credentials');
       if (!this.#telegramCredentialsMissing) {
         const role = this.#options.loaded.config.telegram.receiveUpdates ? 'owner' : 'send-only';
+        const setupCommand = openMurmurRecoveryCommand(
+          recoveryCommandContextForRoot(this.#options.loaded.paths.root),
+          `setup telegram ${role}`,
+        );
         this.#options.logger.warn(
-          `Telegram is not configured; run \`pnpm openmurmur setup telegram ${role}\` from the repository checkout`,
+          `Telegram is not configured; run \`${setupCommand}\` from the repository checkout`,
         );
       }
       this.#telegramCredentialsMissing = true;

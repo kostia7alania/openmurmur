@@ -5,6 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
+  openMurmurRecoveryCommand,
+  recoveryCommandContextForRoot,
+} from '../../src/cli/command-context.ts';
+import {
   claimDaemonMaintenance,
   claimDaemonPid,
   releaseDaemonMaintenance,
@@ -101,10 +105,16 @@ describe('setup completion output', () => {
     assert.match(output, /state root is not safe to print/);
     assert.match(
       output,
-      /pnpm openmurmur --root "\$OPENMURMUR_STATE_ROOT" setup telegram send-only/,
+      /pnpm openmurmur --root "\$\{OPENMURMUR_STATE_ROOT:\?set exact daemon state root locally\}" setup telegram send-only/,
     );
-    assert.match(output, /pnpm openmurmur --root "\$OPENMURMUR_STATE_ROOT" capture test/);
-    assert.match(output, /pnpm openmurmur --root "\$OPENMURMUR_STATE_ROOT" start/);
+    assert.match(
+      output,
+      /pnpm openmurmur --root "\$\{OPENMURMUR_STATE_ROOT:\?set exact daemon state root locally\}" capture test/,
+    );
+    assert.match(
+      output,
+      /pnpm openmurmur --root "\$\{OPENMURMUR_STATE_ROOT:\?set exact daemon state root locally\}" start/,
+    );
   });
 
   it('selects the fresh Telegram role without ever rewriting an existing config', () => {
@@ -554,6 +564,24 @@ describe('Telegram setup ownership handshake', () => {
     };
 
     await assert.rejects(waitForStart(client, 5, 'OpenMurmurBot', 1), /No message arrived/);
+  });
+
+  it('keeps the exact selected root in the production /start timeout remediation', async () => {
+    const root = "/private/tmp/Open Murmur's state";
+    const setupCommand = openMurmurRecoveryCommand(
+      recoveryCommandContextForRoot(root),
+      'setup telegram owner',
+    );
+    const client = { getUpdates: async (): Promise<TelegramUpdate[]> => [] };
+
+    await assert.rejects(
+      waitForStart(client, 5, 'OpenMurmurBot', 1, setupCommand),
+      (error: unknown) => {
+        assert.ok((error as Error).message.includes(setupCommand));
+        assert.match((error as Error).message, /Open Murmur'"'"'s state/);
+        return true;
+      },
+    );
   });
 });
 

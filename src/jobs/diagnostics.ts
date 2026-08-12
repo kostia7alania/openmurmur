@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { openMurmurRecoveryCommand, type RecoveryCommandContext } from '../cli/command-context.ts';
 import { isSafeOllamaModel } from '../config/schema.ts';
 import { redact } from '../logging/redact.ts';
 import { canRetryDeadJob, type DeadJob } from './queue.ts';
@@ -24,22 +25,11 @@ export interface DeadJobAlert {
   readonly detail: string;
 }
 
-export interface RecoveryCommandContext {
-  /** One already shell-safe argument following `--root`. */
-  readonly stateRootArgument: string;
-  /** Optional operator instruction shown before copyable commands. */
-  readonly instruction?: string;
-}
-
-export const TELEGRAM_RECOVERY_COMMAND_CONTEXT: RecoveryCommandContext = {
-  stateRootArgument: `"\${OPENMURMUR_STATE_ROOT:?set exact daemon state root locally}"`,
-  instruction:
-    'Локально задай OPENMURMUR_STATE_ROOT равным точному state root этого демона; путь не отправляется в Telegram.',
-};
-
-export function openMurmurRecoveryCommand(context: RecoveryCommandContext, args: string): string {
-  return `pnpm openmurmur --root ${context.stateRootArgument} ${args}`;
-}
+export {
+  openMurmurRecoveryCommand,
+  type RecoveryCommandContext,
+  TELEGRAM_RECOVERY_COMMAND_CONTEXT,
+} from '../cli/command-context.ts';
 
 export function deadJobFingerprint(jobs: readonly DeadJob[]): string {
   if (jobs.length === 0) return '';
