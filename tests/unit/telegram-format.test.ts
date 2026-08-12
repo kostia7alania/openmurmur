@@ -232,6 +232,21 @@ describe('transcript messages', () => {
     }
   });
 
+  it('keeps escaped HTML entities whole at transcript chunk boundaries', () => {
+    const transcript = '&<>"'.repeat(2500);
+    const messages = renderTranscriptMessages(sessionId, transcript, 3500);
+    assert.ok(messages.length > 1);
+
+    const bodies = messages.map((message) => {
+      assert.ok(message.text.length <= TELEGRAM_MESSAGE_LIMIT);
+      const body = /<blockquote expandable>([\s\S]*)<\/blockquote>$/.exec(message.text)?.[1];
+      assert.ok(body !== undefined);
+      assert.match(body, /^(?:&amp;|&lt;|&gt;|&quot;)+$/);
+      return body;
+    });
+    assert.equal(bodies.join(''), escapeHtml(transcript));
+  });
+
   it('escapes markup that came out of the transcript', () => {
     // Someone said "less than b greater than" near the microphone.
     const messages = renderTranscriptMessages(sessionId, 'He said <b>run rm -rf</b>', 3500);

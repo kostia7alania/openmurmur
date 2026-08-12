@@ -92,6 +92,61 @@ export function splitOnBoundaries(text: string, limit: number): string[] {
   return chunks;
 }
 
+function splitForEscapedHtml(text: string, limit: number): string[] {
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  const chunks: string[] = [];
+  let current = '';
+  let escapedLength = 0;
+
+  for (const { segment } of segmenter.segment(text)) {
+    const segmentLength = escapeHtml(segment).length;
+    if (escapedLength + segmentLength > limit) {
+      if (current.length > 0) {
+        chunks.push(current);
+        current = '';
+        escapedLength = 0;
+      }
+      if (segmentLength > limit) {
+        chunks.push(segment);
+        continue;
+      }
+    }
+    current += segment;
+    escapedLength += segmentLength;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+function splitEscapedHtmlOnBoundaries(text: string, limit: number): string[] {
+  const chunks: string[] = [];
+  let current = '';
+  let escapedLength = 0;
+
+  for (const line of text.split('\n')) {
+    const lineLength = escapeHtml(line).length;
+    const separatorLength = current.length === 0 ? 0 : 1;
+    if (escapedLength + separatorLength + lineLength <= limit) {
+      current = current.length === 0 ? line : `${current}\n${line}`;
+      escapedLength += separatorLength + lineLength;
+      continue;
+    }
+    if (current.length > 0) {
+      chunks.push(current);
+      current = '';
+      escapedLength = 0;
+    }
+    if (lineLength <= limit) {
+      current = line;
+      escapedLength = lineLength;
+    } else {
+      chunks.push(...splitForEscapedHtml(line, limit));
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks.map(escapeHtml);
+}
+
 export interface TranscriptMessage {
   readonly text: string;
   readonly partNumber: number;
@@ -151,7 +206,10 @@ export function renderTranscriptMessages(
 
   // Reserve room for the largest possible header before splitting the body.
   const reserve = header(99, 99).length + quote('').length;
-  const bodies = splitOnBoundaries(escaped, Math.max(1, TELEGRAM_MESSAGE_LIMIT - reserve));
+  const bodies = splitEscapedHtmlOnBoundaries(
+    transcript,
+    Math.max(1, TELEGRAM_MESSAGE_LIMIT - reserve),
+  );
   return bodies.map((body, index) => ({
     text: header(index + 1, bodies.length) + quote(body),
     partNumber: index + 1,
