@@ -37,7 +37,7 @@ mlx = [
     # then failed to load its bundled libonnxruntime. It carries its own
     # onnxruntime and does not conflict with the `onnxruntime` pinned above.
     "sherpa-onnx>=1.13.4,<2",
-    "sherpa-onnx-core>=1.13.4,<2",
+    "sherpa-onnx-core>=1.13.5,<2",
 ]
 
 [project.scripts]
