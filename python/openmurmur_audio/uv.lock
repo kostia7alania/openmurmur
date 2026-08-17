@@ -152,43 +152,43 @@ wheels = [
 
 [package.optional-dependencies]
 cublas = [
-    { name = "nvidia-cublas", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-cuda-nvrtc", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cublas", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-cuda-nvrtc", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cudart = [
-    { name = "nvidia-cuda-runtime", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cuda-runtime", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cufft = [
-    { name = "nvidia-cufft", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cufft", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-nvjitlink", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cufile = [
-    { name = "nvidia-cufile", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "nvidia-cufile", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cupti = [
-    { name = "nvidia-cuda-cupti", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cuda-cupti", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 curand = [
-    { name = "nvidia-curand", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-curand", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cusolver = [
-    { name = "nvidia-cublas", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-cusolver", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-cusparse", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cublas", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-cusolver", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-cusparse", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-nvjitlink", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cusparse = [
-    { name = "nvidia-cusparse", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cusparse", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-nvjitlink", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 nvjitlink = [
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-nvjitlink", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 nvrtc = [
-    { name = "nvidia-cuda-nvrtc", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cuda-nvrtc", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 nvtx = [
-    { name = "nvidia-nvtx", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-nvtx", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 
 [[package]]
@@ -726,7 +726,7 @@ requires-dist = [
     { name = "mlx-qwen3-asr", marker = "extra == 'mlx'", specifier = ">=0.3.5,<0.4" },
     { name = "numpy", specifier = ">=2.5.1,<3" },
     { name = "onnxruntime", specifier = ">=1.28.0,<2" },
-    { name = "sherpa-onnx", marker = "extra == 'mlx'", specifier = ">=1.13.4,<2" },
+    { name = "sherpa-onnx", marker = "extra == 'mlx'", specifier = ">=1.13.5,<2" },
     { name = "sherpa-onnx-core", marker = "extra == 'mlx'", specifier = ">=1.13.4,<2" },
     { name = "silero-vad", marker = "extra == 'mlx'", specifier = ">=6.2.1,<7" },
     { name = "soundfile", specifier = ">=0.14.0,<0.15" },
@@ -918,18 +918,19 @@ wheels = [
 
 [[package]]
 name = "sherpa-onnx"
-version = "1.13.4"
+version = "1.13.5"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ca/f8/735244770b4bc63f85fabdad0e46d6ec1f4cc24e64f6e082c2e0fea92b8c/sherpa_onnx-1.13.4.tar.gz", hash = "sha256:29547692418513ad88034c2b5f98985e33042b2351e4ab375469f19a8de18c5f", size = 982750, upload-time = "2026-07-07T13:04:55.145Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6d/a1/8a7d8751bc71a0814f3b9332717909512a5ff919d07ed53e4baa861ef8c7/sherpa_onnx-1.13.5.tar.gz", hash = "sha256:14bebfe71365a2c678dd94cd08efa8e79df06318b17fe8e97b2e802a7881fd5a", size = 1037285, upload-time = "2026-08-11T08:17:31.817Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8e/9e/cb97cf04c0c4de0a1d43463952e387a938eea8f6ab94e2eb95af21162f57/sherpa_onnx-1.13.4-cp314-cp314-linux_armv7l.whl", hash = "sha256:7ddb3d46fe0d6cc745d222e055844dbb24fd4e66935d4ead67d1315911ea7a46", size = 11930841, upload-time = "2026-07-07T14:37:28.79Z" },
-    { url = "https://files.pythonhosted.org/packages/cc/0f/7fbed45ef8437d20967f4577514e8903b7f4a87a8cea9b9fed9e2b18fa45/sherpa_onnx-1.13.4-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:ff9237b98c173dabf8f5f6317c4ead54afd4b35179b03be652f65e1e121bee74", size = 4425178, upload-time = "2026-07-07T13:01:45.126Z" },
-    { url = "https://files.pythonhosted.org/packages/9a/90/191b3b73af1b54584f9f96e256d9ca9f6f3781cacdb4287c7efea6b25094/sherpa_onnx-1.13.4-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:972137cbf19d501ea6a51857528b340ce1c3d204571e3d56dcc72eded5827418", size = 2345420, upload-time = "2026-07-07T11:46:13.903Z" },
-    { url = "https://files.pythonhosted.org/packages/1f/b5/29997d7de29cae8e3f54e8a993fcf14d48d5a7960deab10df479fcbc7d64/sherpa_onnx-1.13.4-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:ff38ac153527fda0f6158e7c097b66e980a6840455d908e037ce09a4a4c1ce14", size = 2118562, upload-time = "2026-07-07T12:26:40.457Z" },
-    { url = "https://files.pythonhosted.org/packages/8c/e5/8c601626448358ac8571100db051f35af5ef02c1d12ab1cb026436474a22/sherpa_onnx-1.13.4-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:7a6bf37e45727b0e94661a29b34927e9edc4b3849411cc38036e30d81df48d31", size = 4142540, upload-time = "2026-07-07T12:03:40.699Z" },
-    { url = "https://files.pythonhosted.org/packages/5a/4b/49b4be95af2e12bfa8a92a7eba720cc68e4da178847ffa4ddb66479d4e9c/sherpa_onnx-1.13.4-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:16b046f1c7ceecf666947d652c928278c377847db7f697c9e94af9feaf20ac2c", size = 4360312, upload-time = "2026-07-07T13:05:36.871Z" },
-    { url = "https://files.pythonhosted.org/packages/96/1c/a80bfad89846ccb1da4d18ef46bf364c83cff9514a0e298110c8de480e14/sherpa_onnx-1.13.4-cp314-cp314-win32.whl", hash = "sha256:39af016b9fb7c053da2270e44182fb8932eeab991dcdc963bbc4366324e9ec51", size = 1970019, upload-time = "2026-07-07T12:13:06.663Z" },
-    { url = "https://files.pythonhosted.org/packages/89/02/1e10f71be635a3f9ef793b07ab88ddb7afa82ab722f3ea275a4877da1bcb/sherpa_onnx-1.13.4-cp314-cp314-win_amd64.whl", hash = "sha256:cb1834182c4047b8edb1dceeed8d5cf7d6e10295a4079e5e0fea674b4314db06", size = 2308592, upload-time = "2026-07-07T13:03:09.057Z" },
+    { url = "https://files.pythonhosted.org/packages/21/a3/ac238819cca1955b6b80ae802671cc7e4d688c673fb98001c21111922045/sherpa_onnx-1.13.5-cp314-cp314-linux_armv7l.whl", hash = "sha256:a224466e750a435089311d4c763617a4d83478a2f958c311b473ea59f9cce3ae", size = 11997852, upload-time = "2026-08-11T08:54:11.47Z" },
+    { url = "https://files.pythonhosted.org/packages/02/82/3f5b50f84b9a8571bdfe9939983a8e6dff75110961305315887bbc83f626/sherpa_onnx-1.13.5-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:1a4ea5fa45caf31093ff832ab4d198e097edbeeb2244a0d4f958e96bf888110a", size = 4442303, upload-time = "2026-08-11T07:36:28.234Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/90/6d3a1112bc4496b0b918d3a807036912f1f34fb4a4dc506f0cabf398c4a9/sherpa_onnx-1.13.5-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:7582ca42ed2d80bacc984b46904cbdd058ec2b6149a8c8996d7263217a4cc963", size = 2340527, upload-time = "2026-08-11T07:54:35.482Z" },
+    { url = "https://files.pythonhosted.org/packages/84/9d/0cb152e3fd1aa5787ade99c4863cd8cf80d800b879e8ff47f8f99412af78/sherpa_onnx-1.13.5-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:97471fe025fc1d655a1df2f4ffb5d3fe843c269f2016d5e1cca4b0d168a49169", size = 2140247, upload-time = "2026-08-11T08:23:33.405Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/84/38531f16e2c2a0b077257b25c34c02a1c8f7f1f833d5bb61e2b2f510e260/sherpa_onnx-1.13.5-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:2a51751f6c925c405ef6ebcb2f7c44794810da79d0f2743fe57ee3daa5bc4df5", size = 4172385, upload-time = "2026-08-11T08:00:34.952Z" },
+    { url = "https://files.pythonhosted.org/packages/45/91/56a439945713a5cf49080a833fbd0953936fcd50c651c17afe64478c9922/sherpa_onnx-1.13.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:eb4d580d959e16c42dbd404cef0f5764ed1c024edf48d3edc43b5e2f1c96f069", size = 4393503, upload-time = "2026-08-11T07:38:11.97Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/27/cbdfa8bdcf618b28ec5cf383b073be851ff3178ea06d6f1a0fcb3c7532e8/sherpa_onnx-1.13.5-cp314-cp314-win32.whl", hash = "sha256:64cb492cf8a9751f632685c6f169fef7e5a2f449efb9923bc21b6e783a911dba", size = 2000807, upload-time = "2026-08-11T08:57:11.235Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/c2/162840897a528a528bc0f76cf3516d4e3ac1445db9089caf7733df756cfc/sherpa_onnx-1.13.5-cp314-cp314-win_amd64.whl", hash = "sha256:001e1c3440fe335a589c9283a68105f379ffb63f2d1d7c2878e99a5d72eaf5af", size = 2345302, upload-time = "2026-08-11T08:11:46.752Z" },
+    { url = "https://files.pythonhosted.org/packages/28/5e/9a9c63e1dcd646c5f21df6d16e6770fedd956f8a54241f3382343c6289af/sherpa_onnx-1.13.5-cp314-cp314-win_arm64.whl", hash = "sha256:a7e97d8457a51725ffa3fcb44cb1d57bfdb780bc390a9460a65e05bf3d2851b4", size = 2303336, upload-time = "2026-08-11T07:33:25.917Z" },
 ]
 
 [[package]]
