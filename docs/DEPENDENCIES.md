@@ -130,25 +130,21 @@ bounded warm RSS profile for the production backend. It does **not** prove that
 a daemon `JobQueue` lease/failure/retry transaction converges after the worker
 dies; that remains the separate D091 live gate.
 
-### Current-revision Ollama corpus — 2026-08-11
+### Current-revision Ollama corpus — 2026-09-02
 
 The production `OllamaLlm` ran the checked-in single-language RU/EN/TH
-acceptance transcripts against the locally configured `qwen3.6:latest`
-(digest `07d35212591fc27746f0a317c975a6d68754fb38e9053d82e25f06057af28522`)
-with cloud access disabled. A
-first run exposed a real language-control defect: the English transcript was
-summarized in Italian. After making the required output language explicit in
-the prompt contract, all three single-language summaries used the requested
-language, carried bounded source-segment references and hit none of the corpus's forbidden facts.
-The final three calls took 10.129 s, 9.026 s and 7.762 s.
+acceptance transcripts against local `qwen3.8:27b` with cloud access disabled.
+All three summaries used the requested language, carried bounded source-segment
+references and hit none of the corpus's forbidden facts. The three calls took
+51.432 s, 48.344 s and 38.428 s.
 
-The model still did **not** meet the checked-in acceptance threshold: exact
-claim recall was 50%, exact claim precision was 39.1%, and 0/3 cases passed.
-Most misses were grounded paraphrases, but the model also duplicated a task as
-a commitment and categorized an open question as an idea. D108 therefore
-remains partial rather than being presented as accepted model quality.
-The repository default model tag, mixed-language summaries and unknown language
-labels were not live-quality-tested by this corpus.
+The model still did **not** meet the checked-in exact-text acceptance threshold:
+claim recall was 38.9%, claim precision was 26.9%, and 0/3 cases passed. The
+outputs retained grounded facts semantically, but paraphrased them beyond the
+frozen matcher and duplicated tasks or questions across semantic fields. D108
+therefore remains partial rather than being presented as accepted model quality.
+Mixed-language summaries and unknown language labels were not live-quality-tested
+by this corpus.
 
 Silero's **segment-assembly logic** is separately covered by pure Python tests,
 which take a list of probabilities and need no model.
@@ -162,7 +158,7 @@ licence and a Hugging Face token — see [ADR-0008](adr/0008-speaker-diarization
 
 | Service | Version | Verified | Notes |
 | --- | --- | --- | --- |
-| Ollama | configured `qwen3.6:latest` (36B, Q4_K_M; digest above) | ⚠️ real single-language RU/EN/TH corpus executed; acceptance not met | Optional. Its absence degrades the report; it never blocks delivery. The repository default model tag remains unverified. |
+| Ollama | `qwen3.8:27b` | ⚠️ real single-language RU/EN/TH corpus executed; acceptance not met | Optional. Its absence degrades the report; it never blocks delivery. |
 | Telegram Bot API | Cloud, official | ⚠️ **no live calls made** | Response shapes are exercised with a scripted `fetch`. Blocked on a bot token, which only the owner can create. |
 
 ## How Python 3.14 was chosen

@@ -376,5 +376,5 @@ PyTorch all allocate from the same unified pool, and three large models at once
 will wedge the machine rather than degrade gracefully. This is not theoretical —
 it is how the 36 GB development machine was hard-locked during testing.
 
-On less memory, use `qwen3.6:8b` for `llm.model` instead. Recording and
+On less memory, use `qwen3.5:9b` for `llm.model` instead. Recording and
 transcription are unaffected; only summary quality drops.

@@ -195,7 +195,7 @@ describe('config parsing', () => {
       parseConfig({ llm: { model: 'registry/team-model:27b' } }).llm.model,
       'registry/team-model:27b',
     );
-    for (const model of ['qwen3.6:27b\nopen -a Calculator', '-danger', 'model;whoami', '']) {
+    for (const model of ['qwen3.8:27b\nopen -a Calculator', '-danger', 'model;whoami', '']) {
       assert.throws(() => parseConfig({ llm: { model } }), /llm\.model/, model);
     }
   });

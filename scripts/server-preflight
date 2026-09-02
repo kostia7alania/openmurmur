@@ -38,7 +38,7 @@ fi
 
 if [ "$ram" -lt 24 ]; then
   warn "memory" "${ram} GB is tight for a 27B summarizer"
-  note "Use a smaller llm.model (qwen3.6:8b), or expect swapping."
+  note "Use a smaller llm.model (qwen3.5:9b), or expect swapping."
 fi
 
 # --- audio input ---------------------------------------------------------

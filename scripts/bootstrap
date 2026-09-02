@@ -131,7 +131,7 @@ warn "The MLX ASR stack is NOT installed by default (several GB, needs Metal):"
 echo "    /usr/bin/env -u UV_PROJECT_ENVIRONMENT uv sync --project python/openmurmur_audio --extra mlx"
 echo
 warn "Ollama is optional. Without it you get audio and transcripts, but no summaries:"
-echo "    brew install ollama && ollama serve && ollama pull qwen3.6:27b"
+echo "    brew install ollama && ollama serve && ollama pull qwen3.8:27b"
 echo
 
 bold "Next steps"

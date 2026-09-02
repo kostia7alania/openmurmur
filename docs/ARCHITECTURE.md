@@ -39,7 +39,7 @@ SQLite database holds durable work, and one Telegram chat receives delivery.
   └─────────────┘
   ┌─────────────┐    ┌──────────────┐
   │ Python VAD  │    │    Ollama    │ loopback only
-  │ Silero      │    │ qwen3.6:27b  │
+  │ Silero      │    │ qwen3.8:27b  │
   └─────────────┘    └──────────────┘
 ```
 

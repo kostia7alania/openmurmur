@@ -51,7 +51,7 @@ release record** — see [What is verified](#what-is-verified).
 | Requirement | Detail |
 | --- | --- |
 | Hardware | Apple Silicon (M-series). MLX requires Metal; Intel Macs are not supported. |
-| Memory | 64 GB recommended. A 27B LLM and resident 1.7B ASR model need substantial unified-memory headroom; 16 GB is expected to struggle, but the current release record does not claim a live model verification. |
+| Memory | 64 GB recommended. A 27B LLM and resident 1.7B ASR model need substantial unified-memory headroom; 16 GB is expected to struggle. The current `qwen3.8:27b` component canary is recorded below, but the complete pipeline remains unverified. |
 | macOS | 14 or newer. |
 | Node.js | 26.7.0 or newer (`.nvmrc` included). |
 | Python | 3.14, installed automatically by `uv`. |
@@ -63,7 +63,7 @@ release record** — see [What is verified](#what-is-verified).
 | Item | Approx. size |
 | --- | --- |
 | Qwen3-ASR-1.7B (8-bit MLX) | ~4.4 GiB verified cache footprint; keep at least 6 GB free |
-| `qwen3.6:27b` (Q4_K_M) | ~17 GB |
+| `qwen3.8:27b` | ~17 GB |
 | Silero VAD (ONNX) | ~2 MB |
 | Session audio | ~19 MB per hour of recording (16 kHz mono FLAC) |
 

@@ -26,7 +26,7 @@ function deadJob(overrides: Partial<DeadJob> = {}): DeadJob {
 
 describe('failed job diagnostics', () => {
   it('shows host, job kind, bounded cause, install hint and retry command', () => {
-    const alert = renderDeadJobAlert('prod-mac.local', [deadJob()], 'qwen3.6:27b');
+    const alert = renderDeadJobAlert('prod-mac.local', [deadJob()], 'qwen3.8:27b');
 
     assert.equal(alert.active, true);
     assert.match(alert.detail, /Демон: prod-mac\.local/);
@@ -40,9 +40,9 @@ describe('failed job diagnostics', () => {
     const alert = renderDeadJobAlert(
       'prod-mac.local',
       [deadJob({ kind: 'summarize', lastError: 'Ollama is not reachable' })],
-      'qwen3.6:27b',
+      'qwen3.8:27b',
     );
-    assert.match(alert.detail, /ollama pull qwen3\.6:27b/);
+    assert.match(alert.detail, /ollama pull qwen3\.8:27b/);
   });
 
   it('turns the optional-tokenizer failure into exact forced-language recovery commands', () => {
@@ -56,7 +56,7 @@ describe('failed job diagnostics', () => {
           lastError,
         }),
       ],
-      'qwen3.6:27b',
+      'qwen3.8:27b',
       { technicalDetails: true },
     );
 
@@ -97,10 +97,10 @@ describe('failed job diagnostics', () => {
       renderAsrUnavailableDetail('prod.local', 'worker exited'),
       /uv sync --project python\/openmurmur_audio --extra mlx/,
     );
-    const llm = renderLlmUnavailableDetail('prod.local', 'not reachable', 'qwen3.6:27b');
+    const llm = renderLlmUnavailableDetail('prod.local', 'not reachable', 'qwen3.8:27b');
     assert.match(llm, /Аудио и расшифровки продолжают работать/);
     assert.match(llm, /brew services start ollama/);
-    assert.match(llm, /ollama pull qwen3\.6:27b/);
+    assert.match(llm, /ollama pull qwen3\.8:27b/);
   });
 
   it('fingerprints the whole set independent of query order', () => {
