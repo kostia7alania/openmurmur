@@ -26,9 +26,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 26.x is the project target (Current). 24.x is the latest Active LTS,
-        # checked so a gratuitous incompatibility surfaces early — see
-        # docs/adr/0001-node-26.md.
+        # 26.x runs the full project gate. 24.x verifies the intentional
+        # fail-closed runtime boundary — see docs/adr/0001-node-26.md.
         node: ['26.7.0', '24']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,16 +51,31 @@ jobs:
           node -e "const{DatabaseSync}=require('node:sqlite');console.log('sqlite',new DatabaseSync(':memory:').prepare('select sqlite_version() v').get().v)"
 
       - name: Typecheck
+        if: matrix.node != '24'
         run: pnpm run typecheck
 
       - name: Lint and format
+        if: matrix.node != '24'
         run: pnpm run lint
 
       - name: Unit tests
+        if: matrix.node != '24'
         run: pnpm run test:unit
 
       - name: Integration tests (synthetic ffmpeg audio, no microphone)
+        if: matrix.node != '24'
         run: pnpm run test:integration
+
+      - name: Unsupported runtime fails closed
+        if: matrix.node == '24'
+        run: |
+          node --input-type=module -e "
+            import { nodeVersionIsSupported } from './src/cli/doctor.ts';
+            if (nodeVersionIsSupported(process.versions.node)) {
+              throw new Error('Node 24 unexpectedly satisfies the runtime contract');
+            }
+            console.log('Node 24 is rejected by the runtime contract as expected');
+          "
 
   python:
     name: Python worker
