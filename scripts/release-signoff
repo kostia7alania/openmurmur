@@ -154,7 +154,7 @@ inspect_current_facts() {
   local git_top
   local git_status
   local daemon_label digest_label daemon_working digest_working
-  local daemon_node digest_node daemon_cli digest_cli
+  local daemon_capture daemon_node digest_node daemon_cli digest_cli
   local daemon_root digest_root
   local runtime_values tool_candidate
   local authorization_output authorization_code
@@ -189,12 +189,13 @@ inspect_current_facts() {
   [ "$daemon_label" = io.openmurmur.daemon ] || die "installed daemon plist has the wrong label"
   [ "$digest_label" = io.openmurmur.digest ] || die "installed digest plist has the wrong label"
 
-  daemon_node="$(plist_value "$DAEMON_PLIST" ProgramArguments:0)" || die "daemon Node argument is missing"
+  daemon_capture="$(plist_value "$DAEMON_PLIST" ProgramArguments:0)" || die "daemon capture supervisor is missing"
+  [ "$(plist_value "$DAEMON_PLIST" ProgramArguments:1)" = --supervise-daemon ] || \
+    die "daemon supervisor mode is missing"
+  daemon_node="$(plist_value "$DAEMON_PLIST" ProgramArguments:2)" || die "daemon Node argument is missing"
   digest_node="$(plist_value "$DIGEST_PLIST" ProgramArguments:0)" || die "digest Node argument is missing"
-  daemon_cli="$(plist_value "$DAEMON_PLIST" ProgramArguments:1)" || die "daemon CLI argument is missing"
+  daemon_cli="$(plist_value "$DAEMON_PLIST" ProgramArguments:3)" || die "daemon CLI argument is missing"
   digest_cli="$(plist_value "$DIGEST_PLIST" ProgramArguments:1)" || die "digest CLI argument is missing"
-  [ "$(plist_value "$DAEMON_PLIST" ProgramArguments:2)" = start ] || die "daemon command is not start"
-  [ "$(plist_value "$DAEMON_PLIST" ProgramArguments:3)" = --root ] || die "daemon root flag is missing"
   [ "$(plist_value "$DIGEST_PLIST" ProgramArguments:2)" = digest ] || die "digest command is not digest"
   [ "$(plist_value "$DIGEST_PLIST" ProgramArguments:3)" = scheduled ] || die "digest subcommand is not scheduled"
   [ "$(plist_value "$DIGEST_PLIST" ProgramArguments:4)" = --root ] || die "digest root flag is missing"
@@ -202,6 +203,8 @@ inspect_current_facts() {
   digest_root="$(plist_value "$DIGEST_PLIST" ProgramArguments:5)" || die "digest state root is missing"
   assert_no_plist_value "$DAEMON_PLIST" ProgramArguments:5 "installed daemon plist"
   assert_no_plist_value "$DIGEST_PLIST" ProgramArguments:6 "installed digest plist"
+  [ "$daemon_capture" = "$HOME/Applications/OpenMurmur Capture.app/Contents/MacOS/OpenMurmurCapture" ] || \
+    die "installed daemon does not use the stable capture supervisor"
   [ "$daemon_node" = "$digest_node" ] || die "installed agents use different Node executables"
   [ "$daemon_cli" = "$digest_cli" ] || die "installed agents use different CLI entries"
   [ "$daemon_root" = "$digest_root" ] || die "installed agents use different state roots"

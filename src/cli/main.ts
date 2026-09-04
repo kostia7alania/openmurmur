@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { access, rm } from 'node:fs/promises';
-import { hostname } from 'node:os';
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { hostname, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { parseArgs } from 'node:util';
@@ -11,7 +11,6 @@ import {
   createCaptureBackend,
   defaultNativeCaptureExecutable,
   type NativeCaptureAuthorizationStatus,
-  nativeCaptureAuthorizationStatus,
   nativeCaptureExecutableIsUsable,
 } from '../capture/native.ts';
 import { normalizeToWav, probeAudio } from '../capture/probe.ts';
@@ -108,7 +107,7 @@ Setup and diagnostics
   doctor                 Check every dependency. Read-only: changes nothing.
   setup --telegram-role owner|send-only  Create state with one explicit Telegram role.
   setup telegram owner|send-only  Connect a Telegram bot with one explicit input role.
-  capture authorize      Inspect native microphone access; request it only when undecided.
+  capture authorize      Open the verified native app's microphone authorization flow.
   capture test           Record a few seconds and report input levels.
   recover                Report recordings an unclean shutdown left behind.
 
@@ -577,71 +576,68 @@ async function captureAuthorize(
     return 1;
   }
 
-  let status: NativeCaptureAuthorizationStatus;
-  try {
-    status = nativeCaptureAuthorizationStatus(executable);
-  } catch {
-    process.stderr.write(
-      'Could not read the native helper microphone authorization status. Reinstall it with ./scripts/install-capture-app.\n',
-    );
-    return 1;
-  }
-  if (status !== 'not_determined') {
-    return renderNativeAuthorizationResult(status, commandContext, captureBackend);
-  }
-
   const app = dirname(dirname(dirname(executable)));
+  const resultDirectory = await mkdtemp(join(tmpdir(), 'openmurmur-capture-authorize-'));
+  const stdoutPath = join(resultDirectory, 'stdout');
+  const stderrPath = join(resultDirectory, 'stderr');
   process.stdout.write(
     'Opening the native capture helper. macOS may ask for microphone access now.\n',
   );
-  const exitCode = await new Promise<number>((resolve) => {
-    let settled = false;
-    const finish = (code: number) => {
-      if (settled) return;
-      settled = true;
-      resolve(code);
-    };
-    const child = spawn('/usr/bin/open', [app, '--args', '--authorize'], {
-      stdio: 'inherit',
-    });
-    child.once('error', (error) => {
-      process.stderr.write(`Could not open the authorization flow: ${error.message}\n`);
-      finish(1);
-    });
-    child.once('close', (code, signal) => {
-      if (settled) return;
-      if (code === 0) finish(0);
-      else {
-        process.stderr.write(
-          `The GUI launcher did not finish normally (${signal ?? `exit ${code}`}).\n`,
-        );
+  try {
+    const exitCode = await new Promise<number>((resolve) => {
+      let settled = false;
+      const finish = (code: number) => {
+        if (settled) return;
+        settled = true;
+        resolve(code);
+      };
+      const child = spawn(
+        '/usr/bin/open',
+        ['-W', '-n', '-o', stdoutPath, '--stderr', stderrPath, app, '--args', '--authorize'],
+        { stdio: ['ignore', 'inherit', 'inherit'] },
+      );
+      child.once('error', (error) => {
+        process.stderr.write(`Could not open the authorization flow: ${error.message}\n`);
         finish(1);
-      }
+      });
+      child.once('close', (code, signal) => {
+        if (settled) return;
+        if (code === 0) finish(0);
+        else {
+          process.stderr.write(
+            `The GUI launcher did not finish normally (${signal ?? `exit ${code}`}).\n`,
+          );
+          finish(1);
+        }
+      });
     });
-  });
-  if (exitCode !== 0) return exitCode;
+    if (exitCode !== 0) return exitCode;
 
-  const deadline = Date.now() + 30_000;
-  do {
-    try {
-      status = nativeCaptureAuthorizationStatus(executable);
-    } catch {
+    const readResult = async (path: string): Promise<string> => {
+      try {
+        return await readFile(path, 'utf8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+        throw error;
+      }
+    };
+    const diagnostic = `${await readResult(stdoutPath)}${await readResult(stderrPath)}`.trim();
+    const statuses = new Map<string, NativeCaptureAuthorizationStatus>([
+      ['microphone authorization: granted', 'authorized'],
+      ['microphone authorization: denied', 'denied'],
+      ['microphone authorization: unavailable', 'unavailable'],
+    ]);
+    const status = statuses.get(diagnostic);
+    if (status === undefined) {
       process.stderr.write(
-        'The GUI flow opened, but its authorization status could not be read safely. No permission is claimed.\n',
+        'The GUI flow finished without its exact authorization result. No permission is claimed.\n',
       );
       return 1;
     }
-    if (status !== 'not_determined') {
-      return renderNativeAuthorizationResult(status, commandContext, captureBackend);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  } while (Date.now() < deadline);
-
-  process.stderr.write(
-    'The GUI flow opened, but no macOS decision was observed within 30 seconds. No permission is claimed.\n' +
-      `Finish the dialog in the GUI session. ${renderNativeCaptureProofInstruction(commandContext, captureBackend)}\n`,
-  );
-  return 1;
+    return renderNativeAuthorizationResult(status, commandContext, captureBackend);
+  } finally {
+    await rm(resultDirectory, { recursive: true, force: true });
+  }
 }
 
 function renderNativeCaptureProofInstruction(

@@ -19,6 +19,7 @@ TEMPLATES=(
   "launchd/io.openmurmur.digest.plist.example"
 )
 ROOT_ARGUMENT_INDEXES=(4 5)
+NODE_ARGUMENT_INDEXES=(2 0)
 
 CHECK_ONLY=false
 REQUESTED_NODE=""
@@ -307,6 +308,7 @@ if ! CAPTURE_CHECK_OUTPUT="$("$REPO/scripts/install-capture-app" --check 2>&1)";
 fi
 if [ -n "$CAPTURE_CHECK_OUTPUT" ]; then printf '%s\n' "$CAPTURE_CHECK_OUTPUT"; fi
 ok "native capture app is signed, current and authorized"
+CAPTURE_BIN="$HOME/Applications/OpenMurmur Capture.app/Contents/MacOS/OpenMurmurCapture"
 
 inspect_agents_boundary
 
@@ -376,10 +378,10 @@ render_template() {
   local template="$1"
   local target="$2"
   "$NODE_BIN" --input-type=module - \
-    "$template" "$target" "$REPO" "$NODE_BIN" "$HOME" "$STATE_ROOT" <<'NODE'
+    "$template" "$target" "$REPO" "$NODE_BIN" "$CAPTURE_BIN" "$HOME" "$STATE_ROOT" <<'NODE'
 import { readFileSync, writeFileSync } from 'node:fs';
 
-const [template, target, repo, nodeBin, home, stateRoot] = process.argv.slice(2);
+const [template, target, repo, nodeBin, captureBin, home, stateRoot] = process.argv.slice(2);
 const escapeXml = (value) =>
   value
     .replaceAll('&', '&amp;')
@@ -392,6 +394,7 @@ let text = readFileSync(template, 'utf8');
 for (const [placeholder, value] of Object.entries({
   __REPO_DIR__: repo,
   __NODE_BIN__: nodeBin,
+  __CAPTURE_BIN__: captureBin,
   __HOME__: home,
   __STATE_ROOT__: stateRoot,
 })) {
@@ -423,7 +426,7 @@ installed_value() {
 
 check_installation() {
   local issues=0
-  local index name target installed_node installed_root root_index label
+  local index name target installed_node installed_root node_index root_index label
 
   work_directory_unchanged || die "The private check directory changed before inspection."
   if [ "$AGENTS_PRESENT" = true ]; then
@@ -439,6 +442,7 @@ check_installation() {
   for index in "${!NAMES[@]}"; do
     name="${NAMES[$index]}"
     target="$AGENTS/$name"
+    node_index="${NODE_ARGUMENT_INDEXES[$index]}"
     root_index="${ROOT_ARGUMENT_INDEXES[$index]}"
     label="${name%.plist}"
 
@@ -454,7 +458,7 @@ check_installation() {
       fail "$name is not installed"
       issues=$((issues + 1))
     else
-      installed_node="$(installed_value "$target" "ProgramArguments:0")"
+      installed_node="$(installed_value "$target" "ProgramArguments:$node_index")"
       if [ "$installed_node" != "$NODE_BIN" ]; then
         fail "$name runtime mismatch: ${installed_node:-unreadable} (expected $NODE_BIN)"
         issues=$((issues + 1))

@@ -20,7 +20,7 @@ private func terminate(_ code: Int32, _ diagnostic: String) -> Never {
     Darwin.exit(code)
 }
 
-private func runAuthorization() -> Never {
+private func runAuthorizationRequest() -> Never {
     let application = NSApplication.shared
     application.setActivationPolicy(.accessory)
     application.finishLaunching()
@@ -43,6 +43,33 @@ private func runAuthorization() -> Never {
         dispatchMain()
     @unknown default:
         terminate(Exit.notAuthorized, "microphone authorization: unavailable")
+    }
+}
+
+private func runAuthorization() -> Never {
+    guard let executableURL = Bundle.main.executableURL else {
+        terminate(Exit.software, "authorization launcher is unavailable")
+    }
+
+    let child = Process()
+    child.executableURL = executableURL
+    child.arguments = ["--request-authorization"]
+    child.standardInput = FileHandle.nullDevice
+    child.standardOutput = FileHandle.standardOutput
+    child.standardError = FileHandle.standardError
+    do {
+        try child.run()
+        child.waitUntilExit()
+    } catch {
+        terminate(Exit.unavailable, "authorization launcher failed")
+    }
+    switch child.terminationReason {
+    case .exit:
+        Darwin.exit(child.terminationStatus)
+    case .uncaughtSignal:
+        Darwin.exit(128 + child.terminationStatus)
+    @unknown default:
+        Darwin.exit(Exit.software)
     }
 }
 
@@ -87,6 +114,68 @@ private func runSourceDigest() -> Never {
     Darwin.exit(0)
 }
 
+private func runDaemonSupervisor(_ arguments: [String]) -> Never {
+    guard arguments.count == 3 else {
+        terminate(
+            Exit.usage,
+            "usage: OpenMurmurCapture --supervise-daemon NODE MAIN STATE_ROOT"
+        )
+    }
+
+    let nodePath = arguments[0]
+    let mainPath = arguments[1]
+    let stateRoot = arguments[2]
+    let paths = [nodePath, mainPath, stateRoot]
+    guard paths.allSatisfy({ path in
+        path.hasPrefix("/")
+            && path.utf8.count <= 4_096
+            && URL(fileURLWithPath: path).standardizedFileURL.path == path
+    }),
+        FileManager.default.isExecutableFile(atPath: nodePath),
+        FileManager.default.isReadableFile(atPath: mainPath)
+    else {
+        terminate(Exit.usage, "daemon supervisor paths are invalid")
+    }
+
+    let child = Process()
+    child.executableURL = URL(fileURLWithPath: nodePath)
+    child.arguments = [mainPath, "start", "--root", stateRoot]
+    child.standardInput = FileHandle.nullDevice
+    child.standardOutput = FileHandle.standardOutput
+    child.standardError = FileHandle.standardError
+
+    child.terminationHandler = { process in
+        switch process.terminationReason {
+        case .exit:
+            Darwin.exit(process.terminationStatus)
+        case .uncaughtSignal:
+            Darwin.exit(128 + process.terminationStatus)
+        @unknown default:
+            Darwin.exit(Exit.software)
+        }
+    }
+
+    do {
+        try child.run()
+    } catch {
+        terminate(Exit.unavailable, "daemon supervisor could not start Node")
+    }
+
+    let terminationSignal = installSignalSource(SIGTERM) {
+        if child.isRunning {
+            Darwin.kill(child.processIdentifier, SIGTERM)
+        }
+    }
+    let interruptSignal = installSignalSource(SIGINT) {
+        if child.isRunning {
+            Darwin.kill(child.processIdentifier, SIGINT)
+        }
+    }
+    withExtendedLifetime([terminationSignal, interruptSignal]) {
+        dispatchMain()
+    }
+}
+
 private func installSignalSource(
     _ signalNumber: Int32,
     handler: @escaping () -> Void
@@ -122,9 +211,13 @@ private func runStream() -> Never {
     }
 
     let tapFrames: AVAudioFrameCount = 1_024
+    let handoffFrameCapacity = captureHandoffFrameCapacity(
+        format: inputFormat,
+        requestedFrames: tapFrames
+    )
     guard let handoff = BoundedAudioHandoff(
         format: inputFormat,
-        frameCapacity: tapFrames,
+        frameCapacity: handoffFrameCapacity,
         capacity: 64
     ) else {
         terminate(Exit.software, "capture failed: audio buffer allocation")
@@ -291,9 +384,19 @@ private func runSelfCheck() -> Never {
 
     do {
         let converter = try PCMConverter(inputFormat: inputFormat)
+        let requestedTapFrames: AVAudioFrameCount = 1_024
+        let handoffFrameCapacity = captureHandoffFrameCapacity(
+            format: inputFormat,
+            requestedFrames: requestedTapFrames
+        )
+        guard input.frameLength > requestedTapFrames,
+              handoffFrameCapacity >= input.frameLength
+        else {
+            terminate(Exit.software, "self-check failed: advisory tap capacity")
+        }
         guard let handoff = BoundedAudioHandoff(
             format: inputFormat,
-            frameCapacity: input.frameCapacity,
+            frameCapacity: handoffFrameCapacity,
             capacity: 2
         ),
             handoff.offer(input),
@@ -327,27 +430,37 @@ private func runSelfCheck() -> Never {
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
-guard arguments.count == 1 else {
+guard let mode = arguments.first else {
     terminate(
         Exit.usage,
-        "usage: OpenMurmurCapture --authorize|--authorization-status|--source-digest|--stream|--self-check"
+        "usage: OpenMurmurCapture --authorize|--authorization-status|--source-digest|--stream|--self-check|--supervise-daemon"
     )
 }
 
-switch arguments[0] {
+switch mode {
 case "--authorize":
+    guard arguments.count == 1 else { terminate(Exit.usage, "invalid authorization invocation") }
     runAuthorization()
+case "--request-authorization":
+    guard arguments.count == 1 else { terminate(Exit.usage, "invalid authorization request") }
+    runAuthorizationRequest()
 case "--authorization-status":
+    guard arguments.count == 1 else { terminate(Exit.usage, "invalid status invocation") }
     runAuthorizationStatus()
 case "--source-digest":
+    guard arguments.count == 1 else { terminate(Exit.usage, "invalid digest invocation") }
     runSourceDigest()
 case "--stream":
+    guard arguments.count == 1 else { terminate(Exit.usage, "invalid stream invocation") }
     runStream()
 case "--self-check":
+    guard arguments.count == 1 else { terminate(Exit.usage, "invalid self-check invocation") }
     runSelfCheck()
+case "--supervise-daemon":
+    runDaemonSupervisor(Array(arguments.dropFirst()))
 default:
     terminate(
         Exit.usage,
-        "usage: OpenMurmurCapture --authorize|--authorization-status|--source-digest|--stream|--self-check"
+        "usage: OpenMurmurCapture --authorize|--authorization-status|--source-digest|--stream|--self-check|--supervise-daemon"
     )
 }

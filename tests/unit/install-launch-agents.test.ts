@@ -168,6 +168,19 @@ function renderInstalledPlists(home: string, stateRoot: string): void {
     const rendered = template
       .replaceAll('__REPO_DIR__', escapeXml(REPO))
       .replaceAll('__NODE_BIN__', escapeXml(process.execPath))
+      .replaceAll(
+        '__CAPTURE_BIN__',
+        escapeXml(
+          join(
+            home,
+            'Applications',
+            'OpenMurmur Capture.app',
+            'Contents',
+            'MacOS',
+            'OpenMurmurCapture',
+          ),
+        ),
+      )
       .replaceAll('__HOME__', escapeXml(home))
       .replaceAll('__STATE_ROOT__', escapeXml(resolve(stateRoot)));
     writeFileSync(join(agents, name), rendered, { mode: 0o600 });

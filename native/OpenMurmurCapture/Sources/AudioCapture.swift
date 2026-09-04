@@ -61,6 +61,18 @@ enum PCMConversionError: Error {
     case missingOutput
 }
 
+/// AVAudioEngine treats an input tap's buffer size as a request, not a hard
+/// callback bound. Preallocate enough room for one second of the hardware
+/// format so a larger first callback never allocates or fails on the audio
+/// thread. Queue capacity remains bounded independently by its slot count.
+func captureHandoffFrameCapacity(
+    format: AVAudioFormat,
+    requestedFrames: AVAudioFrameCount
+) -> AVAudioFrameCount {
+    let oneSecond = AVAudioFrameCount(format.sampleRate.rounded(.up))
+    return max(requestedFrames, oneSecond)
+}
+
 final class PCMConverter {
     static let outputSampleRate = 16_000.0
     static let outputChannels: AVAudioChannelCount = 1

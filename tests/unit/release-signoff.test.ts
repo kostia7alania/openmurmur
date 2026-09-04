@@ -53,10 +53,25 @@ function writePlist(
   node: string,
   stateRoot: string,
 ): void {
-  const command = label.endsWith('daemon')
-    ? ['start', '--root', stateRoot]
-    : ['digest', 'scheduled', '--root', stateRoot];
-  const argumentsXml = [node, join(repository, 'src', 'cli', 'main.ts'), ...command]
+  const main = join(repository, 'src', 'cli', 'main.ts');
+  const home = dirname(dirname(dirname(path)));
+  const programArguments = label.endsWith('daemon')
+    ? [
+        join(
+          home,
+          'Applications',
+          'OpenMurmur Capture.app',
+          'Contents',
+          'MacOS',
+          'OpenMurmurCapture',
+        ),
+        '--supervise-daemon',
+        node,
+        main,
+        stateRoot,
+      ]
+    : [node, main, 'digest', 'scheduled', '--root', stateRoot];
+  const argumentsXml = programArguments
     .map((value) => `      <string>${escapeXml(value)}</string>`)
     .join('\n');
   writeFileSync(

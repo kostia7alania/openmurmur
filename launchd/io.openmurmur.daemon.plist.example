@@ -3,7 +3,8 @@
   OpenMurmur recording daemon.
 
   scripts/install-launch-agents substitutes __REPO_DIR__, __NODE_BIN__,
-  __STATE_ROOT__ and __HOME__ and installs this into ~/Library/LaunchAgents.
+  __CAPTURE_BIN__, __STATE_ROOT__ and __HOME__ and installs this into
+  ~/Library/LaunchAgents.
 
   No secrets appear here. The Telegram bot token lives in the macOS Keychain;
   a launchd plist is world-readable and is synced by some backup tools.
@@ -16,10 +17,10 @@
 
     <key>ProgramArguments</key>
     <array>
+        <string>__CAPTURE_BIN__</string>
+        <string>--supervise-daemon</string>
         <string>__NODE_BIN__</string>
         <string>__REPO_DIR__/src/cli/main.ts</string>
-        <string>start</string>
-        <string>--root</string>
         <string>__STATE_ROOT__</string>
     </array>
 

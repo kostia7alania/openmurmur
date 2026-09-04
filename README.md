@@ -272,6 +272,12 @@ The two supported operating modes therefore have different boundaries:
   identity. A distributable stable release requires the same Developer ID,
   bundle ID and designated requirement across updates plus notarization; no
   notarized release is claimed here.
+- On 2026-09-01 an initial launchd rehearsal failed closed because macOS
+  attributed the microphone request to Node. The native app now remains the
+  narrowly scoped supervisor and can launch only the fixed OpenMurmur daemon
+  command. A same-login-session rehearsal then proved a fresh daemon heartbeat,
+  a running recorder and real source frames with Node 26.8.1. Login/reboot and
+  sleep/wake transitions remain separate live gates.
 
 ## Sleep and the lid
 
@@ -425,8 +431,9 @@ Only one daemon may own an OpenMurmur data root. SQLite is the atomic ownership
 authority; the PID file is only an operator-facing mirror published without
 replacing a concurrent generation. `status` and `stop` compare the exact process
 birth and ownership generation before acting. A final numeric-PID reuse window
-between that check and the signal remains tracked as CS-31. The launchd
-templates remain unverified in a real login session.
+between that check and the signal remains tracked as CS-31. Same-session
+installation and real-frame readiness are verified; a subsequent login or
+reboot is not.
 
 ## Retention
 
@@ -557,9 +564,9 @@ exposed language and modality defects, then verified the bounded RU/EN/TH fix
 at 18/18 grounded facts and claims, 100% precision and zero forbidden hits on
 one frozen model digest.
 That is useful bounded product evidence, but it is not the complete daemon
-service. **Still not verified end-to-end on this revision:** live microphone
-capture through the long-running daemon, real Telegram delivery, launchd under
-a login session, and sleep/wake behaviour.
+service. **Still not verified end-to-end on this revision:** a complete live
+microphone → ASR → summary → Telegram session, launchd across logout/login or
+reboot, and sleep/wake behaviour.
 
 See [docs/BACKLOG.md](docs/BACKLOG.md) for what closes these gaps.
 

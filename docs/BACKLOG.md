@@ -271,7 +271,11 @@ dependencies, risk, estimate (S/M/L), release, tests.
 - **Scope:** Three plist templates plus install/uninstall scripts.
 - **Acceptance:** `plutil -lint` passes; the agent starts on login.
 - **Dependencies:** P0-05 · **Risk:** medium (TCC under launchd) · **Estimate:** S
-- **Tests:** plist validation in CI. **Not loaded into a real login session.**
+- **Tests:** plist validation in CI. A 2026-09-01 rehearsal first failed closed
+  and rolled back when TCC attributed capture to Node. The native helper now
+  remains the strictly constrained responsible supervisor; a repeated install
+  proved fresh heartbeat, `recorderRunning=true`, real source frames and zero
+  processing lag. Logout/login and reboot startup remain unverified.
 
 ### P0-22 ✅ Retention dry-run
 
@@ -976,6 +980,6 @@ offline slice is recorded on the item itself below.
 | ⬜ Sandbox FFmpeg decode of incoming files | The most plausible RCE path (T3 in the threat model). |
 | ✅ Repeat the real MLX ASR end-to-end on the current revision | D039, D090 and D091 record production daemon scheduling, repeated real-worker reuse and a real worker-death retry on the current repair line. This still does not substitute for the microphone-to-Telegram release run in D120. |
 | ⬜ Verify live Telegram delivery with a real bot | Closes P0-14, P0-18, P0-20. |
-| ⬜ Verify launchd under a real login session | Closes P0-21; TCC under launchd is the known risk. |
+| ⬜ Verify launchd across logout/login and reboot | Same-session installation now proves the TCC-correct supervisor, fresh heartbeat and real frames; startup after a new login and reboot remains unobserved. |
 | ⬜ Test sleep/wake behaviour | Documented in the README from design intent, not from observation. |
 | ✅ Bump SQLite when Node ships ≥ 3.53.4 | Done by pinning Node 26.7.0. |

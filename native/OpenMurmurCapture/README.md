@@ -7,7 +7,10 @@ under the stable `io.openmurmur.capture` bundle identity and writes raw mono
 ## Permission modes
 
 - `--authorize` is the only mode that can display the macOS microphone prompt.
-  Launch it explicitly as a GUI app before starting a background daemon.
+  Launch it explicitly as a GUI app before starting a background daemon. The
+  GUI process starts one private authorization child so TCC records the signed
+  app as the responsible identity instead of the shell or installer that opened
+  it.
 - `--stream` never requests permission. It exits with code 77 unless permission
   was already granted.
 - `--authorization-status` returns fixed JSON and exits 0 when authorized or 77
@@ -16,6 +19,11 @@ under the stable `io.openmurmur.capture` bundle identity and writes raw mono
   not inspect TCC or audio hardware.
 - `--self-check` converts synthetic PCM without opening or enumerating an audio
   device. Build automation uses this mode.
+- `--supervise-daemon NODE MAIN STATE_ROOT` is the launchd-only parent process.
+  Its fixed argument grammar can start only `NODE MAIN start --root STATE_ROOT`;
+  keeping the signed app as the responsible process lets macOS apply its
+  microphone grant to the capture child without granting an arbitrary command
+  runner the same capability.
 
 stdout is reserved for PCM in stream mode. Diagnostics are fixed, bounded
 messages on stderr; status and source-digest modes return their documented

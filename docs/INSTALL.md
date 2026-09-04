@@ -274,9 +274,11 @@ pnpm openmurmur capture authorize
 ```
 
 It first verifies the app at its permanent path, strict code signature, audio
-entitlement and signed source digest without opening the microphone. Only then
-does it inspect the non-prompting authorization status. `not_determined` opens
-the GUI flow and waits at most 30 seconds for a decision; `denied` directs you to
+entitlement and signed source digest without opening the microphone. It then
+opens one fresh GUI app instance and accepts only the helper's fixed
+authorization result from private redirected output. The GUI parent launches a
+private authorization child so TCC records `io.openmurmur.capture` as the
+responsible identity instead of Terminal, Codex or Node. `denied` directs you to
 the System Settings toggle (and a scoped `tccutil` reset if it is stuck);
 `restricted` requires the Mac administrator or MDM policy owner. Re-running the
 GUI command cannot make macOS prompt after a denial. No setup, doctor, installer,
@@ -373,6 +375,10 @@ daemon's local `status --json` shows a fresh heartbeat, a running recorder and
 at least one real audio frame. The probe is bounded to 20 seconds and reads no
 Keychain value or network service. If readiness never becomes true, both plist
 files and the previously loaded service set are restored where possible.
+The daemon plist starts the signed native helper in its constrained supervisor
+mode; it can launch only the selected Node runtime, this checkout's CLI entry
+and the configured state root. Keeping that app as the responsible process is
+what lets TCC apply the GUI microphone grant to the capture child.
 
 #### Attended upgrade rollback rehearsal
 
@@ -472,9 +478,9 @@ AGENT_DIR_ID="$(directory_identity "$AGENT_DIR")"
   echo "D121 needs a regular installed daemon plist: $DAEMON_PLIST" >&2
   exit 1
 }
-NODE_BIN="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$DAEMON_PLIST")"
+NODE_BIN="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:2' "$DAEMON_PLIST")"
 [ -n "$NODE_BIN" ] && [ "${NODE_BIN#/}" != "$NODE_BIN" ] && [ -x "$NODE_BIN" ] || {
-  echo "Installed daemon ProgramArguments:0 is not an absolute executable" >&2
+  echo "Installed daemon ProgramArguments:2 is not an absolute Node executable" >&2
   exit 1
 }
 [ -f "$RUNTIME_CONTRACT" ] && [ ! -L "$RUNTIME_CONTRACT" ]
@@ -1033,8 +1039,8 @@ DAEMON_PLIST_ID="$(file_id "$DAEMON_PLIST")"
 DIGEST_PLIST_ID="$(file_id "$DIGEST_PLIST")"
 DAEMON_PLIST_SHA="$(file_sha256 "$DAEMON_PLIST")"
 DIGEST_PLIST_SHA="$(file_sha256 "$DIGEST_PLIST")"
-NODE_BIN="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$DAEMON_PLIST")"
-CLI_ENTRY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$DAEMON_PLIST")"
+NODE_BIN="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:2' "$DAEMON_PLIST")"
+CLI_ENTRY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$DAEMON_PLIST")"
 STATE_ROOT="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:4' "$DAEMON_PLIST")"
 [ "$NODE_BIN" = "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$DIGEST_PLIST")" ]
 [ "$CLI_ENTRY" = "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$DIGEST_PLIST")" ]
@@ -1363,7 +1369,7 @@ foreign path or artifact drift is preserved and fails closed:
 : "${D121_EVIDENCE_DIR:?export the persistent D121 evidence directory printed above}"
 D121_MANIFEST="$D121_EVIDENCE_DIR/D121.evidence-manifest.json"
 DAEMON_PLIST="$HOME/Library/LaunchAgents/io.openmurmur.daemon.plist"
-NODE_BIN="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$DAEMON_PLIST")"
+NODE_BIN="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:2' "$DAEMON_PLIST")"
 "$NODE_BIN" --input-type=module - \
   "$D121_MANIFEST" "$RELEASE_EVIDENCE_DIR/D121.reference.json" \
   "$RELEASE_EVIDENCE_DIR" <<'NODE'
