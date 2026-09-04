@@ -39,6 +39,7 @@ describe('help text', () => {
 
 describe('capture failure copy', () => {
   it('keeps internal capture exceptions in the local log', () => {
+    const token = ['123456789', 'A'.repeat(35)].join(':');
     assert.equal(
       renderCaptureFailure(false),
       '🔴 Запись не запустилась\n\n' +
@@ -51,7 +52,7 @@ describe('capture failure copy', () => {
       renderCaptureFailure(
         true,
         'pnpm openmurmur doctor',
-        'ffmpeg failed for token 123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+        `ffmpeg failed for token ${token}`,
       ),
       /Технически: ffmpeg failed for token \[REDACTED\]/,
     );
