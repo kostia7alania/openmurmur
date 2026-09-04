@@ -96,6 +96,8 @@ export interface AsrConfig {
    */
   readonly context: string;
   readonly pythonWorkerTimeoutMs: number;
+  /** Retire the MLX worker after this much inactivity, releasing model memory. */
+  readonly workerIdleTimeoutMs: number;
 }
 
 export interface LlmConfig {
@@ -207,6 +209,7 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
     alignerLanguages: ['ru', 'en'],
     context: '',
     pythonWorkerTimeoutMs: 15 * 60 * 1000,
+    workerIdleTimeoutMs: 5 * 60 * 1000,
   },
   llm: {
     backend: 'ollama',
@@ -358,6 +361,7 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
 
   validateAsr(c.asr, issues);
   positive('asr.pythonWorkerTimeoutMs', c.asr.pythonWorkerTimeoutMs);
+  positive('asr.workerIdleTimeoutMs', c.asr.workerIdleTimeoutMs);
   if (c.llm.backend !== 'ollama' && c.llm.backend !== 'fake') {
     issues.push('llm.backend must be "ollama" or "fake"');
   }

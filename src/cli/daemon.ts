@@ -197,8 +197,6 @@ export class Daemon {
   #nextSecretsRetryAt = 0;
   #telegramCredentialsMissing = false;
   #nextLlmReadinessProbeAt = 0;
-  #nextAsrReadinessProbeAt = 0;
-  #asrReadinessProbe: Promise<void> | null = null;
   #llmReadiness: { ready: boolean; detail: string } = {
     ready: false,
     detail: 'not probed yet',
@@ -361,7 +359,6 @@ export class Daemon {
       }
       this.#loop('digest', () => this.#tickDigest(), DIGEST_TICK_INTERVAL_MS);
       this.#loop('retention', () => this.#tickRetention(), 60 * 60 * 1000);
-      this.#scheduleAsrReadinessProbe(true);
 
       // Creating the ONNX session takes about a second. Paying that on the first
       // frame would queue a second of audio behind it at start-up.
@@ -1208,7 +1205,6 @@ export class Daemon {
   async #collectHealth() {
     const { config, paths } = this.#options.loaded;
     await this.#probeLlmReadiness();
-    this.#scheduleAsrReadinessProbe();
     const asrHealth = this.#asr.health();
     const parts = new PartRepository(this.#db.handle);
     const lastPart = parts.lastFinalized();
@@ -1626,35 +1622,6 @@ export class Daemon {
     this.#llmReadiness = llm.ok
       ? { ready: true, detail: `${this.#llm.name}:${llm.model}` }
       : { ready: false, detail: llm.reason };
-  }
-
-  #scheduleAsrReadinessProbe(force = false): void {
-    if (this.#stopping || this.#asrReadinessProbe !== null) return;
-    if (!force && Date.now() < this.#nextAsrReadinessProbeAt) return;
-    this.#nextAsrReadinessProbeAt = Date.now() + 60_000;
-
-    const probe = this.#asr
-      .ready()
-      .then((readiness) => {
-        if (!readiness.ok) {
-          this.#options.logger.warn('ASR readiness probe failed', {
-            reason: readiness.reason,
-          });
-        }
-      })
-      .catch((error: unknown) => {
-        this.#options.logger.warn('ASR readiness probe failed', {
-          reason: (error as Error).message,
-        });
-      });
-    this.#asrReadinessProbe = probe;
-    this.#trackTask(
-      'ASR readiness probe',
-      () => probe,
-      () => {
-        if (this.#asrReadinessProbe === probe) this.#asrReadinessProbe = null;
-      },
-    );
   }
 
   /** Enqueues a status and immediately requests a serialized outbox drain. */

@@ -1,7 +1,8 @@
 """Long-lived NDJSON worker.
 
-Reads requests from stdin, writes responses to stdout, keeps the ASR model
-resident in between. Started by the TypeScript daemon via
+Reads requests from stdin, writes responses to stdout, and keeps the ASR model
+resident between requests in an active burst. The TypeScript owner retires the
+process after bounded idle time. Started by the TypeScript daemon via
 `uv run --project python/openmurmur_audio openmurmur-audio-worker`.
 
 The worker receives no secrets and is launched with Hugging Face offline mode

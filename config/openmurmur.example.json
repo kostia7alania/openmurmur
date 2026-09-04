@@ -30,7 +30,8 @@
     "quantization": "8bit",
     "languageHints": [],
     "alignerLanguages": ["ru", "en"],
-    "pythonWorkerTimeoutMs": 900000
+    "pythonWorkerTimeoutMs": 900000,
+    "workerIdleTimeoutMs": 300000
   },
   "llm": {
     "backend": "ollama",

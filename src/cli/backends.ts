@@ -41,6 +41,7 @@ export function createAsrBackend(loaded: LoadedConfig, logger: Logger): AsrBacke
     quantization: loaded.config.asr.quantization,
     alignerLanguages: loaded.config.asr.alignerLanguages,
     requestTimeoutMs: loaded.config.asr.pythonWorkerTimeoutMs,
+    workerIdleTimeoutMs: loaded.config.asr.workerIdleTimeoutMs,
     logger: logger.child('asr'),
   });
 }

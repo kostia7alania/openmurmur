@@ -99,7 +99,7 @@ Mac download, Command Line Tools, Homebrew itself, model provisioning or final
 | Package | Pinned | Status |
 | --- | --- | --- |
 | mlx | ≥0.32.0,<0.33 | ✅ Installed and run (M4 Max, 36 GB). Wheels cp310–cp314, macOS arm64. |
-| mlx-qwen3-asr | ≥0.3.5,<0.4 | ✅ Qwen3-ASR-1.7B loads in ~5 s and stays resident; RU/EN/TH transcribed. Its `context` biasing is used; its built-in `diarize` is not — see below. |
+| mlx-qwen3-asr | ≥0.3.5,<0.4 | ✅ Qwen3-ASR-1.7B loads in ~5 s and is reused within an active burst; RU/EN/TH transcribed. The worker retires after configured idle time. Its `context` biasing is used; its built-in `diarize` is not — see below. |
 | silero-vad | ≥6.2.1,<7 | ✅ ONNX model run per frame in the live capture path. |
 | sherpa-onnx | ≥1.13.4,<2 | ✅ Speaker diarization, run on real recordings. RTF ~0.08. |
 | sherpa-onnx-core | ≥1.13.4,<2 | ✅ Named explicitly: resolving the extra installed only the wrapper, and the native module then failed to load its bundled `libonnxruntime`. Carries its own onnxruntime; does not conflict with the pin above. |

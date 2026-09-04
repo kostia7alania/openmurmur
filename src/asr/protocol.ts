@@ -4,7 +4,8 @@
  * One JSON object per line on stdin/stdout. The worker keeps the ASR model
  * resident across requests — loading Qwen3-ASR-1.7B per file would add tens of
  * seconds to every session — so the protocol is request/response over a long
- * lived process, correlated by `id`.
+ * lived process for an active work burst, correlated by `id`. The TypeScript
+ * owner retires it after bounded idle time so unified memory is released.
  *
  * stderr is reserved for human-readable logs and is never parsed.
  */

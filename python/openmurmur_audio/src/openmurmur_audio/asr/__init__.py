@@ -1,8 +1,8 @@
-"""Qwen3-ASR via MLX, kept resident across requests.
+"""Qwen3-ASR via MLX, kept resident across an active request burst.
 
 Loading Qwen3-ASR-1.7B takes tens of seconds. Doing that per file would make
-every session's transcript arrive minutes late, so the worker is a long-lived
-process and the model stays in unified memory between requests.
+every session's transcript arrive minutes late, so the worker reuses it within
+a burst and is retired after bounded idle time by its TypeScript owner.
 
 Language handling:
   * Detection is automatic and multiple languages may appear in one recording.

@@ -213,6 +213,7 @@ describe('config parsing', () => {
   it('rejects unsafe timeout, interval and retention values', () => {
     const invalidConfigs = [
       { asr: { pythonWorkerTimeoutMs: 0 } },
+      { asr: { workerIdleTimeoutMs: 0 } },
       { llm: { contextTokens: 0 } },
       { llm: { requestTimeoutMs: -1 } },
       { telegram: { transcriptInlineLimit: 0 } },

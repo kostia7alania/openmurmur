@@ -25,12 +25,16 @@ export interface WorkerProcessOptions {
   /** Appears in log lines, so two workers can be told apart. */
   readonly label: string;
   /** Called once when a generation exits or is retired, expectedly or not. */
-  readonly onExit?: () => void;
+  readonly onExit?: (reason: WorkerExitReason) => void;
+  /** Retire an inactive worker so model memory returns to the operating system. */
+  readonly idleTimeoutMs?: number;
   /** How long an intentional close waits for the protocol shutdown response. */
   readonly shutdownTimeoutMs?: number;
   /** Grace after SIGTERM and again after SIGKILL while joining the child. */
   readonly terminationGraceMs?: number;
 }
+
+export type WorkerExitReason = 'closed' | 'idle' | 'unexpected';
 
 interface Pending {
   generation: number;
@@ -46,6 +50,8 @@ interface WorkerGeneration {
   resolveExited: () => void;
   didExit: boolean;
   exitNotified: boolean;
+  exitReason: WorkerExitReason | null;
+  idleTimer: NodeJS.Timeout | null;
 }
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;
@@ -96,7 +102,10 @@ export class WorkerProcess {
     if (this.#closed) {
       return Promise.reject(new Error(`${this.#options.label} worker is closed`));
     }
-    if (this.#child !== null) return Promise.resolve();
+    if (this.#child !== null) {
+      this.#cancelIdleRetirement(this.#child);
+      return Promise.resolve();
+    }
     if (this.#startPromise !== null) return this.#startPromise;
 
     // A timed-out worker may still be between SIGTERM and SIGKILL. Never put a
@@ -130,6 +139,8 @@ export class WorkerProcess {
       resolveExited: () => resolveExited(),
       didExit: false,
       exitNotified: false,
+      exitReason: null,
+      idleTimer: null,
     };
     this.#child = generation;
 
@@ -163,6 +174,7 @@ export class WorkerProcess {
       });
 
       child.once('close', (code, signal) => {
+        this.#cancelIdleRetirement(generation);
         generation.didExit = true;
         generation.resolveExited();
         if (this.#child?.id === generation.id) this.#child = null;
@@ -214,6 +226,8 @@ export class WorkerProcess {
 
       const generation = this.#child;
       if (generation !== null) {
+        generation.exitReason = 'closed';
+        this.#cancelIdleRetirement(generation);
         // Do not leave callers waiting behind a shutdown request in the
         // worker's strictly sequential queue.
         this.#failGeneration(generation.id, closedError);
@@ -249,6 +263,7 @@ export class WorkerProcess {
     if (generation.didExit || this.#child?.id !== generation.id) {
       return Promise.reject(new Error(`${this.#options.label} worker is not running`));
     }
+    this.#cancelIdleRetirement(generation);
     if (this.#pending.has(request.id)) {
       return Promise.reject(
         new Error(`${this.#options.label} worker already has request "${request.id}" pending`),
@@ -293,10 +308,16 @@ export class WorkerProcess {
     });
   }
 
-  #recycle(generation: WorkerGeneration, failure: Error): Promise<void> {
+  #recycle(
+    generation: WorkerGeneration,
+    failure: Error,
+    reason: WorkerExitReason = 'unexpected',
+  ): Promise<void> {
     const existing = this.#stopping.get(generation.id);
     if (existing !== undefined) return existing;
 
+    generation.exitReason ??= reason;
+    this.#cancelIdleRetirement(generation);
     if (this.#child?.id === generation.id) this.#child = null;
     this.#failGeneration(generation.id, failure);
 
@@ -347,7 +368,7 @@ export class WorkerProcess {
   #notifyExit(generation: WorkerGeneration): void {
     if (generation.exitNotified) return;
     generation.exitNotified = true;
-    this.#options.onExit?.();
+    this.#options.onExit?.(generation.exitReason ?? (this.#closed ? 'closed' : 'unexpected'));
   }
 
   #dispatch(generation: number, line: string): void {
@@ -363,6 +384,41 @@ export class WorkerProcess {
     this.#pending.delete(response.id);
     clearTimeout(pending.timer);
     pending.resolve(response);
+    if (!this.#closed && (!response.ok || response.op !== 'shutdown')) {
+      this.#scheduleIdleRetirement(this.#child?.id === generation ? this.#child : null);
+    }
+  }
+
+  #scheduleIdleRetirement(generation: WorkerGeneration | null): void {
+    const timeoutMs = this.#options.idleTimeoutMs;
+    if (
+      generation === null ||
+      timeoutMs === undefined ||
+      !Number.isFinite(timeoutMs) ||
+      timeoutMs <= 0
+    ) {
+      return;
+    }
+    this.#cancelIdleRetirement(generation);
+    generation.idleTimer = setTimeout(() => {
+      generation.idleTimer = null;
+      if (this.#closed || this.#child?.id !== generation.id) return;
+      if ([...this.#pending.values()].some((pending) => pending.generation === generation.id)) {
+        return;
+      }
+      void this.#recycle(
+        generation,
+        new Error(`${this.#options.label} worker retired after ${timeoutMs} ms idle`),
+        'idle',
+      );
+    }, timeoutMs);
+    generation.idleTimer.unref();
+  }
+
+  #cancelIdleRetirement(generation: WorkerGeneration): void {
+    if (generation.idleTimer === null) return;
+    clearTimeout(generation.idleTimer);
+    generation.idleTimer = null;
   }
 
   #failGeneration(generation: number, error: Error): void {

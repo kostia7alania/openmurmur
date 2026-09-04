@@ -52,7 +52,7 @@ login/reboot and sleep/wake remain **unverified in the current release record**
 | Requirement | Detail |
 | --- | --- |
 | Hardware | Apple Silicon (M-series). MLX requires Metal; Intel Macs are not supported. |
-| Memory | 64 GB recommended. A 27B LLM and resident 1.7B ASR model need substantial unified-memory headroom; 16 GB is expected to struggle. Bounded real-model rehearsals are recorded below; the complete microphone → models → Telegram release path remains unverified. |
+| Memory | 64 GB recommended. A 27B LLM and 1.7B ASR model need substantial unified-memory headroom while processing; both release their model memory after bounded idle time. 16 GB is expected to struggle during processing. Bounded real-model rehearsals are recorded below; the complete microphone → models → Telegram release path remains unverified. |
 | macOS | 14 or newer. |
 | Node.js | 26.7.0 or newer (`.nvmrc` included). |
 | Python | 3.14, installed automatically by `uv`. |

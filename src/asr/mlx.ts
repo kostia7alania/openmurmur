@@ -20,6 +20,7 @@ export interface MlxAsrOptions {
   readonly quantization: string;
   readonly alignerLanguages: readonly string[];
   readonly requestTimeoutMs: number;
+  readonly workerIdleTimeoutMs: number;
   readonly logger: Logger;
 }
 
@@ -32,10 +33,11 @@ type ModelLoadState =
 /**
  * Persistent Python MLX worker.
  *
- * The process is started lazily on first use and kept alive; the model stays
- * resident in unified memory. If the worker dies, every in-flight request is
- * rejected and the next call respawns it — a crash costs one session's
- * transcription attempt (which the job queue retries), not the daemon.
+ * The process is started lazily on first use and retired after bounded idle
+ * time so the model returns unified memory to the system. If the worker dies,
+ * every in-flight request is rejected and the next call respawns it — a crash
+ * costs one session's transcription attempt (which the job queue retries), not
+ * the daemon.
  */
 export class MlxAsr implements AsrBackend {
   readonly name = 'mlx-qwen3-asr';
@@ -47,6 +49,7 @@ export class MlxAsr implements AsrBackend {
   #workerGeneration = 0;
   #workerFailed = false;
   #readinessFailure: string | null = null;
+  #closed = false;
 
   constructor(options: MlxAsrOptions) {
     this.#options = options;
@@ -56,10 +59,16 @@ export class MlxAsr implements AsrBackend {
       cwd: options.cwd,
       logger: options.logger,
       label: 'ASR',
-      onExit: () => {
+      idleTimeoutMs: options.workerIdleTimeoutMs,
+      onExit: (reason) => {
         this.#workerGeneration += 1;
         this.#loadState = { status: 'idle' };
         this.#loadPromise = null;
+        if (reason !== 'unexpected') {
+          this.#workerFailed = false;
+          this.#readinessFailure = null;
+          return;
+        }
         this.#workerFailed = true;
         this.#readinessFailure = 'ASR worker exited; the queued job will restart it';
       },
@@ -67,6 +76,7 @@ export class MlxAsr implements AsrBackend {
   }
 
   health(): { ok: true; detail: string } | { ok: false; reason: string; recovering?: true } {
+    if (this.#closed) return { ok: false, reason: 'ASR worker is closed' };
     if (this.#readinessFailure !== null) {
       return { ok: false, reason: this.#readinessFailure };
     }
@@ -74,7 +84,7 @@ export class MlxAsr implements AsrBackend {
       return { ok: false, reason: 'ASR worker exited; the queued job will restart it' };
     }
     if (!this.#worker.running) {
-      return { ok: false, reason: 'ASR worker is idle; readiness probe pending', recovering: true };
+      return { ok: true, detail: 'model idle; starts on queued audio' };
     }
     switch (this.#loadState.status) {
       case 'idle':
@@ -202,6 +212,7 @@ export class MlxAsr implements AsrBackend {
   }
 
   async close(): Promise<void> {
+    this.#closed = true;
     await this.#worker.close(randomUUID());
     this.#loadState = { status: 'idle' };
     this.#loadPromise = null;

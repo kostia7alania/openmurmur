@@ -12,6 +12,10 @@ const path = require('node:path');
 const mode = process.argv[1];
 const dir = process.argv[2];
 fs.writeFileSync(path.join(dir, 'started'), String(process.pid));
+process.on('SIGTERM', () => {
+  fs.writeFileSync(path.join(dir, 'stopped'), String(process.pid));
+  process.exit(0);
+});
 
 let buffered = '';
 let loadAttempts = 0;
@@ -86,6 +90,7 @@ function backend(
   t: TestContext,
   mode: string,
   requestTimeoutMs = 1_000,
+  workerIdleTimeoutMs = 60_000,
 ): { readonly asr: MlxAsr; readonly dir: string } {
   const dir = mkdtempSync(join(tmpdir(), 'openmurmur-mlx-health-'));
   const asr = new MlxAsr({
@@ -96,6 +101,7 @@ function backend(
     quantization: '8bit',
     alignerLanguages: [],
     requestTimeoutMs,
+    workerIdleTimeoutMs,
     logger: nullLogger,
   });
   t.after(async () => {
@@ -125,11 +131,7 @@ describe('MLX ASR model load health', () => {
   it('reports idle, loading and exact loaded state without probing from health()', async (t) => {
     const { asr, dir } = backend(t, 'slow-load');
 
-    assert.deepEqual(asr.health(), {
-      ok: false,
-      reason: 'ASR worker is idle; readiness probe pending',
-      recovering: true,
-    });
+    assert.deepEqual(asr.health(), { ok: true, detail: 'model idle; starts on queued audio' });
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal(existsSync(join(dir, 'started')), false, 'health must not spawn the worker');
 
@@ -149,6 +151,22 @@ describe('MLX ASR model load health', () => {
 
     await asr.close();
     assert.equal(asr.health().ok, false, 'close must invalidate the generation-local load fact');
+  });
+
+  it('retires an idle model worker and starts a fresh one for the next transcript', async (t) => {
+    const { asr, dir } = backend(t, 'normal', 1_000, 30);
+
+    assert.deepEqual(await asr.ready(), { ok: true });
+    const firstPid = readFileSync(join(dir, 'started'), 'utf8');
+    await waitForFileValue(join(dir, 'stopped'), firstPid);
+    assert.deepEqual(asr.health(), { ok: true, detail: 'model idle; starts on queued audio' });
+
+    const result = await asr.transcribe({
+      audioPath: '/tmp/ignored.wav',
+      requestId: 'after-idle',
+    });
+    assert.equal(result.text, 'ok');
+    assert.notEqual(readFileSync(join(dir, 'started'), 'utf8'), firstPid);
   });
 
   it('keeps a live worker unhealthy after load failure and clears it on exact recovery', async (t) => {

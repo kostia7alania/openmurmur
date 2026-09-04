@@ -6,9 +6,10 @@ spoken to over NDJSON on stdin/stdout.
 ## Why a separate process
 
 MLX and ONNX Runtime are Python-only. Rather than binding them into Node, the
-daemon runs this as a long-lived child process and exchanges one JSON object per
-line. The ASR model stays resident between requests — loading Qwen3-ASR-1.7B per
-file would add tens of seconds to every session.
+daemon runs this as a reusable child process and exchanges one JSON object per
+line. The ASR model stays resident within an active request burst — loading
+Qwen3-ASR-1.7B per file would add tens of seconds to every session — and the
+TypeScript owner retires the process after bounded idle time.
 
 The worker receives **no secrets**. It only ever sees audio file paths.
 

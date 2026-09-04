@@ -33,9 +33,10 @@ uname -m && sw_vers -productVersion
 
 ### If you have 16 GB or 24 GB
 
-The default config loads a 27B summarizer (~17 GB) alongside a resident 1.7B ASR
-model (about 4.4 GiB in the verified Hugging Face cache). That does not fit. It
-still works — use a smaller summarizer:
+During processing, the default config can load a 27B summarizer (~17 GB)
+alongside a 1.7B ASR model (about 4.4 GiB in the verified Hugging Face cache).
+They unload after bounded idle time, but the processing peak still does not fit.
+Use a smaller summarizer:
 
 ```bash
 ollama pull qwen3.6:8b
@@ -339,10 +340,11 @@ no-retry happy path. A delayed audio retry does not block a transcript or report
 that is already ready. `Ctrl-C` stops the daemon and finalizes whatever was
 recording.
 
-The first transcription loads the already-provisioned Qwen3-ASR snapshot from
-disk, so it is slower than later sessions. The model then stays resident and a
-session is transcribed in a fraction of its duration. If the snapshot is
-missing, the job fails locally and never starts a background download.
+The first transcription in an active burst loads the already-provisioned
+Qwen3-ASR snapshot from disk, so it is slower than later sessions in that burst.
+After `asr.workerIdleTimeoutMs` without work, the worker exits and releases the
+model memory; the next job starts it again. If the snapshot is missing, the job
+fails locally and never starts a background download.
 
 ### Then in the background
 

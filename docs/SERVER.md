@@ -376,8 +376,9 @@ into a notarized, identity-stable release.
 
 ## Memory, on a 64 GB machine
 
-The defaults assume this much: a 27B summarizer (~17 GB) and a resident
-Qwen3-ASR-1.7B (about 4.4 GiB in the verified cache) coexist comfortably.
+During processing, the defaults assume this much: a 27B summarizer (~17 GB) and
+Qwen3-ASR-1.7B (about 4.4 GiB in the verified cache) coexist comfortably. Ollama
+and the ASR worker release their model memory after bounded idle time.
 
 **Do not run anything else heavy on the GPU at the same time.** Ollama, MLX and
 PyTorch all allocate from the same unified pool, and three large models at once

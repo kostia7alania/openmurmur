@@ -76,18 +76,21 @@ Telegram.
 
 `uv run --project python/openmurmur_audio openmurmur-audio-worker`, spoken to
 over NDJSON on stdin/stdout. The daemon creates one reusable ASR backend for its
-lifetime. Its worker is lazy and long-lived because loading Qwen3-ASR-1.7B per
-file would make every transcript arrive minutes late. Streaming VAD has its own
-worker so an ASR request cannot hold microphone frames behind it. Both workers
-are closed during orderly daemon shutdown.
+lifetime. Its worker is lazy, reused during an active burst and retired after
+`asr.workerIdleTimeoutMs` because loading Qwen3-ASR-1.7B per file would make
+every transcript arrive minutes late while retaining it forever wastes unified
+memory. Streaming VAD has its own worker so an ASR request cannot hold microphone
+frames behind it. Both workers are closed during orderly daemon shutdown.
 
 The Python workers receive **no secrets**. ASR receives trusted local audio
 paths and streaming VAD receives PCM frames; neither receives Telegram or
 Keychain data.
 
-If the ASR worker dies, every in-flight request is rejected and the next call
-through the same backend respawns it. The cost is one transcription attempt,
-which the job queue retries; the daemon itself is unaffected.
+An intentional idle retirement is healthy and the next audio job starts a fresh
+worker. If the ASR worker dies unexpectedly, every in-flight request is rejected
+and the next call through the same backend respawns it. The cost is one
+transcription attempt, which the job queue retries; the daemon itself is
+unaffected.
 
 Why a separate process rather than bindings: MLX and ONNX Runtime are Python
 libraries. Embedding them would mean native modules, a build toolchain and a
