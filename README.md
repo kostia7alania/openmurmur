@@ -54,9 +54,9 @@ login/reboot and sleep/wake remain **unverified in the current release record**
 | Hardware | Apple Silicon (M-series). MLX requires Metal; Intel Macs are not supported. |
 | Memory | 64 GB recommended. A 27B LLM and 1.7B ASR model need substantial unified-memory headroom while processing; both release their model memory after bounded idle time. 16 GB is expected to struggle during processing. Bounded real-model rehearsals are recorded below; the complete microphone → models → Telegram release path remains unverified. |
 | macOS | 14 or newer. |
-| Node.js | 26.7.0 or newer (`.nvmrc` included). |
+| Node.js | 26.8.1 or newer (`.nvmrc` included). |
 | Python | 3.14, installed automatically by `uv`. |
-| FFmpeg | 8.x (`brew install ffmpeg`). |
+| FFmpeg | 9.x (`brew install ffmpeg`). |
 | Ollama | Optional but recommended, for summaries. |
 
 ### Disk and model sizes
@@ -514,9 +514,9 @@ Honesty matters more than a green badge, so:
 
 | Evidence level | Current authoritative evidence | Boundary it does **not** cross |
 | --- | --- | --- |
-| Offline automated | The exact current-revision Node and Python gate is recorded immediately below; every covered guarantee names deterministic repository tests. | No microphone, model weights, Telegram credential, Keychain mutation, launchd login session or sleep/wake cycle is exercised. |
-| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records dated same-machine MLX/Qwen, Silero, diarization and Ollama runs, including real-Qwen CLI transcription, daemon-owned worker reuse, a real worker-death `JobQueue` retry, real-model source-audio-first outbox eligibility, and the accepted frozen-digest RU/EN/TH summary corpus. | The repository-default Ollama tag, mixed/unknown-language quality and complete capture-to-delivery current-revision release remain unverified. |
-| Live release | No current-revision end-to-end live run is recorded yet; D120–D122 in [`docs/MVP_123.md`](docs/MVP_123.md) are the required gates. | Until those rows are evidenced, the project does not claim real microphone → models → Telegram, launchd login/reboot or sleep/wake verification. |
+| Offline automated | On 2026-09-01, typecheck, Biome and all 714/714 Node tests passed in a sequential resource-stable run, while Python passed Ruff lint/format, strict mypy and 39/39 pytest cases on Python 3.14.7. | No microphone, model weights, Telegram credential, Keychain mutation, launchd login session or sleep/wake cycle is exercised. |
+| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records the refreshed same-machine MLX, ONNX Runtime, sherpa-onnx and Ollama versions alongside the earlier real-model rehearsals and frozen-digest RU/EN/TH summary corpus. | The new `qwen3.8:27b` default is not accepted until its bounded canary passes; mixed/unknown-language quality and complete capture-to-delivery current-revision release remain unverified. |
+| Live release | On 2026-09-01 the installed launchd daemon on this Mac reached a fresh heartbeat, `recorderRunning=true`, 61 ms source-frame age and zero processing lag through the signed native supervisor. D120–D122 in [`docs/MVP_123.md`](docs/MVP_123.md) remain the complete release gates. | This proves same-login-session launchd microphone readiness only: no speech session, ASR, summary, Telegram delivery, logout/login, reboot or sleep/wake transition was exercised. |
 
 **Verified on this revision through offline TypeScript/Python checks and the
 stated live rehearsals:**

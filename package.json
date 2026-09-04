@@ -6,9 +6,9 @@
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
-    "node": ">=26.7.0"
+    "node": ">=26.8.1"
   },
-  "packageManager": "pnpm@10.19.0",
+  "packageManager": "pnpm@11.25.0",
   "bin": {
     "openmurmur": "./src/cli/main.ts"
   },
@@ -24,8 +24,8 @@
     "check": "pnpm run typecheck && pnpm run lint && pnpm run test"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.6",
-    "@types/node": "26.1.2",
+    "@biomejs/biome": "2.5.11",
+    "@types/node": "26.4.0",
     "typescript": "7.0.2"
   }
 }

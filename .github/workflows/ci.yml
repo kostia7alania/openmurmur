@@ -16,8 +16,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NODE_VERSION: '26.7.0'
-  PNPM_VERSION: '10.19.0'
+  NODE_VERSION: '26.8.1'
+  PNPM_VERSION: '11.25.0'
 
 jobs:
   typescript:
@@ -29,7 +29,7 @@ jobs:
         # 26.x is the project target (Current). 24.x is the latest Active LTS,
         # checked so a gratuitous incompatibility surfaces early — see
         # docs/adr/0001-node-26.md.
-        node: ['26.7.0', '24']
+        node: ['26.8.1', '24']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -69,7 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
 
@@ -220,7 +220,7 @@ jobs:
             console.log('All dependency versions are pinned exactly.');
           "
 
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Python lockfile is up to date with pyproject.toml
         working-directory: python/openmurmur_audio

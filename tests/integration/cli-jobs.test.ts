@@ -179,7 +179,7 @@ describe('failed-job CLI recovery', () => {
     const telegramAlert = renderDeadJobAlert(
       'test-mac.local',
       jobs.deadJobs(),
-      'qwen3.6:latest',
+      'qwen3.8:27b',
       TELEGRAM_RECOVERY_COMMAND_CONTEXT,
     );
     assert.ok(!telegramAlert.detail.includes(root), 'Telegram must not expose the state root');

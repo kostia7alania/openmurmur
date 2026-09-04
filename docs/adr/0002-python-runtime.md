@@ -13,10 +13,10 @@ sounds newest:
 
 | Package | Latest | Python wheels |
 | --- | --- | --- |
-| onnxruntime | 1.28.0 | cp311, cp312, cp313, **cp314** |
-| mlx | 0.32.0 | cp310–cp314, macOS arm64 |
+| onnxruntime | 1.29.0 | cp311, cp312, cp313, **cp314** |
+| mlx | 0.32.2 | cp310–cp314, macOS arm64 |
 | mlx-qwen3-asr | 0.3.5 | pure Python, requires ≥ 3.10 |
-| numpy | 2.5.1 | requires ≥ 3.12 |
+| numpy | 2.5.2 | requires ≥ 3.12 |
 
 Python 3.15.0b1 exists and `uv` will install it. onnxruntime publishes no cp315
 wheels.

@@ -14,7 +14,7 @@ type-aware linting, or use a linter that does not need the compiler API.
 
 ## Decision
 
-Use Biome 2.5.6 for both linting and formatting. Do **not** downgrade TypeScript
+Use Biome 2.5.11 for both linting and formatting. Do **not** downgrade TypeScript
 for the sake of a linter.
 
 ## Rationale

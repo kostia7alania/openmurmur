@@ -80,9 +80,9 @@ Capture and every audio conversion go through it.
 brew install ffmpeg
 ```
 
-## 4. Node 26.7.0
+## 4. Node 26.8.1
 
-OpenMurmur runs TypeScript directly, with no build step — that needs Node 26.7.0
+OpenMurmur runs TypeScript directly, with no build step — that needs Node 26.8.1
 or newer. Node 24 will not start it, and earlier Node 26 builds embed an older
 `node:sqlite` than the project target.
 
@@ -203,11 +203,11 @@ Read the output. It is the difference between "it should work" and "it does":
 
 ```
 ✅ platform           darwin/arm64
-✅ node               v26.7.0
+✅ node               v26.8.1
 ✅ sqlite             node:sqlite runtime 3.53.4 (target >= 3.53.4)
-✅ ffmpeg             ffmpeg version 8.1.2
+✅ ffmpeg             ffmpeg version 9.0.1
 ✅ audio_devices      [0] MacBook Pro Microphone
-✅ uv                 uv 0.11.14
+✅ uv                 uv 0.12.7
 ✅ mlx_readiness      configured model snapshot evidence present; 183 GB free on cache volume
 ✅ speech_detection   Silero VAD answered in 1291 ms
 ✅ ollama             qwen3.8:27b available at http://127.0.0.1:11434

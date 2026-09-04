@@ -239,7 +239,7 @@ function prepareLaunchctlHealthMocks(
     [
       '#!/bin/sh',
       `if [ "$1" = "--input-type=module" ] && [ "$3" = "${join(REPO, 'runtime-requirements.json')}" ]; then`,
-      `  printf '%s\\t26.7.0\\t3.53.4' "${node}"`,
+      `  printf '%s\\t26.8.1\\t3.53.4' "${node}"`,
       '  exit 0',
       'fi',
       `if [ "$1" = "${join(REPO, 'src', 'cli', 'main.ts')}" ]; then`,
@@ -315,7 +315,7 @@ describe('launch agent installation check', () => {
       const rejectedNode = join(home, 'incompatible-node');
       writeFileSync(
         rejectedNode,
-        '#!/bin/sh\nprintf "%s\\n" "Node 26.2.0 is below 26.7.0; node:sqlite 3.53.1 is below 3.53.4" >&2\nexit 1\n',
+        '#!/bin/sh\nprintf "%s\\n" "Node 26.2.0 is below 26.8.1; node:sqlite 3.53.1 is below 3.53.4" >&2\nexit 1\n',
         { mode: 0o700 },
       );
       chmodSync(rejectedNode, 0o700);
@@ -324,7 +324,7 @@ describe('launch agent installation check', () => {
 
       assert.equal(result.status, 1);
       assert.match(result.stderr, /Requested Node is incompatible/);
-      assert.match(result.stderr, /Node 26\.2\.0 is below 26\.7\.0/);
+      assert.match(result.stderr, /Node 26\.2\.0 is below 26\.8\.1/);
       assert.equal(
         existsSync(join(home, 'Library', 'LaunchAgents')),
         false,

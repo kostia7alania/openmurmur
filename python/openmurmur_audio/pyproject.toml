@@ -5,13 +5,13 @@ description = "Local MLX ASR and Silero VAD worker for OpenMurmur"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 # 3.14 is the newest interpreter with binary wheels across the whole stack;
-# onnxruntime 1.28 publishes cp311-cp314 and nothing for 3.15 yet. Compatibility
+# onnxruntime 1.29 publishes cp311-cp314 and nothing for 3.15 yet. Compatibility
 # beats version novelty here — see docs/adr/0002-python-runtime.md.
 requires-python = ">=3.14,<3.15"
 
 dependencies = [
-    "numpy>=2.5.1,<3",
-    "onnxruntime>=1.28.0,<2",
+    "numpy>=2.5.2,<3",
+    "onnxruntime>=1.29.0,<2",
     "soundfile>=0.14.0,<0.15",
 ]
 
@@ -25,7 +25,7 @@ dependencies = [
 # and `openmurmur doctor` reports the fake backends as a warning rather than
 # letting a user believe they are getting real transcripts.
 mlx = [
-    "mlx>=0.32.0,<0.33",
+    "mlx>=0.32.2,<0.33",
     "mlx-qwen3-asr>=0.3.5,<0.4",
     "silero-vad>=6.2.1,<7",
     # Speaker diarization. No torch, and its models are ungated, unlike
@@ -36,8 +36,8 @@ mlx = [
     # it: resolving the extra installed only the wrapper, and the native module
     # then failed to load its bundled libonnxruntime. It carries its own
     # onnxruntime and does not conflict with the `onnxruntime` pinned above.
-    "sherpa-onnx>=1.13.4,<2",
-    "sherpa-onnx-core>=1.13.4,<2",
+    "sherpa-onnx>=1.13.6,<2",
+    "sherpa-onnx-core>=1.13.6,<2",
 ]
 
 [project.scripts]
@@ -45,9 +45,9 @@ openmurmur-audio-worker = "openmurmur_audio.worker:main"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.4.0",
-    "ruff>=0.14.0",
-    "mypy>=1.18.0",
+    "pytest>=9.1.1",
+    "ruff>=0.16.5",
+    "mypy>=2.3.1",
 ]
 
 [build-system]

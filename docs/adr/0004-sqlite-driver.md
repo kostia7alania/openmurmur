@@ -1,4 +1,4 @@
-# ADR-0004: node:sqlite, pinned through Node 26.7.0
+# ADR-0004: node:sqlite, pinned through Node 26.8.1
 
 **Status:** Accepted · **Date:** 2026-07-29
 
@@ -19,8 +19,9 @@ $ node -e "const{DatabaseSync}=require('node:sqlite');
 3.53.3
 ```
 
-That gap was surfaced by `doctor` rather than hidden. Node 26.7.0 now bundles
-**3.53.4**, so the repository pins that runtime in `.nvmrc` and `package.json`.
+That gap was surfaced by `doctor` rather than hidden. Node 26.7.0 was the first
+verified release to bundle **3.53.4**; the repository now pins the current
+Node 26.8.1 runtime in `.nvmrc` and `package.json`.
 
 The brief is explicit that this must not be hidden.
 
@@ -29,9 +30,8 @@ The brief is explicit that this must not be hidden.
 Use `node:sqlite`, and verify the actual runtime rather than inferring it:
 
 1. `MINIMUM_SQLITE_VERSION = '3.53.4'` is declared in code.
-2. `.nvmrc` pins Node 26.7.0, the first verified local runtime here with
-   `node:sqlite` 3.53.4.
-3. `package.json` requires Node `>=26.7.0`.
+2. `.nvmrc` pins Node 26.8.1, whose bundled `node:sqlite` remains 3.53.4.
+3. `package.json` requires Node `>=26.8.1`.
 4. `openDatabase()` queries the **actual runtime version** and emits a warning
    if it is below target, naming both versions and explaining that Homebrew will
    not fix it.
@@ -57,7 +57,7 @@ is a supply-chain freshness concern, not a functional or security one **for this
 usage**.
 
 That made the temporary warning acceptable while no Node 26 release had 3.53.4.
-Now that Node 26.7.0 does, the gap is closed and the runtime is pinned.
+Now that the Node 26 line does, the gap is closed and the runtime is pinned.
 
 ## Consequences
 

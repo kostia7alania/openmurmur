@@ -163,7 +163,7 @@ function createFixtureRepository(
   writeFileSync(join(repository, 'src', 'cli', 'main.ts'), 'process.stdout.write("fixture");\n');
   writeFileSync(
     join(repository, 'runtime-requirements.json'),
-    `${JSON.stringify({ schemaVersion: 1, nodeMinimum: '26.7.0', sqliteMinimum: '3.53.4', pnpmExact: '10.19.0' }, null, 2)}\n`,
+    `${JSON.stringify({ schemaVersion: 1, nodeMinimum: '26.8.1', sqliteMinimum: '3.53.4', pnpmExact: '11.25.0' }, null, 2)}\n`,
   );
   writeFileSync(
     join(repository, 'scripts', 'install-capture-app'),
@@ -235,7 +235,7 @@ function createReleaseTools(home: string): void {
       '#!/bin/bash',
       'set -eu',
       `case "\${1:-}" in`,
-      '  --version) [ "$#" -eq 1 ]; printf \'%s\\n\' 10.19.0 ;;',
+      '  --version) [ "$#" -eq 1 ]; printf \'%s\\n\' 11.25.0 ;;',
       '  exec)',
       '    [ "$#" -eq 4 ] && [ "$2" = node ] && [ "$3" = -p ] && [ "$4" = process.execPath ]',
       `    printf '%s\\n' '${node}'`,
@@ -543,7 +543,7 @@ describe('release sign-off provenance', () => {
       assert.equal(marker.receipt.sha256, sha256(receiptRaw));
       assert.equal(marker.manifest.sha256, sha256(readFileSync(manifestPath, 'utf8')));
       assert.equal(receipt.releaseCommit, manifest.releaseCommit);
-      assert.equal(receipt.tools.pnpm.version, '10.19.0');
+      assert.equal(receipt.tools.pnpm.version, '11.25.0');
       assert.equal(receipt.tools.uv.version, 'uv 0.12.2 (fixture)');
       assert.deepEqual(
         receipt.gates.map((gate: { id: string; exitCode: number }) => [gate.id, gate.exitCode]),

@@ -18,7 +18,7 @@ durations are **milliseconds**.
 
 ### SQLite version
 
-The target minimum is **3.53.4**. Node 26.7.0 bundles **3.53.4**, and
+The target minimum is **3.53.4**. Node 26.8.1 bundles **3.53.4**, and
 `openDatabase` still queries the actual runtime so the value is reported rather
 than assumed. [ADR-0004](adr/0004-sqlite-driver.md) explains why the runtime is
 tied to Node.

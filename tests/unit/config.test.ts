@@ -300,9 +300,9 @@ describe('config parsing', () => {
 });
 
 describe('runtime requirements', () => {
-  it('enforces the exact Node 26.7.0 runtime floor', () => {
-    assert.equal(nodeVersionIsSupported('26.6.1'), false);
-    assert.equal(nodeVersionIsSupported('26.7.0'), true);
+  it('enforces the exact Node 26.8.1 runtime floor', () => {
+    assert.equal(nodeVersionIsSupported('26.8.0'), false);
+    assert.equal(nodeVersionIsSupported('26.8.1'), true);
     assert.equal(nodeVersionIsSupported('27.0.0'), true);
   });
 });

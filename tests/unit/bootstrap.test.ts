@@ -33,7 +33,7 @@ function writePnpm(path: string, version: string): void {
   ]);
 }
 
-function runBootstrap(initialPnpmVersion?: string, nodeVersion = '26.7.0') {
+function runBootstrap(initialPnpmVersion?: string, nodeVersion = '26.8.1') {
   const home = mkdtempSync(join(tmpdir(), 'om-bootstrap-'));
   const bin = join(home, 'bin');
   const log = join(home, 'commands.log');
@@ -57,16 +57,16 @@ function runBootstrap(initialPnpmVersion?: string, nodeVersion = '26.7.0') {
     '#!/bin/sh',
     `if [ "$1" = "-v" ]; then printf 'v%s\\n' '${nodeVersion}'; exit 0; fi`,
     'if [ "$1" = "--input-type=module" ]; then',
-    `  if [ '${nodeVersion}' = '26.7.0' ]; then`,
-    "    printf '26.7.0\\t3.53.4\\t10.19.0'",
+    `  if [ '${nodeVersion}' = '26.8.1' ]; then`,
+    "    printf '26.8.1\\t3.53.4\\t11.25.0'",
     '    exit 0',
     '  fi',
-    `  printf 'Node %s is below 26.7.0' '${nodeVersion}' >&2`,
+    `  printf 'Node %s is below 26.8.1' '${nodeVersion}' >&2`,
     '  exit 1',
     'fi',
     'exit 0',
   ]);
-  writePnpm(installedPnpm, '10.19.0');
+  writePnpm(installedPnpm, '11.25.0');
   writeExecutable(join(bin, 'npm'), [
     '#!/bin/sh',
     'printf \'npm %s\\n\' "$*" >> "$BOOTSTRAP_LOG"',
@@ -108,8 +108,8 @@ describe('bootstrap package-manager provisioning', () => {
     const run = runBootstrap();
     try {
       assert.equal(run.result.status, 0, `${run.result.stdout}\n${run.result.stderr}`);
-      assert.match(run.log, /^npm install --global pnpm@10\.19\.0$/m);
-      assert.match(run.result.stdout, /pnpm 10\.19\.0/);
+      assert.match(run.log, /^npm install --global pnpm@11\.25\.0$/m);
+      assert.match(run.result.stdout, /pnpm 11\.25\.0/);
       assert.doesNotMatch(`${run.result.stdout}\n${run.result.stderr}`, /corepack/i);
     } finally {
       run.cleanup();
@@ -121,30 +121,30 @@ describe('bootstrap package-manager provisioning', () => {
     try {
       assert.equal(run.result.status, 0, `${run.result.stdout}\n${run.result.stderr}`);
       assert.match(run.result.stdout, /pnpm 9\.15\.0 found/);
-      assert.match(run.log, /^npm install --global pnpm@10\.19\.0$/m);
-      assert.match(run.result.stdout, /pnpm 10\.19\.0/);
+      assert.match(run.log, /^npm install --global pnpm@11\.25\.0$/m);
+      assert.match(run.result.stdout, /pnpm 11\.25\.0/);
     } finally {
       run.cleanup();
     }
   });
 
   it('does not reinstall an already-correct pnpm', () => {
-    const run = runBootstrap('10.19.0');
+    const run = runBootstrap('11.25.0');
     try {
       assert.equal(run.result.status, 0, `${run.result.stdout}\n${run.result.stderr}`);
       assert.doesNotMatch(run.log, /^npm /m);
       assert.match(run.log, /^pnpm install --frozen-lockfile$/m);
-      assert.match(run.result.stdout, /pnpm 10\.19\.0/);
+      assert.match(run.result.stdout, /pnpm 11\.25\.0/);
     } finally {
       run.cleanup();
     }
   });
 
   it('rejects pnpm before use when the active Node runtime is incompatible', () => {
-    const run = runBootstrap('10.19.0', '26.2.0');
+    const run = runBootstrap('11.25.0', '26.2.0');
     try {
       assert.equal(run.result.status, 1, `${run.result.stdout}\n${run.result.stderr}`);
-      assert.match(run.result.stderr, /Node 26\.2\.0 is below 26\.7\.0/);
+      assert.match(run.result.stderr, /Node 26\.2\.0 is below 26\.8\.1/);
       assert.doesNotMatch(run.log, /^(npm|pnpm) /m);
     } finally {
       run.cleanup();

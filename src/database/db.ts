@@ -9,7 +9,7 @@ export { MINIMUM_SQLITE_VERSION } from '../config/runtime-requirements.ts';
 /**
  * Minimum SQLite runtime we are willing to run against.
  *
- * Node 26.7.0 bundles 3.53.4, matching this target. We still query the actual
+ * Node 26.8.1 bundles 3.53.4, matching this target. We still query the actual
  * runtime because `node:sqlite` is compiled into Node; a Homebrew sqlite3
  * upgrade does not change it. See docs/adr/0004-sqlite-driver.md.
  */
