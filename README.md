@@ -64,7 +64,7 @@ login/reboot and sleep/wake remain **unverified in the current release record**
 | Item | Approx. size |
 | --- | --- |
 | Qwen3-ASR-1.7B (8-bit MLX) | ~4.4 GiB verified cache footprint; keep at least 6 GB free |
-| `qwen3.8:27b` | ~18 GB |
+| `qwen3.8:27b` | ~17 GB |
 | Silero VAD (ONNX) | ~2 MB |
 | Session audio | ~19 MB per hour of recording (16 kHz mono FLAC) |
 
@@ -515,7 +515,7 @@ Honesty matters more than a green badge, so:
 | Evidence level | Current authoritative evidence | Boundary it does **not** cross |
 | --- | --- | --- |
 | Offline automated | On 2026-09-01, typecheck, Biome and all 714/714 Node tests passed in a sequential resource-stable run, while Python passed Ruff lint/format, strict mypy and 39/39 pytest cases on Python 3.14.7. | No microphone, model weights, Telegram credential, Keychain mutation, launchd login session or sleep/wake cycle is exercised. |
-| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records the refreshed same-machine MLX, ONNX Runtime, sherpa-onnx and Ollama versions alongside the earlier real-model rehearsals and frozen-digest RU/EN/TH summary corpus. | The new `qwen3.8:27b` default is not accepted until its bounded canary passes; mixed/unknown-language quality and complete capture-to-delivery current-revision release remain unverified. |
+| Dependency smoke | [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md) records the refreshed same-machine MLX, ONNX Runtime, sherpa-onnx and Ollama versions alongside the earlier real-model rehearsals and frozen-digest RU/EN/TH summary corpus. | The `qwen3.8:27b` canary ran but did not meet the frozen acceptance threshold; mixed/unknown-language quality and complete capture-to-delivery current-revision release remain unverified. |
 | Live release | On 2026-09-01 the installed launchd daemon on this Mac reached a fresh heartbeat, `recorderRunning=true`, 61 ms source-frame age and zero processing lag through the signed native supervisor. D120–D122 in [`docs/MVP_123.md`](docs/MVP_123.md) remain the complete release gates. | This proves same-login-session launchd microphone readiness only: no speech session, ASR, summary, Telegram delivery, logout/login, reboot or sleep/wake transition was exercised. |
 
 **Verified on this revision through offline TypeScript/Python checks and the
