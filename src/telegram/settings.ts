@@ -8,6 +8,7 @@ import type { TelegramBotCommand, TelegramInlineKeyboardMarkup } from './client.
 import { escapeHtml } from './format.ts';
 
 const CALLBACK_PREFIX = 'asr-mode:v1:';
+const RETRY_CALLBACK_PREFIX = 'asr-retry:v1:';
 
 export const OPENMURMUR_BOT_COMMANDS: readonly TelegramBotCommand[] = [
   { command: 'status', description: 'Состояние демона и имя Mac' },
@@ -35,6 +36,51 @@ export function parseAsrModeCallback(
   return ASR_LANGUAGE_CHOICES.includes(value as AsrLanguageCode)
     ? { language: value as AsrLanguageCode, origin }
     : undefined;
+}
+
+export function parseAsrRetryCallback(
+  data: string | undefined,
+): { readonly language: AsrLanguageCode | null; readonly fileUid: string } | undefined {
+  if (data === undefined || !data.startsWith(RETRY_CALLBACK_PREFIX)) return undefined;
+  const [value, fileUid, extra] = data.slice(RETRY_CALLBACK_PREFIX.length).split(':');
+  if (fileUid === undefined || extra !== undefined || !isUuid(fileUid)) return undefined;
+  if (value === 'auto') return { language: null, fileUid };
+  return ASR_LANGUAGE_CHOICES.includes(value as AsrLanguageCode)
+    ? { language: value as AsrLanguageCode, fileUid }
+    : undefined;
+}
+
+export function asrRetryKeyboard(
+  fileUid: string,
+  currentLanguage: string | null,
+): TelegramInlineKeyboardMarkup {
+  const currentCode = asrLanguageCode(currentLanguage);
+  const selected = (value: string | null, label: string) =>
+    `${currentCode === asrLanguageCode(value) ? '↻' : '○'} ${label}`;
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: selected(null, 'Auto / смешанная'),
+          callback_data: `${RETRY_CALLBACK_PREFIX}auto:${fileUid}`,
+        },
+      ],
+      [
+        {
+          text: selected('Russian', 'RU'),
+          callback_data: `${RETRY_CALLBACK_PREFIX}ru:${fileUid}`,
+        },
+        {
+          text: selected('English', 'EN'),
+          callback_data: `${RETRY_CALLBACK_PREFIX}en:${fileUid}`,
+        },
+        {
+          text: selected('Thai', 'TH'),
+          callback_data: `${RETRY_CALLBACK_PREFIX}th:${fileUid}`,
+        },
+      ],
+    ],
+  };
 }
 
 export function asrSettingsKeyboard(
@@ -84,4 +130,8 @@ export function renderAsrSettings(hostName: string, currentLanguage: string | nu
     'Авто рекомендуется для смешанной речи. Фиксированный язык повышает точность, когда вся запись действительно на нём.',
     'Изменение применяется только к следующим расшифровкам на этом компьютере.',
   ].join('\n');
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }

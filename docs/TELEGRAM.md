@@ -403,8 +403,11 @@ The `@botname` suffix Telegram adds in groups is stripped.
 
 `/settings` is a radio choice, not a language allowlist. Qwen accepts either
 automatic identification or one forced language for one audio input. The
-choice is snapshotted into new jobs on this Mac. Transcript buttons change the
-same future default; they do not rewrite the transcript above them.
+choice is snapshotted into new ambient/session jobs on this Mac. Ordinary
+incoming Telegram voice/audio is Auto-first so mixed speech does not wait for
+a preflight question. Incoming transcript buttons are per-file retries: pressing
+Auto/RU/EN/TH enqueues a new local pass for that downloaded file and sends the
+retry result as a separate transcript message.
 
 Only the daemon with `telegram.receiveUpdates: true` can receive callback
 queries, so send-only development instances do not attach dead buttons to
@@ -458,8 +461,9 @@ supported extension or an `audio/*` MIME type. Formats: `.ogg` `.opus` `.mp3`
 10. Normalize to 16 kHz mono WAV through a private temporary file, then fsync
     and atomically rename it. A crash cannot leave a partial deterministic WAV
     that poisons every retry.
-11. Transcribe with the local ASR.
-12. Send the transcript (with a `.md` attachment when long).
+11. Transcribe with the local ASR in Auto mode by default.
+12. Send the transcript (with a `.md` attachment when long) and a per-file
+    retry keyboard for Auto/RU/EN/TH.
 13. Delete after the retention window.
 
 Safe validation failures produce stable Russian messages with the configured

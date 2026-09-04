@@ -95,9 +95,11 @@ import {
   writeOffsetAfterHandledUpdates,
 } from '../telegram/router.ts';
 import {
+  asrRetryKeyboard,
   asrSettingsKeyboard,
   OPENMURMUR_BOT_COMMANDS,
   parseAsrModeCallback,
+  parseAsrRetryCallback,
   renderAsrSettings,
 } from '../telegram/settings.ts';
 import { createAsrBackend, createLlmBackend, createVadBackend } from './backends.ts';
@@ -809,7 +811,7 @@ export class Daemon {
             action.message,
             hostname(),
             botScope,
-            this.#asrLanguage,
+            null,
           );
           continue;
         case 'text':
@@ -917,6 +919,12 @@ export class Daemon {
     updateId: number,
     botScope: string,
   ): Promise<void> {
+    const retry = parseAsrRetryCallback(query.data);
+    if (retry !== undefined) {
+      await this.#handleIncomingRetryCallback(query, updateId, botScope, retry);
+      return;
+    }
+
     const selected = parseAsrModeCallback(query.data);
     const message = query.message;
     if (selected === undefined || message === undefined) {
@@ -978,7 +986,69 @@ export class Daemon {
     }
   }
 
+  async #handleIncomingRetryCallback(
+    query: TelegramCallbackQuery,
+    updateId: number,
+    botScope: string,
+    retry: {
+      readonly language: Parameters<typeof modelLanguageName>[0] | null;
+      readonly fileUid: string;
+    },
+  ): Promise<void> {
+    const completed = completeTelegramUpdate(
+      this.#db.handle,
+      updateId,
+      'callback',
+      botScope,
+      () => {
+        const incoming = new IncomingFileRepository(this.#db.handle).get(retry.fileUid);
+        if (incoming === undefined) return;
+        const forcedLanguage = retry.language === null ? null : modelLanguageName(retry.language);
+        this.#jobs.enqueue({
+          kind: 'incoming_audio',
+          idempotencyKey: scopedUpdateKey(
+            `incoming-retry:${retry.fileUid}:${retry.language ?? 'auto'}`,
+            botScope,
+            updateId,
+          ),
+          payload: {
+            botScope,
+            fileUid: retry.fileUid,
+            forcedLanguage,
+            retryOnly: true,
+          },
+        });
+        this.#enqueueText(
+          `🔁 Перераспознаю: ${recognitionRetryLabel(forcedLanguage)}.`,
+          scopedUpdateKey('incoming-retry-ack', botScope, updateId),
+        );
+      },
+    );
+    if (!completed) return;
+
+    try {
+      await this.#client?.answerCallbackQuery(query.id, 'Перераспознаю');
+    } catch (error) {
+      this.#options.logger.warn('could not acknowledge an incoming ASR retry callback', {
+        error: (error as Error).message,
+      });
+    }
+  }
+
   async #handleIncomingJob(job: ClaimedJob): Promise<void> {
+    if (job.payload['retryOnly'] === true) {
+      const fileUid = job.payload['fileUid'];
+      if (typeof fileUid !== 'string') throw new Error('incoming retry has no valid file UID');
+      const incoming = new IncomingFileRepository(this.#db.handle).get(fileUid);
+      if (incoming === undefined) throw new Error('incoming retry has no stored file');
+      await this.#handleIncomingRetryJob(job, incoming);
+      return;
+    }
+
+    await this.#handleIncomingAudioJob(job);
+  }
+
+  async #handleIncomingAudioJob(job: ClaimedJob): Promise<void> {
     const client = this.#client;
     if (client === null) throw new Error('Telegram is not configured');
     const { config, paths } = this.#options.loaded;
@@ -1168,14 +1238,50 @@ export class Daemon {
     }
   }
 
+  async #handleIncomingRetryJob(job: ClaimedJob, incoming: IncomingFileRow): Promise<void> {
+    const { config } = this.#options.loaded;
+    const wavPath = incoming.normalizedPath;
+    if (wavPath === null || !(await pathExists(wavPath))) {
+      throw new Error(`incoming audio ${incoming.fileUid} has no normalized audio for retry`);
+    }
+    const forcedLanguage = forcedLanguageFromPayload(job.payload, null);
+    const result = await this.#asr.transcribe({
+      audioPath: wavPath,
+      requestId: `${incoming.fileUid}:${job.leaseToken}`,
+      ...(forcedLanguage === null ? {} : { languageHints: [forcedLanguage] }),
+      ...(config.asr.context.length > 0 ? { context: config.asr.context } : {}),
+    });
+    const reconciledLanguages = reconcileLanguages(result.languages, result.text).languages;
+    transaction(this.#db.handle, () => {
+      this.#jobs.assertLease(job);
+      this.#enqueueIncomingTranscript(
+        incoming,
+        result.text,
+        result.segments,
+        reconciledLanguages,
+        forcedLanguage,
+        {
+          deliveryPrefix: `incoming-retry:${incoming.fileUid}:${job.jobId}`,
+          replyMarkup: asrRetryKeyboard(incoming.fileUid, forcedLanguage),
+        },
+      );
+    });
+  }
+
   #enqueueIncomingTranscript(
     incoming: IncomingFileRow,
     text: string,
     segments: readonly AsrSegment[],
     languages: readonly string[],
     forcedLanguage: string | null,
+    options: {
+      readonly deliveryPrefix?: string;
+      readonly replyMarkup?: TelegramInlineKeyboardMarkup;
+    } = {},
   ): void {
     const fileUid = incoming.fileUid;
+    const deliveryPrefix = options.deliveryPrefix ?? `incoming:${fileUid}`;
+    const replyMarkup = options.replyMarkup ?? asrRetryKeyboard(fileUid, forcedLanguage);
     for (const chunk of renderTimedTranscriptMessages(
       fileUid,
       segments,
@@ -1185,7 +1291,7 @@ export class Daemon {
       { languages, forcedLanguage, showSettingsHint: true },
     )) {
       this.#outbox.enqueue({
-        deliveryPartId: `incoming:${fileUid}:${chunk.partNumber}`,
+        deliveryPartId: `${deliveryPrefix}:${chunk.partNumber}`,
         kind: 'incoming_transcript',
         ordinal: 10,
         payload: {
@@ -1194,7 +1300,7 @@ export class Daemon {
           parseMode: 'HTML',
           ...(chunk.partNumber === chunk.partCount
             ? {
-                replyMarkup: asrSettingsKeyboard(this.#asrLanguage, 'transcript'),
+                replyMarkup,
               }
             : {}),
         },
@@ -2153,6 +2259,25 @@ function forcedLanguageFromPayload(
   const value = payload['forcedLanguage'];
   if (value === null || typeof value === 'string') return value;
   throw new Error('incoming audio payload has an invalid forcedLanguage');
+}
+
+function recognitionRetryLabel(language: string | null): string {
+  return language === null ? 'Auto / смешанная речь' : modelLanguageNameLabel(language);
+}
+
+function modelLanguageNameLabel(language: string): string {
+  switch (language) {
+    case 'Russian':
+      return 'русский';
+    case 'English':
+      return 'английский';
+    case 'Thai':
+      return 'тайский';
+    case 'Chinese':
+      return 'китайский';
+    default:
+      return language;
+  }
 }
 
 function markIncomingTranscribed(db: Database['handle'], fileUid: string): void {
