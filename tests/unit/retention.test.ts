@@ -748,7 +748,7 @@ describe('alert deduplication', () => {
     assert.match(clear.text, /🟢 Запись восстановлена/);
     assert.match(
       renderAlert('dead_jobs', 'raised', 'Причина: model missing', 12345).text,
-      /остановилась после повторных ошибок/,
+      /не выполнилась после нескольких попыток/,
     );
     assert.match(
       renderAlert('llm_unavailable', 'raised', 'Причина: not reachable', 12345).text,

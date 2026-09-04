@@ -58,6 +58,14 @@ function humanTechnicalJobError(error: string | null): string {
   return compact.replace(/\s+Install with:\s+pip install\b.*$/i, '').trim();
 }
 
+function publicAndTechnicalReason(error: string | null): readonly string[] {
+  const technical = humanTechnicalJobError(error);
+  const publicReason = publicJobFailureReason(error);
+  return technical === publicReason
+    ? [`Причина: ${publicReason}`]
+    : [`Причина: ${publicReason}`, `Технически: ${technical}`];
+}
+
 export function failureCategory(error: string | null): FailureCategory {
   if (error === null) return 'internal';
   if (/model_load_failed|could not start the local audio worker|mlx|no module named/i.test(error)) {
@@ -78,14 +86,14 @@ export function failureCategory(error: string | null): FailureCategory {
 
 export function publicJobFailureReason(error: string | null): string {
   const reasons: Record<FailureCategory, string> = {
-    asr_dependency: 'Локальный ASR/MLX worker или его модель не готовы.',
+    asr_dependency: 'Локальная модель распознавания или MLX не готовы.',
     llm_dependency: 'Ollama или настроенная LLM-модель не готовы.',
     telegram_auth: 'Telegram отклонил учётные данные бота.',
     telegram_transport: 'Не удалось связаться с Telegram.',
     source_missing: 'Исходный аудиофайл отсутствует или недоступен.',
-    timeout: 'Локальная операция превысила допустимое время.',
+    timeout: 'Локальная операция заняла слишком много времени.',
     disk: 'Недостаточно места или произошла ошибка локального хранилища.',
-    internal: 'Неизвестная внутренняя ошибка; технические детали доступны только локально.',
+    internal: 'Не удалось определить причину; технические детали остались на этом Mac.',
   };
   return reasons[failureCategory(error)];
 }
@@ -99,15 +107,13 @@ export function renderDeadJobAlert(
 ): DeadJobAlert {
   if (jobs.length === 0) return { active: false, fingerprint: '', detail: '' };
 
-  const lines = [`Демон: ${hostName}`, `Задач с исчерпанными попытками: ${jobs.length}`, ''];
+  const lines = [`Mac: ${hostName}`, `Задач с исчерпанными попытками: ${jobs.length}`, ''];
   for (const [index, job] of jobs.slice(0, ALERT_JOB_LIMIT).entries()) {
     lines.push(
       `${index + 1}. ${job.kind} — ${job.jobId}`,
-      `Причина: ${
-        options.technicalDetails
-          ? humanTechnicalJobError(job.lastError)
-          : publicJobFailureReason(job.lastError)
-      }`,
+      ...(options.technicalDetails
+        ? publicAndTechnicalReason(job.lastError)
+        : [`Причина: ${publicJobFailureReason(job.lastError)}`]),
     );
   }
   if (jobs.length > ALERT_JOB_LIMIT) lines.push(`Ещё задач: ${jobs.length - ALERT_JOB_LIMIT}`);
@@ -169,8 +175,9 @@ export function renderAsrUnavailableDetail(
   commandContext: RecoveryCommandContext,
 ): string {
   return [
-    `Демон: ${hostName}`,
+    `Mac: ${hostName}`,
     `Причина: ${publicJobFailureReason(reason)}`,
+    `Технически: ${compactJobError(reason)}`,
     '',
     'Что сделать на этом Mac:',
     ...(commandContext.instruction === undefined ? [] : [commandContext.instruction]),
@@ -186,8 +193,9 @@ export function renderLlmUnavailableDetail(
   commandContext: RecoveryCommandContext,
 ): string {
   return [
-    `Демон: ${hostName}`,
+    `Mac: ${hostName}`,
     `Причина: ${publicJobFailureReason(reason)}`,
+    `Технически: ${compactJobError(reason)}`,
     'Аудио и расшифровки продолжают работать; недоступен только структурный отчёт.',
     '',
     'Что сделать на этом Mac:',

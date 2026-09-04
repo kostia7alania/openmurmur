@@ -591,6 +591,7 @@ export class Daemon {
         this.#outbox,
         failed,
         this.#announcedRecording,
+        this.#recorderFailure,
       );
     } catch (error) {
       this.#options.logger.warn('could not persist the capture availability edge', {
@@ -1339,6 +1340,7 @@ export class Daemon {
         deadJobs,
         config.llm.model,
         TELEGRAM_RECOVERY_COMMAND_CONTEXT,
+        { technicalDetails: true },
       ),
       outboxAgeMinutes: this.#outbox.oldestPendingAgeMinutes(),
       deadOutbox: this.#outbox.deadCount(),
@@ -1811,8 +1813,12 @@ export function recordCaptureAvailabilityAlert(
   outbox: Outbox,
   failed: boolean,
   recordingWasAnnounced: boolean,
-  now = Date.now(),
+  technicalDetailOrNow: string | null | number = null,
+  explicitNow?: number,
 ) {
+  const technicalDetail = typeof technicalDetailOrNow === 'number' ? null : technicalDetailOrNow;
+  const now =
+    typeof technicalDetailOrNow === 'number' ? technicalDetailOrNow : (explicitNow ?? Date.now());
   return alerts.evaluate(
     'capture_failed',
     failed,
@@ -1824,6 +1830,7 @@ export function recordCaptureAvailabilityAlert(
         : renderCaptureFailure(
             recordingWasAnnounced,
             openMurmurRecoveryCommand(TELEGRAM_RECOVERY_COMMAND_CONTEXT, 'doctor'),
+            technicalDetail ?? undefined,
           );
       outbox.enqueue({
         deliveryPartId: `alert:capture_failed:${cleared ? 'clear' : 'raise'}:${now}`,

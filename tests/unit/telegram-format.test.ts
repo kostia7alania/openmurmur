@@ -44,9 +44,17 @@ describe('capture failure copy', () => {
       '🔴 Запись не запустилась\n\n' +
         'Не удалось получать аудио с микрофона.\n' +
         'Проверьте доступ к микрофону и запустите `pnpm openmurmur doctor` в корне репозитория.\n' +
-        'Технические подробности сохранены в локальном журнале.',
+        'Технически: причина не записана',
     );
     assert.match(renderCaptureFailure(true), /^🔴 Запись остановлена$/m);
+    assert.match(
+      renderCaptureFailure(
+        true,
+        'pnpm openmurmur doctor',
+        'ffmpeg failed for token 123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      ),
+      /Технически: ffmpeg failed for token \[REDACTED\]/,
+    );
     const customRoot = renderCaptureFailure(
       true,
       `pnpm openmurmur --root "\${OPENMURMUR_STATE_ROOT:?set exact daemon state root locally}" doctor`,

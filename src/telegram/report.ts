@@ -1,6 +1,7 @@
 import { languageListLabel } from '../asr/preferences.ts';
 import { renderClaimSourceLabel, resolveClaimSource } from '../llm/claim-source.ts';
 import type { StructuredSummary, SummaryClaimField } from '../llm/schema.ts';
+import { redact } from '../logging/redact.ts';
 import {
   escapeHtml,
   formatClock,
@@ -356,15 +357,29 @@ export function renderStatus(input: StatusReportInput): string {
 export function renderCaptureFailure(
   recordingWasAnnounced: boolean,
   doctorCommand = 'pnpm openmurmur doctor',
+  technicalDetail?: string | undefined,
 ): string {
   const heading = recordingWasAnnounced ? '🔴 Запись остановлена' : '🔴 Запись не запустилась';
+  const technical = compactTechnicalDetail(technicalDetail);
   return [
     heading,
     '',
     'Не удалось получать аудио с микрофона.',
     `Проверьте доступ к микрофону и запустите \`${doctorCommand}\` в корне репозитория.`,
-    'Технические подробности сохранены в локальном журнале.',
+    technical === null ? 'Технически: причина не записана' : `Технически: ${technical}`,
   ].join('\n');
+}
+
+function compactTechnicalDetail(detail: string | undefined): string | null {
+  if (detail === undefined || detail.trim().length === 0) return null;
+  const printable = [...redact(detail)]
+    .map((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 31 || codePoint === 127 ? ' ' : character;
+    })
+    .join('');
+  const compact = printable.replace(/\s+/g, ' ').trim();
+  return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
 }
 
 export const HELP_TEXT = [

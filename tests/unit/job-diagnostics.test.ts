@@ -37,9 +37,9 @@ describe('failed job diagnostics', () => {
     );
 
     assert.equal(alert.active, true);
-    assert.match(alert.detail, /Демон: prod-mac\.local/);
+    assert.match(alert.detail, /Mac: prod-mac\.local/);
     assert.match(alert.detail, /asr — job-1/);
-    assert.match(alert.detail, /Локальный ASR\/MLX worker/);
+    assert.match(alert.detail, /Локальная модель распознавания или MLX/);
     assert.match(alert.detail, /uv sync --project python\/openmurmur_audio --extra mlx/);
     assert.match(alert.detail, /pnpm openmurmur --root '\/tmp\/openmurmur' jobs retry job-1/);
   });
@@ -104,20 +104,20 @@ describe('failed job diagnostics', () => {
   it('classifies stable public causes without exposing volatile error text', () => {
     assert.equal(failureCategory('model_load_failed: mlx missing at /Users/a'), 'asr_dependency');
     assert.equal(failureCategory('Ollama is not reachable'), 'llm_dependency');
-    assert.match(publicJobFailureReason('operation timed out after 5s'), /превысила/);
+    assert.match(publicJobFailureReason('operation timed out after 5s'), /слишком много времени/);
   });
 
   it('gives local repair steps for unavailable ASR and Ollama dependencies', () => {
-    assert.match(
-      renderAsrUnavailableDetail('prod.local', 'worker exited', LOCAL_COMMAND_CONTEXT),
-      /uv sync --project python\/openmurmur_audio --extra mlx/,
-    );
+    const asr = renderAsrUnavailableDetail('prod.local', 'worker exited', LOCAL_COMMAND_CONTEXT);
+    assert.match(asr, /uv sync --project python\/openmurmur_audio --extra mlx/);
+    assert.match(asr, /Технически: worker exited/);
     const llm = renderLlmUnavailableDetail(
       'prod.local',
       'not reachable',
       'qwen3.6:27b',
       LOCAL_COMMAND_CONTEXT,
     );
+    assert.match(llm, /Технически: not reachable/);
     assert.match(llm, /Аудио и расшифровки продолжают работать/);
     assert.match(llm, /brew services start ollama/);
     assert.match(llm, /ollama pull qwen3\.6:27b/);

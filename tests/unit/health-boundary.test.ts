@@ -146,8 +146,8 @@ const ALERT_GOLDENS: Readonly<
     cleared: '🟢 Запись восстановлена после ошибки захвата',
   },
   worker_crashed: {
-    raised: '🟡 Локальное распознавание остановилось',
-    cleared: '🟢 Локальное распознавание восстановлено',
+    raised: '🟡 Распознавание на Mac остановилось',
+    cleared: '🟢 Распознавание на Mac восстановлено',
   },
   llm_unavailable: {
     raised: '🟡 Структурный отчёт временно недоступен',
@@ -162,7 +162,7 @@ const ALERT_GOLDENS: Readonly<
     cleared: '🟢 Очередь распознавания разобрана',
   },
   dead_jobs: {
-    raised: '🔴 Задача OpenMurmur остановилась после повторных ошибок',
+    raised: '🔴 Задача OpenMurmur не выполнилась после нескольких попыток',
     cleared: '🟢 Ошибочных задач больше нет',
   },
   telegram_delivery: {
