@@ -49,11 +49,7 @@ describe('capture failure copy', () => {
     );
     assert.match(renderCaptureFailure(true), /^🔴 Запись остановлена$/m);
     assert.match(
-      renderCaptureFailure(
-        true,
-        'pnpm openmurmur doctor',
-        `ffmpeg failed for token ${token}`,
-      ),
+      renderCaptureFailure(true, 'pnpm openmurmur doctor', `ffmpeg failed for token ${token}`),
       /Технически: ffmpeg failed for token \[REDACTED\]/,
     );
     const customRoot = renderCaptureFailure(
