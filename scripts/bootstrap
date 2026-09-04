@@ -182,7 +182,7 @@ cat <<'MLX_STEPS'
 MLX_STEPS
 echo
 warn "Ollama is optional. Without it you get audio and transcripts, but no summaries:"
-echo "    brew install ollama && brew services start ollama && ollama pull qwen3.6:27b"
+echo "    brew install ollama && brew services start ollama && ollama pull qwen3.8:27b"
 echo
 
 bold "Next steps"

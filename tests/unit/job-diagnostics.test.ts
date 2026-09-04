@@ -32,7 +32,7 @@ describe('failed job diagnostics', () => {
     const alert = renderDeadJobAlert(
       'prod-mac.local',
       [deadJob()],
-      'qwen3.6:27b',
+      'qwen3.8:27b',
       LOCAL_COMMAND_CONTEXT,
     );
 
@@ -48,10 +48,10 @@ describe('failed job diagnostics', () => {
     const alert = renderDeadJobAlert(
       'prod-mac.local',
       [deadJob({ kind: 'summarize', lastError: 'Ollama is not reachable' })],
-      'qwen3.6:27b',
+      'qwen3.8:27b',
       LOCAL_COMMAND_CONTEXT,
     );
-    assert.match(alert.detail, /ollama pull qwen3\.6:27b/);
+    assert.match(alert.detail, /ollama pull qwen3\.8:27b/);
   });
 
   it('turns the optional-tokenizer failure into exact forced-language recovery commands', () => {
@@ -65,7 +65,7 @@ describe('failed job diagnostics', () => {
           lastError,
         }),
       ],
-      'qwen3.6:27b',
+      'qwen3.8:27b',
       LOCAL_COMMAND_CONTEXT,
       { technicalDetails: true },
     );
@@ -114,13 +114,13 @@ describe('failed job diagnostics', () => {
     const llm = renderLlmUnavailableDetail(
       'prod.local',
       'not reachable',
-      'qwen3.6:27b',
+      'qwen3.8:27b',
       LOCAL_COMMAND_CONTEXT,
     );
     assert.match(llm, /Технически: not reachable/);
     assert.match(llm, /Аудио и расшифровки продолжают работать/);
     assert.match(llm, /brew services start ollama/);
-    assert.match(llm, /ollama pull qwen3\.6:27b/);
+    assert.match(llm, /ollama pull qwen3\.8:27b/);
   });
 
   it('fingerprints the whole set independent of query order', () => {

@@ -361,7 +361,7 @@ export class OllamaLlm implements LlmBackend {
       if (!response.ok) return { ok: false, reason: `Ollama returned HTTP ${response.status}` };
       const body = (await response.json()) as { models?: { name?: string }[] };
       const names = (body.models ?? []).map((m) => m.name ?? '');
-      // Ollama reports "qwen3.6:27b"; a bare "qwen3.6" in config should match.
+      // Ollama reports "qwen3.8:27b"; a bare "qwen3.8" in config should match.
       const found = names.some(
         (n) => n === this.#config.model || n.startsWith(`${this.#config.model}:`),
       );

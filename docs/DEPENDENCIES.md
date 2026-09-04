@@ -372,7 +372,7 @@ non-thinking three-case run. Because bounded thinking added roughly 9× latency
 without improving the frozen gate, the production `think=false` default was not
 changed. This is not a byte-identical A/B comparison: the older disposable
 runner did not preserve its exact segment and duration inputs, and the tested
-`qwen3.6:latest` tag is not the repository's `qwen3.6:27b` default.
+`qwen3.6:latest` tag was not the repository's then-current `qwen3.6:27b` default.
 
 The repository default model tag, mixed-language summaries and unknown language
 labels were not live-quality-tested by this corpus.
@@ -440,7 +440,7 @@ licence and a Hugging Face token — see [ADR-0008](adr/0008-speaker-diarization
 
 | Service | Version | Verified | Notes |
 | --- | --- | --- | --- |
-| Ollama | frozen `qwen3.6:latest` (36B, Q4_K_M; digest above) | ✅ bounded single-language RU/EN/TH corpus met its frozen acceptance gate | Optional. Its absence degrades the report; it never blocks delivery. The repository default model tag and mixed/unknown-language quality remain unverified. |
+| Ollama | 0.33.2; `qwen3.8:27b` refresh pending | ⏳ download and bounded canary pending; the previous frozen model remains installed | Optional. Its absence degrades the report; it never blocks delivery. The new default must pass the bounded canary before acceptance. |
 | Telegram Bot API | Cloud, official | ⚠️ **no live calls made** | Response shapes are exercised with a scripted `fetch`. Blocked on a bot token, which only the owner can create. |
 
 ## How Python 3.14 was chosen

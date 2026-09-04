@@ -214,7 +214,7 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
   llm: {
     backend: 'ollama',
     baseUrl: 'http://127.0.0.1:11434',
-    model: 'qwen3.6:27b',
+    model: 'qwen3.8:27b',
     contextTokens: 32_768,
     temperature: 0,
     think: false,

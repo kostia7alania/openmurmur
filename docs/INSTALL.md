@@ -39,10 +39,10 @@ They unload after bounded idle time, but the processing peak still does not fit.
 Use a smaller summarizer:
 
 ```bash
-ollama pull qwen3.6:8b
+ollama pull qwen3.5:9b
 ```
 
-and set `llm.model` to `qwen3.6:8b` in the config (step 7). Recording,
+and set `llm.model` to `qwen3.5:9b` in the config (step 7). Recording,
 transcription and delivery are unaffected; only summary quality drops.
 
 ---
@@ -126,7 +126,7 @@ brew services start ollama
 Then pull the model. **~17 GB — start it now and continue reading.**
 
 ```bash
-ollama pull qwen3.6:27b
+ollama pull qwen3.8:27b
 ```
 
 ## 6. The repository
@@ -210,7 +210,7 @@ Read the output. It is the difference between "it should work" and "it does":
 ✅ uv                 uv 0.11.14
 ✅ mlx_readiness      configured model snapshot evidence present; 183 GB free on cache volume
 ✅ speech_detection   Silero VAD answered in 1291 ms
-✅ ollama             qwen3.6:27b available at http://127.0.0.1:11434
+✅ ollama             qwen3.8:27b available at http://127.0.0.1:11434
 ⚠️  state_directory    ... (missing or not writable)
 ⚠️  telegram_setup    no Telegram credential items found in the macOS Keychain
 ```

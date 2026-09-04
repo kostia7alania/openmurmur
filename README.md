@@ -64,7 +64,7 @@ login/reboot and sleep/wake remain **unverified in the current release record**
 | Item | Approx. size |
 | --- | --- |
 | Qwen3-ASR-1.7B (8-bit MLX) | ~4.4 GiB verified cache footprint; keep at least 6 GB free |
-| `qwen3.6:27b` (Q4_K_M) | ~17 GB |
+| `qwen3.8:27b` | ~18 GB |
 | Silero VAD (ONNX) | ~2 MB |
 | Session audio | ~19 MB per hour of recording (16 kHz mono FLAC) |
 
