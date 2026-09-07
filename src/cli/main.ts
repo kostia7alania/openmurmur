@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { parseArgs } from 'node:util';
 import { isAsrLanguageCode, modelLanguageName } from '../asr/preferences.ts';
+import type { CaptureBackend } from '../capture/backend.ts';
 import {
   createCaptureBackend,
   defaultNativeCaptureExecutable,
@@ -556,7 +557,17 @@ function captureCommand(
     case 'authorize':
       return captureAuthorize(commandContext, audio.captureBackend);
     case 'test':
-      return captureTest(audio);
+      return captureTest(
+        createCaptureBackend({
+          backend: audio.captureBackend,
+          sampleRate: audio.sampleRate,
+          channels: audio.channels,
+          device: audio.captureDevice,
+          frameSamples: 512,
+          ffmpegPath: audio.ffmpegPath,
+          clock: systemClock,
+        }),
+      );
     default:
       process.stderr.write('Usage: pnpm openmurmur capture <authorize|test>\n');
       return 1;
@@ -759,20 +770,11 @@ async function confirm(prompt: string): Promise<boolean> {
   }
 }
 
-/** Opens the configured backend and accepts only real PCM frames as success. */
-async function captureTest(audio: AudioConfig): Promise<number> {
-  const capture = createCaptureBackend({
-    backend: audio.captureBackend,
-    sampleRate: audio.sampleRate,
-    channels: audio.channels,
-    device: audio.captureDevice,
-    frameSamples: 512,
-    ffmpegPath: audio.ffmpegPath,
-    clock: systemClock,
-  });
+/** An opened stream is not proof of input: require at least one nonzero sample. */
+async function captureTest(capture: CaptureBackend): Promise<number> {
   const vad = new EnergyVad();
 
-  process.stdout.write(`Testing configured capture backend: ${audio.captureBackend}.\n`);
+  process.stdout.write(`Testing configured capture backend: ${capture.name}.\n`);
   process.stdout.write('Recording 5 seconds of real PCM. Say something.\n');
   process.stdout.write('macOS shows an orange dot near Control Center while the mic is open.\n\n');
 
@@ -786,11 +788,11 @@ async function captureTest(audio: AudioConfig): Promise<number> {
     for await (const frame of capture.start()) {
       frames += 1;
       capturedDurationMs += frame.durationMs;
-      deadline ??= Date.now() + 5000;
+      deadline ??= frame.monotonicMs + 5000;
       const dbfs = rmsDbfs(frame.pcm);
       if (Number.isFinite(dbfs)) peakDbfs = Math.max(peakDbfs, dbfs);
       if (vad.probability(frame.pcm) >= 0.5) speechFrames += 1;
-      if (Date.now() >= deadline) break;
+      if (frame.monotonicMs >= deadline) break;
     }
   } catch (error) {
     process.stderr.write(`\n❌ ${(error as Error).message}\n`);
@@ -804,11 +806,20 @@ async function captureTest(audio: AudioConfig): Promise<number> {
     return 1;
   }
 
+  const hasSignal = Number.isFinite(peakDbfs);
   process.stdout.write(
-    `✅ ${frames} PCM frames captured (${(capturedDurationMs / 1000).toFixed(2)}s of audio)\n`,
+    `${hasSignal ? '✅' : '❌'} ${frames} PCM frames captured (${(capturedDurationMs / 1000).toFixed(2)}s of audio)\n`,
   );
   process.stdout.write(`   Peak level: ${peakDbfs.toFixed(1)} dBFS\n`);
   process.stdout.write(`   Frames above the speech gate: ${speechFrames}\n`);
+  if (!hasSignal) {
+    process.stderr.write(
+      '\n❌ Digital silence only: the stream opened, but every audio sample was zero.\n' +
+        'Microphone access may already be granted; that does not prove a working input.\n' +
+        'Check System Settings -> Sound -> Input and its level meter while speaking.\n',
+    );
+    return 1;
+  }
   if (peakDbfs < -60) {
     process.stdout.write('\n⚠️  Very quiet. Check System Settings -> Sound -> Input.\n');
   }
@@ -1680,4 +1691,4 @@ if (import.meta.main) {
   }
 }
 
-export { main, renderNativeCaptureProofInstruction, TranscriptRepository };
+export { captureTest, main, renderNativeCaptureProofInstruction, TranscriptRepository };

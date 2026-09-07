@@ -32,6 +32,11 @@ dependencies, risk, estimate (S/M/L), release, tests.
   digital silence. The operator also observed no movement in macOS's input
   meter after restarting `coreaudiod`. This is not evidence of a working
   microphone → ASR → summary → Telegram session.
+- The foreground capture diagnostic now exits 1 for all-zero PCM instead of
+  reporting an opened silent stream as success. Quiet nonzero input remains
+  valid, and the five-second probe uses source monotonic time. The regression
+  and adjacent setup/CLI checks passed 26/26; a live native probe reproduced
+  the expected exit 1 with 158 frames, peak negative infinity and zero speech.
 
 ### P0-01 ✅ Repository bootstrap
 
