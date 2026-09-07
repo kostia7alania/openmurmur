@@ -10,6 +10,29 @@ dependencies, risk, estimate (S/M/L), release, tests.
 
 ## P0 — working MVP
 
+### 2026-09-07 notification and live-input follow-up
+
+- Event status delivery now persists a bot/chat-scoped message ID and edits it
+  on subsequent updates, with same-event send ordering and idempotent edit
+  retry handling. Long plain-text notifications use expandable quotes.
+- Ordinary health edges settle for 60 seconds; capture startup/stall watchdogs
+  allow 30/60 seconds. The core recorder's processing-lag bound remains 30 seconds.
+- Targeted real-SQLite/transport regressions cover restart, bot/chat isolation,
+  in-flight/backoff ordering, monotonic debounce and lossless HTML quoting.
+  Typecheck, Biome, all 720 Node tests (sequential) and 39 Python tests passed.
+- The live config was backed up and changed from a 3-second session silence
+  timeout and 15-second stale-input threshold to 60 seconds each; the daemon
+  restarted with a fresh heartbeat and no pending/dead delivery work. The
+  production outbox recorded two successful recording-status updates with the
+  same Telegram message ID across restart. A separate live expandable-quote
+  rendering test awaits operator approval; automated HTML transport checks pass.
+- Live microphone acceptance is still blocked: the signed installed helper
+  reports authorization granted, lid-open is confirmed, input gain is 93% and
+  CoreAudio input mute is off, but both native and FFmpeg capture returned
+  digital silence. The operator also observed no movement in macOS's input
+  meter after restarting `coreaudiod`. This is not evidence of a working
+  microphone → ASR → summary → Telegram session.
+
 ### P0-01 ✅ Repository bootstrap
 
 - **Epic:** Foundation
