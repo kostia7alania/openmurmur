@@ -27,6 +27,22 @@ export function escapeHtml(text: string): string {
     .replaceAll('"', '&quot;');
 }
 
+/** Keep the event headline visible while Telegram collapses verbose details. */
+export function formatNotification(text: string): { text: string; parseMode?: 'HTML' } {
+  // Oversized payloads still fail the transport boundary; formatting must not
+  // turn silently truncated content into a successful delivery fact.
+  if (text.length > TELEGRAM_MESSAGE_LIMIT) return { text };
+  if (text.length <= 350 && text.split('\n').length <= 5) return { text };
+  const newline = text.indexOf('\n');
+  const hasHeadline = newline >= 0 && newline <= 200;
+  const headline = hasHeadline ? `${escapeHtml(text.slice(0, newline))}\n\n` : '';
+  const detail = hasHeadline ? text.slice(newline + 1).trim() : text;
+  return {
+    text: `${headline}<blockquote expandable>${escapeHtml(detail)}</blockquote>`,
+    parseMode: 'HTML',
+  };
+}
+
 function splitOversizedGrapheme(
   grapheme: string,
   limit: number,

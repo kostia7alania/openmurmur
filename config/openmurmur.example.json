@@ -62,11 +62,12 @@
   },
   "health": {
     "pollIntervalMs": 5000,
-    "recorderStaleSeconds": 15,
+    "recorderStaleSeconds": 60,
     "asrBacklogMinutes": 60,
     "outboxStaleMinutes": 30,
     "diskFreeWarnGb": 20,
-    "alertCooldownMinutes": 30
+    "alertCooldownMinutes": 30,
+    "alertDebounceSeconds": 60
   },
   "digest": {
     "enabled": true,

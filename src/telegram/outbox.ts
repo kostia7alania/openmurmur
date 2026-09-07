@@ -11,6 +11,7 @@ import {
   type TelegramClient,
   type TelegramInlineKeyboardMarkup,
 } from './client.ts';
+import { formatNotification } from './format.ts';
 
 /**
  * Transactional outbox for every Telegram send.
@@ -60,6 +61,7 @@ export interface EnqueueMessage {
   /** Breaks ties between rows created together; readiness time is the primary order. */
   readonly ordinal: number;
   readonly payload: OutboxPayload;
+  readonly eventKey?: string;
 }
 
 export interface ClaimedOutboxRow {
@@ -70,6 +72,7 @@ export interface ClaimedOutboxRow {
   readonly payload: string;
   readonly attempts: number;
   readonly max_attempts: number;
+  readonly event_key: string | null;
   /** Monotonic token fencing this claim after any recovery and reclaim. */
   readonly claim_generation: number;
 }
@@ -104,6 +107,23 @@ function isTelegramChannelFailure(error: unknown): boolean {
   );
 }
 
+function notificationEventKey(message: EnqueueMessage): string | null {
+  if (message.payload.type !== 'text') return null;
+  if (message.kind === 'alert') {
+    const alertId = /^alert:([^:]+):/u.exec(message.deliveryPartId)?.[1];
+    if (alertId === 'capture_failed' || alertId === 'recorder_stale') return 'recording';
+    if (alertId !== undefined) return `health:${alertId}`;
+  }
+  if (
+    message.kind === 'status' &&
+    message.sessionId !== undefined &&
+    message.deliveryPartId.startsWith('session-status:')
+  ) {
+    return `session:${message.sessionId}`;
+  }
+  return null;
+}
+
 export class Outbox {
   readonly #db: DatabaseSync;
   #channelBlockedUntil = 0;
@@ -114,12 +134,19 @@ export class Outbox {
   /** Returns false when this exact delivery unit was already enqueued. */
   enqueue(message: EnqueueMessage): boolean {
     const ts = nowIso();
+    const eventKey = message.eventKey ?? notificationEventKey(message);
+    const payload =
+      (message.kind === 'alert' || message.kind === 'status') &&
+      message.payload.type === 'text' &&
+      message.payload.parseMode === undefined
+        ? { ...message.payload, ...formatNotification(message.payload.text) }
+        : message.payload;
     const result = this.#db
       .prepare(
         `INSERT INTO telegram_outbox
            (outbox_id, delivery_part_id, session_id, kind, ordinal, payload,
-            run_after, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            run_after, created_at, updated_at, event_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (delivery_part_id) DO NOTHING`,
       )
       .run(
@@ -128,10 +155,11 @@ export class Outbox {
         message.sessionId ?? null,
         message.kind,
         message.ordinal,
-        JSON.stringify(message.payload),
+        JSON.stringify(payload),
         ts,
         ts,
         ts,
+        eventKey,
       );
     return result.changes > 0;
   }
@@ -142,9 +170,15 @@ export class Outbox {
       const row = this.#db
         .prepare(
           `SELECT outbox_id, delivery_part_id, session_id, kind, payload, attempts, max_attempts,
-                  claim_generation
-             FROM telegram_outbox
+                  claim_generation, event_key
+             FROM telegram_outbox AS candidate
             WHERE state = 'pending' AND run_after <= ?
+              AND (event_key IS NULL OR NOT EXISTS (
+                SELECT 1 FROM telegram_outbox AS inflight
+                 WHERE inflight.event_key = candidate.event_key
+                   AND (inflight.state = 'sending' OR
+                        (inflight.state = 'pending' AND inflight.rowid < candidate.rowid))
+              ))
             ORDER BY created_at, rowid, ordinal
             LIMIT 1`,
         )
@@ -168,6 +202,25 @@ export class Outbox {
         claim_generation: row.claim_generation + 1,
       };
     });
+  }
+
+  eventMessageId(eventKey: string, chatScope: string): number | null {
+    const row = this.#db
+      .prepare(
+        'SELECT telegram_message_id FROM telegram_event_messages WHERE event_key = ? AND chat_scope = ?',
+      )
+      .get(eventKey, chatScope) as { telegram_message_id: number } | undefined;
+    return row?.telegram_message_id ?? null;
+  }
+
+  recordEventMessage(eventKey: string, chatScope: string, messageId: number): void {
+    this.#db
+      .prepare(
+        `INSERT INTO telegram_event_messages (event_key, chat_scope, telegram_message_id)
+       VALUES (?, ?, ?) ON CONFLICT (event_key, chat_scope)
+       DO UPDATE SET telegram_message_id = excluded.telegram_message_id`,
+      )
+      .run(eventKey, chatScope, messageId);
   }
 
   markSent(
@@ -388,6 +441,13 @@ export async function drainOutbox(deps: OutboxWorkerDeps, budget = 25): Promise<
     try {
       const messageId = await sendPayload(deps, row, payload);
       const outcome = deps.outbox.markSent(row, messageId, () => {
+        if (row.event_key !== null && messageId !== null) {
+          deps.outbox.recordEventMessage(
+            row.event_key,
+            deps.client.messageScope(deps.chatId),
+            messageId,
+          );
+        }
         deps.onDelivered?.({
           deliveryPartId: row.delivery_part_id,
           sessionId: row.session_id,
@@ -459,18 +519,47 @@ async function cleanupEphemeralPayload(payload: OutboxPayload, logger: Logger): 
   }
 }
 
+async function sendEventText(
+  deps: OutboxWorkerDeps,
+  row: ClaimedOutboxRow,
+  payload: Extract<OutboxPayload, { type: 'text' }>,
+): Promise<number> {
+  const previousMessageId =
+    row.event_key === null
+      ? null
+      : deps.outbox.eventMessageId(row.event_key, deps.client.messageScope(deps.chatId));
+  if (previousMessageId !== null) {
+    try {
+      await deps.client.editMessageText(deps.chatId, previousMessageId, payload.text, {
+        ...(payload.parseMode === undefined ? {} : { parseMode: payload.parseMode }),
+        ...(payload.replyMarkup === undefined ? {} : { replyMarkup: payload.replyMarkup }),
+      });
+      return previousMessageId;
+    } catch (error) {
+      const failure = error as Partial<TelegramApiError>;
+      // A retried edit may already have reached Telegram before its ACK was lost.
+      if (failure.errorCode === 400 && failure.message?.includes('message is not modified')) {
+        return previousMessageId;
+      }
+      // Only authoritative deletion permits replacing the event's message.
+      if (failure.errorCode !== 400 || !failure.message?.includes('message to edit not found')) {
+        throw error;
+      }
+    }
+  }
+  const message = await deps.client.sendMessage(deps.chatId, payload.text, {
+    parseMode: payload.parseMode,
+    ...(payload.replyMarkup === undefined ? {} : { replyMarkup: payload.replyMarkup }),
+  });
+  return message.message_id;
+}
+
 async function sendPayload(
   deps: OutboxWorkerDeps,
   row: ClaimedOutboxRow,
   payload: OutboxPayload,
 ): Promise<number | null> {
-  if (payload.type === 'text') {
-    const message = await deps.client.sendMessage(deps.chatId, payload.text, {
-      parseMode: payload.parseMode,
-      ...(payload.replyMarkup === undefined ? {} : { replyMarkup: payload.replyMarkup }),
-    });
-    return message.message_id;
-  }
+  if (payload.type === 'text') return sendEventText(deps, row, payload);
 
   if (row.kind === 'digest') {
     if (deps.prepareDigestDocument === undefined) {

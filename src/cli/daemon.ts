@@ -217,6 +217,7 @@ export class Daemon {
     this.#outbox = new Outbox(this.#db.handle);
     this.#alerts = new AlertEvaluator(this.#db.handle, {
       cooldownMinutes: config.health.alertCooldownMinutes,
+      debounceSeconds: config.health.alertDebounceSeconds,
     });
     this.#asr = createAsrBackend(options.loaded, options.logger);
     this.#llm = createLlmBackend(config);
@@ -243,10 +244,14 @@ export class Daemon {
             'Silero VAD недоступен, сессии временно определяются по громкости: ' +
             'шум может быть принят за речь, а тихая речь — пропущена.\n' +
             `Причина: ${reason.slice(0, 300)}`,
+          'speech-detection',
         );
       },
       onRecovered: () => {
-        void this.#sendNow('🟢 Определение речи снова работает нормально (Silero VAD)');
+        void this.#sendNow(
+          '🟢 Определение речи снова работает нормально (Silero VAD)',
+          'speech-detection',
+        );
       },
     });
 
@@ -580,7 +585,7 @@ export class Daemon {
     this.#options.logger.info('first audio frame received');
     const captureDecision = this.#recordCaptureAvailability(false);
     if (shouldSendRecordingStartedNotice(captureDecision)) {
-      void this.#sendNow('🟢 Запись включена');
+      void this.#sendNow('🟢 Запись включена', 'recording');
     }
   }
 
@@ -1733,8 +1738,14 @@ export class Daemon {
   }
 
   /** Enqueues a status and immediately requests a serialized outbox drain. */
-  async #sendNow(text: string): Promise<void> {
-    this.#enqueueText(text, `notice:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`);
+  async #sendNow(text: string, eventKey: string): Promise<void> {
+    this.#outbox.enqueue({
+      deliveryPartId: `notice:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'status',
+      ordinal: 5,
+      eventKey,
+      payload: { type: 'text', text },
+    });
     await this.#tickOutbox().catch(() => {});
   }
 

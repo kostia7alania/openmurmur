@@ -48,9 +48,9 @@ const COMPONENT_GOLDENS: Readonly<Record<HealthComponent, readonly HealthGolden[
       text: 'ВНИМАНИЕ: запись — ожидаю первый аудиокадр',
     },
     {
-      inputs: { msSinceLastFrame: 16_000 },
+      inputs: { msSinceLastFrame: 61_000 },
       status: 'failed',
-      text: 'ОШИБКА: запись — нет аудиокадров 16 сек',
+      text: 'ОШИБКА: запись — нет аудиокадров 61 сек',
     },
   ],
   capture_pipeline: [

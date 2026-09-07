@@ -1616,10 +1616,11 @@ describe('daemon terminal state reconciliation', () => {
       type: 'text',
       text:
         '🟡 После некорректного завершения обнаружены данные; выполняю локальное восстановление\n\n' +
-        'Временных артефактов: 0\n' +
+        '<blockquote expandable>Временных артефактов: 0\n' +
         'Частей для восстановления: 0\n' +
         'Неопубликованных недоступных частей: 0\n' +
-        'Незавершённых сессий: 1',
+        'Незавершённых сессий: 1</blockquote>',
+      parseMode: 'HTML',
     });
 
     const requests: string[] = [];
@@ -1894,8 +1895,9 @@ describe('daemon terminal state reconciliation', () => {
     assert.equal(
       text,
       '🔴 Не удалось обработать аудио после нескольких попыток.\n\n' +
-        'Технические подробности сохранены в локальном журнале.\n\n' +
-        renderProvenancePlain(incomingTelegramProvenance(incoming)),
+        '<blockquote expandable>Технические подробности сохранены в локальном журнале.\n\n' +
+        renderProvenancePlain(incomingTelegramProvenance(incoming)) +
+        '</blockquote>',
     );
     assert.ok(!text.includes(technicalError));
   });

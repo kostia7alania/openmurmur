@@ -57,6 +57,7 @@ describe('migrations', () => {
       'alert_state',
       'telegram_updates',
       'telegram_outbox',
+      'telegram_event_messages',
       'incoming_telegram_files',
       'audio_delivery_reconciliation_audit',
       'telegram_delivery_reconciliation_audit',
@@ -313,6 +314,7 @@ describe('migrations', () => {
         '017_daemon_ownership.sql',
         '018_telegram_maintenance_outbox_guard.sql',
         '019_telegram_maintenance_job_guard.sql',
+        '020_telegram_event_messages.sql',
       ]);
       const rows = legacy
         .prepare('SELECT part_id, delivered_at FROM audio_parts ORDER BY part_id')
@@ -572,6 +574,9 @@ describe('migrations', () => {
       DROP TRIGGER telegram_jobs_block_requeue_during_maintenance;
       ALTER TABLE telegram_outbox DROP COLUMN claim_generation;
       DROP TABLE daemon_ownership;
+      DROP TABLE telegram_event_messages;
+      DROP INDEX idx_outbox_event_sending;
+      ALTER TABLE telegram_outbox DROP COLUMN event_key;
       DELETE FROM schema_migrations
        WHERE name IN (
          '014_current_transcript_uniqueness.sql',
@@ -579,7 +584,8 @@ describe('migrations', () => {
          '016_transcript_timestamp_provenance.sql',
          '017_daemon_ownership.sql',
          '018_telegram_maintenance_outbox_guard.sql',
-         '019_telegram_maintenance_job_guard.sql'
+         '019_telegram_maintenance_job_guard.sql',
+         '020_telegram_event_messages.sql'
        );
     `);
     const at = '2026-08-11T01:00:00.000Z';
@@ -611,6 +617,7 @@ describe('migrations', () => {
       '017_daemon_ownership.sql',
       '018_telegram_maintenance_outbox_guard.sql',
       '019_telegram_maintenance_job_guard.sql',
+      '020_telegram_event_messages.sql',
     ]);
     const pointers = db.handle
       .prepare(

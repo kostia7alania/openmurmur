@@ -461,7 +461,10 @@ describe('end to end: capture through delivery, without a microphone', () => {
       queued.some((q) => q.kind === 'report'),
       'the report is queued',
     );
-    assert.equal(outbox.claimNext()?.kind, 'status', 'the start notice is first');
+    const startNotice = outbox.claimNext();
+    assert.equal(startNotice?.kind, 'status', 'the start notice is first');
+    assert.ok(startNotice);
+    outbox.markSent(startNotice, 1);
     assert.equal(outbox.claimNext()?.kind, 'status', 'the finish/upload notice follows');
     assert.equal(outbox.claimNext()?.kind, 'audio', 'audio goes before transcript and report');
 

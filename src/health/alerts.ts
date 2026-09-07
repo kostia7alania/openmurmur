@@ -32,6 +32,8 @@ export interface AlertDecision {
 export interface AlertEvaluatorOptions {
   readonly cooldownMinutes: number;
   readonly now?: () => number;
+  readonly debounceSeconds?: number;
+  readonly monotonicNow?: () => number;
 }
 
 interface AlertStateRow {
@@ -45,11 +47,16 @@ export class AlertEvaluator {
   readonly #db: DatabaseSync;
   readonly #cooldownMs: number;
   readonly #now: () => number;
+  readonly #monotonicNow: () => number;
+  readonly #debounceMs: number;
+  readonly #pending = new Map<AlertId, { active: boolean; since: number }>();
 
   constructor(db: DatabaseSync, options: AlertEvaluatorOptions) {
     this.#db = db;
     this.#cooldownMs = options.cooldownMinutes * 60_000;
     this.#now = options.now ?? Date.now;
+    this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
+    this.#debounceMs = (options.debounceSeconds ?? 0) * 1000;
   }
 
   /**
@@ -69,11 +76,28 @@ export class AlertEvaluator {
     fingerprint?: string,
     onSend?: (decision: AlertDecision) => void,
   ): AlertDecision {
-    return transaction(this.#db, () => {
+    // A terminal capture failure exits the daemon; its source watchdog already
+    // provides the grace period. Other health edges must remain stable first.
+    if (alertId !== 'capture_failed' && this.#debounceMs > 0) {
+      if (this.isActive(alertId) === active) {
+        this.#pending.delete(alertId);
+      } else {
+        const now = this.#monotonicNow();
+        let pending = this.#pending.get(alertId);
+        if (pending?.active !== active) {
+          pending = { active, since: now };
+          this.#pending.set(alertId, pending);
+        }
+        if (now - pending.since < this.#debounceMs) return { send: false, transition: 'none' };
+      }
+    }
+    const result = transaction(this.#db, () => {
       const decision = this.#evaluate(alertId, active, fingerprint);
       if (decision.send) onSend?.(decision);
       return decision;
     });
+    this.#pending.delete(alertId);
+    return result;
   }
 
   #evaluate(alertId: AlertId, active: boolean, fingerprint?: string): AlertDecision {

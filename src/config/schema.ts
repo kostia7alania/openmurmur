@@ -152,6 +152,8 @@ export interface HealthConfig {
   readonly outboxStaleMinutes: number;
   readonly diskFreeWarnGb: number;
   readonly alertCooldownMinutes: number;
+  /** Require a stable ordinary health edge before changing its Telegram message. */
+  readonly alertDebounceSeconds: number;
 }
 
 export interface DigestConfig {
@@ -240,11 +242,12 @@ export const DEFAULT_CONFIG: OpenMurmurConfig = {
   },
   health: {
     pollIntervalMs: 5000,
-    recorderStaleSeconds: 15,
+    recorderStaleSeconds: 60,
     asrBacklogMinutes: 60,
     outboxStaleMinutes: 30,
     diskFreeWarnGb: 20,
     alertCooldownMinutes: 30,
+    alertDebounceSeconds: 60,
   },
   digest: {
     enabled: true,
@@ -394,6 +397,7 @@ function validate(c: OpenMurmurConfig, issues: string[]): void {
   nonNegative('health.outboxStaleMinutes', health.outboxStaleMinutes);
   nonNegative('health.diskFreeWarnGb', health.diskFreeWarnGb);
   positive('health.alertCooldownMinutes', health.alertCooldownMinutes);
+  nonNegative('health.alertDebounceSeconds', health.alertDebounceSeconds);
 
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(c.digest.atLocalTime)) {
     issues.push('digest.atLocalTime must be HH:MM in 24-hour form');

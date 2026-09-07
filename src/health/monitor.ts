@@ -84,7 +84,9 @@ export function evaluateHealth(inputs: HealthInputs, config: HealthConfig): Heal
   }
 
   if (inputs.processingLagMs !== null) {
-    const lagging = inputs.processingLagMs > config.recorderStaleSeconds * 1000;
+    // A longer device grace period must not hide hot-path overload before the
+    // recorder's independent 30-second processing bound is reached.
+    const lagging = inputs.processingLagMs > Math.min(config.recorderStaleSeconds, 15) * 1000;
     checks.push({
       component: 'capture_pipeline',
       status: lagging ? 'degraded' : 'healthy',

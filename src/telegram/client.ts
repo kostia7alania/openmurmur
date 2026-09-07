@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { openAsBlob } from 'node:fs';
 import { basename, isAbsolute } from 'node:path';
 import { redact } from '../logging/redact.ts';
@@ -263,6 +264,13 @@ export class TelegramClient {
     if (!Number.isFinite(this.#transferTimeoutMs) || this.#transferTimeoutMs <= 0) {
       throw new Error('Telegram transferTimeoutMs must be a positive finite number');
     }
+  }
+
+  /** Message IDs must never be reused after changing the bot or recipient. */
+  messageScope(chatId: number): string {
+    return createHash('sha256')
+      .update(JSON.stringify([this.#token, chatId]))
+      .digest('hex');
   }
 
   async #call<T>(

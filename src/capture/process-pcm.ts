@@ -11,8 +11,8 @@ import {
 import { CaptureBufferOverflowError, CaptureFrameBuffer } from './frame-buffer.ts';
 
 const MAX_PROCESSING_LAG_MS = 30_000;
-export const FIRST_SOURCE_FRAME_TIMEOUT_MS = 10_000;
-export const SOURCE_FRAME_STALL_TIMEOUT_MS = 15_000;
+export const FIRST_SOURCE_FRAME_TIMEOUT_MS = 30_000;
+export const SOURCE_FRAME_STALL_TIMEOUT_MS = 60_000;
 
 export interface ProcessPcmCaptureOptions extends CaptureBackendOptions {
   readonly name: string;

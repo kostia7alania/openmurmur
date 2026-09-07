@@ -5,6 +5,32 @@ uses, and you configure it yourself. Explicit foreground dependency and model
 provisioning may contact their documented package/model hosts; this document
 describes exactly what crosses the Telegram boundary.
 
+## Event notifications
+
+Recording availability, each health condition and each recording session's
+lifecycle have one editable Telegram status message. The first update sends
+it; subsequent updates, including recovery, edit the stored message ID. That
+mapping survives daemon restarts and is scoped to the exact bot credential
+and recipient. Source audio, transcripts and reports remain separate artifacts.
+
+Ordinary health transitions must remain stable for
+`health.alertDebounceSeconds` (60 seconds by default). A brief failure or
+recovery does not publish a new edge. Terminal capture failures are recorded
+before process exit; the capture watchdog now allows 30 seconds for the first
+frame and 60 seconds between frames. Actual health observations remain local
+and immediately available even while a notification is settling.
+
+Notifications longer than 350 characters or five lines keep a short headline
+and put the details inside an expandable quote. Formatting escapes untrusted
+text and does not truncate oversized messages to bypass Telegram limits.
+
+Updates for the same event are serialized through retries. A successful
+repeated edit (`message is not modified`) counts as acknowledged; an edit
+failure creates a replacement message only when Telegram explicitly says the
+old message no longer exists. As with other outbox sends, losing the first
+send's remote ACK before its local commit retains the documented at-least-once
+ambiguity; the Bot API does not provide idempotency keys for message creation.
+
 ## Setup
 
 Choose the role while creating the fresh config. Configuration defaults to
